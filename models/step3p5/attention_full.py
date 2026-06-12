@@ -491,6 +491,21 @@ def attention_full(
                     [pad_row_base + Q_HEAD_BATCH_FULL, 0],
                 )
 
+    # Diagnostic prune: after RoPE/cache staging, skip attention + MLP and
+    # materialize a simple output. This isolates whether 507018 is raised by
+    # full_rope_kv_cache itself or by a later consumer running in the same
+    # orchestration.
+    for prune_b0 in pl.spmd(BATCH // BATCH_TILE, name_hint="full_prune_out"):
+        prune_b = prune_b0 * BATCH_TILE
+        for prune_kb in pl.range(HIDDEN // K_CHUNK):
+            prune_k0 = prune_kb * K_CHUNK
+            resid1_out = pl.assemble(
+                resid1_out,
+                pl.slice(current_hidden, [BATCH_TILE, K_CHUNK], [prune_b, prune_k0]),
+                [prune_b, prune_k0],
+            )
+    return resid1_out
+
     # ----- fa_fused — Phase A (2026-06-11): qwen3/32b-style 4-spmd split. -----
     # The previous fused mixed AIC+AIV single root tripped 507018 / VEC UB
     # not-aligned at this shape (NUM_HEADS_FULL_LOCAL=8, KV_HEADS_LOCAL=1,

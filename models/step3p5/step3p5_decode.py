@@ -6,7 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 top-level end-to-end smoke entry — 8-card TP/EP decode.
+"""[中文摘要] decode 真机 / smoke CLI 入口:加载 per-rank weight bundle,通过
+`select_decode_layer` 走 45 主层,通过 mtp.py 走 3 个 MTP 层;CPU torch
+reference 8-rank smoke 与真机 NPU 启动器都从这里发。这里是纯 host Python,
+不带任何 pypto 装饰器。
+[关键装饰器] 无(纯 host Python)。
+[SPMD 角色] host 入口:启动 per-rank 进程,每张卡跑同一份 program;实际 SPMD
+执行从 Step3p5DecodeFwd.host_orch 开始。
+[详见] 中文架构指南 §10
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 top-level end-to-end smoke entry — 8-card TP/EP decode.
 
 This module is the integration point for Phase 8: it loads the per-card
 weight bundle from the HF safetensors checkpoint, dispatches every layer
@@ -372,15 +383,40 @@ def run_real_npu(args: argparse.Namespace) -> int:
         cfg_mod.NUM_HEADS_SWA_LOCAL_PAD  = math.ceil(cfg_mod.NUM_HEADS_SWA  / 16) * 16
         # KV_PROJ_K_CHUNK_LOCAL: TP=1 KV_HIDDEN_LOCAL=1024 > INPUT_PROJ_K_CHUNK=256 → use 128.
         cfg_mod.KV_PROJ_K_CHUNK_LOCAL    = cfg_mod.KV_PROJ_K_CHUNK
+        # The LAYER_*_ROWS_DYN constants in config.py are static integers
+        # (workaround for upstream pypto bugs #3/#4 — see
+        # docs/known-pypto-pitfalls.md). Their cached values were derived
+        # for the canonical TP=8 path:
+        #   LAYER_INTER_ROWS_DYN  = N_DENSE_MLP * INTERMEDIATE_LOCAL  = 3 * 1408  = 4224
+        #   LAYER_QHIDDEN_ROWS_DYN = N_FULL_ATTN * HIDDEN_Q_FULL_LOCAL = 12 * 1024 = 12288
+        # Under TP=1 the LOCAL widths multiply 8x → bounds rise to:
+        #   LAYER_INTER_ROWS_DYN  = 3  * 11264 = 33792
+        #   LAYER_QHIDDEN_ROWS_DYN = 12 * 8192  = 98304
+        # Without these patches dense_down_matmul / out_proj_matmul
+        # access weight rows past the kernel-baked bound → MTE DDR
+        # out-of-range fault (errcode 0x800000, AICore subErrType:4) →
+        # 507046 stream sync timeout. Patch BEFORE module reload so the
+        # rebuilt attention_full / decode_layer kernels capture the new
+        # values in their tensor-shape annotations.
+        N_DENSE_MLP_LAYERS = 3
+        N_FULL_ATTN_LAYERS = 12
+        cfg_mod.LAYER_INTER_ROWS_DYN = N_DENSE_MLP_LAYERS * cfg_mod.INTERMEDIATE_LOCAL
 
         attn_full_mod = importlib.reload(attn_full_mod)
         attn_swa_mod  = importlib.reload(attn_swa_mod)
+        # ``LAYER_QHIDDEN_ROWS_DYN`` lives in ``attention_full.py`` (not
+        # config.py) — override AFTER attn_full_mod reload, BEFORE
+        # decode_layer reload so decode_layer re-imports the patched
+        # value.
+        attn_full_mod.LAYER_QHIDDEN_ROWS_DYN = N_FULL_ATTN_LAYERS * cfg_mod.HIDDEN_Q_FULL_LOCAL
         dl_mod        = importlib.reload(dl_mod)
 
         print(
             f"  TP=1/EP=1 patch: KV_HIDDEN_LOCAL={cfg_mod.KV_HIDDEN_LOCAL}"
             f"  INTERMEDIATE_LOCAL={cfg_mod.INTERMEDIATE_LOCAL}"
             f"  NUM_HEADS_FULL_LOCAL_PAD={cfg_mod.NUM_HEADS_FULL_LOCAL_PAD}"
+            f"  LAYER_INTER_ROWS_DYN={cfg_mod.LAYER_INTER_ROWS_DYN}"
+            f"  LAYER_QHIDDEN_ROWS_DYN={attn_full_mod.LAYER_QHIDDEN_ROWS_DYN}"
         )
     else:
         print(
@@ -618,39 +654,11 @@ def run_real_npu(args: argparse.Namespace) -> int:
 
     Orchestrator.allocate_domain = _single_rank_alloc_domain
     try:
-        # Phase 15.1: pypto codegen leaves dynamic-shape symbols (LAYER_DYN,
-        # USER_BATCH_DYN, …) unresolved in the generated host_orch.py — they
-        # surface as NameError at first dispatch. Patch the file in place
-        # with concrete integer values derived from cfg + layer-type counts.
-        from .config import (  # noqa: PLC0415
-            DENSE_LAYER_INDICES,
-            LAYER_TYPE_FULL,
-            LAYER_TYPES,
-        )
-        _n_full = sum(1 for _t in LAYER_TYPES if _t == LAYER_TYPE_FULL)
-        _n_dense = len(DENSE_LAYER_INDICES)
-        _h_q_full = cfg_mod.NUM_HEADS_FULL_LOCAL * cfg_mod.HEAD_DIM
-        _dyn_values = {
-            "LAYER_DYN":              cfg_mod.NUM_HIDDEN_LAYERS,
-            "USER_BATCH_DYN":         cfg_mod.BATCH,
-            "BLOCK_TABLE_FLAT_DYN":   cfg_mod.MAX_BLOCKS_PER_SEQ * cfg_mod.BATCH,
-            "ROPE_SEQ_DYN":           cfg_mod.MAX_SEQ_DEFAULT,
-            "KV_CACHE_ROWS_DYN":      cfg_mod.MAX_SEQ_DEFAULT,
-            "LAYER_HIDDEN_ROWS_DYN":  _n_full * cfg_mod.HIDDEN,
-            "LAYER_QHIDDEN_ROWS_DYN": _n_full * _h_q_full,
-            "LAYER_INTER_ROWS_DYN":   _n_dense * cfg_mod.INTERMEDIATE_LOCAL,
-        }
-        _horch_path = (
-            pathlib.Path(compiled_l0.output_dir)
-            / "orchestration" / "host_orch.py"
-        )
-        import re as _re  # noqa: PLC0415
-        _text = _horch_path.read_text()
-        for _sym, _val in _dyn_values.items():
-            _text = _re.sub(rf"\b{_sym}\b", str(_val), _text)
-        _horch_path.write_text(_text)
-        print(f"  Patched DYN symbols in host_orch.py: {_dyn_values}")
-        sys.stdout.flush()
+        # Phase 15.1 note: ``config.py`` now exports the previously-dyn
+        # context/layer dims as integer constants (USER_BATCH=16, ROPE_SEQ=
+        # KV_CACHE_ROWS=4096, LAYER=45, LAYER_HIDDEN_ROWS=49152, …) so the
+        # generated ``host_orch.py`` already contains literal ints. No
+        # post-codegen symbol-substitution patching is needed any more.
 
         t0 = time.time()
         compiled_l0(*inputs)

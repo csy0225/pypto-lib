@@ -6,7 +6,21 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 full-attention kernel — TP=8 in-place refactor (Phase 9 Wave 2).
+"""[中文摘要] 64 头 full-attention 的多卡 @pl.program(每张卡 8 头,partial RoPE 0.5,
+llama3-yarn 缩放);包含 Wave-2 三层(host_orch / chip_orch / InCore body),
+末尾用 tp_all_reduce 汇集 o_proj 的 partial sum。
+[关键装饰器] @pl.program +
+   @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)  ← host_orch
+   @pl.function(type=pl.FunctionType.Orchestration)              ← chip_orch
+   @pl.function(type=pl.FunctionType.InCore)                     ← 各 InCore kernel body
+   @pl.jit.inline 模块级 helper(本文件内 + _ops.py 复制)
+[SPMD 角色] 跨卡 SPMD(TP=8 切头)+ 片上 SPMD(`pl.spmd(...)` 多核分派);
+chip_orch 用 `self.tp_all_reduce(...)` 汇集 partial。
+[详见] 中文架构指南 §3, §4.2, §4.5, §6
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 full-attention kernel — TP=8 in-place refactor (Phase 9 Wave 2).
 
 Each rank holds an attention shard:
 
@@ -131,8 +145,12 @@ TOTAL_Q_GROUPS = NUM_KV_HEADS_DIM * Q_GROUPS       # 1
 # hidden in a single chunk.
 KV_OUT_CHUNK_LOCAL = KV_HIDDEN_LOCAL
 
-# Per-layer dyn dim for the o_proj weight (LAYERS * HIDDEN_Q_LOCAL rows).
-LAYER_QHIDDEN_ROWS_DYN = pl.dynamic("LAYER_QHIDDEN_ROWS_DYN")
+# Per-layer rows for the o_proj weight: model-bound (= n_full_attn × HIDDEN_Q_FULL_LOCAL).
+# Derivation: there are 12 full-attention layers (config.LAYER_TYPES) and each
+# contributes HIDDEN_Q_FULL_LOCAL = 1024 rows of wo, so 12 * 1024 = 12288.
+# Kept static (not pl.dynamic) for the same reasons documented in
+# config.py's static-dim block.
+LAYER_QHIDDEN_ROWS_DYN = 12288
 
 assert Q_HEAD_PAD % 4 == 0 and Q_HEAD_PAD // 2 >= Q_HEAD_BATCH
 assert BATCH % 2 == 0, (
@@ -409,9 +427,6 @@ def attention_full(
                 k_hi = pl.slice(
                     k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col + ROTARY_HALF_FULL],
                 )
-                k_pass = pl.slice(
-                    k_proj_norm, [1, HEAD_DIM - ROTARY_HALF_FULL * 2], [b, kv_col + ROTARY_HALF_FULL * 2],
-                )
                 rot_k_lo = pl.sub(
                     pl.col_expand_mul(k_lo, cos_lo),
                     pl.col_expand_mul(k_hi, sin_lo),
@@ -428,11 +443,14 @@ def attention_full(
                 # AICore lowers cleanly), then overwrite cols 0..2*HALF with
                 # the RoPE'd halves. The pass-through tail (cols 2*HALF..)
                 # is left as the initial full-row cast.
-                k_full_bf16 = pl.cast(
-                    pl.slice(k_proj_norm, [1, HEAD_DIM], [b, kv_col]),
-                    target_type=pl.BF16,
+                k_cache = pl.assemble(
+                    k_cache,
+                    pl.cast(
+                        pl.slice(k_proj_norm, [1, HEAD_DIM], [b, kv_col]),
+                        target_type=pl.BF16,
+                    ),
+                    [cache_row, 0],
                 )
-                k_cache = pl.assemble(k_cache, k_full_bf16, [cache_row, 0])
                 k_cache = pl.assemble(
                     k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
                 )
@@ -457,7 +475,6 @@ def attention_full(
                 )
                 q_lo = pl.slice(q_block, [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL], [0, 0])
                 q_hi = pl.slice(q_block, [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL], [0, ROTARY_HALF_FULL])
-                q_pass = pl.slice(q_block, [Q_HEAD_BATCH_FULL, HEAD_DIM - ROTARY_HALF_FULL * 2], [0, ROTARY_HALF_FULL * 2])
                 rot_q_lo = pl.sub(
                     pl.col_expand_mul(q_lo, cos_lo),
                     pl.col_expand_mul(q_hi, sin_lo),
@@ -466,20 +483,18 @@ def attention_full(
                     pl.col_expand_mul(q_hi, cos_hi),
                     pl.col_expand_mul(q_lo, sin_hi),
                 )
-                rot_q_lo_bf16 = pl.cast(rot_q_lo, target_type=pl.BF16)
-                rot_q_hi_bf16 = pl.cast(rot_q_hi, target_type=pl.BF16)
-                # Phase A (2026-06-11): full-Q-block cast then overwrite RoPE
-                # halves (qwen3/32b idiom). Eliminates the partial-slice ->
-                # cast path that previously needed the `pl.add(q_pass, 0.0)`
-                # workaround (which compiled but tripped 507018 VEC UB align
-                # at runtime).
-                q_block_bf16 = pl.cast(q_block, target_type=pl.BF16)
-
+                # Cast inline at each store site. This keeps the generated VEC
+                # schedule identical to the passing minimal RoPE repro: full
+                # q_block cast/store first, then the two RoPE half overwrites.
                 pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL + ki * Q_HEAD_PAD_FULL
-                all_q_padded = pl.assemble(all_q_padded, q_block_bf16, [pad_row_base, 0])
-                all_q_padded = pl.assemble(all_q_padded, rot_q_lo_bf16, [pad_row_base, 0])
                 all_q_padded = pl.assemble(
-                    all_q_padded, rot_q_hi_bf16, [pad_row_base, ROTARY_HALF_FULL],
+                    all_q_padded, pl.cast(q_block, target_type=pl.BF16), [pad_row_base, 0],
+                )
+                all_q_padded = pl.assemble(
+                    all_q_padded, pl.cast(rot_q_lo, target_type=pl.BF16), [pad_row_base, 0],
+                )
+                all_q_padded = pl.assemble(
+                    all_q_padded, pl.cast(rot_q_hi, target_type=pl.BF16), [pad_row_base, ROTARY_HALF_FULL],
                 )
                 all_q_padded = pl.assemble(
                     all_q_padded,
@@ -490,21 +505,6 @@ def attention_full(
                     ),
                     [pad_row_base + Q_HEAD_BATCH_FULL, 0],
                 )
-
-    # Diagnostic prune: after RoPE/cache staging, skip attention + MLP and
-    # materialize a simple output. This isolates whether 507018 is raised by
-    # full_rope_kv_cache itself or by a later consumer running in the same
-    # orchestration.
-    for prune_b0 in pl.spmd(BATCH // BATCH_TILE, name_hint="full_prune_out"):
-        prune_b = prune_b0 * BATCH_TILE
-        for prune_kb in pl.range(HIDDEN // K_CHUNK):
-            prune_k0 = prune_kb * K_CHUNK
-            resid1_out = pl.assemble(
-                resid1_out,
-                pl.slice(current_hidden, [BATCH_TILE, K_CHUNK], [prune_b, prune_k0]),
-                [prune_b, prune_k0],
-            )
-    return resid1_out
 
     # ----- fa_fused — Phase A (2026-06-11): qwen3/32b-style 4-spmd split. -----
     # The previous fused mixed AIC+AIV single root tripped 507018 / VEC UB
@@ -656,36 +656,38 @@ def attention_full(
         attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])
 
     # ----- Scope 2.5 — head-wise sigmoid gate (local heads only). -----
-    # Phase 15.1: outer spmd over batch tiles only; load the full
-    # gate_logits row [BATCH_TILE, NUM_HEADS_FULL_LOCAL_PAD] once as a
-    # contiguous ND tile, sigmoid all heads at once, then pluck each head
-    # column intra-tile.  This avoids the [BATCH_TILE, 1] DN-Vec ↔ ND-GM
-    # TLOAD pair that pto-isa rejects (`isSameLayout` static_assert in
-    # TLoad.hpp:459).
-    attn_out_gated = pl.create_tensor([BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16)
-    for hg_spmd_idx in pl.spmd(
-        BATCH // BATCH_TILE, name_hint="full_head_gate",
-    ):
-        hg_b0 = hg_spmd_idx * BATCH_TILE
-        gate_row_fp32 = pl.slice(
-            gate_logits,
-            [BATCH_TILE, NUM_HEADS_FULL_LOCAL_PAD],
-            [hg_b0, 0],
-        )
-        sigmoid_all = pl.recip(
-            pl.add(pl.exp(pl.neg(gate_row_fp32)), 1.0),
-        )
-        for hg_h in pl.range(NUM_HEADS_FULL_LOCAL):
-            hg_col = hg_h * HEAD_DIM
-            head_slice_bf16 = pl.slice(
-                attn_out, [BATCH_TILE, HEAD_DIM], [hg_b0, hg_col],
-            )
-            hg_gate = pl.slice(sigmoid_all, [BATCH_TILE, 1], [0, hg_h])
-            hg_gated_fp32 = pl.row_expand_mul(
-                pl.cast(head_slice_bf16, target_type=pl.FP32), hg_gate,
-            )
-            gated = pl.cast(hg_gated_fp32, target_type=pl.BF16)
-            attn_out_gated = pl.assemble(attn_out_gated, gated, [hg_b0, hg_col])
+    # Phase 15 BYPASS: gate is currently disabled (identity pass-through).
+    #
+    # Why bypassed:
+    #   The head-wise gate is intrinsically a *per-(batch, head) scalar
+    #   broadcast across HEAD_DIM lanes*. The only pypto VEC primitive
+    #   that broadcasts a scalar over a row direction is
+    #   ``pl.row_expand_mul(left[N, K], right[N, 1])`` — and **any**
+    #   ``[N, 1]`` FP32 VEC tile (whether built via ``pl.slice`` or
+    #   via ``pl.reshape`` of a 2D tile) trips the AIV 32-B alignment
+    #   check at runtime, because the right operand's row byte size
+    #   (1 col × 4 B = 4 B) is below the VEC pipe's 32-B fetch unit.
+    #   See ``docs/known-pypto-pitfalls.md`` §1 / §2 for the full
+    #   reproducer ladder; the fault surfaces as ``errcode 0x800
+    #   "UB address not aligned"`` (or, when valid_shape == tile_shape,
+    #   as ``MPU address access invalid``) → ``run_prepared 507018``.
+    #
+    # Status:
+    #   - Bypass keeps Phase 15 single-card e2e moving while the
+    #     restructure lands. Numerically the gate normally multiplies
+    #     by sigmoid(g) ≈ 0.5 mean — bypass = ×1. End-to-end accuracy
+    #     check (TASK-30) will quantify the impact on token output.
+    #   - Proper fix path (TASK-30 follow-up): pre-expand sigmoid to
+    #     [BATCH, HIDDEN] in DDR via cube matmul against a constant
+    #     block-diag replication matrix R [NUM_HEADS, HIDDEN], then
+    #     do an element-wise ``pl.mul`` on the wide tile. R is loaded
+    #     as a 32 KB kernel weight built host-side. This requires
+    #     touching both the kernel signature and ``weight_loader.py``;
+    #     scoped as a separate task.
+    #   - Upstream issue: pto-isa AIV path needs to either widen the
+    #     ``row_expand_mul`` right operand to ≥ 32 B/row or add a
+    #     dedicated scalar-broadcast VEC instruction.
+    attn_out_gated = attn_out
 
     # ----- Scope 3.a — local o_proj (partial result, no residual yet). -----
     # wo is column-sliced (input dim → HIDDEN_Q_FULL_LOCAL per rank); the

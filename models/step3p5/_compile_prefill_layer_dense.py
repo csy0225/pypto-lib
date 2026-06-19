@@ -1,4 +1,14 @@
-"""Compile a single step3p5 prefill layer (dense, TP=8) for codegen verification.
+"""[中文摘要] Phase 14.H 编译验证驱动(prefill dense 单层),目前 deferred 到
+Phase 17 —— 当前 prefill 单层 monolithic body 在 PREFILL_T=128 + FP32
+buffer 下会 192KB Vec overflow,需要先做 token-tiling(BATCH<=8)重构。
+**不上 NPU**。
+[关键装饰器] 无(纯 host Python 入口)。
+[SPMD 角色] host 编译驱动。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Compile a single step3p5 prefill layer (dense, TP=8) for codegen verification.
 
 DEFERRED — current prefill per-layer programs overflow 192KB Vec (PREFILL_T=128
 monolithic + FP32 buffers); needs token-tiling (BATCH<=8) restructuring, tracked

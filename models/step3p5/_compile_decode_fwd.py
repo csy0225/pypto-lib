@@ -1,4 +1,13 @@
-"""Compile the step3p5 ``Step3p5DecodeFwd`` program (final RMSNorm + LM head).
+"""[中文摘要] Phase 14.F 编译验证驱动:把 `Step3p5DecodeFwd` 顶层 @pl.program
+喂给 pypto.ir.compile,跑完 frontend → IR → ptoas → distributed codegen
+全链路,产物落 `$PYPTO_PROG_BUILD_DIR`。**不上 NPU**,只验证 codegen 路径。
+[关键装饰器] 无(纯 host Python 入口)。
+[SPMD 角色] host 编译驱动;构造 DistributedConfig 让 codegen 知道有 8 张卡。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Compile the step3p5 ``Step3p5DecodeFwd`` program (final RMSNorm + LM head).
 
 Compile-only driver — no NPU execution. Builds the multi-card
 ``Step3p5DecodeFwd`` ``@pl.program`` from ``decode_fwd.py`` and runs it

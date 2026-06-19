@@ -1,4 +1,14 @@
-"""Minimal compile-only reproducer for hw-native-sys/pypto#1738 (follow-up of #1702 / PR #1718).
+"""[中文摘要] hw-native-sys/pypto#1738(multi-output spmd aliasing)的 follow-up
+最小 codegen-only 复现器。PR#1718 修了一类(GenerateSingleReturnAlias /
+VarLineageCollector::VisitStmt_(AssignStmt) 的 SSA-base 消歧),这个 reproducer
+专门戳 sibling 路径(tuple / __ssa_v1 / __phi)。**纯编译触发,不跑 device。**
+[关键装饰器] @pl.jit + pl.spmd(单卡 codegen 用例)。
+[SPMD 角色] 单卡 codegen 复现;无跨卡。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Minimal compile-only reproducer for hw-native-sys/pypto#1738 (follow-up of #1702 / PR #1718).
 
 Builds a single fanned-out ``pl.spmd`` scope that writes TWO same-shape GM
 outputs and returns the SECOND one.  The PR #1718 fix added SSA-base

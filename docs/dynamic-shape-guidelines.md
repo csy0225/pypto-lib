@@ -5,6 +5,20 @@ support dynamic B (batch) and S (sequence length) dimensions.  The patterns
 below were extracted from the DeepSeek-V4 compressor and hc_post conversions
 (static → dynamic B/S, decode-only → unified decode+prefill).
 
+> **⚠ Caveat — `pl.dynamic` on a parameter's *leading* dim has known
+> codegen bugs.** When a tensor parameter shape contains a
+> `pl.dynamic(...)` Var and the kernel slices that tensor across an
+> InCore boundary, two pypto codegen issues bite: (i) the slice loses
+> its parent-stride view in `OptimizeOrchTensors` so the lowered kernel
+> emits the wrong GM stride for `pos > 0`, and (ii) every dyn-dim Var
+> threads a phantom unreferenced `int32_t` parameter into the kernel
+> signature that the host dispatch does not fill. Use `pl.dynamic`
+> **only** for genuinely per-request dimensions — for **model-bound**
+> dims (context length, layer count, KV-cache layout, MLP intermediate)
+> declare integer constants in `config.py`. See
+> [known-pypto-pitfalls.md](known-pypto-pitfalls.md) §3 and §4 for the
+> source-level evidence and the fix path.
+
 ```python
 import pypto.language as pl
 ```

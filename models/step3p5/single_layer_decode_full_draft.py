@@ -6,7 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 Phase-2a single-layer decode draft — FULL-attention layer 0.
+"""[中文摘要] Phase 2a 历史草稿:单卡(无 TP/EP)的 layer-0 decode 实现 ——
+full attention + dense SwiGLU,首次落地 step3p5 的 4 个增量(zero-centered
+RMSNorm、partial RoPE 0.5、per-head q/k_norm、head-wise gate);后被
+attention_full.py 与 decode_layer.py 取代。`_draft.py` 后缀 → CI 不收。
+[关键装饰器] 单卡 Form A(@pl.jit / @pl.jit.inline);无 @pl.program。
+[SPMD 角色] 仅本卡内多核 SPMD;无任何 pld.* 调用。
+[详见] 中文架构指南 §4.1, §11
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 Phase-2a single-layer decode draft — FULL-attention layer 0.
 
 This file mirrors the the dense-GQA reference ``decode_layer.py`` fa_fused decode skeleton
 and adds the four step3p5 increments required for layer 0:

@@ -6,7 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host-side weight loader for the step3p5 8-card TP=EP=8 deployment.
+"""[中文摘要] host 侧权重切片:把 HuggingFace safetensors checkpoint 切成每张卡需
+要的 weight bundle —— REPLICATED(embed/RMSNorm/router 等)/ TP-sliced
+(各种 attention 与 dense MLP 权重)/ EP-sliced(每卡 36 个 routed expert)
++ MTP 专属。这里是纯 host Python,不进 NPU,不带任何 pypto 装饰器。
+[关键装饰器] 无(纯 host Python 函数)。
+[SPMD 角色] host 侧 per-rank 切片;真正的 SPMD 由 step3p5_decode.py /
+step3p5_prefill.py 拉起每卡进程后开始。
+[详见] 中文架构指南 §1, §9
+
+────── 以下为英文原 docstring ──────
+
+Host-side weight loader for the step3p5 8-card TP=EP=8 deployment.
 
 This module maps the HuggingFace-format safetensors checkpoint shipped at
 ``/mnt/chensiyu-jfs/multi-hardware/models/step3p5_flash_release_hf_mtp3_bf16/``

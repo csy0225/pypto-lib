@@ -6,7 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 MoE dispatch (decode, TP=EP=8 BF16 — EP all-to-all).
+"""[中文摘要] MoE 在 EP all-to-all 之前的 prelude:本地 histogram → AtomicAdd
+公布到跨卡 pub_counts 窗口 → prefix-sum 算 send/recv offsets → 把 token
+按 (dst_rank, local_eid) 打包成 CSR;真正的 token 推送由
+collectives.ep_all_to_all 负责。
+[关键装饰器] @pl.jit.inline / @pl.function(本文件的 body 由 EpTpMoE 与
+DecodeLayerMoE 复制为方法形式调用,见指南 §4.5)。
+[SPMD 角色] 跨卡(写 pub_counts、读对端 hist)+ 片上(本卡多核构造 CSR)。
+[详见] 中文架构指南 §9, §4.5
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 MoE dispatch (decode, TP=EP=8 BF16 — EP all-to-all).
 
 Replaces the single-card CSR scatter with an EP all-to-all dispatch:
 
@@ -97,7 +108,23 @@ TOTAL_LOCAL_ROUTES = T * TOPK                  # 128 (b, k) pairs per rank
 LOCAL_RECV_MAX = N_RANKS * T * TOPK            # 1024 — worst case recv rows
 
 # Static padding/alignment widths.
-PER_RANK_BUCKETS = N_RANKS * N_LOCAL_EXPERTS   # 8 * 36 = 288 buckets
+# PER_RANK_BUCKETS is the count of (dst_rank, local_expert) buckets that
+# this rank's histogram covers. Canonical TP=8/EP=8: 8 * 36 = 288, which
+# is already a multiple of 8 so INT32 tile cols (288 * 4 = 1152 B) are
+# 32B-aligned. Under per-rank single-card patch (EP=1), the raw value
+# would collapse to 1 * 36 = 36, INT32 tile cols = 144 B which fails
+# ptoas's row_byte % 32 == 0 check. Pad to next multiple of 8 so the
+# tile is always 32B-aligned regardless of N_RANKS. Padded buckets stay
+# zero (writes target only valid (peer, e) pairs at indices
+# `peer * N_LOCAL_EXPERTS + e ∈ [0, N_RANKS*N_LOCAL_EXPERTS)`), so the
+# padding is purely a storage extension and does not affect math.
+PER_RANK_BUCKETS = ((N_RANKS * N_LOCAL_EXPERTS + 7) // 8) * 8   # 288 at TP=8 (no change), 40 at per-rank
+# Padded N_RANKS for INT32 tile allocations of shape [N_RANKS]. At
+# canonical TP=8 we have 8 cells * 4 = 32 B (aligned). Under per-rank
+# patch (N_RANKS=1) the raw [1] alloc = 4 B fails the 32B align check.
+# Pad to next multiple of 8. Padded cells stay zero (writes/reads only
+# touch indices [0, N_RANKS), so the padding is storage-only.
+N_RANKS_PAD = ((N_RANKS + 7) // 8) * 8                          # 8 at TP=8 (no change), 8 at per-rank
 
 
 # =============================================================================
@@ -243,8 +270,8 @@ def build_inverse_map(
     INT32 because ``N_RANKS * LOCAL_RECV_MAX = 8 * 1024 = 8192``.
     """
     # Per-rank, per-local-expert cursor of MY contribution so far.
-    cursor = pl.create_tensor([N_RANKS * N_LOCAL_EXPERTS], dtype=pl.INT32)
-    for bkt in pl.range(N_RANKS * N_LOCAL_EXPERTS):
+    cursor = pl.create_tensor([PER_RANK_BUCKETS], dtype=pl.INT32)
+    for bkt in pl.range(PER_RANK_BUCKETS):
         pl.write(cursor, [bkt], pl.cast(0, pl.INT32))
 
     for t in pl.range(T):
@@ -483,4 +510,5 @@ __all__ = [
     "TOTAL_LOCAL_ROUTES",
     "LOCAL_RECV_MAX",
     "PER_RANK_BUCKETS",
+    "N_RANKS_PAD",
 ]

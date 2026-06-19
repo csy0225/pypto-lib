@@ -1,4 +1,13 @@
-"""Compile the standalone step3p5 ``EpTpMoE`` block (TP+EP=8) for codegen.
+"""[中文摘要] Phase 14.E 编译验证驱动:独立跑 `EpTpMoE` block(8 卡 EP+TP)
+codegen,对应 `DecodeLayerMoE` 里被拍扁的那一份代码的"独立 program"姊妹版。
+**不上 NPU**。
+[关键装饰器] 无(纯 host Python 入口)。
+[SPMD 角色] host 编译驱动。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Compile the standalone step3p5 ``EpTpMoE`` block (TP+EP=8) for codegen.
 
 Compile-only driver — no NPU execution. Builds the multi-card
 ``EpTpMoE`` ``@pl.program`` from ``moe.py`` and runs it through

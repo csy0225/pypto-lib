@@ -6,7 +6,21 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 multi-layer decode forward pass — TP/EP wired (Phase 9 Wave 3).
+"""[中文摘要] `Step3p5DecodeFwd`:整模型 decode 顶层 @pl.program。host_orch 一次性
+分配跨 45 层共用的 window pool(tmp_window 大池 + 每层独立的 signal_window),
+chip_orch 在 Python 编译期 for 循环里调 `select_decode_layer(idx)` 选择当前层
+的 @pl.program 并触发,末尾接 `rms_lm_head` 给每张卡产出本卡 logits shard。
+3 个 MTP 层不在这里(走 mtp.py 的独立 program)。
+[关键装饰器] @pl.program +
+   @pl.function(level=HOST, role=Orchestrator)  ← host_orch
+   @pl.function(type=Orchestration)             ← chip_orch
+[SPMD 角色] 顶层入口,跨卡 + 片上 SPMD 全程;每个 chip_orch 调用一个 per-layer
+@pl.program 实例,层与层之间通过被全局 reduce 过的 hidden 串接。
+[详见] 中文架构指南 §3, §10
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 multi-layer decode forward pass — TP/EP wired (Phase 9 Wave 3).
 
 Top-level distributed decode entry. The 45 main layers are dispatched
 in a Python compile-time loop; each layer's TP+EP-aware ``@pl.program``

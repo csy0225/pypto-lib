@@ -6,7 +6,23 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 MoE block orchestration (decode, TP=EP=8 BF16 — single ``@pl.program``).
+"""[中文摘要] `EpTpMoE` 类:把 gate → dispatch → expert_routed → expert_shared(+末尾
+tp_all_reduce)→ combine 这 6 个子阶段串成一个独立的多卡 @pl.program;按
+(routed_swiglu_limit, shared_swiglu_limit) 在工厂函数里编译期烤出 3 个特化
+(SiLU/SiLU、SwiGLU7/SiLU、SwiGLU7/SwiGLU16),`select_moe_block(layer_idx)`
+按层选一个。
+[关键装饰器] @pl.program +
+   @pl.function(level=HOST, role=Orchestrator)  ← host_orch
+   @pl.function(type=Orchestration)             ← chip_orch
+   @pl.function(type=InCore)                    ← gate / dispatch / expert_*
+   @pl.function(type=Inline)                    ← 小段 helper
+另含同名 `self.tp_all_reduce(...)` 方法(collective 在 @pl.program 内的 self-method 复制,见指南 §4.5)。
+[SPMD 角色] 跨卡(EP all-to-all + TP all-reduce 共享专家)+ 片上多核 SPMD(每段 stage 用 pl.spmd)。
+[详见] 中文架构指南 §3, §4.2, §4.5, §10
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 MoE block orchestration (decode, TP=EP=8 BF16 — single ``@pl.program``).
 
 Wires the 6 sub-stages into one ``@pl.program`` class ``EpTpMoE``:
 
@@ -108,6 +124,7 @@ from .config import (
 )
 from .dispatch import (
     LOCAL_RECV_MAX,
+    N_RANKS_PAD,
     PER_RANK_BUCKETS,
 )
 
@@ -419,7 +436,7 @@ def _build_ep_tp_moe_program(
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
             expert_indices: pl.Tensor[[T, TOPK], pl.INT32],
-            expert_weights: pl.Tensor[[T, TOPK], pl.BF16],
+            expert_weights: pl.Tensor[[T, TOPK], pl.FP32],
         ):
             score_buf = pl.create_tensor(
                 [T, ROUTER_SCORE_PAD], dtype=pl.FP32,
@@ -534,9 +551,7 @@ def _build_ep_tp_moe_program(
                         )
                         pl.write(
                             expert_weights, [tt, k],
-                            pl.cast(
-                                pl.read(weights_pad, [tt, k]), pl.BF16,
-                            ),
+                            pl.read(weights_pad, [tt, k]),
                         )
 
             return expert_weights
@@ -548,10 +563,10 @@ def _build_ep_tp_moe_program(
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
             expert_indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
-            expert_weights: pl.Out[pl.Tensor[[T, TOPK], pl.BF16]],
+            expert_weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
         ) -> tuple[
             pl.Tensor[[T, TOPK], pl.INT32],
-            pl.Tensor[[T, TOPK], pl.BF16],
+            pl.Tensor[[T, TOPK], pl.FP32],
         ]:
             self._gate(
                 x, gate_w, router_bias, expert_indices, expert_weights,
@@ -707,9 +722,9 @@ def _build_ep_tp_moe_program(
             Packed as ``dst_rank * LOCAL_RECV_MAX + dst_row``.
             """
             cursor = pl.create_tensor(
-                [N_RANKS * N_LOCAL_EXPERTS], dtype=pl.INT32,
+                [PER_RANK_BUCKETS], dtype=pl.INT32,
             )
-            for bkt in pl.range(N_RANKS * N_LOCAL_EXPERTS):
+            for bkt in pl.range(PER_RANK_BUCKETS):
                 pl.write(cursor, [bkt], pl.cast(0, pl.INT32))
 
             for t in pl.range(T):
@@ -786,8 +801,8 @@ def _build_ep_tp_moe_program(
             send_counts_bkt = pl.create_tensor(
                 [PER_RANK_BUCKETS], dtype=pl.INT32,
             )
-            send_counts_rank = pl.create_tensor([N_RANKS], dtype=pl.INT32)
-            send_offsets_rank = pl.create_tensor([N_RANKS], dtype=pl.INT32)
+            send_counts_rank = pl.create_tensor([N_RANKS_PAD], dtype=pl.INT32)
+            send_offsets_rank = pl.create_tensor([N_RANKS_PAD], dtype=pl.INT32)
             self._histogram_and_prefix_sum(
                 expert_indices,
                 send_counts_bkt, send_counts_rank, send_offsets_rank,
@@ -847,7 +862,7 @@ def _build_ep_tp_moe_program(
             )
 
             # ---- Build send/recv counts/offsets for ep_all_to_all ----
-            recv_counts = pl.create_tensor([N_RANKS], dtype=pl.INT32)
+            recv_counts = pl.create_tensor([N_RANKS_PAD], dtype=pl.INT32)
             for src in pl.range(N_RANKS):
                 acc = pl.cast(0, pl.INT32)
                 for e in pl.range(N_LOCAL_EXPERTS):
@@ -855,7 +870,7 @@ def _build_ep_tp_moe_program(
                         pub_counts, [src * N_RANKS + my_rank, e],
                     )
                 pl.write(recv_counts, [src], pl.cast(acc, pl.INT32))
-            recv_offsets = pl.create_tensor([N_RANKS], dtype=pl.INT32)
+            recv_offsets = pl.create_tensor([N_RANKS_PAD], dtype=pl.INT32)
             pl.write(recv_offsets, [0], pl.cast(0, pl.INT32))
             for r in pl.range(1, N_RANKS):
                 prev_off = pl.read(recv_offsets, [r - 1])
@@ -1334,9 +1349,9 @@ def _build_ep_tp_moe_program(
             my_rank: pl.Scalar[pl.INT32],
         ):
             cursor = pl.create_tensor(
-                [N_RANKS * N_LOCAL_EXPERTS], dtype=pl.INT32,
+                [PER_RANK_BUCKETS], dtype=pl.INT32,
             )
-            for i in pl.range(N_RANKS * N_LOCAL_EXPERTS):
+            for i in pl.range(PER_RANK_BUCKETS):
                 pl.write(cursor, [i], pl.cast(0, pl.INT32))
 
             for t in pl.range(T):
@@ -1470,7 +1485,7 @@ def _build_ep_tp_moe_program(
             routed_y_buf: pld.DistributedTensor[
                 [N_ROUTES_PER_RANK, HIDDEN], pl.BF16
             ],
-            expert_weights: pl.Tensor[[T, TOPK], pl.BF16],
+            expert_weights: pl.Tensor[[T, TOPK], pl.FP32],
             sh_y: pl.Tensor[[T, HIDDEN], pl.BF16],
             moe_out: pl.Tensor[[T, HIDDEN], pl.BF16],
         ):
@@ -1485,8 +1500,7 @@ def _build_ep_tp_moe_program(
                         target_type=pl.FP32,
                     )
                     for k in pl.range(TOPK):
-                        w_bf = pl.read(expert_weights, [b, k])
-                        w_fp = pl.cast(w_bf, pl.FP32)
+                        w_fp = pl.read(expert_weights, [b, k])
 
                         r_route = b * TOPK + k
                         # ``routed_y_buf`` is a ``pld.DistributedTensor``
@@ -1527,7 +1541,7 @@ def _build_ep_tp_moe_program(
                 [LOCAL_RECV_MAX, HIDDEN], pl.BF16
             ],
             expert_indices: pl.Tensor[[T, TOPK], pl.INT32],
-            expert_weights: pl.Tensor[[T, TOPK], pl.BF16],
+            expert_weights: pl.Tensor[[T, TOPK], pl.FP32],
             sh_y: pl.Tensor[[T, HIDDEN], pl.BF16],
             moe_out: pl.Out[pl.Tensor[[T, HIDDEN], pl.BF16]],
             pub_counts: pld.DistributedTensor[
@@ -1637,7 +1651,7 @@ def _build_ep_tp_moe_program(
         ) -> pl.Tensor[[T, HIDDEN], pl.BF16]:
             # 1) Gate (local, replicated).
             expert_indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
-            expert_weights = pl.create_tensor([T, TOPK], dtype=pl.BF16)
+            expert_weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
             expert_indices, expert_weights = self.gate_step(
                 x, gate_w, router_bias,
                 expert_indices, expert_weights,

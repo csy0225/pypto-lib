@@ -6,7 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 multi-layer prefill forward pass — TP/EP wired (Phase 6).
+"""[中文摘要] `Step3p5PrefillFwd`:整模型 prefill 顶层 @pl.program。结构与
+decode_fwd.py 对偶 —— host_orch 一次性分配 window pool,chip_orch 编译期
+for 45 层走 select_prefill_layer 选当前层的 @pl.program;末尾接 rms_lm_head。
+3 个 MTP 层不在这里(走 mtp.py 的 program)。Phase 6 阶段的 Phase 17 待办:
+某些 prefill 层 5MB L1 overflow,故 _compile_prefill_layer_*.py 仍 deferred。
+[关键装饰器] @pl.program +
+   @pl.function(level=HOST, role=Orchestrator)
+   @pl.function(type=Orchestration)
+[SPMD 角色] 顶层入口,跨卡 + 片上 SPMD 全程。
+[详见] 中文架构指南 §10
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 multi-layer prefill forward pass — TP/EP wired (Phase 6).
 
 Top-level distributed prefill entry. The 45 main layers are dispatched
 in a Python compile-time loop; each layer's TP+EP-aware ``@pl.program``
@@ -128,7 +141,7 @@ from .prefill_attention_swa import (
     LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_SWA,
     attention_swa_prefill,
 )
-from .dispatch import PER_RANK_BUCKETS
+from .dispatch import N_RANKS_PAD, PER_RANK_BUCKETS
 from .prefill_moe import select_prefill_moe_block
 from .prefill_qkv_proj_rope import PREFILL_BATCH, PREFILL_SEQ, PREFILL_T, TOK_TILE
 from .rms_lm_head import rms_lm_head
@@ -799,6 +812,7 @@ def _build_prefill_layer_moe_program(
     )
 
     n_ranks = tp_size
+    n_ranks_pad = N_RANKS_PAD
     n_local_experts = N_LOCAL_EXPERTS
     inter = INTER
     sh_inter_local = SHARE_EXPERT_DIM_LOCAL
@@ -1066,7 +1080,7 @@ def _build_prefill_layer_moe_program(
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
             expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
-            expert_weights: pl.Tensor[[BATCH, TOPK], pl.BF16],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
         ):
             score_buf = pl.create_tensor(
                 [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
@@ -1155,9 +1169,7 @@ def _build_prefill_layer_moe_program(
                         )
                         pl.write(
                             expert_weights, [tt, k],
-                            pl.cast(
-                                pl.read(weights_pad, [tt, k]), pl.BF16,
-                            ),
+                            pl.read(weights_pad, [tt, k]),
                         )
 
             return expert_weights
@@ -1169,10 +1181,10 @@ def _build_prefill_layer_moe_program(
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
             expert_indices: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
-            expert_weights: pl.Out[pl.Tensor[[BATCH, TOPK], pl.BF16]],
+            expert_weights: pl.Out[pl.Tensor[[BATCH, TOPK], pl.FP32]],
         ) -> tuple[
             pl.Tensor[[BATCH, TOPK], pl.INT32],
-            pl.Tensor[[BATCH, TOPK], pl.BF16]
+            pl.Tensor[[BATCH, TOPK], pl.FP32]
         ]:
             self._gate(
                 x, gate_w, router_bias, expert_indices, expert_weights,
@@ -1319,9 +1331,9 @@ def _build_prefill_layer_moe_program(
             my_rank: pl.Scalar[pl.INT32],
         ):
             cursor = pl.create_tensor(
-                [n_ranks * n_local_experts], dtype=pl.INT32,
+                [per_rank_buckets], dtype=pl.INT32,
             )
-            for bkt in pl.range(n_ranks * n_local_experts):
+            for bkt in pl.range(per_rank_buckets):
                 pl.write(cursor, [bkt], pl.cast(0, pl.INT32))
 
             for t in pl.range(BATCH):
@@ -1391,8 +1403,8 @@ def _build_prefill_layer_moe_program(
             send_counts_bkt = pl.create_tensor(
                 [per_rank_buckets], dtype=pl.INT32,
             )
-            send_counts_rank = pl.create_tensor([n_ranks], dtype=pl.INT32)
-            send_offsets_rank = pl.create_tensor([n_ranks], dtype=pl.INT32)
+            send_counts_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
+            send_offsets_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
             self._histogram_and_prefix_sum(
                 expert_indices,
                 send_counts_bkt, send_counts_rank, send_offsets_rank,
@@ -1451,7 +1463,7 @@ def _build_prefill_layer_moe_program(
                 send_buf, cursor_bkt, bucket_offset,
             )
 
-            recv_counts = pl.create_tensor([n_ranks], dtype=pl.INT32)
+            recv_counts = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
             for src in pl.range(n_ranks):
                 acc = pl.cast(0, pl.INT32)
                 for e in pl.range(n_local_experts):
@@ -1459,7 +1471,7 @@ def _build_prefill_layer_moe_program(
                         pub_counts, [src * n_ranks + my_rank, e],
                     )
                 pl.write(recv_counts, [src], pl.cast(acc, pl.INT32))
-            recv_offsets = pl.create_tensor([n_ranks], dtype=pl.INT32)
+            recv_offsets = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
             pl.write(recv_offsets, [0], pl.cast(0, pl.INT32))
             for r in pl.range(1, n_ranks):
                 prev_off = pl.read(recv_offsets, [r - 1])
@@ -1852,9 +1864,9 @@ def _build_prefill_layer_moe_program(
             my_rank: pl.Scalar[pl.INT32],
         ):
             cursor = pl.create_tensor(
-                [n_ranks * n_local_experts], dtype=pl.INT32,
+                [per_rank_buckets], dtype=pl.INT32,
             )
-            for i in pl.range(n_ranks * n_local_experts):
+            for i in pl.range(per_rank_buckets):
                 pl.write(cursor, [i], pl.cast(0, pl.INT32))
 
             for t in pl.range(BATCH):
@@ -1974,7 +1986,7 @@ def _build_prefill_layer_moe_program(
             routed_y_buf: pld.DistributedTensor[
                 [n_routes_per_rank, HIDDEN], pl.BF16
             ],
-            expert_weights: pl.Tensor[[BATCH, TOPK], pl.BF16],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
             sh_y: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
             moe_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         ):
@@ -1985,8 +1997,7 @@ def _build_prefill_layer_moe_program(
                         target_type=pl.FP32,
                     )
                     for k in pl.range(TOPK):
-                        w_bf = pl.read(expert_weights, [b, k])
-                        w_fp = pl.cast(w_bf, pl.FP32)
+                        w_fp = pl.read(expert_weights, [b, k])
 
                         r_route = b * TOPK + k
                         row_fp32 = pl.cast(
@@ -2013,7 +2024,7 @@ def _build_prefill_layer_moe_program(
                 [local_recv_max, HIDDEN], pl.BF16
             ],
             expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
-            expert_weights: pl.Tensor[[BATCH, TOPK], pl.BF16],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
             sh_y: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
             moe_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             pub_counts: pld.DistributedTensor[
@@ -2259,9 +2270,7 @@ def _build_prefill_layer_moe_program(
                 expert_indices = pl.create_tensor(
                     [BATCH, TOPK], dtype=pl.INT32,
                 )
-                expert_weights = pl.create_tensor(
-                    [BATCH, TOPK], dtype=pl.BF16,
-                )
+                expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
                 expert_indices, expert_weights = self.gate_step(
                     tile_x, gate_w, router_bias,
                     expert_indices, expert_weights,

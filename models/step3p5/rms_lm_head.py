@@ -6,7 +6,21 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 final RMSNorm + LM-head projection — TP vocab-sliced (Phase 9 Wave 3).
+"""[中文摘要] 末尾的 zero-centered RMSNorm + vocab 切片(每卡 16112 词表)的 LM
+head matmul。每张卡只产出本卡 [USER_BATCH, VOCAB_LOCAL] 的 logits shard,
+不做跨卡 gather —— argmax/概率 reduce 留给上层调度。
+[关键装饰器] @pl.program +
+   @pl.function(level=HOST, role=Orchestrator)
+   @pl.function(type=Orchestration)
+   @pl.function(type=InCore)
+   @pl.jit.inline 模块级 body
+[SPMD 角色] 跨卡(权重沿 vocab 切片;每张卡独立产出本卡 shard)+ 片上多核。
+RMSNorm 因为入口 hidden 已被上一层 tp_all_reduce 过,本层不再需要 collective。
+[详见] 中文架构指南 §3, §4.2
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 final RMSNorm + LM-head projection — TP vocab-sliced (Phase 9 Wave 3).
 
 Each TP rank owns a contiguous ``VOCAB_LOCAL = VOCAB // TP_WORLD_SIZE``
 vocabulary slab of ``lm_head_weight``. The kernel emits the per-rank

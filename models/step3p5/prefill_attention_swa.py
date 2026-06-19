@@ -6,7 +6,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 prefill SWA (sliding-window) attention kernel — TP=8 (Phase 6).
+"""[中文摘要] Prefill 侧 SWA 因果+滑窗(window=512)attention(每卡 12 头,
+partial RoPE 1.0,无 yarn);Scope 2/3 同 prefill_attention_full.py;
+sliding-window 在 KV-cache 读端做 mask,与 TP 切片正交。
+[关键装饰器] @pl.program +
+   @pl.function(level=HOST, role=Orchestrator)
+   @pl.function(type=Orchestration)
+   @pl.function(type=InCore)
+[SPMD 角色] 跨卡(TP=8)+ 片上多核 SPMD。
+[详见] 中文架构指南 §3
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 prefill SWA (sliding-window) attention kernel — TP=8 (Phase 6).
 
 Sequence-major counterpart of the decode-side ``attention_swa.py``.
 Per-token attention is **causal** AND **window-clamped**: query

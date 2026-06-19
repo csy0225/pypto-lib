@@ -6,7 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 MoE FP32 sigmoid+bias router (decode, TP=EP=8 BF16).
+"""[中文摘要] MoE 路由器:对每个 token 跑 FP32 sigmoid + router_bias + 全 288
+专家的 top-8 + ×3.0 重归一化;路由权重在每张卡 REPLICATED,所以每张卡独立产
+出 bit-identical 的 expert_indices(无需跨卡 barrier)。
+[关键装饰器] @pl.jit.inline(实际算子 body)+ @pl.jit(独立测试入口);
+moe.py / decode_layer.py / prefill_moe.py 把这段 body 复制为 self.method 调用。
+[SPMD 角色] 仅本卡内多核 SPMD(片上),无任何 pld.* 调用;输出 expert_indices
+是 GLOBAL id,EP 切分由下游 dispatch.py 用 ep_expert_owner 映射。
+[详见] 中文架构指南 §4.1, §6
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 MoE FP32 sigmoid+bias router (decode, TP=EP=8 BF16).
 
 Per-token top-K=8 router for the 288-expert step3p5 MoE block.
 
@@ -103,7 +114,7 @@ def gate(
     gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
     router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     expert_indices: pl.Tensor[[T, TOPK], pl.INT32],
-    expert_weights: pl.Tensor[[T, TOPK], pl.BF16],
+    expert_weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
     """Step3p5 router: sigmoid + additive bias + top-K + renorm + scale.
 
@@ -187,16 +198,19 @@ def gate(
             pl.row_expand_div(topk_vals_pad, denom), ROUTE_SCALE,
         )
 
-        # Scalar scatter of the K leading **global** indices and BF16
+        # Scalar scatter of the K leading **global** indices and FP32
         # weights into the caller-visible outputs. K=8 is small; an
         # explicit loop avoids the 24B/32B alignment pitfalls of
         # slice-assigning a [T, K] sub-tile.
+        # NOTE: expert_weights is FP32 (not BF16) so combine's downstream
+        # tile-level bf16->fp32 TCVT cast doesn't need a [BATCH, TOPK=8]
+        # bf16 tile alloc (16-byte row, fails ptoas's 32B align check).
         for tt in pl.range(T):
             for k in pl.range(TOPK):
                 pl.write(expert_indices, [tt, k],
                          pl.read(topk_idx_tile, [tt, k]))
                 pl.write(expert_weights, [tt, k],
-                         pl.cast(pl.read(weights_pad, [tt, k]), pl.BF16))
+                         pl.read(weights_pad, [tt, k]))
 
     # @pl.inline parser requires inline calls to return a value.
     return expert_weights
@@ -208,7 +222,7 @@ def gate_test(
     gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
     router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     expert_indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
-    expert_weights: pl.Out[pl.Tensor[[T, TOPK], pl.BF16]],
+    expert_weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
     gate(x, gate_w, router_bias, expert_indices, expert_weights)
     return expert_indices, expert_weights
@@ -236,7 +250,7 @@ def golden_gate(tensors):
     weights = (topk_vals / topk_vals.sum(dim=-1, keepdim=True)) * ROUTE_SCALE
 
     tensors["expert_indices"][:] = indices.to(torch.int32)
-    tensors["expert_weights"][:] = weights.to(torch.bfloat16)
+    tensors["expert_weights"][:] = weights.to(torch.float32)
 
 
 def build_tensor_specs():
@@ -257,7 +271,7 @@ def build_tensor_specs():
         TensorSpec("router_bias", [N_EXPERTS], torch.float32,
                    init_value=init_router_bias),
         TensorSpec("expert_indices", [T, TOPK], torch.int32, is_output=True),
-        TensorSpec("expert_weights", [T, TOPK], torch.bfloat16, is_output=True),
+        TensorSpec("expert_weights", [T, TOPK], torch.float32, is_output=True),
     ]
 
 

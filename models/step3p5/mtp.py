@@ -6,7 +6,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 Multi-Token-Prediction (MTP) layers — TP-aware (Phase 9 Wave 3).
+"""[中文摘要] 3 个 multi-token-predict 层(LAYER_TYPES[45..47] 全是 SWA + dense MLP);
+关键 trick:`eh_proj` 沿 HIDDEN 行切到每卡 HIDDEN_LOCAL=512,本卡的 partial
+写入零填 [BATCH, HIDDEN] 的本卡列槽,然后 `tp_all_reduce` 把 8 张卡的非零
+slot 拼成完整的 mtp_in。每个 MTP 还有自己的 shared_head(vocab 切片)。
+[关键装饰器] @pl.program +
+   @pl.function(level=HOST, role=Orchestrator)
+   @pl.function(type=Orchestration)
+   @pl.function(type=InCore)
+   @pl.jit.inline 共享 helper(_ops 复制 + tp_all_reduce 复制)
+[SPMD 角色] 跨卡(eh_proj/dense_MLP/SWA o_proj 三处 tp_all_reduce + shared_head
+vocab 切片)+ 片上多核 SPMD。
+[详见] 中文架构指南 §3, §10
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 Multi-Token-Prediction (MTP) layers — TP-aware (Phase 9 Wave 3).
 
 The step3p5 checkpoint carries three "next-N-predict" layers (indices
 45/46/47 in the 48-long ``LAYER_TYPES`` table) hanging off the tail of

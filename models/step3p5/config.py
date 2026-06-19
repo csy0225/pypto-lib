@@ -6,7 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 model configuration.
+"""[中文摘要] step3p5 模型常量与拓扑(45 主层 + 3 MTP、TP=EP=8、按层 attention/MLP
+类别表),以及 `is_full_attention` / `is_moe_layer` / `ep_expert_owner` 等
+查询函数;是全模块共享的事实源。
+[关键装饰器] 无(纯 Python 常量与函数)。
+[SPMD 角色] 不参与 SPMD 自身,但提供 TP_WORLD_SIZE / EP_WORLD_SIZE / 各种
+LOCAL 维度,所有 @pl.program kernel 的 shape 决策都靠这里。
+[详见] 中文架构指南 §1, §9
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 model configuration.
 
 Source of truth for the
 ``step3p5_flash_release_hf_mtp3_bf16`` checkpoint shipped under
@@ -32,15 +42,29 @@ from __future__ import annotations
 import pypto.language as pl
 
 # -----------------------------------------------------------------------------
-# Dynamic dimensions used by the JIT/program signatures.
+# Model-bound shape constants (formerly ``pl.dynamic(...)``).
+#
+# Step3p5's context length, layer count, and KV-cache layout are fixed by the
+# model checkpoint, so these dimensions belong in the program signature as
+# integer constants — not symbolic ``pl.dynamic`` placeholders. We also hit
+# two pypto codegen bugs when they were dyn:
+#   * ``OptimizeOrchTensors::ComputeRowMajorStrides`` returned empty for any
+#     parent shape with a dyn dim, so cross-function slices lost their
+#     ``TensorView(stride=…)`` annotation.
+#   * The codegen added a phantom trailing ``int32_t`` per dyn-dim Var to the
+#     kernel signature, which the dispatch did not pass.
+# Numeric values mirror the runtime patches that ``step3p5_decode.run_real_npu``
+# used to apply to the generated ``host_orch.py``.
 # -----------------------------------------------------------------------------
-USER_BATCH_DYN = pl.dynamic("USER_BATCH_DYN")
-KV_CACHE_ROWS_DYN = pl.dynamic("KV_CACHE_ROWS_DYN")
-BLOCK_TABLE_FLAT_DYN = pl.dynamic("BLOCK_TABLE_FLAT_DYN")
-ROPE_SEQ_DYN = pl.dynamic("ROPE_SEQ_DYN")
-LAYER_DYN = pl.dynamic("LAYER_DYN")
-LAYER_HIDDEN_ROWS_DYN = pl.dynamic("LAYER_HIDDEN_ROWS_DYN")
-LAYER_INTER_ROWS_DYN = pl.dynamic("LAYER_INTER_ROWS_DYN")
+USER_BATCH_DYN = 16                        # = BATCH (line below)
+KV_CACHE_ROWS_DYN = 4096                   # = MAX_SEQ_DEFAULT
+BLOCK_TABLE_FLAT_DYN = 512                 # = MAX_BLOCKS_PER_SEQ * BATCH = 32 * 16
+ROPE_SEQ_DYN = 4096                        # = MAX_SEQ_DEFAULT
+LAYER_DYN = 45                             # = NUM_HIDDEN_LAYERS
+LAYER_HIDDEN_ROWS_DYN = 49152              # = n_full_attn_layers * HIDDEN = 12 * 4096
+LAYER_INTER_ROWS_DYN = 4224                # = n_dense_mlp_layers * INTERMEDIATE_LOCAL = 3 * 1408
+# MoE-only dims that are declared in __all__ but not yet referenced by any
+# tensor signature; left dyn until DecodeLayerMoE wires them up.
 LAYER_EXPERTS_DYN = pl.dynamic("LAYER_EXPERTS_DYN")  # n_layers * num_experts
 LAYER_EXPERT_ROWS_DYN = pl.dynamic("LAYER_EXPERT_ROWS_DYN")
 LAYER_SHARE_ROWS_DYN = pl.dynamic("LAYER_SHARE_ROWS_DYN")

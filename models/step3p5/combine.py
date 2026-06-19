@@ -6,7 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 MoE combine (decode, TP=EP=8 BF16 — EP all-to-all back).
+"""[中文摘要] MoE 回流:第二次 EP all-to-all 把路由专家输出推回 source rank →
+按 top-K 权重 gather → 加上(已经 tp_all_reduce 过的)共享专家输出。combine
+之后不需要再做一次 tp_all_reduce。
+[关键装饰器] @pl.jit.inline(本卡阶段);跨卡推送由上层 @pl.program 类的
+ep_all_to_all 完成。
+[SPMD 角色] 跨卡(EP a2a 回流)+ 片上(本卡多核加权 gather)。
+[详见] 中文架构指南 §9
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 MoE combine (decode, TP=EP=8 BF16 — EP all-to-all back).
 
 Returns routed-expert outputs to each token's source rank via a second
 EP all-to-all (mirror of ``dispatch.py``), then performs the weighted
@@ -65,6 +75,7 @@ from .config import (
     MOE_NUM_EXPERTS_LOCAL,
     MOE_TOP_K,
 )
+from .dispatch import PER_RANK_BUCKETS
 
 
 T = BATCH
@@ -83,7 +94,7 @@ N_ROUTES_PER_RANK = T * TOPK                      # 128
 @pl.jit.inline
 def weighted_gather_and_add(
     routed_y_buf: pl.Tensor[[N_ROUTES_PER_RANK, HIDDEN], pl.BF16],
-    expert_weights: pl.Tensor[[T, TOPK], pl.BF16],
+    expert_weights: pl.Tensor[[T, TOPK], pl.FP32],
     sh_y: pl.Tensor[[T, HIDDEN], pl.BF16],
     moe_out: pl.Tensor[[T, HIDDEN], pl.BF16],
 ):
@@ -96,6 +107,11 @@ def weighted_gather_and_add(
     additional reduce here.
     """
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_combine"):
+        # NOTE: gate output ``expert_weights`` is FP32 (changed from BF16
+        # to avoid the CANN-9.0.0 ccec scalar `(float) bfloat16_t` cast
+        # backend bug + the [BATCH, TOPK=8] BF16 tile alloc 16-byte row
+        # alignment failure). Reading FP32 scalar directly avoids any
+        # cast in the generated kernel.
         for b in pl.range(T):
             # Start the FP32 accumulator at the shared-expert contribution.
             acc = pl.cast(
@@ -103,8 +119,7 @@ def weighted_gather_and_add(
                 target_type=pl.FP32,
             )
             for k in pl.range(TOPK):
-                w_bf = pl.read(expert_weights, [b, k])
-                w_fp = pl.cast(w_bf, pl.FP32)
+                w_fp = pl.read(expert_weights, [b, k])
 
                 r_route = b * TOPK + k
                 row_fp32 = pl.cast(
@@ -241,8 +256,8 @@ def publish_src_route_table(
     import pypto.language.distributed as pld
 
     # Per-bucket cursor (dst, loc_e) -> next free idx in the published list.
-    cursor = pl.create_tensor([N_RANKS * N_LOCAL_EXPERTS], dtype=pl.INT32)
-    for i in pl.range(N_RANKS * N_LOCAL_EXPERTS):
+    cursor = pl.create_tensor([PER_RANK_BUCKETS], dtype=pl.INT32)
+    for i in pl.range(PER_RANK_BUCKETS):
         pl.write(cursor, [i], pl.cast(0, pl.INT32))
 
     for t in pl.range(T):

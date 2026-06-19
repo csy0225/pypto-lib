@@ -6,7 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 single-layer decode draft — SLIDING-WINDOW attention (layer 1).
+"""[中文摘要] Phase 2b 历史草稿:单卡(无 TP/EP)的 layer-1 decode 实现 ——
+SWA(滑窗 512)attention + dense SwiGLU,与 single_layer_decode_full_draft.py
+对偶,后被 attention_swa.py 与 decode_layer.py 取代。`_draft.py` 后缀 → CI 不收。
+[关键装饰器] 单卡 Form A(@pl.jit / @pl.jit.inline);无 @pl.program。
+[SPMD 角色] 仅本卡内多核 SPMD;无任何 pld.* 调用。
+[详见] 中文架构指南 §4.1, §11
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 single-layer decode draft — SLIDING-WINDOW attention (layer 1).
 
 Phase 2b of the step3p5 migration plan (see ``MIGRATION_PLAN.md``). Produces
 the standalone decode draft for one SWA layer of step3p5 (e.g. layer 1).

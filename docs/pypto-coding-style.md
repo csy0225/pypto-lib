@@ -210,6 +210,16 @@ vector and relying on elementwise broadcast.
 normed = pl.col_expand_mul(pl.row_expand_mul(x, inv_rms), gamma)
 ```
 
+> **⚠ Hard limit — `[N, 1]` right operand of `row_expand_mul`.**
+> Build the `[N, 1]` (or `[1, N]`) operand from a **reduction**
+> (`pl.row_sum`, `pl.row_max`, `pl.col_sum`, ...) or a **reshape** of a
+> 1-D vector. **Never** build it via `pl.slice(t, [N, 1], [r, c])` —
+> column-slicing lowers to a tile descriptor whose valid row byte size
+> is below the AIV 32-byte alignment rule and the AIV VEC pipe faults
+> at runtime with `errcode 0x800 "UB address not aligned"`. See
+> [known-pypto-pitfalls.md](known-pypto-pitfalls.md) §1 for the
+> bisect that pinned this.
+
 ### Fill and pad
 
 `pl.full(shape, dtype=..., value=...)` allocates a scalar-filled

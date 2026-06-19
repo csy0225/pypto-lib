@@ -6,7 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 routed-expert grouped FFN (decode, TP=EP=8 BF16).
+"""[中文摘要] 36 个本地路由专家的 grouped SwiGLU FFN(EP 切片后每卡 36/288);
+本卡纯计算,不含任何跨卡通信(通信由 dispatch.py 进入、combine.py 退出)。
+[关键装饰器] @pl.jit.inline(模块级 body)。
+[SPMD 角色] 仅本卡内多核 SPMD —— 因为输入 CSR 已经是"只属于本卡 36 个专家
+的 token 行",所以专家间天然独立,直接 pl.spmd 多核分派。
+[详见] 中文架构指南 §4.1, §8
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 routed-expert grouped FFN (decode, TP=EP=8 BF16).
 
 Per-card local routed-expert path: each of the 8 EP ranks owns
 ``MOE_NUM_EXPERTS_LOCAL = 36`` of the 288 global routed experts. The

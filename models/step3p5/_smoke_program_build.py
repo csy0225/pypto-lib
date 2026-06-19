@@ -1,4 +1,14 @@
-"""Smoke probe: instantiate Step3p5DecodeFwd / Step3p5PrefillFwd @pl.program
+"""[中文摘要] 最小 smoke probe:只构造 `Step3p5DecodeFwd` / `Step3p5PrefillFwd` /
+各 per-layer @pl.program 类,**不进编译、不上 NPU**,只确认 frontend 能
+解析当前代码;rc=0 是迁移期最重要的一根绿灯。
+[关键装饰器] 无(纯 host Python;但 import 链会触发被 import 模块里的
+@pl.jit / @pl.program 装饰器执行)。
+[SPMD 角色] host 入口,只走 frontend 解析。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Smoke probe: instantiate Step3p5DecodeFwd / Step3p5PrefillFwd @pl.program
 
 builders to confirm the pypto frontend can chew the Phase 9 codebase.
 This does NOT touch the NPU — it only constructs the program objects so

@@ -1,4 +1,13 @@
-"""Compile a single step3p5 decode layer (TP=8) for codegen verification.
+"""[中文摘要] Phase 14.C 编译验证驱动:把 `DecodeLayerDense`(layer 0..2 用)单层
+@pl.program 喂给 pypto.ir.compile,跑完 8 张卡的 codegen。**不上 NPU**。
+[关键装饰器] 无(纯 host Python 入口)。
+[SPMD 角色] host 编译驱动;DistributedConfig 配 TP_WORLD_SIZE 让 codegen
+产出 per-rank 工件。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Compile a single step3p5 decode layer (TP=8) for codegen verification.
 
 Compile-only driver — no NPU execution. Builds a multi-card
 ``DecodeLayerDense`` ``@pl.program`` and runs it through

@@ -6,7 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 top-level prefill entry — 8-card TP/EP prefill.
+"""[中文摘要] prefill 真机 / smoke CLI 入口,与 step3p5_decode.py 对称(real-NPU
+路径目前因 prefill 内核 5MB L1 overflow 走 Phase 17 deferred,会 raise
+NotImplementedError)。
+[关键装饰器] 无(纯 host Python)。
+[SPMD 角色] host 入口:启动 per-rank 进程,每张卡跑同一份 program;实际 SPMD
+执行从 Step3p5PrefillFwd.host_orch 开始。
+[详见] 中文架构指南 §10
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 top-level prefill entry — 8-card TP/EP prefill.
 
 Sibling of ``step3p5_decode.py``; same per-rank weight bundle, same
 CLI shape, but the residual stream walks a sequence-major prefill

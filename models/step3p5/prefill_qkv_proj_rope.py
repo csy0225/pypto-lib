@@ -6,7 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 prefill input RMSNorm + TP-sliced Q/K/V projection + partial RoPE.
+"""[中文摘要] Prefill 侧 Scope 1:对 sequence-major 的 [T, HIDDEN] 跑 zero-centered
+RMSNorm + TP-切片的 Q/K/V 投影 + per-head q_norm/k_norm + partial RoPE。
+两个变体由工厂函数烤出:full(rotary_dim=64,yarn 缩放)与 swa(rotary_dim=128,
+无缩放),各自在自己的 prefill_attention_*.py 里被 @pl.inline 进 chip_orch。
+[关键装饰器] @pl.program 三层 + @pl.jit.inline helper(本文件内 + 来自 _ops.py)。
+[SPMD 角色] 跨卡(TP=8 切 Q/K/V 头)+ 片上多核 SPMD。
+[详见] 中文架构指南 §3, §4.2
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 prefill input RMSNorm + TP-sliced Q/K/V projection + partial RoPE.
 
 Counterpart of the decode-side ``attention_full.py`` / ``attention_swa.py``
 Scope-1 prelude, generalised for a sequence-major prefill shape. The

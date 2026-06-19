@@ -6,7 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 prefill full-attention kernel — TP=8 (Phase 6).
+"""[中文摘要] Prefill 侧 full-attention(因果,无滑窗;每张卡 8 头,partial RoPE 0.5,
+yarn 缩放);Scope 2 写 KV cache → causal flash;Scope 3 末尾
+`tp_all_reduce` + 残差。结构与 attention_full.py 镜像,只是 [T, HIDDEN]
+sequence-major,不再有 BATCH 凑齐。
+[关键装饰器] @pl.program +
+   @pl.function(level=HOST, role=Orchestrator)
+   @pl.function(type=Orchestration)
+   @pl.function(type=InCore)
+[SPMD 角色] 跨卡(TP=8)+ 片上 SPMD。
+[详见] 中文架构指南 §3
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 prefill full-attention kernel — TP=8 (Phase 6).
 
 Sequence-major counterpart of the decode-side ``attention_full.py``.
 The prefill body carries ``T = PREFILL_BATCH * PREFILL_SEQ`` tokens and

@@ -1,4 +1,12 @@
-"""Compile a step3p5 MoE decode layer (TP+EP=8) for codegen verification.
+"""[中文摘要] Phase 14.D 编译验证驱动:把 `DecodeLayerMoE`(layer 3..44 用)单层
+@pl.program 喂给 pypto.ir.compile,跑 EP+TP 8 卡 codegen。**不上 NPU**。
+[关键装饰器] 无(纯 host Python 入口)。
+[SPMD 角色] host 编译驱动。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Compile a step3p5 MoE decode layer (TP+EP=8) for codegen verification.
 
 Compile-only driver — no NPU execution. Builds a multi-card
 ``DecodeLayerMoE`` ``@pl.program`` and runs it through ``pypto.ir.compile``

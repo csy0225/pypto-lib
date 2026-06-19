@@ -6,7 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 shared-expert MLP (decode, TP=EP=8 BF16).
+"""[中文摘要] 1280 维共享专家 FFN 沿 TP 切片(每卡 160 维);本卡输出 partial,
+末尾交给上游 caller 调 `tp_all_reduce` 汇总成完整 1280 维 hidden。
+[关键装饰器] @pl.jit.inline(本卡计算 body);上层 @pl.program 类负责调用 collective。
+[SPMD 角色] 本卡 SPMD(片上多核计算 partial)+ caller 跨卡 reduce。
+[详见] 中文架构指南 §4.1, §9
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 shared-expert MLP (decode, TP=EP=8 BF16).
 
 A 1280-dim FFN sliced across the TP group: each of the 8 cards owns
 ``SHARE_EXPERT_DIM_LOCAL = 1280 / 8 = 160`` of the intermediate

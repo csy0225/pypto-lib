@@ -6,7 +6,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Distributed collective wrappers — ``@pl.jit.inline`` shape.
+"""[中文摘要] 4 个跨卡集合通信原语(`tp_all_reduce` / `tp_all_gather` /
+`tp_reduce_scatter` / `ep_all_to_all`)的 @pl.jit.inline 实现;基于
+pld.tile.remote_load + pld.system.notify/wait 的 pull-side ring 模板。
+[关键装饰器] @pl.jit.inline(模块级)。注意:同名 collective 还会被各 @pl.program
+类(attention_full / attention_swa / moe / decode_layer / mtp 等)以 self.method(...)
+形式复制一份(self-method 复制的 InCore 等价体),原因见指南 §4.5。
+[SPMD 角色] 跨卡 SPMD 通信的实现层;依赖 host_orch 预先分配的双 buffer
+(scratch tmp_window + AtomicAdd signal_window)。
+[详见] 中文架构指南 §9, §4.5
+
+────── 以下为英文原 docstring ──────
+
+Distributed collective wrappers — ``@pl.jit.inline`` shape.
 
 This file rewrites the four collective helpers against the **canonical**
 pypto frontend patterns documented in ``docs/step3p5/pypto-api-cheat-sheet.md``,

@@ -1,4 +1,13 @@
-"""Compile a step3p5 prefill MoE layer (TP+EP=8) for codegen verification.
+"""[中文摘要] Phase 14.H 编译验证驱动(prefill MoE 单层),目前 deferred 到
+Phase 17(同 _compile_prefill_layer_dense.py 的原因 —— 192KB Vec overflow)。
+**不上 NPU**。
+[关键装饰器] 无(纯 host Python 入口)。
+[SPMD 角色] host 编译驱动。
+[详见] 中文架构指南 §11
+
+────── 以下为英文原 docstring ──────
+
+Compile a step3p5 prefill MoE layer (TP+EP=8) for codegen verification.
 
 DEFERRED — current prefill per-layer programs overflow 192KB Vec (PREFILL_T=128
 monolithic + FP32 buffers); needs token-tiling (BATCH<=8) restructuring, tracked

@@ -6,7 +6,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Step3p5 shared kernel helpers (Phase 3 dedup target).
+"""[中文摘要] 跨 kernel 共享的 inline helper(zero-centered RMSNorm、per-head QK norm、
+partial RoPE、head-wise attention gate),以及 host 侧 llama3-yarn / 普通 RoPE
+cos/sin 表的 torch 生成函数。
+[关键装饰器] @pl.jit.inline(模块级 helper);本身不是独立 kernel,需要被 @pl.jit
+入口或 @pl.program 类拼接调用。
+[SPMD 角色] inline helper(片上单核体内的小积木);因为 @pl.jit.inline 不能从
+@pl.function(InCore) 内直接调用,各 @pl.program 类(attention_full / attention_swa /
+decode_layer / moe / mtp 等)都把这些 helper 复制为 self.method(...) 形式 —— 见指南 §4.5。
+[详见] 中文架构指南 §4.1, §4.5, §8
+
+────── 以下为英文原 docstring ──────
+
+Step3p5 shared kernel helpers (Phase 3 dedup target).
 
 Hoists the four inline helpers that were duplicated across the Phase 2
 drafts ``single_layer_decode_full_draft.py`` and
@@ -165,6 +177,17 @@ def head_wise_gate_apply(
     For each Q head ``h``, the column ``gate_logits[:, h:h+1]`` is
     broadcast across the HEAD_DIM lanes of that head's attn_out slab and
     multiplied in. This helper handles one such head's broadcast.
+
+    .. warning::
+       Caller must build ``gate_logit_col_fp32`` via **reduction** (e.g.
+       ``pl.row_sum(...)``) or **reshape** of a 1-D vector, NOT via
+       ``pl.slice(t, [rows, 1], [r, c])``. Slicing a single column out of
+       a wider 2D tile produces a tile descriptor with
+       ``valid_shape=[rows, 1]`` whose row byte size is below pto-isa's
+       32-B alignment rule, and the AIV VEC pipe faults at runtime with
+       ``errcode 0x800 "UB address not aligned" subErrType:4``. See
+       ``pypto-lib/docs/known-pypto-pitfalls.md`` §1 for the
+       reproducer and the upstream-fix path.
     """
     gate = pl.recip(pl.add(pl.exp(pl.neg(gate_logit_col_fp32)), 1.0))
     gated_fp32 = pl.col_expand_mul(

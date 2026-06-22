@@ -340,54 +340,98 @@ tile.)
 
 ---
 
-## 7. Collective `HIDDEN` tiling must not follow `tp_size` (chunk-follows-slice → UB overflow)
+## 7. `pl.range(constant)` unrolls without SSA buffer reuse → UB overflow at compile time
 
-**Symptom** — compile-time fault at the `AllocateMemoryAddr` pass, only on the
-single-card unslice path (`apply_tp1_patch`, `tp_size=1`):
+**Symptom** — compile-time fault at `AllocateMemoryAddr` pass:
 
 ```
-Verification failed after 'AllocateMemoryAddr' ...
+Verification failed after 'AllocateMemoryAddr' for properties {AllocatedMemoryAddr}:
+[1] ERROR - AllocatedMemoryAddr
   Message: Function 'tp_all_reduce': Vec buffer usage (655360 bytes)
            exceeds platform limit (188416 bytes)
-  Location: decode_layer.py:<line>
+  Location: <kernel>.py:<line>
 ```
 
-**Trigger** — a collective (e.g. the barrier-mesh `tp_all_reduce`) that tiles the
-`HIDDEN` dimension with a chunk **derived from `tp_size`**:
+**Trigger** — a `pl.range(N)` whose bound `N` is a Python int (factory
+closure constant, module global, captured `tp_size=8`, etc.) where each
+iteration of the body creates fresh tile SSA values that depend on the
+iteration index, including a loop-carried accumulator. Concretely:
 
 ```python
-tp_chunk = HIDDEN // tp_size          # ❌ chunk follows the TP slice width
-for k0 in pl.range(0, HIDDEN, tp_chunk):
-    own = pl.load(window, [0, k0], [BATCH, tp_chunk])
-    acc = pl.cast(own, target_type=pl.FP32)   # [BATCH, tp_chunk] FP32 tile
-    ...
+group_size = tp_size            # Python int, e.g. 8
+acc = pl.cast(own_tile, target_type=pl.FP32)
+for peer in pl.range(group_size):
+    if peer != my_rank:
+        recv      = pld.tile.remote_load(window, peer=peer, ...)  # BF16 [B, CHUNK]
+        recv_fp32 = pl.cast(recv, target_type=pl.FP32)             # FP32 [B, CHUNK]
+        acc       = pl.add(acc, recv_fp32)                         # NEW FP32 [B, CHUNK]
 ```
 
-At the canonical TP=8 this is fine (`tp_chunk = 4096 // 8 = 512`, 32 KB FP32 acc
-tile). But under `apply_tp1_patch` (`tp_size=1`, used for single-card e2e / dense
-ST) it collapses to `tp_chunk = HIDDEN = 4096`, so the FP32 acc tile is
-`[16, 4096] × 4 B = 256 KB`, well over the 188 KB UB limit — and the loop runs
-once (no tiling). This is the "chunk-follows-slice" anti-pattern in
-`../models/step3p5/CLAUDE.md`.
+The compiler **fully unrolls** the loop because `group_size` is a
+compile-time constant. It then treats each iteration's `recv`,
+`recv_fp32`, and `acc` as **distinct SSA values** and allocates UB
+slots for all of them simultaneously. Tile-reuse / liveness analysis
+across unrolled iterations is **not implemented** for the loop-carried
+`acc`. UB cost = `(group_size - 1) × per_iter_tile_bytes`, easily
+blowing the 184 KB Vec UB budget on A2A3 once `B × CHUNK × 4` per tile
+exceeds ~25 KB.
 
-**Avoidance recipe** — tile `HIDDEN` with a **fixed** width that does not depend
-on `tp_size`:
+**Source location** — pypto compiler `AllocateMemoryAddr` pass; visible
+in `Vec buffer usage` overflow messages from `MaterializeTensorStrides`
+and downstream codegen.
 
-```python
-ar_chunk = HIDDEN // 8     # ✅ fixed; = canonical TP=8 chunk (512); HIDDEN divisible
-for k0 in pl.range(0, HIDDEN, ar_chunk):
-    own = pl.load(window, [0, k0], [BATCH, ar_chunk])
-    ...
-```
+**Avoidance recipes**:
 
-At TP=8 the behaviour is identical (`ar_chunk == tp_chunk`); at TP=1 the working
-set stays bounded regardless of slice width. The window (`[BATCH, HIDDEN]` in
-distributed memory) and the comm semantics are unchanged — only the UB tiling
-loop is decoupled from `tp_size`.
+A. **Make the loop bound runtime-dynamic** so the compiler emits a real
+   loop and allocates UB once for the iteration body. Mirror the
+   canonical `pypto/tests/st/distributed/test_l3_allreduce.py`:
 
-**Related** — the broader story (why the all-reduce is barrier-mesh and not ring,
-and the multi-card 507018 A/B) is in
-[upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md](upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md).
+   ```python
+   ctx    = pld.get_comm_ctx(data)
+   nranks = pld.nranks(ctx)        # runtime Scalar, NOT a Python int
+   for peer in pl.range(nranks):
+       ...
+   ```
+
+B. **Don't carry the accumulator across iterations** — write the
+   partial result back to a host-visible tensor (`local`) at the end of
+   each peer iteration and re-load it at the start of the next. Per-
+   iteration working set is `cur + recv + cur_fp32 + recv_fp32 + sum +
+   sum_bf16` ≈ `6 × B × CHUNK × 2..4` ≈ 144 KB at `B=16, CHUNK=512`
+   which fits 184 KB:
+
+   ```python
+   for peer in pl.range(group_size):
+       if peer != my_rank:
+           cur  = pl.load(local, [0, k0], [B, CHUNK])
+           recv = pld.tile.remote_load(window, peer=peer, offsets=[0, k0],
+                                       shape=[B, CHUNK])
+           summed = pl.add(pl.cast(cur,  target_type=pl.FP32),
+                           pl.cast(recv, target_type=pl.FP32))
+           pl.store(pl.cast(summed, target_type=pl.BF16), [0, k0], local)
+   ```
+
+   This trades one extra DDR round-trip per peer for predictable UB.
+
+C. **Shrink CHUNK** so `(group_size - 1) × per_iter_tile_bytes ≤ UB
+   limit`. Quick and degrades DMA efficiency; only useful when the
+   kernel cannot tolerate (A) or (B).
+
+**Reproducer** — observed 2026-06-22 on csy0225/pypto-lib branch
+`wip/step3p5-barrier-allreduce-20260622` HEAD `b5bb6ee`, in
+`models/step3p5/decode_layer.py:487` `_dense_mlp_body_tp.tp_all_reduce`.
+The body matches pattern (A) above but with `group_size = tp_size = 8`
+(Python int from factory closure), and trips the overflow because the
+compiler sees seven distinct unrolled `acc` SSA values plus their FP32
+casts. The HEAD-of-`stepfun/develop` ring all_reduce avoids the issue
+by storing each chunk back to `local` immediately (pattern B applied
+naturally to the ring shape).
+
+**Cross-reference** — this is **distinct** from §6 ("kernel body must
+use `pl.range/parallel/unroll/...`"). §6 is a frontend rejection of
+raw `for x in range(N):`. §7 is a back-end UB-budget defect that bites
+you even when you correctly use `pl.range`, but the bound is a compile-
+time int.
 
 ---
 
@@ -400,5 +444,10 @@ and the multi-card 507018 A/B) is in
 - [debugging.md](debugging.md) — runtime / precision symptom triage.
 - [compile-runtime-workflow.md](compile-runtime-workflow.md) — what the
   pypto compile + simpler dispatch pipeline does at each stage.
+- [dev-workflow-gotchas.md](dev-workflow-gotchas.md) — operational
+  pitfalls outside pypto itself (stale `__pycache__` after monkey-
+  patching, environment activation, git/SSH/PAT auth on netboot
+  hosts) — separate from this file because they are *workflow* bugs,
+  not *pypto* bugs, but burn the same kind of debugging time.
 - `../models/step3p5/CLAUDE.md` — the project-level tracker that
   references this file from §"已知风险".

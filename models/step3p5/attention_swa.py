@@ -818,8 +818,15 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             """Barrier-style all-reduce(sum) across the TP group."""
             group_size = tp_size
 
-            for k0 in pl.range(0, HIDDEN, tp_chunk):
-                stage_tile = pl.load(local, [0, k0], [BATCH, tp_chunk])
+            # All-reduce HIDDEN tiling width: fixed, INDEPENDENT of tp_size.
+            # tp_chunk = HIDDEN // tp_size collapses to HIDDEN (4096) at
+            # tp_size=1 (apply_tp1_patch single-card e2e), so [BATCH, 4096]
+            # FP32 acc tiles (256KB) overflow the 188KB UB limit. A fixed
+            # tile keeps the per-iteration working set bounded for every
+            # tp_size (512 = canonical TP=8 chunk; HIDDEN is divisible by it).
+            ar_chunk = HIDDEN // 8
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
                 pl.store(stage_tile, [0, k0], tmp_window)
 
             for peer in pl.range(group_size):
@@ -836,14 +843,14 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                         expected=1, cmp=pld.WaitCmp.Ge,
                     )
 
-            for k0 in pl.range(0, HIDDEN, tp_chunk):
-                own_tile = pl.load(tmp_window, [0, k0], [BATCH, tp_chunk])
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
                 acc = pl.cast(own_tile, target_type=pl.FP32)
                 for peer in pl.range(group_size):
                     if peer != my_rank:
                         recv = pld.tile.remote_load(
                             tmp_window, peer=peer,
-                            offsets=[0, k0], shape=[BATCH, tp_chunk],
+                            offsets=[0, k0], shape=[BATCH, ar_chunk],
                         )
                         acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(

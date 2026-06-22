@@ -494,8 +494,15 @@ def _build_decode_layer_dense_program(
             group_size = tp_size
 
             # Phase 1: stage-in — copy local into my tmp_window slot (full HIDDEN).
-            for k0 in pl.range(0, HIDDEN, tp_chunk):
-                stage_tile = pl.load(local, [0, k0], [BATCH, tp_chunk])
+            # All-reduce HIDDEN tiling width: fixed, INDEPENDENT of tp_size.
+            # tp_chunk = HIDDEN // tp_size collapses to HIDDEN (4096) at
+            # tp_size=1 (apply_tp1_patch single-card e2e), so [BATCH, 4096]
+            # FP32 acc tiles (256KB) overflow the 188KB UB limit. A fixed
+            # tile keeps the per-iteration working set bounded for every
+            # tp_size (512 = canonical TP=8 chunk; HIDDEN is divisible by it).
+            ar_chunk = HIDDEN // 8
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
                 pl.store(stage_tile, [0, k0], tmp_window)
 
             # Phase 2: barrier — notify all peers (one round), then wait on all
@@ -519,14 +526,14 @@ def _build_decode_layer_dense_program(
             # Phase 3: load own tmp slot, then for each peer remote_load + tadd
             # (FP32 — PTOAS bf16 tadd unsupported, cast through f32). Result lands
             # back in `local` (in-place reduction target).
-            for k0 in pl.range(0, HIDDEN, tp_chunk):
-                own_tile = pl.load(tmp_window, [0, k0], [BATCH, tp_chunk])
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
                 acc = pl.cast(own_tile, target_type=pl.FP32)
                 for peer in pl.range(group_size):
                     if peer != my_rank:
                         recv = pld.tile.remote_load(
                             tmp_window, peer=peer,
-                            offsets=[0, k0], shape=[BATCH, tp_chunk],
+                            offsets=[0, k0], shape=[BATCH, ar_chunk],
                         )
                         acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(

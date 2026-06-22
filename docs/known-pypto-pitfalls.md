@@ -340,7 +340,58 @@ tile.)
 
 ---
 
-## 7. Cross-references and further reading
+## 7. Collective `HIDDEN` tiling must not follow `tp_size` (chunk-follows-slice → UB overflow)
+
+**Symptom** — compile-time fault at the `AllocateMemoryAddr` pass, only on the
+single-card unslice path (`apply_tp1_patch`, `tp_size=1`):
+
+```
+Verification failed after 'AllocateMemoryAddr' ...
+  Message: Function 'tp_all_reduce': Vec buffer usage (655360 bytes)
+           exceeds platform limit (188416 bytes)
+  Location: decode_layer.py:<line>
+```
+
+**Trigger** — a collective (e.g. the barrier-mesh `tp_all_reduce`) that tiles the
+`HIDDEN` dimension with a chunk **derived from `tp_size`**:
+
+```python
+tp_chunk = HIDDEN // tp_size          # ❌ chunk follows the TP slice width
+for k0 in pl.range(0, HIDDEN, tp_chunk):
+    own = pl.load(window, [0, k0], [BATCH, tp_chunk])
+    acc = pl.cast(own, target_type=pl.FP32)   # [BATCH, tp_chunk] FP32 tile
+    ...
+```
+
+At the canonical TP=8 this is fine (`tp_chunk = 4096 // 8 = 512`, 32 KB FP32 acc
+tile). But under `apply_tp1_patch` (`tp_size=1`, used for single-card e2e / dense
+ST) it collapses to `tp_chunk = HIDDEN = 4096`, so the FP32 acc tile is
+`[16, 4096] × 4 B = 256 KB`, well over the 188 KB UB limit — and the loop runs
+once (no tiling). This is the "chunk-follows-slice" anti-pattern in
+`../models/step3p5/CLAUDE.md`.
+
+**Avoidance recipe** — tile `HIDDEN` with a **fixed** width that does not depend
+on `tp_size`:
+
+```python
+ar_chunk = HIDDEN // 8     # ✅ fixed; = canonical TP=8 chunk (512); HIDDEN divisible
+for k0 in pl.range(0, HIDDEN, ar_chunk):
+    own = pl.load(window, [0, k0], [BATCH, ar_chunk])
+    ...
+```
+
+At TP=8 the behaviour is identical (`ar_chunk == tp_chunk`); at TP=1 the working
+set stays bounded regardless of slice width. The window (`[BATCH, HIDDEN]` in
+distributed memory) and the comm semantics are unchanged — only the UB tiling
+loop is decoupled from `tp_size`.
+
+**Related** — the broader story (why the all-reduce is barrier-mesh and not ring,
+and the multi-card 507018 A/B) is in
+[upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md](upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md).
+
+---
+
+## 8. Cross-references and further reading
 
 - [pypto-coding-style.md](pypto-coding-style.md) — the canonical happy-
   path API (broadcast ops, slicing, loop primitives, `pl.at` scopes).

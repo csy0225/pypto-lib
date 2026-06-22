@@ -340,7 +340,102 @@ tile.)
 
 ---
 
-## 7. Cross-references and further reading
+## 7. `pl.range(constant)` unrolls without SSA buffer reuse → UB overflow at compile time
+
+**Symptom** — compile-time fault at `AllocateMemoryAddr` pass:
+
+```
+Verification failed after 'AllocateMemoryAddr' for properties {AllocatedMemoryAddr}:
+[1] ERROR - AllocatedMemoryAddr
+  Message: Function 'tp_all_reduce': Vec buffer usage (655360 bytes)
+           exceeds platform limit (188416 bytes)
+  Location: <kernel>.py:<line>
+```
+
+**Trigger** — a `pl.range(N)` whose bound `N` is a Python int (factory
+closure constant, module global, captured `tp_size=8`, etc.) where each
+iteration of the body creates fresh tile SSA values that depend on the
+iteration index, including a loop-carried accumulator. Concretely:
+
+```python
+group_size = tp_size            # Python int, e.g. 8
+acc = pl.cast(own_tile, target_type=pl.FP32)
+for peer in pl.range(group_size):
+    if peer != my_rank:
+        recv      = pld.tile.remote_load(window, peer=peer, ...)  # BF16 [B, CHUNK]
+        recv_fp32 = pl.cast(recv, target_type=pl.FP32)             # FP32 [B, CHUNK]
+        acc       = pl.add(acc, recv_fp32)                         # NEW FP32 [B, CHUNK]
+```
+
+The compiler **fully unrolls** the loop because `group_size` is a
+compile-time constant. It then treats each iteration's `recv`,
+`recv_fp32`, and `acc` as **distinct SSA values** and allocates UB
+slots for all of them simultaneously. Tile-reuse / liveness analysis
+across unrolled iterations is **not implemented** for the loop-carried
+`acc`. UB cost = `(group_size - 1) × per_iter_tile_bytes`, easily
+blowing the 184 KB Vec UB budget on A2A3 once `B × CHUNK × 4` per tile
+exceeds ~25 KB.
+
+**Source location** — pypto compiler `AllocateMemoryAddr` pass; visible
+in `Vec buffer usage` overflow messages from `MaterializeTensorStrides`
+and downstream codegen.
+
+**Avoidance recipes**:
+
+A. **Make the loop bound runtime-dynamic** so the compiler emits a real
+   loop and allocates UB once for the iteration body. Mirror the
+   canonical `pypto/tests/st/distributed/test_l3_allreduce.py`:
+
+   ```python
+   ctx    = pld.get_comm_ctx(data)
+   nranks = pld.nranks(ctx)        # runtime Scalar, NOT a Python int
+   for peer in pl.range(nranks):
+       ...
+   ```
+
+B. **Don't carry the accumulator across iterations** — write the
+   partial result back to a host-visible tensor (`local`) at the end of
+   each peer iteration and re-load it at the start of the next. Per-
+   iteration working set is `cur + recv + cur_fp32 + recv_fp32 + sum +
+   sum_bf16` ≈ `6 × B × CHUNK × 2..4` ≈ 144 KB at `B=16, CHUNK=512`
+   which fits 184 KB:
+
+   ```python
+   for peer in pl.range(group_size):
+       if peer != my_rank:
+           cur  = pl.load(local, [0, k0], [B, CHUNK])
+           recv = pld.tile.remote_load(window, peer=peer, offsets=[0, k0],
+                                       shape=[B, CHUNK])
+           summed = pl.add(pl.cast(cur,  target_type=pl.FP32),
+                           pl.cast(recv, target_type=pl.FP32))
+           pl.store(pl.cast(summed, target_type=pl.BF16), [0, k0], local)
+   ```
+
+   This trades one extra DDR round-trip per peer for predictable UB.
+
+C. **Shrink CHUNK** so `(group_size - 1) × per_iter_tile_bytes ≤ UB
+   limit`. Quick and degrades DMA efficiency; only useful when the
+   kernel cannot tolerate (A) or (B).
+
+**Reproducer** — observed 2026-06-22 on csy0225/pypto-lib branch
+`wip/step3p5-barrier-allreduce-20260622` HEAD `b5bb6ee`, in
+`models/step3p5/decode_layer.py:487` `_dense_mlp_body_tp.tp_all_reduce`.
+The body matches pattern (A) above but with `group_size = tp_size = 8`
+(Python int from factory closure), and trips the overflow because the
+compiler sees seven distinct unrolled `acc` SSA values plus their FP32
+casts. The HEAD-of-`stepfun/develop` ring all_reduce avoids the issue
+by storing each chunk back to `local` immediately (pattern B applied
+naturally to the ring shape).
+
+**Cross-reference** — this is **distinct** from §6 ("kernel body must
+use `pl.range/parallel/unroll/...`"). §6 is a frontend rejection of
+raw `for x in range(N):`. §7 is a back-end UB-budget defect that bites
+you even when you correctly use `pl.range`, but the bound is a compile-
+time int.
+
+---
+
+## 8. Cross-references and further reading
 
 - [pypto-coding-style.md](pypto-coding-style.md) — the canonical happy-
   path API (broadcast ops, slicing, loop primitives, `pl.at` scopes).
@@ -349,5 +444,10 @@ tile.)
 - [debugging.md](debugging.md) — runtime / precision symptom triage.
 - [compile-runtime-workflow.md](compile-runtime-workflow.md) — what the
   pypto compile + simpler dispatch pipeline does at each stage.
+- [dev-workflow-gotchas.md](dev-workflow-gotchas.md) — operational
+  pitfalls outside pypto itself (stale `__pycache__` after monkey-
+  patching, environment activation, git/SSH/PAT auth on netboot
+  hosts) — separate from this file because they are *workflow* bugs,
+  not *pypto* bugs, but burn the same kind of debugging time.
 - `../models/step3p5/CLAUDE.md` — the project-level tracker that
   references this file from §"已知风险".

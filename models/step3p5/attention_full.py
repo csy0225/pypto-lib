@@ -808,98 +808,53 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
 
     @pl.program
     class TpAttentionFull:
-        # ---------- Collective: TP all_reduce (lifted from collectives.py) ----
-        # Phase X.2: pull-side ring all-reduce body, baked with
-        # t_rows=BATCH, d_cols=HIDDEN, group_size=tp_size from the
-        # factory closure. See ``tests/st/distributed/test_l3_allreduce.py``
-        # for the canonical pattern.
+        # ---------- Collective: TP all_reduce (barrier-style) ------------
+        # Mirrors pypto/tests/st/distributed/test_l3_allreduce.py — verified
+        # PASS at TP=2/4/8 on real NPU. Replaces the previous ring all-reduce
+        # which hit a codegen bug (multi-step monotonic AtomicAdd → 507018).
         @pl.function(type=pl.FunctionType.InCore)
         def tp_all_reduce(
             self,
             local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-            tmp_window: pld.DistributedTensor[[BATCH, tp_chunk], pl.BF16],
+            tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-            """Pull-side ring all-reduce(sum) across the TP group."""
+            """Barrier-style all-reduce(sum) across the TP group."""
             group_size = tp_size
-            t_rows = BATCH
-            d_cols = HIDDEN
-            chunk = d_cols // group_size
 
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + group_size) % group_size
-                recv_idx = (my_rank - step - 1 + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
+            for k0 in pl.range(0, HIDDEN, tp_chunk):
+                stage_tile = pl.load(local, [0, k0], [BATCH, tp_chunk])
+                pl.store(stage_tile, [0, k0], tmp_window)
 
-                send_tile = pl.load(
-                    local, [0, send_idx * chunk], [t_rows, chunk],
-                )
-                pl.store(send_tile, [0, 0], tmp_window)
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
 
-                pld.system.notify(
-                    target=signal_window,
-                    peer=next_rank,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    signal=signal_window,
-                    offsets=[prev_rank, 0],
-                    expected=step + 1,
-                    cmp=pld.WaitCmp.Ge,
-                )
-
-                recv_tile = pld.tile.remote_load(
-                    tmp_window,
-                    peer=prev_rank,
-                    offsets=[0, 0],
-                    shape=[t_rows, chunk],
-                )
-                old_tile = pl.load(
-                    local, [0, recv_idx * chunk], [t_rows, chunk],
-                )
+            for k0 in pl.range(0, HIDDEN, tp_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [BATCH, tp_chunk])
+                acc = pl.cast(own_tile, target_type=pl.FP32)
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        recv = pld.tile.remote_load(
+                            tmp_window, peer=peer,
+                            offsets=[0, k0], shape=[BATCH, tp_chunk],
+                        )
+                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(
-                    pl.add(old_tile, recv_tile),
-                    [0, recv_idx * chunk],
-                    local,
+                    pl.cast(acc, target_type=pl.BF16),
+                    [0, k0], local,
                 )
-
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + 1 + group_size) % group_size
-                recv_idx = (my_rank - step + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
-
-                send_tile = pl.load(
-                    local, [0, send_idx * chunk], [t_rows, chunk],
-                )
-                pl.store(send_tile, [0, 0], tmp_window)
-
-                pld.system.notify(
-                    target=signal_window,
-                    peer=next_rank,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    signal=signal_window,
-                    offsets=[prev_rank, 0],
-                    expected=group_size - 1 + step + 1,
-                    cmp=pld.WaitCmp.Ge,
-                )
-
-                recv_tile = pld.tile.remote_load(
-                    tmp_window,
-                    peer=prev_rank,
-                    offsets=[0, 0],
-                    shape=[t_rows, chunk],
-                )
-                pl.store(recv_tile, [0, recv_idx * chunk], local)
-
             return local
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -922,7 +877,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
             w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS], pl.BF16],
             resid1_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
-            tmp_window: pld.DistributedTensor[[BATCH, tp_chunk], pl.BF16],
+            tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
@@ -970,11 +925,11 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             resid1_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
             layer_idx: pl.Scalar[pl.INT32],
         ):
-            tmp_buf = pld.alloc_window_buffer(BATCH * tp_chunk * 2)  # BF16
+            tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)  # BF16
             sig_buf = pld.alloc_window_buffer(tp_size * 4)           # INT32
 
             for r in pl.range(pld.world_size()):
-                tmp_window = pld.window(tmp_buf, [BATCH, tp_chunk], dtype=pl.BF16)
+                tmp_window = pld.window(tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
                 signal_window = pld.window(sig_buf, [tp_size, 1], dtype=pl.INT32)
                 self.chip_orch(
                     current_hidden[r],

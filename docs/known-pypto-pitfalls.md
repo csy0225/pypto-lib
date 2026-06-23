@@ -433,6 +433,52 @@ raw `for x in range(N):`. §7 is a back-end UB-budget defect that bites
 you even when you correctly use `pl.range`, but the bound is a compile-
 time int.
 
+### 7a. Collective `HIDDEN` tiling must not follow `tp_size` (chunk-follows-slice → UB overflow)
+
+A specific application of recipe (C) above to the **barrier-mesh**
+`tp_all_reduce` used by `step3p5` decode/attention layers. The same
+`AllocateMemoryAddr` UB overflow surfaces on the single-card unslice
+path (`apply_tp1_patch`, `tp_size=1`) when the collective tiles
+`HIDDEN` with a chunk **derived from `tp_size`**:
+
+```python
+tp_chunk = HIDDEN // tp_size          # chunk follows the TP slice width
+for k0 in pl.range(0, HIDDEN, tp_chunk):
+    own = pl.load(window, [0, k0], [BATCH, tp_chunk])
+    acc = pl.cast(own, target_type=pl.FP32)   # [BATCH, tp_chunk] FP32 tile
+    ...
+```
+
+At the canonical TP=8 this is fine (`tp_chunk = 4096 // 8 = 512`, 32 KB FP32 acc
+tile). But under `apply_tp1_patch` (`tp_size=1`, used for single-card e2e / dense
+ST) it collapses to `tp_chunk = HIDDEN = 4096`, so the FP32 acc tile is
+`[16, 4096] × 4 B = 256 KB`, well over the 188 KB UB limit — and the loop runs
+once (no tiling). This is the "chunk-follows-slice" anti-pattern in
+`../models/step3p5/CLAUDE.md`.
+
+**Fix** — tile `HIDDEN` with a **fixed** width that does not depend
+on `tp_size` (recipe C applied to the inner HIDDEN loop):
+
+```python
+ar_chunk = HIDDEN // 8     # fixed; = canonical TP=8 chunk (512); HIDDEN divisible
+for k0 in pl.range(0, HIDDEN, ar_chunk):
+    own = pl.load(window, [0, k0], [BATCH, ar_chunk])
+    ...
+```
+
+At TP=8 the behaviour is identical (`ar_chunk == tp_chunk`); at TP=1 the working
+set stays bounded regardless of slice width. The window (`[BATCH, HIDDEN]` in
+distributed memory) and the comm semantics are unchanged — only the UB tiling
+loop is decoupled from `tp_size`.
+
+This fix is landed on `wip/barrier-ub-fix` for the barrier-mesh
+`tp_all_reduce` in `decode_layer.py`, `attention_full.py`, and
+`attention_swa.py` (TP=8 canonical path + single-card unslice path
+both compile clean).
+
+**Related** — the broader story (why the all-reduce is barrier-mesh and not ring,
+and the multi-card 507018 A/B) is in
+[upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md](upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md).
 ---
 
 ## 8. Cross-references and further reading

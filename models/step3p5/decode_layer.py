@@ -248,7 +248,7 @@ def _dense_mlp_body_tp(
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
-    tmp_window: pld.DistributedTensor[[BATCH, TP_CHUNK], pl.BF16],
+    tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
@@ -473,83 +473,73 @@ def _build_decode_layer_dense_program(
 
     @pl.program
     class DecodeLayerDense:
-        # ---------- Collective: TP all_reduce (lifted from collectives.py) ----
-        # Phase X.2: pull-side ring all-reduce body, t_rows=BATCH,
-        # d_cols=HIDDEN, group_size=tp_size from factory closure.
+        # ---------- Collective: TP all_reduce (barrier-style) ------------
+        # Mirrors pypto/tests/st/distributed/test_l3_allreduce.py — verified
+        # PASS at TP=2/4/8 on real NPU. Replaces the previous ring all-reduce
+        # which hit a codegen bug when the multi-step + monotonic AtomicAdd
+        # pattern was lowered (synchronized 507018 across all 8 ranks at
+        # task 13 of decode_layer; details in
+        # docs/upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md).
+        # Bandwidth tradeoff: O(N²) bytes/rank vs ring's O(N), but at N=8 and
+        # HIDDEN=4096 BF16 that is 7×8KB ≈ 56KB cross-rank read per rank —
+        # negligible compared to dense gate_up matmul memory traffic.
         @pl.function(type=pl.FunctionType.InCore)
         def tp_all_reduce(
             self,
             local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-            tmp_window: pld.DistributedTensor[[BATCH, tp_chunk], pl.BF16],
+            tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             group_size = tp_size
-            # Inline shape constants — pypto's tile shape inference cannot follow
-            # Python-level aliases like ``t_rows = BATCH`` past load/remote_load
-            # boundaries (it preserves the alias name in the tile type, which
-            # then mismatches the concrete shape from sibling pl.load calls).
-            # Using the literals everywhere matches tests/st/distributed/test_l3_allreduce.py.
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + group_size) % group_size
-                recv_idx = (my_rank - step - 1 + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
-                send_tile = pl.load(
-                    local, [0, send_idx * tp_chunk], [BATCH, tp_chunk],
-                )
-                pl.store(send_tile, [0, 0], tmp_window)
-                pld.system.notify(
-                    target=signal_window, peer=next_rank,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    signal=signal_window, offsets=[prev_rank, 0],
-                    expected=pl.cast(step + 1, pl.INT32), cmp=pld.WaitCmp.Ge,
-                )
-                recv_tile = pld.tile.remote_load(
-                    tmp_window, peer=prev_rank,
-                    offsets=[0, 0], shape=[BATCH, tp_chunk],
-                )
-                old_tile = pl.load(
-                    local, [0, recv_idx * tp_chunk], [BATCH, tp_chunk],
-                )
-                # PTOAS A2/A3 ``tadd`` doesn't support bf16; upcast to f32,
-                # add, then downcast for the store.
-                summed_fp32 = pl.add(
-                    pl.cast(old_tile, target_type=pl.FP32),
-                    pl.cast(recv_tile, target_type=pl.FP32),
-                )
-                pl.store(
-                    pl.cast(summed_fp32, target_type=pl.BF16),
-                    [0, recv_idx * tp_chunk], local,
-                )
 
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + 1 + group_size) % group_size
-                recv_idx = (my_rank - step + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
-                send_tile = pl.load(
-                    local, [0, send_idx * tp_chunk], [BATCH, tp_chunk],
+            # Phase 1: stage-in — copy local into my tmp_window slot (full HIDDEN).
+            # All-reduce HIDDEN tiling width: fixed, INDEPENDENT of tp_size.
+            # tp_chunk = HIDDEN // tp_size collapses to HIDDEN (4096) at
+            # tp_size=1 (apply_tp1_patch single-card e2e), so [BATCH, 4096]
+            # FP32 acc tiles (256KB) overflow the 188KB UB limit. A fixed
+            # tile keeps the per-iteration working set bounded for every
+            # tp_size (512 = canonical TP=8 chunk; HIDDEN is divisible by it).
+            ar_chunk = HIDDEN // 8
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
+                pl.store(stage_tile, [0, k0], tmp_window)
+
+            # Phase 2: barrier — notify all peers (one round), then wait on all
+            # peers (one round). Separate loops, matching the pypto own-test
+            # pattern. expected=1 fixed (cells start zero, accumulate to N-1
+            # after all notifies land; we only require >=1 from each peer slot).
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            # Phase 3: load own tmp slot, then for each peer remote_load + tadd
+            # (FP32 — PTOAS bf16 tadd unsupported, cast through f32). Result lands
+            # back in `local` (in-place reduction target).
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
+                acc = pl.cast(own_tile, target_type=pl.FP32)
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        recv = pld.tile.remote_load(
+                            tmp_window, peer=peer,
+                            offsets=[0, k0], shape=[BATCH, ar_chunk],
+                        )
+                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
+                pl.store(
+                    pl.cast(acc, target_type=pl.BF16),
+                    [0, k0], local,
                 )
-                pl.store(send_tile, [0, 0], tmp_window)
-                pld.system.notify(
-                    target=signal_window, peer=next_rank,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    signal=signal_window, offsets=[prev_rank, 0],
-                    expected=pl.cast(group_size - 1 + step + 1, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
-                )
-                recv_tile = pld.tile.remote_load(
-                    tmp_window, peer=prev_rank,
-                    offsets=[0, 0], shape=[BATCH, tp_chunk],
-                )
-                pl.store(recv_tile, [0, recv_idx * tp_chunk], local)
             return local
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -576,11 +566,11 @@ def _build_decode_layer_dense_program(
             w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
             w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
             next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
-            attn_tmp_window: pld.DistributedTensor[[BATCH, tp_chunk], pl.BF16],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             attn_signal_window: pld.DistributedTensor[
                 [tp_size, 1], pl.INT32
             ],
-            mlp_tmp_window: pld.DistributedTensor[[BATCH, tp_chunk], pl.BF16],
+            mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[
                 [tp_size, 1], pl.INT32
             ],
@@ -657,20 +647,20 @@ def _build_decode_layer_dense_program(
             ],
             layer_idx: pl.Scalar[pl.INT32],
         ):
-            attn_tmp_buf = pld.alloc_window_buffer(BATCH * tp_chunk * 2)
+            attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
-            mlp_tmp_buf = pld.alloc_window_buffer(BATCH * tp_chunk * 2)
+            mlp_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             mlp_sig_buf = pld.alloc_window_buffer(tp_size * 4)
 
             for r in pl.range(pld.world_size()):
                 attn_tmp_window = pld.window(
-                    attn_tmp_buf, [BATCH, tp_chunk], dtype=pl.BF16,
+                    attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16,
                 )
                 attn_signal_window = pld.window(
                     attn_sig_buf, [tp_size, 1], dtype=pl.INT32,
                 )
                 mlp_tmp_window = pld.window(
-                    mlp_tmp_buf, [BATCH, tp_chunk], dtype=pl.BF16,
+                    mlp_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16,
                 )
                 mlp_signal_window = pld.window(
                     mlp_sig_buf, [tp_size, 1], dtype=pl.INT32,

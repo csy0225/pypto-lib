@@ -567,39 +567,60 @@ def run_real_npu(args: argparse.Namespace) -> int:
     MBS  = cfg_mod.MAX_BLOCKS_PER_SEQ
     ROTARY_DIM_FULL = cfg_mod.ROTARY_HALF_FULL * 2  # 64 for full-attention layers
 
+    # Distributed input layout: codegen-generated host_orch.py indexes every
+    # input tensor as ``tensors[name][r_idx, ...]`` for r_idx in [0, N_RANKS).
+    # The leading dim therefore MUST equal len(device_ids) = N_RANKS — not 1.
+    # At single-rank (TP=1) N_RANKS=1 and the legacy [1, ...] pattern is fine;
+    # at canonical TP=8 multi-rank we must broadcast every host input to
+    # [N_RANKS, ...]. Dummy weights are random and rank-symmetric here, so
+    # repeat-broadcast is correct for compile-pipeline verification (real
+    # weights would differ per rank — that lives in load_step3p5_weights_for_rank
+    # and uses [N_RANKS, ...] from the start).
+    N_RANKS = len(device_ids)
+
     def flat(t: torch.Tensor) -> torch.Tensor:
-        """[L, M, N] -> [1, L*M, N]; [L, N] -> [1, L, N]."""
+        """[L, M, N] -> [N_RANKS, L*M, N]; [L, N] -> [N_RANKS, L, N]."""
         if t.dim() == 3:
             L, M, N = t.shape
-            return t.reshape(1, L * M, N)
-        return t.unsqueeze(0)
+            base = t.reshape(1, L * M, N)
+        else:
+            base = t.unsqueeze(0)
+        if N_RANKS == 1:
+            return base
+        return base.expand(N_RANKS, *base.shape[1:]).contiguous()
 
-    current_hidden  = torch.zeros(1, B, H, dtype=torch.bfloat16)
-    next_hidden_out = torch.zeros(1, B, H, dtype=torch.bfloat16)
+    def per_rank(t: torch.Tensor) -> torch.Tensor:
+        """Broadcast [1, ...] -> [N_RANKS, ...] (or pass through at TP=1)."""
+        if N_RANKS == 1:
+            return t
+        return t.expand(N_RANKS, *t.shape[1:]).contiguous()
+
+    current_hidden  = per_rank(torch.zeros(1, B, H, dtype=torch.bfloat16))
+    next_hidden_out = per_rank(torch.zeros(1, B, H, dtype=torch.bfloat16))
 
     inputs = [
-        current_hidden,                                              # [1, B, H] BF16
-        bundle[KEY_INPUT_RMS].float().unsqueeze(0),                  # [1, L, H] FP32
-        flat(bundle[KEY_WQ_FULL]),                                   # [1, NF*H, H_Q] BF16
-        flat(bundle[KEY_WK_FULL]),                                   # [1, NF*H, KV_H] BF16
-        flat(bundle[KEY_WV_FULL]),                                   # [1, NF*H, KV_H] BF16
-        bundle[KEY_Q_NORM].float().unsqueeze(0),                     # [1, L, HDim] FP32
-        bundle[KEY_K_NORM].float().unsqueeze(0),                     # [1, L, HDim] FP32
-        torch.ones(1, B, dtype=torch.int32),                         # seq_lens (>=1: chip-side rope pos=ctx_len-1 must be in-bounds)
-        torch.zeros(1, MBS * B, dtype=torch.int32),                  # block_table
-        torch.arange(B, dtype=torch.int32).unsqueeze(0),             # slot_mapping (unique slot per batch — avoids same-slot KV-cache dep stall)
-        torch.zeros(1, SEQ, ROTARY_DIM_FULL, dtype=torch.float32),  # rope_cos
-        torch.zeros(1, SEQ, ROTARY_DIM_FULL, dtype=torch.float32),  # rope_sin
-        torch.zeros(1, SEQ, HDim, dtype=torch.bfloat16),             # k_cache
-        torch.zeros(1, SEQ, HDim, dtype=torch.bfloat16),             # v_cache
-        flat(bundle[KEY_WO_FULL]),                                   # [1, NF*H_Q, H] BF16
-        flat(bundle[KEY_WG_FULL]),                                   # [1, NF*H, N_HEADS_PAD] BF16
-        bundle[KEY_POST_ATTN_RMS].float().unsqueeze(0),              # [1, L, H] FP32
-        flat(bundle[KEY_DENSE_GATE]),                                # [1, ND*H, INTER] BF16
-        flat(bundle[KEY_DENSE_UP]),                                  # [1, ND*H, INTER] BF16
-        flat(bundle[KEY_DENSE_DOWN]),                                # [1, ND*INTER, H] BF16
-        next_hidden_out,                                             # Out [1, B, H] BF16
-        torch.tensor(0, dtype=torch.int32),                          # layer_idx — LAST
+        current_hidden,                                                              # [N_RANKS, B, H] BF16
+        per_rank(bundle[KEY_INPUT_RMS].float().unsqueeze(0)),                        # [N_RANKS, L, H] FP32
+        flat(bundle[KEY_WQ_FULL]),                                                   # [N_RANKS, NF*H, H_Q] BF16
+        flat(bundle[KEY_WK_FULL]),                                                   # [N_RANKS, NF*H, KV_H] BF16
+        flat(bundle[KEY_WV_FULL]),                                                   # [N_RANKS, NF*H, KV_H] BF16
+        per_rank(bundle[KEY_Q_NORM].float().unsqueeze(0)),                           # [N_RANKS, L, HDim] FP32
+        per_rank(bundle[KEY_K_NORM].float().unsqueeze(0)),                           # [N_RANKS, L, HDim] FP32
+        per_rank(torch.ones(1, B, dtype=torch.int32)),                               # seq_lens (>=1: chip-side rope pos=ctx_len-1 must be in-bounds)
+        per_rank(torch.zeros(1, MBS * B, dtype=torch.int32)),                        # block_table
+        per_rank(torch.arange(B, dtype=torch.int32).unsqueeze(0)),                   # slot_mapping (unique slot per batch — avoids same-slot KV-cache dep stall)
+        per_rank(torch.zeros(1, SEQ, ROTARY_DIM_FULL, dtype=torch.float32)),         # rope_cos
+        per_rank(torch.zeros(1, SEQ, ROTARY_DIM_FULL, dtype=torch.float32)),         # rope_sin
+        per_rank(torch.zeros(1, SEQ, HDim, dtype=torch.bfloat16)),                   # k_cache
+        per_rank(torch.zeros(1, SEQ, HDim, dtype=torch.bfloat16)),                   # v_cache
+        flat(bundle[KEY_WO_FULL]),                                                   # [N_RANKS, NF*H_Q, H] BF16
+        flat(bundle[KEY_WG_FULL]),                                                   # [N_RANKS, NF*H, N_HEADS_PAD] BF16
+        per_rank(bundle[KEY_POST_ATTN_RMS].float().unsqueeze(0)),                    # [N_RANKS, L, H] FP32
+        flat(bundle[KEY_DENSE_GATE]),                                                # [N_RANKS, ND*H, INTER] BF16
+        flat(bundle[KEY_DENSE_UP]),                                                  # [N_RANKS, ND*H, INTER] BF16
+        flat(bundle[KEY_DENSE_DOWN]),                                                # [N_RANKS, ND*INTER, H] BF16
+        next_hidden_out,                                                             # Out [N_RANKS, B, H] BF16
+        torch.tensor(0, dtype=torch.int32),                                          # layer_idx — LAST (scalar; not per-rank)
     ]
 
     print(f"  Running layer 0 on device_ids={device_ids} (B={B}, H={H}) ...")

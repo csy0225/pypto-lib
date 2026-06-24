@@ -10,6 +10,34 @@
 > source of truth.
 
 
+## 0. Current validation status (2026-06-24 evening)
+
+The 8-card communication/scheduler issue is no longer a global blocker on
+`gpu-a910x-0162` with the current CANN 9.0.0 non-GA environment and rebuilt
+runtime/native artifacts:
+
+- `test_decode_layer_full_dense_multirank_st` passes 8-card numerical golden
+  validation on devices `0..7` (`bad_ratio=0.0004` on every rank).
+- `test_decode_layer_moe_st --smoke` passes for all six MoE variants.
+- The MoE ST harness now validates `world_size=8` numerically instead of
+  skipping golden validation: each rank computes its local attention `o_proj`
+  partial, TP all-reduce is modeled by summing those partials, the replicated
+  residual is added once, and zero expert weights make dispatch/combine/shared
+  execute while contributing zero to the final tensor.
+- With that golden, five of six 8-card MoE variants pass on real devices:
+  `full_silu_silu`, `full_swiglu7_silu`, `full_swiglu7_swiglu16`,
+  `swa_silu_silu`, and `swa_swiglu7_silu`.
+- Remaining blocker: `swa_swiglu7_swiglu16` runs to completion but validation
+  fails because `next_hidden_out` is all NaN (`524288/524288` NaN values). The
+  failure is now narrowed to the SWA attention + routed swiglu7 + shared
+  swiglu16 combination. Full attention with shared swiglu16 passes, and SWA
+  with silu shared expert passes.
+
+Suggested next debug cut: add dump or dispatch-cut points around the SWA
+attention residual, combine output, and shared-expert swiglu16 path for
+`swa_swiglu7_swiglu16`.
+
+
 ## 1. Goal (this work item)
 
 Refactor the step3p5 MoE expert-parallel (EP) dispatch/combine to the DeepSeek **push**

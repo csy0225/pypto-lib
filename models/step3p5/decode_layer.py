@@ -751,6 +751,16 @@ def _build_decode_layer_moe_program(
     n_ranks = tp_size
     n_ranks_pad = N_RANKS_PAD
     n_local_experts = N_LOCAL_EXPERTS
+    # pub_counts cols padded to a multiple of 8 so a [n_ranks, n_local_experts_pad]
+    # INT32 tile has 32B-aligned rows (40*4=160B), required by the burst-free
+    # count exchange's remote_load (36*4=144B fails ptoas alloc_tile alignment).
+    # Downstream scalar reads use cols [0, n_local_experts); the pad cols are
+    # storage-only and never read.
+    n_local_experts_pad = ((n_local_experts + 7) // 8) * 8
+    # r_route push channel pad (INT32 8*4=32B, min 32B-aligned tile) and the
+    # recv_x -> local_routed_x stage_out chunk height.
+    idx_pad = 8
+    stage_rows = 8
     inter = MOE_INTERMEDIATE
     sh_inter_local = INTER_S_LOCAL
     sh_tp_chunk = HIDDEN // tp_size
@@ -878,7 +888,7 @@ def _build_decode_layer_moe_program(
                         peer=peer,
                         offsets=[my_rank, 0],
                         value=1,
-                        op=pld.NotifyOp.Set,
+                        op=pld.NotifyOp.AtomicAdd,
                     )
 
             # 3) Ge(1) wait for every peer.
@@ -1157,7 +1167,7 @@ def _build_decode_layer_moe_program(
         def _build_local_expert_csr(
             self,
             pub_counts: pld.DistributedTensor[
-                [n_ranks * n_ranks, n_local_experts], pl.INT32
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
             local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
             local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
@@ -1186,7 +1196,7 @@ def _build_decode_layer_moe_program(
             self,
             indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
             pub_counts: pld.DistributedTensor[
-                [n_ranks * n_ranks, n_local_experts], pl.INT32
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
             inverse_map: pl.Tensor[[BATCH, TOPK], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
@@ -1233,6 +1243,184 @@ def _build_decode_layer_moe_program(
                     )
 
         @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_publish(
+            self,
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            # Dispatch task 1: histogram + AtomicAdd-notify publish of the count
+            # matrix. Its own InCore task so the runtime task boundary DRAINS
+            # these cross-rank notifies before the count_done barrier in
+            # _dispatch_push — the DSL stand-in for the reference kernel's
+            # pipe_barrier(PIPE_ALL) between the two notify groups (dispatch.cpp).
+            send_counts_bkt = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            send_counts_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
+            send_offsets_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
+            self._histogram_and_prefix_sum(
+                expert_indices,
+                send_counts_bkt, send_counts_rank, send_offsets_rank,
+            )
+            for peer in pl.range(n_ranks):
+                for d in pl.range(n_ranks):
+                    for e in pl.range(n_local_experts):
+                        v = pl.read(send_counts_bkt, [d * n_local_experts + e])
+                        if peer == my_rank:
+                            pl.write(
+                                pub_counts, [my_rank * n_ranks + d, e], v,
+                            )
+                        else:
+                            if v != 0:
+                                pld.system.notify(
+                                    target=pub_counts, peer=peer,
+                                    offsets=[my_rank * n_ranks + d, e],
+                                    value=v, op=pld.NotifyOp.AtomicAdd,
+                                )
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_push(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            local_expert_offset: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            local_expert_count: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[n_local_experts], pl.INT32],
+        ]:
+            # Dispatch task 2: count_done barrier (peer publishes are drained by
+            # the task boundary before this) -> per-expert CSR -> push each token
+            # into the destination peer's recv_x / recv_r_route at its CSR row ->
+            # data_done barrier.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=count_done_sig, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=count_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            self._build_local_expert_csr(
+                pub_counts, local_expert_offset, local_expert_count, my_rank,
+            )
+
+            cursor_bkt = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            for i in pl.range(per_rank_buckets):
+                pl.write(cursor_bkt, [i], pl.cast(0, pl.INT32))
+            idx_tile = pl.tile.full([1, idx_pad], dtype=pl.INT32, value=0)
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(expert_indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    loc_e_off = pl.cast(0, pl.INT32)
+                    for prev_e in pl.range(n_local_experts):
+                        if prev_e < loc_e:
+                            for s in pl.range(n_ranks):
+                                loc_e_off = loc_e_off + pl.read(
+                                    pub_counts, [s * n_ranks + dst, prev_e],
+                                )
+                    src_off = pl.cast(0, pl.INT32)
+                    for s in pl.range(n_ranks):
+                        if s < my_rank:
+                            src_off = src_off + pl.read(
+                                pub_counts, [s * n_ranks + dst, loc_e],
+                            )
+                    cur = pl.read(cursor_bkt, [bkt])
+                    dst_row = pl.cast(loc_e_off + src_off + cur, pl.INDEX)
+                    pl.write(cursor_bkt, [bkt], pl.cast(cur + 1, pl.INT32))
+                    pld.tensor.put(
+                        dst=recv_x, peer=dst, src=x,
+                        dst_offsets=[dst_row, 0], src_offsets=[t, 0],
+                        shape=[1, HIDDEN],
+                    )
+                    pl.tile.write(
+                        idx_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32),
+                    )
+                    pld.tile.remote_store(
+                        idx_tile, target=recv_r_route, peer=dst,
+                        offsets=[dst_row, 0],
+                    )
+
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=data_done_sig, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=data_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            return local_expert_offset, local_expert_count
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_stage(  # noqa: PLR0913
+            self,
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            local_routed_x_out: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            pl.Tensor[[local_recv_max], pl.INT32],
+        ]:
+            # Dispatch task 3: stage the pushed recv_x / recv_r_route windows out
+            # to host tensors. Separate task so the push TPUTs from _dispatch_push
+            # are DRAINED at the task boundary before these reads (the reference
+            # kernel's pipe_barrier between the TPUT loop and stage_out). recv_x
+            # is already expert-major CSR -> straight chunked copy.
+            for row in pl.range(0, local_recv_max, stage_rows):
+                tile = pl.load(recv_x, [row, 0], [stage_rows, HIDDEN])
+                pl.store(tile, [row, 0], local_routed_x_out)
+            for e in pl.range(n_local_experts):
+                off = pl.cast(pl.read(local_expert_offset, [e]), pl.INDEX)
+                n = pl.cast(pl.read(local_expert_count, [e]), pl.INDEX)
+                for s in pl.range(n):
+                    pl.write(
+                        recv_r_route_out, [off + s],
+                        pl.read(recv_r_route, [off + s, 0]),
+                    )
+            return local_routed_x_out, recv_r_route_out
+
+        @pl.function(type=pl.FunctionType.Inline)
         def dispatch_step(  # noqa: PLR0913
             self,
             x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
@@ -1246,18 +1434,16 @@ def _build_decode_layer_moe_program(
             local_expert_count: pl.Out[
                 pl.Tensor[[n_local_experts], pl.INT32]
             ],
-            inverse_map: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
-            # ``send_buf`` is a DistributedTensor window allocated by the
-            # orchestration caller (DDR-backed, ~8 MB BF16).  Using
-            # DistributedTensor allows ep_all_to_all (inlined here) to call
-            # pld.tile.remote_load on it for cross-rank pull.
-            send_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],
             pub_counts: pld.DistributedTensor[
-                [n_ranks * n_ranks, n_local_experts], pl.INT32
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
             count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             recv_x: pld.DistributedTensor[
                 [local_recv_max, HIDDEN], pl.BF16
+            ],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
             ],
             data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
@@ -1265,132 +1451,29 @@ def _build_decode_layer_moe_program(
             pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[n_local_experts], pl.INT32],
-            pl.Tensor[[BATCH, TOPK], pl.INT32]
+            pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            send_counts_bkt = pl.create_tensor(
-                [per_rank_buckets], dtype=pl.INT32,
-            )
-            send_counts_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
-            send_offsets_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
-            self._histogram_and_prefix_sum(
-                expert_indices,
-                send_counts_bkt, send_counts_rank, send_offsets_rank,
-            )
-
-            for peer in pl.range(n_ranks):
-                for e in pl.range(n_local_experts):
-                    v = pl.read(
-                        send_counts_bkt, [peer * n_local_experts + e],
-                    )
-                    if peer == my_rank:
-                        pl.write(
-                            pub_counts,
-                            [my_rank * n_ranks + my_rank, e],
-                            v,
-                        )
-                    else:
-                        pld.system.notify(
-                            target=pub_counts,
-                            peer=peer,
-                            offsets=[my_rank * n_ranks + peer, e],
-                            value=v,
-                            op=pld.NotifyOp.Set,
-                        )
-
-            for peer in pl.range(n_ranks):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=count_done_sig,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=1,
-                        op=pld.NotifyOp.Set,
-                    )
-            for src in pl.range(n_ranks):
-                if src != my_rank:
-                    pld.system.wait(
-                        signal=count_done_sig,
-                        offsets=[src, 0],
-                        expected=1,
-                        cmp=pld.WaitCmp.Ge,
-                    )
-
-            cursor_bkt = pl.create_tensor(
-                [per_rank_buckets], dtype=pl.INT32,
-            )
-            bucket_offset = pl.create_tensor(
-                [per_rank_buckets], dtype=pl.INT32,
-            )
-            self._pack_send_payload(
+            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
+            # group of cross-rank ops drains at the task boundary — the DSL
+            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
+            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            self._dispatch_publish(expert_indices, pub_counts, my_rank)
+            local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
-                send_counts_bkt, send_offsets_rank,
-                send_buf, cursor_bkt, bucket_offset,
-            )
-
-            recv_counts = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
-            for src in pl.range(n_ranks):
-                acc = pl.cast(0, pl.INT32)
-                for e in pl.range(n_local_experts):
-                    acc = acc + pl.read(
-                        pub_counts, [src * n_ranks + my_rank, e],
-                    )
-                pl.write(recv_counts, [src], pl.cast(acc, pl.INT32))
-            recv_offsets = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
-            pl.write(recv_offsets, [0], pl.cast(0, pl.INT32))
-            for r in pl.range(1, n_ranks):
-                prev_off = pl.read(recv_offsets, [r - 1])
-                prev_cnt = pl.read(recv_counts, [r - 1])
-                pl.write(
-                    recv_offsets, [r],
-                    pl.cast(prev_off + prev_cnt, pl.INT32),
-                )
-
-            self.ep_all_to_all(
-                send_buf, recv_x,
-                send_counts_rank, recv_counts,
-                send_offsets_rank, recv_offsets,
+                local_expert_offset, local_expert_count,
+                pub_counts, count_done_sig, recv_x, recv_r_route,
                 data_done_sig, my_rank,
             )
-
-            self._build_local_expert_csr(
-                pub_counts,
+            local_routed_x_out, recv_r_route_out = self._dispatch_stage(
+                recv_x, recv_r_route,
                 local_expert_offset, local_expert_count,
-                my_rank,
+                local_routed_x_out, recv_r_route_out, my_rank,
             )
-            running = pl.cast(0, pl.INT32)
-            for e in pl.range(n_local_experts):
-                for src in pl.range(n_ranks):
-                    n = pl.cast(
-                        pl.read(pub_counts, [src * n_ranks + my_rank, e]),
-                        pl.INDEX,
-                    )
-                    src_base = pl.cast(pl.read(recv_offsets, [src]), pl.INDEX)
-                    src_e_off = pl.cast(0, pl.INT32)
-                    for prev_e in pl.range(n_local_experts):
-                        if prev_e < e:
-                            src_e_off = src_e_off + pl.read(
-                                pub_counts,
-                                [src * n_ranks + my_rank, prev_e],
-                            )
-                    for row in pl.range(n):
-                        src_row = (
-                            src_base
-                            + pl.cast(src_e_off, pl.INDEX) + row
-                        )
-                        dst_row = pl.cast(running, pl.INDEX) + row
-                        tile = pl.load(recv_x, [src_row, 0], [1, HIDDEN])
-                        pl.store(tile, [dst_row, 0], local_routed_x_out)
-                    running = running + pl.cast(n, pl.INT32)
-
-            self._build_inverse_map(
-                expert_indices, pub_counts, inverse_map, my_rank,
-            )
-
             return (
                 local_routed_x_out,
                 local_expert_offset,
                 local_expert_count,
-                inverse_map,
+                recv_r_route_out,
             )
 
         # ---------- Stage 3a: expert_routed (local 36 experts) ----------
@@ -1437,151 +1520,129 @@ def _build_decode_layer_moe_program(
                     # (``pl.minimum`` is the tensor variant — frontend rejects
                     # mixing Scalar + ConstInt operands).
                     tile_valid = pl.min(RECV_TILE, valid_rows - tile_row0)
+                    if tile_valid > 0:
 
-                    # Bridge tensor — lives at tile_idx loop level, shared
-                    # between expert_gate_up and expert_down SPMD dispatches
-                    # (mirrors deepseek/v4/expert_routed.py bridge pattern).
-                    # As an Inline-level create_tensor it is in vec (UB) space;
-                    # pl.slice of it in expert_down gives tmov vec→left ✓.
-                    h_bf16 = pl.create_tensor(
-                        [RECV_TILE, inter], dtype=pl.BF16,
-                    )
+                        # Bridge tensor — lives at tile_idx loop level, shared
+                        # between expert_gate_up and expert_down SPMD dispatches
+                        # (mirrors deepseek/v4/expert_routed.py bridge pattern).
+                        # As an Inline-level create_tensor it is in vec (UB) space;
+                        # pl.slice of it in expert_down gives tmov vec→left ✓.
+                        h_bf16 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.BF16,
+                        )
 
-                    # Gate+up projection: each SPMD block handles one N-chunk
-                    # of the inter dimension.  pl.slice of external BF16 input
-                    # (local_routed_x) produces tmov mat→left which is valid in
-                    # cube kernels (cube kind = Inline + pl.spmd).
-                    for nb in pl.spmd(
-                        inter // ROUTED_GATE_N_CHUNK,
-                        name_hint="expert_gate_up",
-                    ):
-                        n0 = nb * ROUTED_GATE_N_CHUNK
-                        x0 = pl.slice(
-                            local_routed_x,
-                            [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                            [tile_offset, 0],
-                            valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
-                        )
-                        wg0_2d = pl.reshape(
-                            pl.slice(
-                                w_gate,
-                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                                [e, 0, n0],
-                            ),
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                        )
-                        wu0_2d = pl.reshape(
-                            pl.slice(
-                                w_up,
-                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                                [e, 0, n0],
-                            ),
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                        )
-                        gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
-                        up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
-                            k0 = kb * ROUTED_GATE_K_CHUNK
-                            xk = pl.slice(
+                        # Gate+up projection: each SPMD block handles one N-chunk
+                        # of the inter dimension.  pl.slice of external BF16 input
+                        # (local_routed_x) produces tmov mat→left which is valid in
+                        # cube kernels (cube kind = Inline + pl.spmd).
+                        for nb in pl.spmd(
+                            inter // ROUTED_GATE_N_CHUNK,
+                            name_hint="expert_gate_up",
+                        ):
+                            n0 = nb * ROUTED_GATE_N_CHUNK
+                            x0 = pl.slice(
                                 local_routed_x,
                                 [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                                [tile_offset, k0],
-                                valid_shape=[
-                                    tile_valid, ROUTED_GATE_K_CHUNK,
-                                ],
+                                [tile_offset, 0],
+                                valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
                             )
-                            wgk = pl.reshape(
+                            wg0_2d = pl.reshape(
                                 pl.slice(
                                     w_gate,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
                                 ),
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            wuk = pl.reshape(
+                            wu0_2d = pl.reshape(
                                 pl.slice(
                                     w_up,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
                                 ),
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
-                            up_acc = pl.matmul_acc(up_acc, xk, wuk)
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
+                                k0 = kb * ROUTED_GATE_K_CHUNK
+                                xk = pl.slice(
+                                    local_routed_x,
+                                    [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                    [tile_offset, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_GATE_K_CHUNK,
+                                    ],
+                                )
+                                wgk = pl.reshape(
+                                    pl.slice(
+                                        w_gate,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                wuk = pl.reshape(
+                                    pl.slice(
+                                        w_up,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                                up_acc = pl.matmul_acc(up_acc, xk, wuk)
 
-                        sigmoid = pl.recip(
-                            pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
-                        )
-                        silu = pl.mul(gate_acc, sigmoid)
-                        if _routed_swiglu_step:
-                            silu_c = pl.minimum(silu, _routed_swiglu_limit)
-                            up_c = pl.maximum(
-                                pl.minimum(up_acc, _routed_swiglu_limit),
-                                -_routed_swiglu_limit,
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
                             )
-                            gated = pl.mul(silu_c, up_c)
-                        else:
-                            gated = pl.mul(silu, up_acc)
+                            silu = pl.mul(gate_acc, sigmoid)
+                            if _routed_swiglu_step:
+                                silu_c = pl.minimum(silu, _routed_swiglu_limit)
+                                up_c = pl.maximum(
+                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    -_routed_swiglu_limit,
+                                )
+                                gated = pl.mul(silu_c, up_c)
+                            else:
+                                gated = pl.mul(silu, up_acc)
 
-                        gated_v = pl.set_validshape(
-                            gated, tile_valid, ROUTED_GATE_N_CHUNK,
-                        )
-                        # No fillpad — gated_v (none-pad mode) matches
-                        # uninitialised h_bf16 subview (none-pad mode);
-                        # expert_down reads h_bf16 with valid_shape= so
-                        # padding rows beyond tile_valid are not used.
-                        h_bf16[
-                            :, n0 : n0 + ROUTED_GATE_N_CHUNK
-                        ] = pl.cast(gated_v, target_type=pl.BF16)
+                            gated_v = pl.set_validshape(
+                                gated, tile_valid, ROUTED_GATE_N_CHUNK,
+                            )
+                            # No fillpad — gated_v (none-pad mode) matches
+                            # uninitialised h_bf16 subview (none-pad mode);
+                            # expert_down reads h_bf16 with valid_shape= so
+                            # padding rows beyond tile_valid are not used.
+                            h_bf16[
+                                :, n0 : n0 + ROUTED_GATE_N_CHUNK
+                            ] = pl.cast(gated_v, target_type=pl.BF16)
 
-                    # Down projection: each SPMD block handles one D-chunk of
-                    # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
-                    # pl.slice of it gives tmov vec→left ✓.
-                    for db in pl.spmd(
-                        HIDDEN // ROUTED_DOWN_N_CHUNK,
-                        name_hint="expert_down",
-                    ):
-                        d0 = db * ROUTED_DOWN_N_CHUNK
-                        h0 = pl.slice(
-                            h_bf16,
-                            [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                            [0, 0],
-                            valid_shape=[
-                                tile_valid, ROUTED_DOWN_K_CHUNK,
-                            ],
-                        )
-                        wd0 = pl.reshape(
-                            pl.slice(
-                                w_down,
-                                [
-                                    1,
-                                    ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
-                                ],
-                                [e, 0, d0],
-                            ),
-                            [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
-                        )
-                        y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
-                        for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
-                            k0 = kb2 * ROUTED_DOWN_K_CHUNK
-                            hk = pl.slice(
+                        # Down projection: each SPMD block handles one D-chunk of
+                        # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
+                        # pl.slice of it gives tmov vec→left ✓.
+                        for db in pl.spmd(
+                            HIDDEN // ROUTED_DOWN_N_CHUNK,
+                            name_hint="expert_down",
+                        ):
+                            d0 = db * ROUTED_DOWN_N_CHUNK
+                            h0 = pl.slice(
                                 h_bf16,
                                 [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                                [0, k0],
+                                [0, 0],
                                 valid_shape=[
                                     tile_valid, ROUTED_DOWN_K_CHUNK,
                                 ],
                             )
-                            wdk = pl.reshape(
+                            wd0 = pl.reshape(
                                 pl.slice(
                                     w_down,
                                     [
@@ -1589,26 +1650,49 @@ def _build_decode_layer_moe_program(
                                         ROUTED_DOWN_K_CHUNK,
                                         ROUTED_DOWN_N_CHUNK,
                                     ],
-                                    [e, k0, d0],
+                                    [e, 0, d0],
                                 ),
-                                [
-                                    ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
-                                ],
+                                [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
                             )
-                            y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
+                                k0 = kb2 * ROUTED_DOWN_K_CHUNK
+                                hk = pl.slice(
+                                    h_bf16,
+                                    [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                    [0, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_DOWN_K_CHUNK,
+                                    ],
+                                )
+                                wdk = pl.reshape(
+                                    pl.slice(
+                                        w_down,
+                                        [
+                                            1,
+                                            ROUTED_DOWN_K_CHUNK,
+                                            ROUTED_DOWN_N_CHUNK,
+                                        ],
+                                        [e, k0, d0],
+                                    ),
+                                    [
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                )
+                                y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
-                        y_v = pl.set_validshape(
-                            y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
-                        )
-                        y_m = pl.fillpad(
-                            y_v, pad_value=pl.PadValue.zero,
-                        )
-                        local_routed_y = pl.assemble(
-                            local_routed_y,
-                            pl.cast(y_m, target_type=pl.BF16),
-                            [tile_offset, d0],
-                        )
+                            y_v = pl.set_validshape(
+                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                            )
+                            y_m = pl.fillpad(
+                                y_v, pad_value=pl.PadValue.zero,
+                            )
+                            local_routed_y = pl.assemble(
+                                local_routed_y,
+                                pl.cast(y_m, target_type=pl.BF16),
+                                [tile_offset, d0],
+                            )
 
             return local_routed_y
 
@@ -1826,7 +1910,7 @@ def _build_decode_layer_moe_program(
                 [local_recv_max, HIDDEN], pl.BF16
             ],
             pub_counts: pld.DistributedTensor[
-                [n_ranks * n_ranks, n_local_experts], pl.INT32
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
             routed_y_buf: pld.DistributedTensor[
                 [n_routes_per_rank, HIDDEN], pl.BF16
@@ -1834,9 +1918,7 @@ def _build_decode_layer_moe_program(
             combine_done: pld.DistributedTensor[
                 [n_ranks, 1], pl.INT32
             ],
-            src_route_table: pld.DistributedTensor[
-                [n_ranks, n_local_experts, n_routes_per_rank], pl.INT32
-            ],
+            recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
             e_cursor = pl.cast(0, pl.INT32)
@@ -1850,14 +1932,13 @@ def _build_decode_layer_moe_program(
                         pl.INDEX,
                     )
                     for row in pl.range(n):
-                        r_route = pl.read(
-                            src_route_table,
-                            [src, e, pl.cast(row, pl.INDEX)],
-                        )
                         local_row = (
                             pl.cast(e_cursor, pl.INDEX)
                             + pl.cast(src_off, pl.INDEX) + row
                         )
+                        # r_route rode with the token at dispatch (recv_r_route);
+                        # local_row is the same expert-major CSR row order.
+                        r_route = pl.read(recv_r_route_out, [local_row])
                         tile = pl.load(
                             local_routed_y,
                             [local_row, 0], [1, HIDDEN],
@@ -1886,7 +1967,7 @@ def _build_decode_layer_moe_program(
                         peer=peer,
                         offsets=[my_rank, 0],
                         value=1,
-                        op=pld.NotifyOp.Set,
+                        op=pld.NotifyOp.AtomicAdd,
                     )
             for src in pl.range(n_ranks):
                 if src != my_rank:
@@ -1940,17 +2021,13 @@ def _build_decode_layer_moe_program(
             local_routed_y: pl.Tensor[
                 [local_recv_max, HIDDEN], pl.BF16
             ],
-            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
             sh_y: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
             moe_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             pub_counts: pld.DistributedTensor[
-                [n_ranks * n_ranks, n_local_experts], pl.INT32
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
-            src_route_table: pld.DistributedTensor[
-                [n_ranks, n_local_experts, n_routes_per_rank], pl.INT32
-            ],
-            route_pub_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             routed_y_buf: pld.DistributedTensor[
                 [n_routes_per_rank, HIDDEN], pl.BF16
             ],
@@ -1959,34 +2036,15 @@ def _build_decode_layer_moe_program(
             ],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-            self._publish_src_route_table(
-                expert_indices, src_route_table, my_rank,
-            )
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="pub_route_barrier"):
-                for peer in pl.range(n_ranks):
-                    if peer != my_rank:
-                        pld.system.notify(
-                            target=route_pub_sig,
-                            peer=peer,
-                            offsets=[my_rank, 0],
-                            value=1,
-                            op=pld.NotifyOp.Set,
-                        )
-                for src in pl.range(n_ranks):
-                    if src != my_rank:
-                        pld.system.wait(
-                            signal=route_pub_sig,
-                            offsets=[src, 0],
-                            expected=1,
-                            cmp=pld.WaitCmp.Ge,
-                        )
-
+            # Push design: r_route rode with each token into recv_r_route at
+            # dispatch, so combine drops the src_route_table publish + its
+            # barrier and scatters the routed output straight back.
             self._push_routed_y_to_sources(
                 local_routed_y,
                 pub_counts,
                 routed_y_buf,
                 combine_done_sig,
-                src_route_table,
+                recv_r_route_out,
                 my_rank,
             )
 
@@ -2029,24 +2087,22 @@ def _build_decode_layer_moe_program(
                 [tp_size, 1], pl.INT32
             ],
             pub_counts: pld.DistributedTensor[
-                [n_ranks * n_ranks, n_local_experts], pl.INT32
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
             count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             recv_x: pld.DistributedTensor[
                 [local_recv_max, HIDDEN], pl.BF16
             ],
             data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
-            send_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
             sh_tmp_window: pld.DistributedTensor[
                 [BATCH, HIDDEN], pl.BF16
             ],
             sh_signal_window: pld.DistributedTensor[
                 [n_ranks, 1], pl.INT32
             ],
-            src_route_table: pld.DistributedTensor[
-                [n_ranks, n_local_experts, n_routes_per_rank], pl.INT32
-            ],
-            route_pub_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             routed_y_buf: pld.DistributedTensor[
                 [n_routes_per_rank, HIDDEN], pl.BF16
             ],
@@ -2143,7 +2199,7 @@ def _build_decode_layer_moe_program(
                 sh_tmp_window, sh_signal_window, my_rank,
             )
 
-            # 3) Dispatch (EP all-to-all).
+            # 3) Dispatch (EP push: tokens remote_store'd into peer recv_x).
             local_routed_x = pl.create_tensor(
                 [local_recv_max, HIDDEN], dtype=pl.BF16,
             )
@@ -2153,20 +2209,21 @@ def _build_decode_layer_moe_program(
             local_expert_count = pl.create_tensor(
                 [n_local_experts], dtype=pl.INT32,
             )
-            inverse_map = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
-            # send_buf is a DistributedTensor window passed in from host_orch
-            # (~8 MB BF16); required by ep_all_to_all's pld.tile.remote_load.
+            # Per-recv-row r_route (= source t*TOPK+k), staged from recv_r_route;
+            # combine uses it to scatter the routed output back to the source.
+            recv_r_route_out = pl.create_tensor(
+                [local_recv_max], dtype=pl.INT32,
+            )
             (
                 local_routed_x,
                 local_expert_offset,
                 local_expert_count,
-                inverse_map,
+                recv_r_route_out,
             ) = self.dispatch_step(
                 post_norm, expert_indices,
                 local_routed_x,
-                local_expert_offset, local_expert_count, inverse_map,
-                send_buf,
-                pub_counts, count_done_sig, recv_x, data_done_sig,
+                local_expert_offset, local_expert_count, recv_r_route_out,
+                pub_counts, count_done_sig, recv_x, recv_r_route, data_done_sig,
                 my_rank,
             )
 
@@ -2181,12 +2238,12 @@ def _build_decode_layer_moe_program(
                 local_routed_y,
             )
 
-            # 5) Combine (EP a2a back + weighted gather + sh_y add).
+            # 5) Combine (EP push back + weighted gather + sh_y add).
             moe_out = self.combine_step(
                 local_routed_y,
-                expert_indices, expert_weights, sh_y,
+                recv_r_route_out, expert_weights, sh_y,
                 moe_out,
-                pub_counts, src_route_table, route_pub_sig,
+                pub_counts,
                 routed_y_buf, combine_done_sig,
                 my_rank,
             )
@@ -2269,22 +2326,18 @@ def _build_decode_layer_moe_program(
             attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
             pub_counts_buf = pld.alloc_window_buffer(
-                n_ranks * n_ranks * n_local_experts * 4,
+                n_ranks * n_ranks * n_local_experts_pad * 4,
             )
             count_done_buf = pld.alloc_window_buffer(n_ranks * 4)
             recv_x_buf = pld.alloc_window_buffer(
                 local_recv_max * HIDDEN * 2,
             )
-            data_done_buf = pld.alloc_window_buffer(n_ranks * 4)
-            send_x_buf = pld.alloc_window_buffer(
-                local_recv_max * HIDDEN * 2,
+            recv_r_route_buf = pld.alloc_window_buffer(
+                local_recv_max * idx_pad * 4,
             )
+            data_done_buf = pld.alloc_window_buffer(n_ranks * 4)
             sh_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             sh_sig_buf = pld.alloc_window_buffer(n_ranks * 4)
-            src_route_buf = pld.alloc_window_buffer(
-                n_ranks * n_local_experts * n_routes_per_rank * 4,
-            )
-            route_pub_buf = pld.alloc_window_buffer(n_ranks * 4)
             routed_y_window_buf = pld.alloc_window_buffer(
                 n_routes_per_rank * HIDDEN * 2,
             )
@@ -2299,7 +2352,7 @@ def _build_decode_layer_moe_program(
                 )
                 pub_counts = pld.window(
                     pub_counts_buf,
-                    [n_ranks * n_ranks, n_local_experts],
+                    [n_ranks * n_ranks, n_local_experts_pad],
                     dtype=pl.INT32,
                 )
                 count_done_sig = pld.window(
@@ -2313,24 +2366,16 @@ def _build_decode_layer_moe_program(
                 data_done_sig = pld.window(
                     data_done_buf, [n_ranks, 1], dtype=pl.INT32,
                 )
-                send_x = pld.window(
-                    send_x_buf,
-                    [local_recv_max, HIDDEN],
-                    dtype=pl.BF16,
+                recv_r_route = pld.window(
+                    recv_r_route_buf,
+                    [local_recv_max, idx_pad],
+                    dtype=pl.INT32,
                 )
                 sh_tmp_window = pld.window(
                     sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16,
                 )
                 sh_signal_window = pld.window(
                     sh_sig_buf, [n_ranks, 1], dtype=pl.INT32,
-                )
-                src_route_table = pld.window(
-                    src_route_buf,
-                    [n_ranks, n_local_experts, n_routes_per_rank],
-                    dtype=pl.INT32,
-                )
-                route_pub_sig = pld.window(
-                    route_pub_buf, [n_ranks, 1], dtype=pl.INT32,
                 )
                 routed_y_buf = pld.window(
                     routed_y_window_buf,
@@ -2357,9 +2402,8 @@ def _build_decode_layer_moe_program(
                     attn_tmp_window, attn_signal_window,
                     pub_counts, count_done_sig,
                     recv_x, data_done_sig,
-                    send_x,
+                    recv_r_route,
                     sh_tmp_window, sh_signal_window,
-                    src_route_table, route_pub_sig,
                     routed_y_buf, combine_done_sig,
                     layer_idx,
                     r,

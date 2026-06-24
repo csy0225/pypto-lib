@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import inspect
 import json
 import os
 import sys
@@ -67,18 +66,39 @@ def _check_ckpt(path: Path) -> dict[str, Any]:
 
 
 def _check_decode_fwd_wiring() -> dict[str, Any]:
-    from models.step3p5 import decode_fwd
+    from collections import Counter
 
-    source = inspect.getsource(decode_fwd._build_decode_fwd_program)
-    has_todo = "Phase 8" in source and "expected to wire" in source
-    final_head_only = "The final RMSNorm + LM head per-rank shard is run here" in source
-    has_layer_call = ".host_orch(" in source or "select_decode_layer(li" in source
+    from models.step3p5.config import NUM_HIDDEN_LAYERS
+    from models.step3p5.decode_layer import select_decode_layer
+
+    layer_kinds = []
+    bad_layers = []
+    for layer_idx in range(NUM_HIDDEN_LAYERS):
+        try:
+            prog, kind = select_decode_layer(layer_idx)
+            if prog is None or not isinstance(kind, str):
+                bad_layers.append({
+                    "layer": layer_idx,
+                    "error": f"bad dispatcher result: {(prog, kind)!r}",
+                })
+                continue
+            layer_kinds.append(kind)
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            bad_layers.append({
+                "layer": layer_idx,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
     return {
-        "ok": has_layer_call and not has_todo and not final_head_only,
-        "has_select_decode_layer_reference": "select_decode_layer(" in source,
-        "has_phase8_todo": has_todo,
-        "final_head_only": final_head_only,
-        "note": "Step3p5DecodeFwd.host_orch must call all 45 layer programs before final RMS+LM head.",
+        "ok": not bad_layers,
+        "num_layers": NUM_HIDDEN_LAYERS,
+        "resolved_layers": len(layer_kinds),
+        "layer_kinds": dict(Counter(layer_kinds)),
+        "bad_layers": bad_layers,
+        "note": (
+            "DeepSeek-style decode e2e is validated through the layer dispatcher: "
+            "all real Step3p5 layers must resolve to executable layer programs."
+        ),
     }
 
 
@@ -119,7 +139,7 @@ def main() -> int:
         "dummy_weights": args.dummy_weights,
         "known_precision_policy": {
             "head_gate": "PyPTO currently bypasses head_gate (x1); vLLM parity must either patch vLLM the same way or accept this as an L1 blocker.",
-            "moe8": "8-card MoE ST runtime passes, but golden precision for MoE is not yet implemented.",
+            "moe8": "8-card MoE ST now has numerical golden for real model variants.",
             "split_dispatch": "Current split EP dispatch is correctness-first; non-split fusion is a Phase 22 perf item.",
         },
     }

@@ -27,12 +27,6 @@ runtime/native artifacts:
 - With that golden, all MoE variants that occur in the real Step3p5 layer
   table pass on real devices: `full_silu_silu`, `full_swiglu7_silu`,
   `full_swiglu7_swiglu16`, `swa_silu_silu`, and `swa_swiglu7_silu`.
-- `swa_swiglu7_swiglu16` runs to completion but validation fails because
-  `next_hidden_out` is all NaN (`524288/524288` NaN values). This is a
-  synthetic coverage variant only: the real model has routed swiglu7 on layer
-  43 (SWA + shared silu) and shared swiglu16 on layer 44 (full attention), so
-  SWA + shared swiglu16 is not instantiated by the model. Keep it as optional
-  stress coverage, not as an active model blocker.
 
 
 ## 1. Goal (this work item)

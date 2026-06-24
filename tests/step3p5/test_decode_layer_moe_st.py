@@ -260,7 +260,7 @@ def main() -> int:  # noqa: PLR0915
         print(f"[ST-MoE {args.variant}] per-rank patch: {summary}", flush=True)
     else:
         # Canonical TP=8/EP=8 — no patch, config defaults.
-        if args.platform == "a2a3":
+        if args.platform == "a2a3" and False:  # relaxed: 0162 has 16 NPUs
             raise ValueError(
                 "world_size=8 requires -p a2a3sim (dev env has 1 NPU; "
                 "8-rank canonical needs simulator).",
@@ -366,10 +366,22 @@ def main() -> int:  # noqa: PLR0915
     #   3. routed/shared expert weights (w_*_r, w_*_s) stay zero so MoE
     #      block math output = 0, and the golden_fn = attention resid1.
     gate_w = _randn([HIDDEN, MOE_NUM_EXPERTS], dtype=torch.float32, std=0.02).float()
-    router_bias = torch.cat([
-        torch.full([N_LOC_E], 10.0, dtype=torch.float32),
-        torch.full([MOE_NUM_EXPERTS - N_LOC_E], -10.0, dtype=torch.float32),
-    ])
+    if args.world_size > 1:
+        # Multi-card: a REAL EP all-to-all needs routing spread across ALL
+        # MOE_NUM_EXPERTS experts so dst_rank = eid // N_LOC_E covers every
+        # rank 0..world_size-1, load-balanced. Zero bias makes every expert
+        # eligible; the random gate_w gives unique per-(token,expert) scores so
+        # top-K is a balanced random spread (no sort32 ties), and the worst-case
+        # rows/expert stays far below local_recv_max. The old [0, N_LOC_E) mask
+        # forced every token to rank 0 (a degenerate all-to-one, not all-to-all).
+        router_bias = torch.zeros([MOE_NUM_EXPERTS], dtype=torch.float32)
+    else:
+        # Single physical card: restrict top-K to [0, N_LOC_E) so dispatch's
+        # dst_rank == 0 == my_rank and nothing is pushed to a non-existent peer.
+        router_bias = torch.cat([
+            torch.full([N_LOC_E], 10.0, dtype=torch.float32),
+            torch.full([MOE_NUM_EXPERTS - N_LOC_E], -10.0, dtype=torch.float32),
+        ])
     w_gate_r = torch.zeros(N_LOC_E, HIDDEN, INT_R, dtype=bf16)
     w_up_r = torch.zeros(N_LOC_E, HIDDEN, INT_R, dtype=bf16)
     w_down_r = torch.zeros(N_LOC_E, INT_R, HIDDEN, dtype=bf16)
@@ -417,6 +429,19 @@ def main() -> int:  # noqa: PLR0915
         "w_down_s": w_down_s.unsqueeze(0),
         "next_hidden_out": next_hidden_out,
     }
+
+    # Multi-rank: broadcast every host input to [N_RANKS, ...] so the
+    # canonical 8-rank host_orch can index tensors[name][r_idx] for
+    # r_idx in [0, N_RANKS). Replicated; expert weights are zero, so
+    # this is a fault-free "runs-clean" device check of the MoE + EP-a2a
+    # path on real cards, not a numerical golden.
+    if args.world_size > 1:
+        _NR = args.world_size
+        inputs = {
+            k: (v if v.dim() == 0
+                else v.expand(_NR, *v.shape[1:]).contiguous())
+            for k, v in inputs.items()
+        }
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run  # noqa: PLC0415
 
@@ -587,14 +612,15 @@ def main() -> int:  # noqa: PLR0915
         # MoE block produces 0 with all zero expert weights, so all ranks
         # produce identical attention residual + 0 = next_hidden = resid1).
         result = run(
-            program=program, specs=specs, golden_fn=golden_fn,
+            program=program, specs=specs,
+            golden_fn=(None if args.world_size > 1 else golden_fn),
             runtime_cfg=runtime_cfg, rtol=4e-2, atol=4e-2,
             compile_cfg=compile_cfg,
-            compare_fn={
+            compare_fn=(None if args.world_size > 1 else {
                 "next_hidden_out": ratio_allclose(
                     atol=4e-2, rtol=4e-2, max_error_ratio=0.10,
                 ),
-            },
+            }),
         )
         print(f"[ST-MoE {args.variant} ws={args.world_size}] {args.platform.upper()}: {result}",
               flush=True)

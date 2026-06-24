@@ -270,6 +270,17 @@ def main() -> int:  # noqa: PLR0915
             flush=True,
         )
 
+    if args.world_size > 1 and not full_attn:
+        # Standalone SWA builds need the dynamic WO row bound materialized
+        # before decode_layer imports LAYER_QHIDDEN_ROWS_DYN_SWA.
+        import models.step3p5.attention_swa as attention_swa_mod  # noqa: PLC0415
+        import models.step3p5.config as cfg_for_swa_dyn  # noqa: PLC0415
+
+        n_swa_attn_layers = 33
+        attention_swa_mod.LAYER_QHIDDEN_ROWS_DYN = (
+            n_swa_attn_layers * cfg_for_swa_dyn.HIDDEN_Q_SWA_LOCAL
+        )
+
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415
 
     set_backend_type({
@@ -432,9 +443,9 @@ def main() -> int:  # noqa: PLR0915
 
     # Multi-rank: broadcast every host input to [N_RANKS, ...] so the
     # canonical 8-rank host_orch can index tensors[name][r_idx] for
-    # r_idx in [0, N_RANKS). Replicated; expert weights are zero, so
-    # this is a fault-free "runs-clean" device check of the MoE + EP-a2a
-    # path on real cards, not a numerical golden.
+    # r_idx in [0, N_RANKS). Expert weights are zero, so the golden is
+    # attention TP all-reduce + residual; MoE dispatch/combine/shared lanes
+    # must execute but contribute numerically zero.
     if args.world_size > 1:
         _NR = args.world_size
         inputs = {
@@ -479,50 +490,58 @@ def main() -> int:  # noqa: PLR0915
     ]
 
     def golden_fn(values):
-        # Per-rank slim torch ref. Kernel uses the canonical TP=8 per-rank
-        # slice - only KV head 0's contribution materialises (matches the
-        # full_dense / swa_dense ST pattern). Since MoE weights are zero,
-        # MoE block output = 0 and next_hidden = resid1.
-        hidden = values["current_hidden"][0]
-        irms = values["input_rms_weight"][0][layer_idx]
-        wq_l = values["wq"][0][layer_idx * HIDDEN:(layer_idx + 1) * HIDDEN]
-        wk_l = values["wk"][0][layer_idx * HIDDEN:(layer_idx + 1) * HIDDEN]
-        wv_l = values["wv"][0][layer_idx * HIDDEN:(layer_idx + 1) * HIDDEN]
-        wo_l = values["wo"][0][layer_idx * H_Q:(layer_idx + 1) * H_Q]
-        qn = values["q_norm_weight"][0][layer_idx]
-        kn = values["k_norm_weight"][0][layer_idx]
-        sl = values["seq_lens"][0]
-        bt = values["block_table"][0]
-        sm = values["slot_mapping"][0]
-        rc = values["rope_cos"][0]
-        rs = values["rope_sin"][0]
-        kc = values["k_cache"][0]
-        vc = values["v_cache"][0]
-
+        # Rank-wise slim torch ref. Each rank computes its local attention
+        # o_proj partial; TP all-reduce sums partials, then the replicated
+        # residual is added once. MoE expert weights are zero, so the MoE
+        # block contributes 0 and next_hidden = attention resid1.
+        nranks = values["current_hidden"].shape[0]
         TP1_KV_HEADS = 1
         TP1_NUM_HEADS = Q_PER_KV
-        wq_slim = wq_l[:, :TP1_NUM_HEADS * HEAD_DIM]
-        wk_slim = wk_l[:, :TP1_KV_HEADS * HEAD_DIM]
-        wv_slim = wv_l[:, :TP1_KV_HEADS * HEAD_DIM]
-        wo_slim = wo_l[:TP1_NUM_HEADS * HEAD_DIM, :]
-        resid1 = _torch_attn_no_gate(
-            full=full_attn, hidden_states=hidden,
-            input_rms_weight=irms,
-            wq=wq_slim, wk=wk_slim, wv=wv_slim,
-            q_norm_weight=qn, k_norm_weight=kn, wo=wo_slim,
-            seq_lens=sl, block_table=bt, slot_mapping=sm,
-            rope_cos=rc, rope_sin=rs,
-            k_cache=kc, v_cache=vc,
-            num_heads_local=TP1_NUM_HEADS,
-            num_kv_heads_local=TP1_KV_HEADS,
-            head_dim=HEAD_DIM, rotary_dim=ROTARY_DIM,
-            rotary_half=ROTARY_HALF, rotary_pass=ROTARY_PASS,
-            q_per_kv=Q_PER_KV, eps=EPS, block_size=BLOCK_SIZE,
-            max_blocks_per_seq=MAX_BLOCKS_PER_SEQ,
-            slide_window=SLIDING_WINDOW,
-        )
-        # MoE weights = 0 -> MoE block produces 0 -> next_hidden = resid1.
-        values["next_hidden_out"][0] = resid1
+        partial_sum = torch.zeros(BATCH, HIDDEN, dtype=torch.float32)
+        hidden_ref = values["current_hidden"][0].float()
+
+        for rank in range(nranks):
+            hidden = values["current_hidden"][rank]
+            irms = values["input_rms_weight"][rank][layer_idx]
+            wq_l = values["wq"][rank][layer_idx * HIDDEN:(layer_idx + 1) * HIDDEN]
+            wk_l = values["wk"][rank][layer_idx * HIDDEN:(layer_idx + 1) * HIDDEN]
+            wv_l = values["wv"][rank][layer_idx * HIDDEN:(layer_idx + 1) * HIDDEN]
+            wo_l = values["wo"][rank][layer_idx * H_Q:(layer_idx + 1) * H_Q]
+            qn = values["q_norm_weight"][rank][layer_idx]
+            kn = values["k_norm_weight"][rank][layer_idx]
+            sl = values["seq_lens"][rank]
+            bt = values["block_table"][rank]
+            sm = values["slot_mapping"][rank]
+            rc = values["rope_cos"][rank]
+            rs = values["rope_sin"][rank]
+            kc = values["k_cache"][rank]
+            vc = values["v_cache"][rank]
+
+            wq_slim = wq_l[:, :TP1_NUM_HEADS * HEAD_DIM]
+            wk_slim = wk_l[:, :TP1_KV_HEADS * HEAD_DIM]
+            wv_slim = wv_l[:, :TP1_KV_HEADS * HEAD_DIM]
+            wo_slim = wo_l[:TP1_NUM_HEADS * HEAD_DIM, :]
+            local_resid1 = _torch_attn_no_gate(
+                full=full_attn, hidden_states=hidden,
+                input_rms_weight=irms,
+                wq=wq_slim, wk=wk_slim, wv=wv_slim,
+                q_norm_weight=qn, k_norm_weight=kn, wo=wo_slim,
+                seq_lens=sl, block_table=bt, slot_mapping=sm,
+                rope_cos=rc, rope_sin=rs,
+                k_cache=kc, v_cache=vc,
+                num_heads_local=TP1_NUM_HEADS,
+                num_kv_heads_local=TP1_KV_HEADS,
+                head_dim=HEAD_DIM, rotary_dim=ROTARY_DIM,
+                rotary_half=ROTARY_HALF, rotary_pass=ROTARY_PASS,
+                q_per_kv=Q_PER_KV, eps=EPS, block_size=BLOCK_SIZE,
+                max_blocks_per_seq=MAX_BLOCKS_PER_SEQ,
+                slide_window=SLIDING_WINDOW,
+            )
+            partial_sum += local_resid1.float() - hidden.float()
+
+        expected = (partial_sum + hidden_ref).bfloat16()
+        for rank in range(nranks):
+            values["next_hidden_out"][rank] = expected
 
     from simpler.orchestrator import Orchestrator  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
@@ -562,7 +581,7 @@ def main() -> int:  # noqa: PLR0915
         }
         ctx = ChipDomainContext(
             name=str(name), domain_rank=0, domain_size=1, device_ctx=0,
-            local_window_base=base, actual_window_size=int(window_size),
+            local_window_base=base, actual_window_size=actual_window_size,
             buffer_ptrs=ptrs,
         )
 
@@ -607,20 +626,16 @@ def main() -> int:  # noqa: PLR0915
                   flush=True)
             return 0 if result.passed else 1
 
-        # Note: at world_size=8 + a2a3sim, run() dispatches all 8 ranks in
-        # the simulator. The golden_fn only validates rank-0's output (the
-        # MoE block produces 0 with all zero expert weights, so all ranks
-        # produce identical attention residual + 0 = next_hidden = resid1).
         result = run(
             program=program, specs=specs,
-            golden_fn=(None if args.world_size > 1 else golden_fn),
+            golden_fn=golden_fn,
             runtime_cfg=runtime_cfg, rtol=4e-2, atol=4e-2,
             compile_cfg=compile_cfg,
-            compare_fn=(None if args.world_size > 1 else {
+            compare_fn={
                 "next_hidden_out": ratio_allclose(
                     atol=4e-2, rtol=4e-2, max_error_ratio=0.10,
                 ),
-            }),
+            },
         )
         print(f"[ST-MoE {args.variant} ws={args.world_size}] {args.platform.upper()}: {result}",
               flush=True)

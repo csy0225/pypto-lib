@@ -131,7 +131,7 @@ USE_QK_NORM = True                     # per-head q_norm / k_norm; treat as
 # -----------------------------------------------------------------------------
 # Numeric constants.
 # -----------------------------------------------------------------------------
-EPS = 1e-6
+EPS = 1e-5
 HIDDEN_INV = 1.0 / HIDDEN
 HEAD_DIM_INV = 1.0 / HEAD_DIM
 ATTN_SCALE = 1.0 / (HEAD_DIM ** 0.5)

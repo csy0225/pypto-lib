@@ -119,7 +119,7 @@ def run_dispatcher_smoke() -> dict[str, int]:
 # math + the per-layer dispatcher selects the right path.
 # =============================================================================
 def _zero_centered_rmsnorm(
-    x: "torch.Tensor", gamma: "torch.Tensor", eps: float = 1e-6,
+    x: "torch.Tensor", gamma: "torch.Tensor", eps: float = 1e-5,
 ) -> "torch.Tensor":
     """Step3p5 zero-centred RMSNorm: gamma_eff = gamma + 1.0."""
     import torch  # noqa: PLC0415

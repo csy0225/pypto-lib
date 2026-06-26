@@ -36,12 +36,16 @@ def _insert_repo_path() -> None:
 
 
 def _check_checkpoint(ckpt_dir: Path) -> dict[str, Any]:
-    index = ckpt_dir / "model.safetensors.index.json"
+    bf16_index = ckpt_dir / "model.safetensors.index.json"
+    w8a8_index = ckpt_dir / "quant_model_weights.safetensors.index.json"
+    index = bf16_index if bf16_index.exists() else w8a8_index
     shards = sorted(ckpt_dir.glob("*.safetensors")) if ckpt_dir.exists() else []
     report: dict[str, Any] = {
         "ok": ckpt_dir.exists() and index.exists() and bool(shards),
         "path": str(ckpt_dir),
         "has_index": index.exists(),
+        "index_name": index.name if index.exists() else None,
+        "is_w8a8_dynamic": w8a8_index.exists(),
         "num_safetensors": len(shards),
         "num_tensors": None,
         "total_size": None,

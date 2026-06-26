@@ -281,25 +281,36 @@ def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, 
 # Safetensors index loader (lazy import).
 # =============================================================================
 def _read_index(ckpt_dir: str) -> dict[str, str]:
-    """Map tensor-name -> shard-file by reading ``model.safetensors.index.json``.
+    """Map tensor-name -> shard-file for BF16 or Ascend W8A8 checkpoints.
 
-    Falls back to a single-shard ``model.safetensors`` if the index file is
+    BF16 Step3p5 checkpoints use the standard HuggingFace
+    ``model.safetensors.index.json`` name.  Ascend W8A8_DYNAMIC checkpoints
+    generated for Step3p5 use ``quant_model_weights.safetensors.index.json``
+    and contain per-expert INT8 MoE tensors plus ``*_scale``/``*_offset``
+    tensors.  The rest of the loader consumes only this tensor-name -> shard
+    map, so supporting both layouts here keeps callers unchanged.
+
+    Falls back to a single-shard ``model.safetensors`` if an index file is
     absent (some converted checkpoints are stored as one file).
     """
-    index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
-    if os.path.isfile(index_path):
-        with open(index_path, "r", encoding="utf-8") as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map")
-        if weight_map is None:
-            raise RuntimeError(
-                f"{index_path} does not contain a 'weight_map' field.",
-            )
-        return dict(weight_map)
+    index_candidates = [
+        os.path.join(ckpt_dir, "model.safetensors.index.json"),
+        os.path.join(ckpt_dir, "quant_model_weights.safetensors.index.json"),
+    ]
+    for index_path in index_candidates:
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map")
+            if weight_map is None:
+                raise RuntimeError(
+                    f"{index_path} does not contain a 'weight_map' field.",
+                )
+            return dict(weight_map)
     single = os.path.join(ckpt_dir, "model.safetensors")
     if not os.path.isfile(single):
         raise FileNotFoundError(
-            f"Neither {index_path} nor {single} found.",
+            "Neither " + ", ".join(index_candidates) + f" nor {single} found.",
         )
     # Single-file ckpt: enumerate the tensor names lazily via safetensors.
     from safetensors import safe_open  # noqa: PLC0415 — lazy import
@@ -428,6 +439,51 @@ def _hf_mtp_keys(layer_idx: int) -> dict[str, str]:
 # =============================================================================
 # Slicing helpers.
 # =============================================================================
+
+def _dequant_w8a8_dynamic_weight(
+    weight: "torch.Tensor",
+    scale: "torch.Tensor",
+    offset: "torch.Tensor | None" = None,
+) -> "torch.Tensor":
+    """Dequantize an Ascend W8A8_DYNAMIC per-output-channel weight tensor.
+
+    The Step3p5 W8A8 checkpoint stores routed MoE expert matrices as INT8
+    tensors with one FP32 scale per output row.  ``*_offset`` is present in
+    the checkpoint and is currently all zeros; it is still applied for
+    forward compatibility with asymmetric exports.  Returned tensors stay on
+    CPU and are converted to BF16 to feed the existing BF16 PyPTO reference
+    and kernels.
+    """
+    import torch  # noqa: PLC0415
+
+    w = weight.to(torch.float32)
+    s = scale.to(torch.float32)
+    if offset is not None:
+        w = w - offset.to(torch.float32)
+    return (w * s).to(torch.bfloat16).contiguous()
+
+
+def _quant_expert_prefix(layer_idx: int, expert_idx: int, proj: str) -> str:
+    return f"model.layers.{layer_idx}.moe.experts.{expert_idx}.{proj}.weight"
+
+
+def _has_quantized_routed_experts(weight_map: dict[str, str], layer_idx: int) -> bool:
+    return _quant_expert_prefix(layer_idx, 0, "gate_proj") in weight_map
+
+
+def _load_quantized_expert_projector(
+    cache: _ShardCache,
+    layer_idx: int,
+    expert_idx: int,
+    proj: str,
+) -> "torch.Tensor":
+    key = _quant_expert_prefix(layer_idx, expert_idx, proj)
+    weight = cache.get(key)
+    scale = cache.get(f"{key}_scale")
+    offset_key = f"{key}_offset"
+    offset = cache.get(offset_key) if offset_key in cache.weight_map else None
+    return _dequant_w8a8_dynamic_weight(weight, scale, offset)
+
 def _to_bf16(t: "torch.Tensor") -> "torch.Tensor":
     import torch  # noqa: PLC0415
 
@@ -749,16 +805,39 @@ def load_step3p5_weights_for_rank(
             gate_w_rows.append(gate_w)
             router_bias_rows.append(_to_fp32(cache.get(moe["router_bias"])))
 
-            # Routed experts: full HF block is [NUM_EXPERTS, *, *]; we
-            # slice the per-rank expert window and transpose to kernel
-            # orientation.
-            gate_full = cache.get(moe["gate_proj"])    # [E, MOE_INTER, HIDDEN]
-            up_full = cache.get(moe["up_proj"])
-            down_full = cache.get(moe["down_proj"])    # [E, HIDDEN, MOE_INTER]
+            # Routed experts.
+            #
+            # BF16 checkpoints store one packed tensor per projection:
+            #   gate/up: [NUM_EXPERTS, MOE_INTERMEDIATE, HIDDEN]
+            #   down   : [NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE]
+            # W8A8_DYNAMIC checkpoints instead store one INT8 tensor plus
+            # per-output-row scale/offset per expert:
+            #   model.layers.L.moe.experts.E.{gate,up,down}_proj.weight
+            # We dequantize only this rank's EP-owned experts and then reuse
+            # the exact BF16 bundle layout expected by existing kernels.
+            if _has_quantized_routed_experts(weight_map, li):
+                gate_slab = torch.stack([
+                    _load_quantized_expert_projector(cache, li, eid, "gate_proj")
+                    for eid in range(ep_lo, ep_hi)
+                ], dim=0)
+                up_slab = torch.stack([
+                    _load_quantized_expert_projector(cache, li, eid, "up_proj")
+                    for eid in range(ep_lo, ep_hi)
+                ], dim=0)
+                down_slab = torch.stack([
+                    _load_quantized_expert_projector(cache, li, eid, "down_proj")
+                    for eid in range(ep_lo, ep_hi)
+                ], dim=0)
+            else:
+                # Full HF block is [NUM_EXPERTS, *, *]; slice the per-rank
+                # expert window and transpose to kernel orientation below.
+                gate_full = cache.get(moe["gate_proj"])    # [E, MOE_INTER, HIDDEN]
+                up_full = cache.get(moe["up_proj"])
+                down_full = cache.get(moe["down_proj"])    # [E, HIDDEN, MOE_INTER]
 
-            gate_slab = gate_full[ep_lo:ep_hi].contiguous()
-            up_slab = up_full[ep_lo:ep_hi].contiguous()
-            down_slab = down_full[ep_lo:ep_hi].contiguous()
+                gate_slab = gate_full[ep_lo:ep_hi].contiguous()
+                up_slab = up_full[ep_lo:ep_hi].contiguous()
+                down_slab = down_full[ep_lo:ep_hi].contiguous()
 
             routed_gate_rows.append(_to_bf16(_transpose_routed_block(gate_slab)))
             routed_up_rows.append(_to_bf16(_transpose_routed_block(up_slab)))

@@ -61,6 +61,16 @@ def _dense_mlp_partial(post_norm, w_gate, w_up, w_down):
     return (hidden.float() @ w_down.float()).bfloat16()
 
 
+def _quantize_w8a8_dynamic_activation(x):
+    import torch
+
+    x_f = x.float()
+    amax = x_f.abs().amax(dim=-1, keepdim=True)
+    scale = torch.clamp(amax / 127.0, min=1e-12)
+    q = torch.clamp(torch.round(x_f / scale), -127, 127)
+    return (q * scale).to(torch.bfloat16).float()
+
+
 def _moe_ref_dynamic(
     routed_swiglu_limit: float,
     shared_swiglu_limit: float,
@@ -75,6 +85,7 @@ def _moe_ref_dynamic(
     w_down_s_full,
     topk_ids=None,
     topk_weights=None,
+    routed_w8a8_dynamic: bool = False,
 ):
     import torch
     import torch.nn.functional as F
@@ -101,8 +112,12 @@ def _moe_ref_dynamic(
         for top_idx in range(top_k):
             expert_id = int(indices[token_idx, top_idx].item())
             x_row = x[token_idx:token_idx + 1, :].float()
-            gate_a = x_row @ w_gate_r_full[expert_id].float()
-            up_a = x_row @ w_up_r_full[expert_id].float()
+            routed_in = (
+                _quantize_w8a8_dynamic_activation(x_row)
+                if routed_w8a8_dynamic else x_row
+            )
+            gate_a = routed_in @ w_gate_r_full[expert_id].float()
+            up_a = routed_in @ w_up_r_full[expert_id].float()
             if routed_swiglu_limit > 0.0:
                 silu_g = F.silu(gate_a).clamp(max=routed_swiglu_limit)
                 up_c = up_a.clamp(
@@ -112,7 +127,11 @@ def _moe_ref_dynamic(
                 moe_hidden = silu_g * up_c
             else:
                 moe_hidden = F.silu(gate_a) * up_a
-            y = moe_hidden.to(torch.bfloat16).float() @ w_down_r_full[expert_id].float()
+            down_in = (
+                _quantize_w8a8_dynamic_activation(moe_hidden)
+                if routed_w8a8_dynamic else moe_hidden.to(torch.bfloat16).float()
+            )
+            y = down_in @ w_down_r_full[expert_id].float()
             routed_acc[token_idx, :] += weights_bf[token_idx, top_idx] * y[0]
 
     sh_gate = x.float() @ w_gate_s_full.float()
@@ -227,6 +246,7 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
 
     dump_root = Path(args.dump_root)
     files = _select_files(dump_root)
+    routed_w8a8_dynamic = (Path(args.ckpt_dir) / "quant_model_weights.safetensors.index.json").exists()
     bundles = [
         load_step3p5_weights_for_rank(args.ckpt_dir, rank, args.tp_world_size)
         for rank in range(args.tp_world_size)
@@ -402,6 +422,7 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
                     _rank_tensor(files, f"layer_{layer_idx:02d}_moe_router", 0, "topk_weights")
                     if f"layer_{layer_idx:02d}_moe_router" in files else None
                 ),
+                routed_w8a8_dynamic=routed_w8a8_dynamic,
             )
         else:
             ffn_reduced = torch.stack(
@@ -445,6 +466,7 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
         "dump_root": str(dump_root),
         "ckpt_dir": args.ckpt_dir,
         "tp_world_size": args.tp_world_size,
+        "routed_w8a8_dynamic": routed_w8a8_dynamic,
         "num_checks": len(reports),
         "ok": all(item["ok"] for item in reports),
         "worst_pass_rate": min((item["pass_rate"] for item in reports), default=0.0),

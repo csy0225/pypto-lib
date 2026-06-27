@@ -213,6 +213,89 @@ def validate_vllm_param_meta(path: str | Path, tp_world_size: int) -> dict[str, 
     }
 
 
+def build_vllm_to_pypto_transform_plan(tp_world_size: int = 8) -> dict[str, Any]:
+    """Describe live vLLM parameter -> PyPTO decode-fwd bundle transforms.
+
+    The plan intentionally excludes ``embed_tokens`` and MTP-only keys because
+    ``Step3p5DecodeFwd`` consumes hidden states and covers the 45 main layers +
+    final LM-head shard.  This is the exact transform surface the online runner
+    needs before calling PyPTO.
+    """
+    from models.step3p5.config import (  # noqa: PLC0415
+        DENSE_LAYER_INDICES,
+        HEAD_DIM,
+        HIDDEN,
+        INTERMEDIATE,
+        MOE_INTERMEDIATE,
+        MOE_LAYER_INDICES,
+        NUM_HEADS_FULL,
+        NUM_HEADS_SWA,
+        NUM_KV_HEADS,
+        NUM_HIDDEN_LAYERS,
+        SHARE_EXPERT_DIM,
+        VOCAB,
+        is_full_attention,
+    )
+
+    q_full_local = (NUM_HEADS_FULL // tp_world_size) * HEAD_DIM
+    q_swa_local = (NUM_HEADS_SWA // tp_world_size) * HEAD_DIM
+    kv_local = (NUM_KV_HEADS // tp_world_size) * HEAD_DIM
+    inter_local = INTERMEDIATE // tp_world_size
+    share_local = SHARE_EXPERT_DIM // tp_world_size
+    vocab_local = VOCAB // tp_world_size
+
+    plan: dict[str, Any] = {
+        "final_norm_weight": {"source": "model.norm.weight", "transform": "identity"},
+        "lm_head_weight": {"source": "lm_head.weight", "transform": "identity_local_vocab_shard"},
+        "input_rms_weight": [],
+        "post_attn_rms_weight": [],
+        "q_norm_weight": [],
+        "k_norm_weight": [],
+        "wq_full": [], "wk_full": [], "wv_full": [], "wo_full": [], "w_g_full": [],
+        "wq_swa": [], "wk_swa": [], "wv_swa": [], "wo_swa": [], "w_g_swa": [],
+        "dense_w_gate": [], "dense_w_up": [], "dense_w_down": [],
+        "moe_gate_w": [], "moe_router_bias": [],
+        "moe_w_gate_s": [], "moe_w_up_s": [], "moe_w_down_s": [],
+        "moe_w_gate_r": [], "moe_w_up_r": [], "moe_w_down_r": [],
+    }
+    dense_layers = set(DENSE_LAYER_INDICES)
+    moe_layers = set(MOE_LAYER_INDICES)
+    for li in range(NUM_HIDDEN_LAYERS):
+        prefix = f"model.layers.{li}"
+        full = is_full_attention(li)
+        q_local = q_full_local if full else q_swa_local
+        attn_target = "full" if full else "swa"
+        plan["input_rms_weight"].append({"layer": li, "source": f"{prefix}.input_layernorm.weight", "transform": "identity"})
+        plan["post_attn_rms_weight"].append({"layer": li, "source": f"{prefix}.post_attention_layernorm.weight", "transform": "identity"})
+        plan["q_norm_weight"].append({"layer": li, "source": f"{prefix}.self_attn.q_norm.weight", "transform": "identity"})
+        plan["k_norm_weight"].append({"layer": li, "source": f"{prefix}.self_attn.k_norm.weight", "transform": "identity"})
+        qkv_src = f"{prefix}.self_attn.qkv_proj.weight"
+        for name, start, stop in [
+            (f"wq_{attn_target}", 0, q_local),
+            (f"wk_{attn_target}", q_local, q_local + kv_local),
+            (f"wv_{attn_target}", q_local + kv_local, q_local + 2 * kv_local),
+        ]:
+            plan[name].append({"layer": li, "source": qkv_src, "slice_rows": [start, stop], "transform": "transpose_to_hidden_by_local"})
+        plan[f"wo_{attn_target}"].append({"layer": li, "source": f"{prefix}.self_attn.o_proj.weight", "transform": "transpose_to_local_by_hidden"})
+        plan[f"w_g_{attn_target}"].append({"layer": li, "source": f"{prefix}.self_attn.g_proj.weight", "transform": "transpose_and_pad_heads_to_16"})
+        if li in dense_layers:
+            src = f"{prefix}.mlp.gate_up_proj.weight"
+            plan["dense_w_gate"].append({"layer": li, "source": src, "slice_rows": [0, inter_local], "transform": "transpose"})
+            plan["dense_w_up"].append({"layer": li, "source": src, "slice_rows": [inter_local, 2 * inter_local], "transform": "transpose"})
+            plan["dense_w_down"].append({"layer": li, "source": f"{prefix}.mlp.down_proj.weight", "transform": "transpose"})
+        elif li in moe_layers:
+            plan["moe_gate_w"].append({"layer": li, "source": f"{prefix}.moe.gate.weight", "transform": "transpose_to_hidden_by_experts_fp32"})
+            plan["moe_router_bias"].append({"layer": li, "source": f"{prefix}.moe.router_bias", "transform": "to_fp32"})
+            src = f"{prefix}.moe.share_expert.gate_up_proj.weight"
+            plan["moe_w_gate_s"].append({"layer": li, "source": src, "slice_rows": [0, share_local], "transform": "transpose"})
+            plan["moe_w_up_s"].append({"layer": li, "source": src, "slice_rows": [share_local, 2 * share_local], "transform": "transpose"})
+            plan["moe_w_down_s"].append({"layer": li, "source": f"{prefix}.moe.share_expert.down_proj.weight", "transform": "transpose"})
+            plan["moe_w_gate_r"].append({"layer": li, "source": f"{prefix}.moe.experts.w13_weight", "scale": f"{prefix}.moe.experts.w13_weight_scale", "offset": f"{prefix}.moe.experts.w13_weight_offset", "slice_last_dim": [0, MOE_INTERMEDIATE], "transform": "w8a8_dequant_keep_expert_hidden_inter"})
+            plan["moe_w_up_r"].append({"layer": li, "source": f"{prefix}.moe.experts.w13_weight", "scale": f"{prefix}.moe.experts.w13_weight_scale", "offset": f"{prefix}.moe.experts.w13_weight_offset", "slice_last_dim": [MOE_INTERMEDIATE, 2 * MOE_INTERMEDIATE], "transform": "w8a8_dequant_keep_expert_hidden_inter"})
+            plan["moe_w_down_r"].append({"layer": li, "source": f"{prefix}.moe.experts.w2_weight", "scale": f"{prefix}.moe.experts.w2_weight_scale", "offset": f"{prefix}.moe.experts.w2_weight_offset", "transform": "w8a8_dequant_keep_expert_inter_hidden"})
+    return plan
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt-dir", default=None, help="HF/W8A8 checkpoint directory")
@@ -227,6 +310,7 @@ def parse_args() -> argparse.Namespace:
                         help="Save rankXX_bundle.pt files. Potentially very large; opt-in only.")
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--vllm-param-meta", default=None, help="Validate parameter metadata dumped by vllm_monkey_patch.py")
+    parser.add_argument("--emit-vllm-transform-plan", action="store_true", help="Write vllm_to_pypto_transform_plan.json")
     return parser.parse_args()
 
 
@@ -252,6 +336,11 @@ def main() -> int:
         vllm_param_meta_report = validate_vllm_param_meta(args.vllm_param_meta, args.tp_world_size)
         (out_dir / "vllm_param_meta_report.json").write_text(
             json.dumps(vllm_param_meta_report, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+    if args.emit_vllm_transform_plan:
+        (out_dir / "vllm_to_pypto_transform_plan.json").write_text(
+            json.dumps(build_vllm_to_pypto_transform_plan(args.tp_world_size), indent=2, ensure_ascii=False, default=str),
             encoding="utf-8",
         )
 

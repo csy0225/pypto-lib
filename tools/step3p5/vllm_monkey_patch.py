@@ -64,6 +64,31 @@ def _set_patch_state(step3p5, state: PatchState | None) -> None:
         setattr(step3p5, _PATCH_ATTR, state)
 
 
+def _maybe_dump_param_meta(model) -> None:
+    """Dump vLLM Step3p5 parameter metadata once for translator bring-up."""
+    out_path = os.environ.get("PYPTO_STEP3P5_DUMP_PARAM_META")
+    if not out_path or getattr(model, "_pypto_param_meta_dumped", False):
+        return
+    import json
+    from pathlib import Path
+
+    meta = {}
+    for name, param in model.named_parameters():
+        meta[name] = {
+            "shape": list(param.shape),
+            "dtype": str(param.dtype).removeprefix("torch."),
+            "device": str(param.device),
+            "requires_grad": bool(getattr(param, "requires_grad", False)),
+        }
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"num_parameters": len(meta), "parameters": meta}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    setattr(model, "_pypto_param_meta_dumped", True)
+
+
 def _pypto_tail_compute_logits(self, hidden_states):
     """PyPTO-compatible final RMSNorm + LM-head tail.
 
@@ -73,6 +98,7 @@ def _pypto_tail_compute_logits(self, hidden_states):
     vLLM's live modules for now so quantized LM-head sharding remains identical
     to vLLM-Ascend while the PyPTO runner ABI is being wired.
     """
+    _maybe_dump_param_meta(self)
     normed_hidden_states = self.model.norm(hidden_states)
     logits = self.logits_processor(self.lm_head, normed_hidden_states)
     setattr(self, "_pypto_tail_last_shape", tuple(logits.shape))

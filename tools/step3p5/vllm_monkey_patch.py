@@ -121,6 +121,37 @@ def _pypto_layer_ref_forward(self, positions, hidden_states):
     return hidden_states
 
 
+def _maybe_dump_layer_ref_report(model) -> None:
+    """Dump per-layer replacement invocation counts after an online request."""
+    out_path = os.environ.get("PYPTO_STEP3P5_LAYER_REF_REPORT")
+    if not out_path:
+        return
+    import json
+    from pathlib import Path
+
+    layers = getattr(getattr(model, "model", None), "layers", [])
+    layer_reports = []
+    for idx, layer in enumerate(layers):
+        if layer.__class__.__name__ == "PPMissingLayer":
+            continue
+        layer_reports.append({
+            "layer": int(getattr(layer, "layer_idx", idx)),
+            "calls": int(getattr(layer, "_pypto_layer_ref_calls", 0)),
+            "last_shape": list(getattr(layer, "_pypto_layer_ref_last_shape", []) or []),
+            "replaced": bool(getattr(layer, "_pypto_layer_ref_calls", 0)),
+        })
+    payload = {
+        "mode": os.environ.get("PYPTO_STEP3P5_PATCH_MODE"),
+        "num_layers_observed": len(layer_reports),
+        "num_layers_replaced": sum(1 for item in layer_reports if item["replaced"]),
+        "all_observed_layers_replaced": bool(layer_reports) and all(item["replaced"] for item in layer_reports),
+        "layers": layer_reports,
+    }
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def _pypto_tail_compute_logits(self, hidden_states):
     """PyPTO-compatible final RMSNorm + LM-head tail.
 
@@ -133,6 +164,7 @@ def _pypto_tail_compute_logits(self, hidden_states):
     _maybe_dump_param_meta(self)
     normed_hidden_states = self.model.norm(hidden_states)
     logits = self.logits_processor(self.lm_head, normed_hidden_states)
+    _maybe_dump_layer_ref_report(self)
     setattr(self, "_pypto_tail_last_shape", tuple(logits.shape))
     return logits
 

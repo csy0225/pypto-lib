@@ -102,6 +102,8 @@ def _pypto_layer_ref_forward(self, positions, hidden_states):
     hidden_states = self.input_layernorm(hidden_states)
     self.self_attn.layer_idx = self.layer_idx
     attn_delta = self.self_attn(positions=positions, hidden_states=hidden_states)
+    if int(getattr(self, "_pypto_layer_ref_calls", 0)) == 0:
+        _maybe_dump_forward_context(self)
     hidden_states = attn_delta + residual
 
     residual = hidden_states
@@ -119,6 +121,64 @@ def _pypto_layer_ref_forward(self, positions, hidden_states):
     except Exception:
         pass
     return hidden_states
+
+
+def _tensor_brief(x) -> dict[str, Any]:
+    try:
+        return {"shape": list(x.shape), "dtype": str(x.dtype).removeprefix("torch."), "device": str(x.device)}
+    except Exception:
+        return {"repr": repr(x)[:200]}
+
+
+def _maybe_dump_forward_context(model) -> None:
+    """Dump vLLM forward context metadata needed by a future PyPTO runner."""
+    out_path = os.environ.get("PYPTO_STEP3P5_FORWARD_CONTEXT_REPORT")
+    if not out_path:
+        return
+    import json
+    from pathlib import Path
+
+    report: dict[str, Any] = {"ok": False}
+    try:
+        from vllm.forward_context import get_forward_context
+        ctx = get_forward_context()
+        attn_metadata = ctx.attn_metadata
+        slot_mapping = ctx.slot_mapping
+        no_compile_layers = ctx.no_compile_layers
+        report["attn_metadata_type"] = type(attn_metadata).__name__
+        report["slot_mapping_type"] = type(slot_mapping).__name__
+        report["no_compile_layers_count"] = len(no_compile_layers) if hasattr(no_compile_layers, "__len__") else None
+        if isinstance(slot_mapping, dict):
+            report["slot_mapping"] = {str(k): _tensor_brief(v) for k, v in list(slot_mapping.items())[:8]}
+            report["slot_mapping_count"] = len(slot_mapping)
+        if isinstance(attn_metadata, dict):
+            sample = {}
+            for k, v in list(attn_metadata.items())[:3]:
+                attrs = {}
+                for attr in ("num_prefills", "num_decode_tokens", "num_prefill_tokens", "seq_lens", "block_table", "block_table_tensor", "slot_mapping"):
+                    if hasattr(v, attr):
+                        val = getattr(v, attr)
+                        attrs[attr] = _tensor_brief(val) if hasattr(val, "shape") else repr(val)[:200]
+                sample[str(k)] = {"type": type(v).__name__, "attrs": attrs}
+            report["attn_metadata_count"] = len(attn_metadata)
+            report["attn_metadata_sample"] = sample
+        # KV cache objects live on no_compile attention layers.
+        kv_sample = {}
+        for k, layer in list(no_compile_layers.items())[:3]:
+            kv = getattr(layer, "kv_cache", None)
+            kv_sample[str(k)] = _tensor_brief(kv) if kv is not None else None
+        report["kv_cache_sample"] = kv_sample
+        report["ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        # Forward context may already be cleared by compute_logits; do not
+        # overwrite a successful layer-time report with a tail-time miss.
+        path = Path(out_path)
+        if path.exists():
+            return
+        report["error"] = repr(exc)
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _maybe_dump_layer_ref_report(model) -> None:
@@ -165,6 +225,7 @@ def _pypto_tail_compute_logits(self, hidden_states):
     normed_hidden_states = self.model.norm(hidden_states)
     logits = self.logits_processor(self.lm_head, normed_hidden_states)
     _maybe_dump_layer_ref_report(self)
+    _maybe_dump_forward_context(self)
     setattr(self, "_pypto_tail_last_shape", tuple(logits.shape))
     return logits
 

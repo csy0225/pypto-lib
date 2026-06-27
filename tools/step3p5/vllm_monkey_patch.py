@@ -36,6 +36,7 @@ class PatchState:
     original_model_forward: Callable[..., Any]
     original_causal_forward: Callable[..., Any]
     original_compute_logits: Callable[..., Any]
+    original_decoder_layer_forward: Callable[..., Any] | None = None
 
 
 class PyPTOBackendUnavailable(RuntimeError):
@@ -89,6 +90,37 @@ def _maybe_dump_param_meta(model) -> None:
     setattr(model, "_pypto_param_meta_dumped", True)
 
 
+def _pypto_layer_ref_forward(self, positions, hidden_states):
+    """PyPTO-style decoder-layer orchestration using live vLLM kernels.
+
+    This replaces ``Step3p5DecoderLayer.forward`` for all 45 main layers while
+    reusing vLLM's attention/MoE/MLP submodules for the heavy math and KV-cache
+    side effects.  It is the online layer-replacement bridge before the true
+    PyPTO @pl NPU programs are wired into ``Step3p5DecodeFwd``.
+    """
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    self.self_attn.layer_idx = self.layer_idx
+    attn_delta = self.self_attn(positions=positions, hidden_states=hidden_states)
+    hidden_states = attn_delta + residual
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    if self.use_moe:
+        ffn_output = self.moe(hidden_states)
+    else:
+        ffn_output = self.mlp(hidden_states)
+    hidden_states = ffn_output + residual
+
+    # Lightweight observability for online E2E reports.
+    try:
+        self._pypto_layer_ref_calls = int(getattr(self, "_pypto_layer_ref_calls", 0)) + 1
+        self._pypto_layer_ref_last_shape = tuple(hidden_states.shape)
+    except Exception:
+        pass
+    return hidden_states
+
+
 def _pypto_tail_compute_logits(self, hidden_states):
     """PyPTO-compatible final RMSNorm + LM-head tail.
 
@@ -125,11 +157,13 @@ def install(mode: str | None = None) -> dict[str, Any]:
     Modes:
       - ``tail``: replace ``Step3p5ForCausalLM.compute_logits`` only.
       - ``shadow``: wrap ``Step3p5Model.forward`` and delegate to original.
+      - ``layer_ref``: replace all 45 ``Step3p5DecoderLayer.forward`` bodies
+        with PyPTO-style Python orchestration while reusing vLLM kernels.
       - ``full``: replace ``Step3p5Model.forward`` with fail-closed full-runner
         placeholder (until real PyPTO online runner lands).
     """
     mode = (mode or os.environ.get("PYPTO_STEP3P5_PATCH_MODE") or "tail").lower()
-    if mode not in {"tail", "shadow", "full"}:
+    if mode not in {"tail", "shadow", "layer_ref", "full"}:
         raise ValueError(f"unsupported Step3p5 PyPTO patch mode: {mode}")
 
     step3p5 = _load_step3p5_module()
@@ -141,9 +175,13 @@ def install(mode: str | None = None) -> dict[str, Any]:
         original_model_forward=step3p5.Step3p5Model.forward,
         original_causal_forward=step3p5.Step3p5ForCausalLM.forward,
         original_compute_logits=step3p5.Step3p5ForCausalLM.compute_logits,
+        original_decoder_layer_forward=step3p5.Step3p5DecoderLayer.forward,
     )
 
     if mode == "tail":
+        step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
+    elif mode == "layer_ref":
+        step3p5.Step3p5DecoderLayer.forward = _pypto_layer_ref_forward
         step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
     elif mode == "shadow":
         original = state.original_model_forward
@@ -170,6 +208,8 @@ def uninstall() -> dict[str, Any]:
     if state is None:
         return {"ok": True, "installed": False}
     step3p5.Step3p5Model.forward = state.original_model_forward
+    if state.original_decoder_layer_forward is not None:
+        step3p5.Step3p5DecoderLayer.forward = state.original_decoder_layer_forward
     step3p5.Step3p5ForCausalLM.forward = state.original_causal_forward
     step3p5.Step3p5ForCausalLM.compute_logits = state.original_compute_logits
     _set_patch_state(step3p5, None)
@@ -189,7 +229,7 @@ def status() -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["install", "uninstall", "status"])
-    parser.add_argument("--mode", choices=["tail", "shadow", "full"], default=None)
+    parser.add_argument("--mode", choices=["tail", "shadow", "layer_ref", "full"], default=None)
     args = parser.parse_args()
 
     sys.path.insert(0, str(_repo_root()))

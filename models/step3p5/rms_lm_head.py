@@ -68,6 +68,12 @@ assert VOCAB_LOCAL % VOCAB_CHUNK == 0, (
 )
 assert HIDDEN % LM_HEAD_K_CHUNK == 0
 assert HIDDEN % FINAL_RMS_K_CHUNK == 0
+# The flat/serial rms_lm_head body (2026-07-04 inline fix) drops the outer
+# b0 tiling loop; it requires the kernel batch to equal one tile.
+assert BATCH == BATCH_TILE, (
+    f"rms_lm_head assumes BATCH({BATCH}) == BATCH_TILE({BATCH_TILE}); "
+    "re-introduce a serial b0 tiling loop if this changes."
+)
 
 
 # =============================================================================
@@ -101,112 +107,108 @@ def rms_lm_head(
     k_blocks = HIDDEN // LM_HEAD_K_CHUNK
     vocab_blocks = VOCAB_LOCAL // VOCAB_CHUNK
 
-    # ── Step 1: replicated zero-centred RMSNorm. ───────────────────────
-    final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm_zc"):
-            sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(rms_blocks):
-                final_sq_k0 = kb * FINAL_RMS_K_CHUNK
-                final_sq_chunk = pl.cast(
-                    pl.slice(
-                        hidden_states,
-                        [BATCH_TILE, FINAL_RMS_K_CHUNK],
-                        [b0, final_sq_k0],
-                    ),
-                    target_type=pl.FP32,
-                )
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(
-                        pl.row_sum(pl.mul(final_sq_chunk, final_sq_chunk)),
-                        [1, BATCH_TILE],
-                    ),
-                )
-            inv_rms_final = pl.reshape(
-                pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-                [BATCH_TILE, 1],
+    # NOTE (2026-07-04 fix): single-scope, no ``final_normed`` scratch.
+    # History: the original body produced a ``final_normed`` GM scratch in a
+    # Step-1 ``pl.at(CORE_GROUP)`` scope and consumed it in SEPARATE Step-2
+    # matmul scopes. Fine as a top-level ``@pl.jit`` (monolithic ``lm_real``
+    # PASSES), but INLINED into a ``@pl.program`` chip_orch, orchestration
+    # decomposes each CORE_GROUP scope into its own task and the RMSNorm-scope
+    # → 1007 matmul-scope fan-out dependency on ``final_normed`` is
+    # mis-tracked (magnitude ~right, ~99.7% positions wrong; or ~60x blow-up
+    # with ``pl.parallel`` / a GM-roundtrip store). Folding everything into
+    # ONE scope but still MATERIALISING ``final_normed`` (create_tensor +
+    # assemble, then re-read in the same scope) fails codegen
+    # ("Tensor view not found for ... final_normed__rv_v2"): a reassigned GM
+    # scratch can't be re-read within the same scope. Fix: do NOT materialise
+    # ``final_normed`` at all — compute ``inv_rms`` once, then in the vocab
+    # matmul loop normalise each hidden k-chunk INLINE
+    # (h_chunk * inv_rms * (gamma+1)) and matmul, all in ONE scope. Only the
+    # small read-only ``inv_rms`` tile crosses the RMSNorm→matmul boundary
+    # (no reassigned GM scratch). Normalisation is recomputed per vocab block
+    # (wasteful; perf = Phase 26) but correct under inline. (BATCH ==
+    # BATCH_TILE enforced by a module-level assert.)
+    lm_valid_rows = pl.min(BATCH_TILE, user_batch)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rms_lm_head_fused_tp"):
+        # ── per-row inv_rms of the replicated zero-centred RMSNorm ──
+        sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.range(rms_blocks):
+            final_sq_k0 = kb * FINAL_RMS_K_CHUNK
+            final_sq_chunk = pl.cast(
+                pl.slice(
+                    hidden_states,
+                    [BATCH_TILE, FINAL_RMS_K_CHUNK],
+                    [0, final_sq_k0],
+                ),
+                target_type=pl.FP32,
             )
+            sq_sum = pl.add(
+                sq_sum,
+                pl.reshape(
+                    pl.row_sum(pl.mul(final_sq_chunk, final_sq_chunk)),
+                    [1, BATCH_TILE],
+                ),
+            )
+        inv_rms_final = pl.reshape(
+            pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+            [BATCH_TILE, 1],
+        )
 
-            for kb in pl.range(rms_blocks):
-                final_norm_k0 = kb * FINAL_RMS_K_CHUNK
-                final_hidden_chunk = pl.cast(
-                    pl.slice(
-                        hidden_states,
-                        [BATCH_TILE, FINAL_RMS_K_CHUNK],
-                        [b0, final_norm_k0],
-                    ),
-                    target_type=pl.FP32,
-                )
-                final_gamma = pl.slice(
-                    final_norm_weight,
-                    [1, FINAL_RMS_K_CHUNK],
-                    [0, final_norm_k0],
-                )
-                scaled = pl.row_expand_mul(final_hidden_chunk, inv_rms_final)
-                # Inlined zero_centered_rmsnorm_apply: gamma_eff = gamma + 1.0,
-                # then col-broadcast multiply. pypto frontend rejects calling
-                # the @pl.jit.inline helper from inside a @pl.program method
-                # body (Phase X.7 lift recipe), so we expand it here.
-                final_normed_chunk = pl.col_expand_mul(
-                    scaled, pl.add(final_gamma, 1.0),
-                )
-                final_normed = pl.assemble(
-                    final_normed,
-                    pl.cast(final_normed_chunk, target_type=pl.BF16),
-                    [b0, final_norm_k0],
-                )
-
-    # ── Step 2: per-rank LM-head matmul into the VOCAB_LOCAL shard. ────
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
-        for ob in pl.parallel(vocab_blocks):
+        # ── per-rank LM-head matmul with inline normalisation ──
+        for ob in pl.range(vocab_blocks):
             lm_o0 = ob * VOCAB_CHUNK
-            lm_acc_gm = pl.create_tensor(
-                [BATCH_TILE, VOCAB_CHUNK], dtype=pl.FP32,
+            # k-chunk 0: normalise hidden[:, 0:LM_HEAD_K_CHUNK] inline.
+            hid0 = pl.cast(
+                pl.slice(hidden_states, [BATCH_TILE, LM_HEAD_K_CHUNK], [0, 0]),
+                target_type=pl.FP32,
             )
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_tp"):
-                lm_hidden_chunk = pl.slice(
-                    final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0],
+            scaled0 = pl.row_expand_mul(hid0, inv_rms_final)
+            gamma0 = pl.slice(final_norm_weight, [1, LM_HEAD_K_CHUNK], [0, 0])
+            normed0 = pl.cast(
+                pl.col_expand_mul(scaled0, pl.add(gamma0, 1.0)),
+                target_type=pl.BF16,
+            )
+            lm_weight_chunk = pl.slice(
+                lm_head_weight,
+                [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
+                [lm_o0, 0],
+            )
+            lm_acc = pl.matmul(
+                normed0, lm_weight_chunk,
+                out_dtype=pl.FP32, b_trans=True,
+            )
+            for kb in pl.range(1, k_blocks):
+                lm_k0 = kb * LM_HEAD_K_CHUNK
+                hidk = pl.cast(
+                    pl.slice(
+                        hidden_states, [BATCH_TILE, LM_HEAD_K_CHUNK], [0, lm_k0],
+                    ),
+                    target_type=pl.FP32,
+                )
+                scaledk = pl.row_expand_mul(hidk, inv_rms_final)
+                gammak = pl.slice(
+                    final_norm_weight, [1, LM_HEAD_K_CHUNK], [0, lm_k0],
+                )
+                normedk = pl.cast(
+                    pl.col_expand_mul(scaledk, pl.add(gammak, 1.0)),
+                    target_type=pl.BF16,
                 )
                 lm_weight_chunk = pl.slice(
                     lm_head_weight,
                     [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
-                    [lm_o0, 0],
+                    [lm_o0, lm_k0],
                 )
-                lm_acc = pl.matmul(
-                    lm_hidden_chunk, lm_weight_chunk,
-                    out_dtype=pl.FP32, b_trans=True,
+                lm_acc = pl.matmul_acc(
+                    lm_acc, normedk, lm_weight_chunk,
+                    b_trans=True,
                 )
-                for kb in pl.range(1, k_blocks):
-                    lm_k0 = kb * LM_HEAD_K_CHUNK
-                    lm_hidden_chunk = pl.slice(
-                        final_normed,
-                        [BATCH_TILE, LM_HEAD_K_CHUNK],
-                        [b0, lm_k0],
-                    )
-                    lm_weight_chunk = pl.slice(
-                        lm_head_weight,
-                        [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
-                        [lm_o0, lm_k0],
-                    )
-                    lm_acc = pl.matmul_acc(
-                        lm_acc, lm_hidden_chunk, lm_weight_chunk,
-                        b_trans=True,
-                    )
-                lm_acc_gm = pl.assemble(lm_acc_gm, lm_acc, [0, 0])
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_store_tp"):
-                lm_acc_chunk = pl.slice(
-                    lm_acc_gm, [BATCH_TILE, VOCAB_CHUNK], [0, 0],
-                )
-                lm_acc_trimmed = pl.slice(
-                    lm_acc_chunk,
-                    [BATCH_TILE, VOCAB_CHUNK],
-                    [0, 0],
-                    valid_shape=[lm_valid_rows, VOCAB_CHUNK],
-                )
-                out = pl.assemble(out, lm_acc_trimmed, [b0, lm_o0])
+            lm_acc_trimmed = pl.slice(
+                lm_acc,
+                [BATCH_TILE, VOCAB_CHUNK],
+                [0, 0],
+                valid_shape=[lm_valid_rows, VOCAB_CHUNK],
+            )
+            out = pl.assemble(out, lm_acc_trimmed, [0, lm_o0])
 
     return out
 
@@ -226,7 +228,14 @@ def _build_tp_rms_lm_head_program(tp_size: int = TP_WORLD_SIZE):
             f"VOCAB={VOCAB} must be divisible by tp_size={tp_size}"
         )
     rms_lm_head_inline = pl.inline(rms_lm_head._func)
-    vocab_per_tp = VOCAB // tp_size
+    # Per-rank vocab slab. Use the config ``VOCAB_LOCAL`` (the canonical TP=8
+    # per-rank width, preserved by apply_perrank_patch) rather than
+    # ``VOCAB // tp_size``: the single-card worker builds with ``tp_size=1`` for
+    # a leading-dim-1 host_orch but must still slice the vocab to VOCAB_LOCAL
+    # (16112), not the full VOCAB. For the canonical distributed build
+    # (tp_size == TP_WORLD_SIZE, no perrank patch) VOCAB_LOCAL == VOCAB//tp_size
+    # so this is backward-compatible with the 8-card path.
+    vocab_per_tp = VOCAB_LOCAL
 
     @pl.program
     class TpRmsLmHead:

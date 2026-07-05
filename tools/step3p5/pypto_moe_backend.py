@@ -42,7 +42,13 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from models.step3p5.vllm_routed_experts import HIDDEN, LOCAL_RECV_MAX, N_LOCAL_EXPERTS  # noqa: E402
+try:
+    # host (has pypto) — authoritative constants
+    from models.step3p5.vllm_routed_experts import HIDDEN, LOCAL_RECV_MAX, N_LOCAL_EXPERTS  # noqa: E402
+except Exception:
+    # vLLM engine container may lack pypto; these step3p5 constants are stable. install()/
+    # RoutedClient/_apply_mlp only need the constants (no pypto). _selftest imports lazily.
+    HIDDEN, LOCAL_RECV_MAX, N_LOCAL_EXPERTS = 4096, 1024, 36
 
 _HDR = struct.Struct(">I")  # big-endian, matches pypto_mlp_worker.py
 

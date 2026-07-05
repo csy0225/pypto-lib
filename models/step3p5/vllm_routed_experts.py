@@ -371,7 +371,7 @@ def _serve(sock_path: str, device: int, ckpt: str, layer: int, rank: int) -> int
                     c1 = cnts.unsqueeze(0).contiguous()
                     y1 = y.unsqueeze(0).contiguous()
                     compiled(x1, o1, c1, wg, wu, wd, y1)
-                    ob = y1[0].contiguous().view(torch.uint16).numpy().tobytes()
+                    ob = y1[0].contiguous().numpy().tobytes()
                     hb = json.dumps({"ok": True, "body_len": len(ob)}).encode()
                     conn.sendall(HDR.pack(len(hb)) + hb + ob)
                     continue

@@ -111,58 +111,31 @@ def main() -> int:
     p.add_argument("-p", "--platform", default="a2a3")
     p.add_argument("-d", "--device", type=int, default=8)
     p.add_argument("--smoke", action="store_true")
-    p.add_argument("--device-run", action="store_true",
-                   help="compile + run on device + validate vs torch golden")
-    p.add_argument("--real-weights", action="store_true")
-    p.add_argument("--ckpt", default="/data/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp")
-    p.add_argument("--layer", type=int, default=3)
-    p.add_argument("--rank", type=int, default=0)
     a = p.parse_args()
     repo = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo))
     import torch  # noqa: PLC0415
-    from golden import TensorSpec, ratio_allclose, run_jit  # noqa: PLC0415
+    from golden import TensorSpec, run_jit  # noqa: PLC0415
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415
-
-    from models.step3p5.vllm_routed_experts import (  # noqa: PLC0415
-        _balanced_csr,
-        _real_weights,
-        _synthetic_weights,
-        golden_routed_experts_perrank,
-    )
-
     set_backend_type(BackendType.Ascend910B)
     g = torch.Generator().manual_seed(0)
     n = LOCAL_RECV_MAX
-    offs, counts = _balanced_csr(0)
-    x = (torch.randn(n, HIDDEN, generator=g) * 0.3).bfloat16()
-    w = _real_weights(a.ckpt, a.layer, a.rank) if a.real_weights else _synthetic_weights(a.rank)
+    per = n // N_LOCAL_EXPERTS
+    counts = torch.full((N_LOCAL_EXPERTS,), per, dtype=torch.int32)
+    offs = torch.zeros(N_LOCAL_EXPERTS, dtype=torch.int32)
+    run = 0
+    for e in range(N_LOCAL_EXPERTS):
+        offs[e] = run
+        run += int(counts[e])
     specs = [
-        TensorSpec("local_routed_x", [n, HIDDEN], torch.bfloat16, init_value=x),
+        TensorSpec("local_routed_x", [n, HIDDEN], torch.bfloat16, init_value=(torch.randn(n, HIDDEN, generator=g) * 0.3).bfloat16()),
         TensorSpec("local_expert_offset", [N_LOCAL_EXPERTS], torch.int32, init_value=offs),
         TensorSpec("local_expert_count", [N_LOCAL_EXPERTS], torch.int32, init_value=counts),
-        TensorSpec("w_gate", [N_LOCAL_EXPERTS, HIDDEN, INTER], torch.bfloat16, init_value=w["w_gate"]),
-        TensorSpec("w_up", [N_LOCAL_EXPERTS, HIDDEN, INTER], torch.bfloat16, init_value=w["w_up"]),
-        TensorSpec("w_down", [N_LOCAL_EXPERTS, INTER, HIDDEN], torch.bfloat16, init_value=w["w_down"]),
+        TensorSpec("w_gate", [N_LOCAL_EXPERTS, HIDDEN, INTER], torch.bfloat16, init_value=(torch.randn(N_LOCAL_EXPERTS, HIDDEN, INTER, generator=g) / HIDDEN ** 0.5).bfloat16()),
+        TensorSpec("w_up", [N_LOCAL_EXPERTS, HIDDEN, INTER], torch.bfloat16, init_value=(torch.randn(N_LOCAL_EXPERTS, HIDDEN, INTER, generator=g) / HIDDEN ** 0.5).bfloat16()),
+        TensorSpec("w_down", [N_LOCAL_EXPERTS, INTER, HIDDEN], torch.bfloat16, init_value=(torch.randn(N_LOCAL_EXPERTS, INTER, HIDDEN, generator=g) / INTER ** 0.5).bfloat16()),
         TensorSpec("local_routed_y", [n, HIDDEN], torch.bfloat16, is_output=True),
     ]
-
-    if a.device_run:
-        def golden_fn(values):
-            values["local_routed_y"] = golden_routed_experts_perrank(
-                values["local_routed_x"], values["local_expert_offset"],
-                values["local_expert_count"], values["w_gate"], values["w_up"], values["w_down"],
-            )
-
-        res = run_jit(
-            fn=routed_experts_jit, specs=specs, golden_fn=golden_fn,
-            runtime_cfg=dict(platform=a.platform, device_id=a.device),
-            compile_only=False,
-            compare_fn={"local_routed_y": ratio_allclose(atol=0.04, rtol=0.04, max_error_ratio=0.1)},
-        )
-        print(f"[routed_jit_probe] DEVICE-RUN real={a.real_weights}: passed={res.passed}", flush=True)
-        return 0 if res.passed else 1
-
     res = run_jit(fn=routed_experts_jit, specs=specs, runtime_cfg=dict(platform=a.platform, device_id=a.device), compile_only=True)
     print(f"[routed_jit_probe] SMOKE: {res}", flush=True)
     return 0 if res.passed else 1

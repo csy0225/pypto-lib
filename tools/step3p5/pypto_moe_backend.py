@@ -132,10 +132,10 @@ class RoutedClient:
         return torch.frombuffer(bytearray(rb), dtype=torch.int16).view(torch.bfloat16).reshape(rows, HIDDEN)
 
 
-def make_apply_mlp(client: RoutedClient, orig, layers: set[int]):
-    """Build the _apply_mlp replacement. Routes only when current_layer() is in *layers*
-    (or, if layer tracking is unavailable and exactly one target layer is configured,
-    routes every MoE call as a single-layer bring-up shortcut)."""
+def make_apply_mlp(client_getter, orig, layers: set[int]):
+    """Build the _apply_mlp replacement. *client_getter* is a 0-arg callable returning a
+    RoutedClient (resolved lazily on first call, when the rank/socket is known). Routes only
+    when current_layer() is in *layers* (or single-layer shortcut when tracking unavailable)."""
 
     single = len(layers) == 1
     only_layer = next(iter(layers)) if single else None
@@ -156,10 +156,27 @@ def make_apply_mlp(client: RoutedClient, orig, layers: set[int]):
             return orig(self, mlp_compute_input)  # chunking TODO -> vanilla fallback
         offsets, counts = _to_csr(mlp_compute_input.group_list, mlp_compute_input.group_list_type)
         xp = x.detach().to("cpu", torch.bfloat16)
-        y = client.routed(layer, xp, offsets, counts)
+        y = client_getter().routed(layer, xp, offsets, counts)
         return y.to(x.device, x.dtype)
 
     return _pypto_apply_mlp
+
+
+def _resolve_rank() -> int:
+    """Rank of this worker process. Env is set at spawn; torch.distributed is a fallback once
+    initialized (first forward). Called lazily so both are available."""
+    import os
+    for k in ("LOCAL_RANK", "RANK", "VLLM_DP_RANK"):
+        v = os.environ.get(k)
+        if v is not None and v != "":
+            return int(v)
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return 0
 
 
 def _install_layer_tracking(layers):
@@ -201,17 +218,27 @@ def install():  # pragma: no cover - runs inside vLLM engine
 
     if os.environ.get("PYPTO_MOE") != "1":
         return
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-    sock = os.environ.get("PYPTO_MOE_SOCK", f"/tmp/routed_r{rank}.sock")
+    sock_dir = os.environ.get("PYPTO_MOE_SOCK_DIR", "/tmp")
+    fixed_sock = os.environ.get("PYPTO_MOE_SOCK")  # optional override (single-rank)
     layers = {int(x) for x in os.environ.get("PYPTO_MOE_LAYERS", "3").split(",") if x != ""}
     import vllm_ascend.ops.fused_moe.moe_comm_method as mcm
 
     orig = mcm.MoECommMethod._apply_mlp
-    client = RoutedClient(sock)
-    routed_fn = make_apply_mlp(client, orig, layers)
-    mcm.MoECommMethod._apply_mlp = routed_fn
+    _holder = {}
+
+    def _client_getter():
+        c = _holder.get("c")
+        if c is None:
+            rank = _resolve_rank()
+            sp = fixed_sock or os.path.join(sock_dir, f"routed_r{rank}.sock")
+            c = RoutedClient(sp)
+            _holder["c"] = c
+            print(f"[pypto_moe_backend] rank={rank} routed sock={sp}", flush=True)
+        return c
+
+    mcm.MoECommMethod._apply_mlp = make_apply_mlp(_client_getter, orig, layers)
     _install_layer_tracking(layers)
-    print(f"[pypto_moe_backend] installed: sock={sock} layers={layers} rank={rank}", flush=True)
+    print(f"[pypto_moe_backend] installed: sock_dir={sock_dir} layers={layers}", flush=True)
 
 
 def _selftest(sock_path: str, ckpt: str, layer: int, rank: int) -> int:
@@ -234,7 +261,7 @@ def _selftest(sock_path: str, ckpt: str, layer: int, rank: int) -> int:
     assert torch.equal(offs, offs_ref) and torch.equal(counts, counts_ref), "CSR conv mismatch"
 
     client = RoutedClient(sock_path)
-    fn = make_apply_mlp(client, orig=lambda s, m: None, layers={layer})
+    fn = make_apply_mlp(lambda: client, orig=lambda s, m: None, layers={layer})
     set_current_layer(layer)
     mlp_in = types.SimpleNamespace(hidden_states=x, group_list=counts_ref.clone(), group_list_type=1)
     y = fn(None, mlp_in)  # [num_recv, HIDDEN]

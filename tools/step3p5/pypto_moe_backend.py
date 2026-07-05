@@ -1,26 +1,30 @@
 """vLLM-Ascend MoE routed-expert backend hook (pypto).
 
 Monkey-patches `MoECommMethod._apply_mlp` (vllm_ascend/ops/fused_moe/moe_comm_method.py)
-to route the per-rank post-dispatch grouped-GEMM to the pypto RoutedExperts worker
-(vllm_routed_experts.py `_serve`) instead of vanilla `unified_apply_mlp`.
+to route the per-rank post-dispatch grouped-GEMM to the co-resident pypto routed worker
+(tools/step3p5/pypto_mlp_worker.py `op=routed`) instead of vanilla `unified_apply_mlp`.
+
+Wire protocol matches pypto_mlp_worker.py (co-resident @pl.jit worker, no @pl.program
+co-tenancy): BE 4-byte header_len | json header (op/rows/layer/offsets/counts/nbytes) | body
+(int16-reinterpreted bf16). Response = BE 4-byte payload_len | raw int16(bf16) bytes.
 
 Seam contract (verified against running container source, 2026-07-05):
   input  MoEMlpComputeInput: .hidden_states [num_recv, HIDDEN] BF16 (sorted-by-local-expert),
          .group_list [N_LOCAL_EXPERTS] (counts if group_list_type==1 else cumsum), .group_list_type
   output torch.Tensor [num_recv, HIDDEN] BF16 -> token_combine
 
-The worker holds dequantized-BF16 W8A8 experts for a layer; we intercept at the BF16
-hidden entry (dynamic_scale is None) = the W8A8 reference-precision path the offline
-golden matched (bad_ratio=0.0000).
+We intercept at the BF16 hidden entry (dynamic_scale None) = the W8A8 reference-precision path
+the offline golden matched (bad_ratio=0.0000).
 
 Env / install:
   PYPTO_MOE=1                          enable
-  PYPTO_MOE_SOCK=/tmp/routed_r{rank}.sock  worker socket (per rank)
-  PYPTO_MOE_LAYERS=3                   which layer_idx to route (single-layer bring-up)
-Call install() from a sitecustomize (like pypto_attn_backend.py).
+  PYPTO_MOE_SOCK=/tmp/routed_r{rank}.sock  co-resident worker socket (per rank)
+  PYPTO_MOE_LAYERS=3                   MoE layer_idx values to route (others stay vanilla)
+Call install() from a sitecustomize (like pypto_attn_backend.py). install() also patches
+FusedMoE.forward to track the current layer_idx (so only PYPTO_MOE_LAYERS route).
 
-Self-test (needs a running worker + real ckpt, no vLLM):
-  python -m tools.step3p5.pypto_moe_backend --selftest --sock /tmp/routed_test.sock
+Self-test (needs a running pypto_mlp_worker --routed-layers L, no vLLM):
+  python -m tools.step3p5.pypto_moe_backend --selftest --sock /tmp/mlpw_routed.sock --layer 3
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ import json
 import socket
 import struct
 import sys
+import threading
 from pathlib import Path
 
 import torch
@@ -39,7 +44,18 @@ if str(_REPO) not in sys.path:
 
 from models.step3p5.vllm_routed_experts import HIDDEN, LOCAL_RECV_MAX, N_LOCAL_EXPERTS  # noqa: E402
 
-_HDR = struct.Struct("<I")
+_HDR = struct.Struct(">I")  # big-endian, matches pypto_mlp_worker.py
+
+# --- current-layer tracking (so only target MoE layers route) ---
+_TL = threading.local()
+
+
+def set_current_layer(idx):
+    _TL.layer = idx
+
+
+def current_layer():
+    return getattr(_TL, "layer", None)
 
 
 def _to_csr(group_list: torch.Tensor, group_list_type: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -63,7 +79,7 @@ def _to_csr(group_list: torch.Tensor, group_list_type: int) -> tuple[torch.Tenso
 
 
 class RoutedClient:
-    """UDS client to a vllm_routed_experts `_serve` worker."""
+    """UDS client to a co-resident pypto_mlp_worker `routed` op (BE / nbytes protocol)."""
 
     def __init__(self, sock_path: str):
         self.sock_path = sock_path
@@ -86,49 +102,92 @@ class RoutedClient:
             b += c
         return b
 
-    def _round(self, header, body=b""):
+    def _send(self, header, body=b""):
         conn = self._connect()
         header = dict(header)
-        header["body_len"] = len(body)
+        header["nbytes"] = len(body)
         hb = json.dumps(header).encode()
         conn.sendall(_HDR.pack(len(hb)) + hb + body)
-        (hlen,) = _HDR.unpack(self._recvn(conn, 4))
-        h = json.loads(self._recvn(conn, hlen).decode())
-        rb = self._recvn(conn, h.get("body_len", 0)) if h.get("body_len") else b""
-        return h, rb
 
-    def routed(self, x_bf16: torch.Tensor, offsets: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        """x_bf16 [LOCAL_RECV_MAX, HIDDEN] on CPU -> y [LOCAL_RECV_MAX, HIDDEN] bf16."""
-        body = x_bf16.contiguous().view(torch.uint16).numpy().tobytes()
-        h, rb = self._round(
-            {"op": "routed", "offsets": offsets.tolist(), "counts": counts.tolist()}, body
-        )
-        if not h.get("ok"):
-            raise RuntimeError(f"worker error: {h}")
-        return torch.frombuffer(bytearray(rb), dtype=torch.uint16).view(torch.bfloat16).reshape(
-            LOCAL_RECV_MAX, HIDDEN
-        )
+    def _recv_payload(self):
+        conn = self._connect()
+        (plen,) = _HDR.unpack(self._recvn(conn, 4))
+        return self._recvn(conn, plen)
+
+    def routed(self, layer: int, x_bf16: torch.Tensor, offsets: torch.Tensor,
+               counts: torch.Tensor) -> torch.Tensor:
+        """x_bf16 [rows, HIDDEN] on CPU (rows<=LOCAL_RECV_MAX) -> y [rows, HIDDEN] bf16.
+        Worker pads to LOCAL_RECV_MAX internally; offsets/counts describe the CSR."""
+        rows = x_bf16.shape[0]
+        body = x_bf16.contiguous().view(torch.int16).view(-1).numpy().tobytes()
+        self._send({"op": "routed", "rows": rows, "layer": layer,
+                    "offsets": offsets.tolist(), "counts": counts.tolist()}, body)
+        rb = self._recv_payload()
+        return torch.frombuffer(bytearray(rb), dtype=torch.int16).view(torch.bfloat16).reshape(rows, HIDDEN)
 
 
-def make_apply_mlp(client: RoutedClient, orig):
-    """Build the _apply_mlp replacement bound to a worker client.
+def make_apply_mlp(client: RoutedClient, orig, layers: set[int]):
+    """Build the _apply_mlp replacement. Routes only when current_layer() is in *layers*
+    (or, if layer tracking is unavailable and exactly one target layer is configured,
+    routes every MoE call as a single-layer bring-up shortcut)."""
 
-    layer targeting is left to the caller (install() decides when to route); this fn
-    always routes when called.
-    """
+    single = len(layers) == 1
+    only_layer = next(iter(layers)) if single else None
 
     def _pypto_apply_mlp(self, mlp_compute_input):
+        cur = current_layer()
+        if cur is not None:
+            if cur not in layers:
+                return orig(self, mlp_compute_input)
+            layer = cur
+        elif single:
+            layer = only_layer  # bring-up shortcut: no tracking, single target layer
+        else:
+            return orig(self, mlp_compute_input)
         x = mlp_compute_input.hidden_states
         num_recv = x.shape[0]
         if num_recv > LOCAL_RECV_MAX:
             return orig(self, mlp_compute_input)  # chunking TODO -> vanilla fallback
         offsets, counts = _to_csr(mlp_compute_input.group_list, mlp_compute_input.group_list_type)
-        xp = torch.zeros(LOCAL_RECV_MAX, HIDDEN, dtype=torch.bfloat16)
-        xp[:num_recv] = x.detach().to("cpu", torch.bfloat16)
-        y = client.routed(xp, offsets, counts)
-        return y[:num_recv].to(x.device, x.dtype)
+        xp = x.detach().to("cpu", torch.bfloat16)
+        y = client.routed(layer, xp, offsets, counts)
+        return y.to(x.device, x.dtype)
 
     return _pypto_apply_mlp
+
+
+def _install_layer_tracking(layers):
+    """Best-effort: wrap FusedMoE.forward to publish self.layer_idx into the threadlocal
+    so _apply_mlp knows which layer it is serving. Guarded — if the attribute/class differ
+    in this vLLM build, single-layer bring-up still works via the shortcut."""
+    try:
+        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE as _FM  # type: ignore
+    except Exception:
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE as _FM  # type: ignore
+        except Exception:
+            print("[pypto_moe_backend] layer tracking unavailable (FusedMoE import failed)", flush=True)
+            return
+    if getattr(_FM, "_pypto_layer_wrapped", False):
+        return
+    _orig_fwd = _FM.forward
+
+    def _tracked_forward(self, *a, **k):
+        li = getattr(self, "layer_idx", None)
+        if li is None:
+            pfx = getattr(self, "prefix", "")
+            for tok in str(pfx).split("."):
+                if tok.isdigit():
+                    li = int(tok); break
+        set_current_layer(li)
+        try:
+            return _orig_fwd(self, *a, **k)
+        finally:
+            set_current_layer(None)
+
+    _FM.forward = _tracked_forward
+    _FM._pypto_layer_wrapped = True
+    print("[pypto_moe_backend] FusedMoE.forward layer-tracking installed", flush=True)
 
 
 def install():  # pragma: no cover - runs inside vLLM engine
@@ -143,22 +202,15 @@ def install():  # pragma: no cover - runs inside vLLM engine
 
     orig = mcm.MoECommMethod._apply_mlp
     client = RoutedClient(sock)
-    routed_fn = make_apply_mlp(client, orig)
-
-    def _dispatch(self, mlp_compute_input):
-        # NOTE: layer_idx is not on mlp_compute_input; single-layer bring-up routes every
-        # MoE call. For multi-layer, inject layer_idx via a FusedMoE.forward counter/threadlocal.
-        return routed_fn(self, mlp_compute_input)
-
-    mcm.MoECommMethod._apply_mlp = _dispatch
+    routed_fn = make_apply_mlp(client, orig, layers)
+    mcm.MoECommMethod._apply_mlp = routed_fn
+    _install_layer_tracking(layers)
     print(f"[pypto_moe_backend] installed: sock={sock} layers={layers} rank={rank}", flush=True)
 
 
 def _selftest(sock_path: str, ckpt: str, layer: int, rank: int) -> int:
     """Exercise _to_csr + RoutedClient + _pypto_apply_mlp against the torch golden.
-
-    Needs a running vllm_routed_experts `_serve` worker at sock_path.
-    """
+    Needs a running pypto_mlp_worker --routed-layers <layer> at sock_path."""
     import types
 
     from models.step3p5.vllm_routed_experts import (
@@ -172,22 +224,22 @@ def _selftest(sock_path: str, ckpt: str, layer: int, rank: int) -> int:
     num_recv = int(counts_ref.sum().item())  # 1024 balanced
     x = (torch.randn(num_recv, HIDDEN, generator=g) * 0.3).bfloat16()
 
-    # sanity: our _to_csr reproduces the balanced CSR from counts (group_list_type=1)
     offs, counts = _to_csr(counts_ref.clone(), 1)
     assert torch.equal(offs, offs_ref) and torch.equal(counts, counts_ref), "CSR conv mismatch"
 
     client = RoutedClient(sock_path)
-    fn = make_apply_mlp(client, orig=lambda s, m: None)
+    fn = make_apply_mlp(client, orig=lambda s, m: None, layers={layer})
+    set_current_layer(layer)
     mlp_in = types.SimpleNamespace(hidden_states=x, group_list=counts_ref.clone(), group_list_type=1)
     y = fn(None, mlp_in)  # [num_recv, HIDDEN]
+    set_current_layer(None)
 
     w = _real_weights(ckpt, layer, rank)
     x_full = torch.zeros(LOCAL_RECV_MAX, HIDDEN, dtype=torch.bfloat16)
     x_full[:num_recv] = x
-    golden_full = golden_routed_experts_perrank(
+    golden = golden_routed_experts_perrank(
         x_full, offs_ref, counts_ref, w["w_gate"], w["w_up"], w["w_down"]
-    )
-    golden = golden_full[:num_recv]
+    )[:num_recv]
     diff = (y.float() - golden.float()).abs()
     bad = (diff > 0.05).float().mean().item()
     print(
@@ -202,7 +254,7 @@ def _selftest(sock_path: str, ckpt: str, layer: int, rank: int) -> int:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--selftest", action="store_true")
-    p.add_argument("--sock", default="/tmp/routed_test.sock")
+    p.add_argument("--sock", default="/tmp/mlpw_routed.sock")
     p.add_argument("--ckpt", default="/data/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp")
     p.add_argument("--layer", type=int, default=3)
     p.add_argument("--rank", type=int, default=0)

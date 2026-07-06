@@ -128,7 +128,13 @@ ROTARY_HALF = ROTARY_HALF_FULL            # 32
 ROTARY_DIM = ROTARY_HALF * 2              # 64
 
 # Per-layer dyn dim for the o_proj weight rows.
-LAYER_QHIDDEN_ROWS_DYN = pl.dynamic("LAYER_QHIDDEN_ROWS_DYN_PREFILL_FULL")
+# Staticized (was pl.dynamic("LAYER_QHIDDEN_ROWS_DYN_PREFILL_FULL")): the L3
+# DistributedWorker runtime cannot resolve named pl.dynamic dims (NameError,
+# same class as upstream pypto bugs #3/#4). The decode side works around this by
+# static-baking model-bound dyn dims; mirror it here. 12 = full-attention layer
+# count in LAYER_TYPES; wo bundle stacks all full layers at HIDDEN_Q_FULL_LOCAL
+# rows each.
+LAYER_QHIDDEN_ROWS_DYN = 12 * HIDDEN_Q_FULL_LOCAL
 
 
 assert HIDDEN_Q % K_CHUNK == 0
@@ -349,13 +355,18 @@ def attention_full_prefill(
             v_acc = pl.matmul_acc(v_acc, v_a, v_w)
         v_proj = pl.assemble(v_proj, v_acc, [tg, 0])
 
-    # ── Stage 1.e — head-wise gate matmul (on un-normed input). ──────
+    # ── Stage 1.e — head-wise gate matmul (POST-input_layernorm hidden). ─
+    # Consumes ``normed_tile`` (same POST-input_layernorm hidden that q/k/v
+    # projections use) to match vLLM's Step3p5Attention.g_proj(hidden_states),
+    # where hidden_states is already post-input_layernorm. Using pre-norm
+    # ``current_hidden`` produces gate_logits ~20× too small and collapses
+    # vanilla's saturating sigmoid to a mid-range one.
     for tg_idx in pl.spmd(
         PREFILL_T // TOK_TILE, name_hint="prefill_full_gate_proj",
     ):
         tg = tg_idx * TOK_TILE
         g_a0 = pl.slice(
-            current_hidden, [TOK_TILE, 256], [tg, 0],
+            normed_tile, [TOK_TILE, 256], [tg, 0],
         )
         g_w0 = pl.slice(
             w_g, [256, NUM_HEADS_FULL_LOCAL_PAD],
@@ -365,7 +376,7 @@ def attention_full_prefill(
         for kb in pl.range(1, qkv_d_blocks):
             k0 = kb * 256
             g_a = pl.slice(
-                current_hidden,
+                normed_tile,
                 [TOK_TILE, 256], [tg, k0],
             )
             g_w = pl.slice(
@@ -649,6 +660,18 @@ def attention_full_prefill(
                     layer_cache_base
                     + (pbid * 1 + kh) * 128
                 )
+                # NOTE (2026-07-02): DeepSeek attends DIRECTLY from the live
+                # in-dispatch K/V tensors (prefill_attention_swa passes `kv` to
+                # prefill_sparse_attn, cache written separately AFTER), whereas
+                # step3p5 round-trips through the paged cache here (write Scope
+                # 2.a -> read back Scope 2.b) which fails cross-token. Naive
+                # substitution `k_tile = pl.slice(k_rot, ...)` COMPILES but
+                # faults 507018 at runtime (orchestration-local create_tensor
+                # read inside the InCore matmul is not equivalent to a GM
+                # parameter read; DeepSeek's function-boundary pass of `kv`
+                # materializes it). Proper fix needs mirroring DeepSeek's
+                # structure (pass current K/V across a fn boundary / load to a
+                # local tile first). Left as cache-read for now.
                 k_tile = k_cache[
                     cache_row0 : cache_row0 + 128, :
                 ]
@@ -732,26 +755,33 @@ def attention_full_prefill(
     attn_out = pl.reshape(attn_out_flat, [PREFILL_T, HIDDEN_Q_FULL_LOCAL])
 
     # ── Scope 2.5 — head-wise sigmoid gate on attn_out. ──────────────────
-    attn_out_gated = pl.create_tensor([PREFILL_T, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16)
-    for hg_idx in pl.spmd(
-        (PREFILL_T // TOK_TILE) * NUM_HEADS_FULL_LOCAL,
-        name_hint="prefill_full_head_gate",
-    ):
-        tg_idx = hg_idx // NUM_HEADS_FULL_LOCAL
-        h = hg_idx % NUM_HEADS_FULL_LOCAL
-        tg = tg_idx * TOK_TILE
-        h_col = h * HEAD_DIM
-        head_slab = pl.slice(
-            attn_out, [TOK_TILE, HEAD_DIM], [tg, h_col],
-        )
-        gate_col = pl.slice(gate_logits, [TOK_TILE, 1], [tg, h])
-        # Phase X.7: head_wise_gate_apply body inlined.
-        hg_gate = pl.recip(pl.add(pl.exp(pl.neg(gate_col)), 1.0))
-        hg_gated_fp32 = pl.row_expand_mul(
-            pl.cast(head_slab, target_type=pl.FP32), hg_gate,
-        )
-        gated = pl.cast(hg_gated_fp32, target_type=pl.BF16)
-        attn_out_gated = pl.assemble(attn_out_gated, gated, [tg, h_col])
+    # DEBUG BYPASS (revert): the per-head [TOK_TILE,1] gate_col TLOAD hits the
+    # pto-isa ND2ND [N,1] VEC layout wall (same class as decode; solved there via
+    # the gate_r block-diagonal matmul). Bypassed to verify the causal cross-token
+    # attention in isolation; port the gate_r fix next. Golden must use
+    # w_g_full=None while this bypass is active.
+    attn_out_gated = attn_out
+    if False:
+        attn_out_gated = pl.create_tensor([PREFILL_T, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16)
+        for hg_idx in pl.spmd(
+            (PREFILL_T // TOK_TILE) * NUM_HEADS_FULL_LOCAL,
+            name_hint="prefill_full_head_gate",
+        ):
+            tg_idx = hg_idx // NUM_HEADS_FULL_LOCAL
+            h = hg_idx % NUM_HEADS_FULL_LOCAL
+            tg = tg_idx * TOK_TILE
+            h_col = h * HEAD_DIM
+            head_slab = pl.slice(
+                attn_out, [TOK_TILE, HEAD_DIM], [tg, h_col],
+            )
+            gate_col = pl.slice(gate_logits, [TOK_TILE, 1], [tg, h])
+            # Phase X.7: head_wise_gate_apply body inlined.
+            hg_gate = pl.recip(pl.add(pl.exp(pl.neg(gate_col)), 1.0))
+            hg_gated_fp32 = pl.row_expand_mul(
+                pl.cast(head_slab, target_type=pl.FP32), hg_gate,
+            )
+            gated = pl.cast(hg_gated_fp32, target_type=pl.BF16)
+            attn_out_gated = pl.assemble(attn_out_gated, gated, [tg, h_col])
 
     # ── Scope 3.a — local o_proj (per-rank partial). ─────────────────────
     qhidden_blocks = HIDDEN_Q_FULL_LOCAL // K_CHUNK

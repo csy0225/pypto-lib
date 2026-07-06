@@ -51,7 +51,7 @@ def rms_lm_head_test(
         pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
     ],
 ):
-    rms_lm_head(
+    logits_shard_out = rms_lm_head(
         hidden_states, final_norm_weight, lm_head_weight,
         seq_lens, logits_shard_out,
     )

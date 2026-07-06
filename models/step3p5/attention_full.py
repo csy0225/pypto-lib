@@ -184,6 +184,7 @@ def attention_full(
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_FULL_LOCAL_PAD], pl.BF16],
+    gate_r: pl.Tensor[[NUM_HEADS_FULL_LOCAL_PAD, HIDDEN_Q_FULL_LOCAL], pl.BF16],
     resid1_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[
@@ -221,7 +222,6 @@ def attention_full(
     q_proj_norm = pl.create_tensor([BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.FP32)
     k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN_LOCAL], dtype=pl.FP32)
     normed_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    gate_logits = pl.create_tensor([BATCH, NUM_HEADS_FULL_LOCAL_PAD], dtype=pl.FP32)
 
     # ----- Scope 1.a — zero-centred input RMSNorm. -----
     # input_rms_weight is replicated across TP ranks (HIDDEN dim is not
@@ -261,6 +261,19 @@ def attention_full(
             normed_all = pl.assemble(
                 normed_all, pl.cast(normed, target_type=pl.BF16), [0, norm_k0],
             )
+
+    # ----- Scope 1.f REMOVED — head-gate is now precomputed worker-side. -----
+    # The on-device gate_logits matmul (normed_all @ w_g, output N=16) hit a
+    # pypto matmul_acc codegen bug: it dropped the K-accumulation, so gate_logits
+    # came out ~20x too small (dumped rank-5 -0.6 vs correct -13.8), sigmoid never
+    # saturated, the gate never suppressed, and rank-5's hot heads blew up ~40x.
+    # matmul+add won't compile (matmul dst must be acc space) and reordering
+    # didn't help. The worker now precomputes the full multiplier
+    # gate_exp = expand_per_head(sigmoid(RMSNorm(current_hidden) @ w_g))
+    # [BATCH, HIDDEN_Q_FULL_LOCAL] FP32 and passes it through the ``gate_r`` param
+    # slot (BATCH == NUM_HEADS_FULL_LOCAL_PAD == 16, so no shape change). The
+    # o_proj scope below multiplies attn_out by gate_r directly. w_g stays in the
+    # signature (worker still sends it) but is now unused by the kernel.
 
     # ----- Scope 1.b — Q projection. -----
     # wq is row-sliced (output dim → HIDDEN_Q_FULL_LOCAL per rank), so the
@@ -365,22 +378,13 @@ def attention_full(
         k_normed = pl.col_expand_mul(k_scaled, pl.add(k_gamma, 1.0))
         k_proj_norm = pl.assemble(k_proj_norm, k_normed, [qkn_b0, qkn_k0])
 
-    # ----- Scope 1.f — head-wise gate matmul (current_hidden, NOT normed). -----
-    # w_g is row-sliced (output dim → NUM_HEADS_FULL_LOCAL = 8 per rank);
-    # gate_logits has the per-rank local heads only.
-    for gp_spmd_idx in pl.spmd(BATCH // BATCH_TILE, name_hint="full_gate_proj"):
-        gp_b0 = gp_spmd_idx * BATCH_TILE
-        gp_a_0 = pl.slice(current_hidden, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [gp_b0, 0])
-        gp_b_0 = pl.slice(w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_FULL_LOCAL_PAD], [layer_hidden_base, 0])
-        gp_acc = pl.matmul(gp_a_0, gp_b_0, out_dtype=pl.FP32)
-        for kb in pl.range(1, decode_scope1_hidden_blocks):
-            gp_k0 = kb * INPUT_PROJ_K_CHUNK
-            gp_a = pl.slice(current_hidden, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [gp_b0, gp_k0])
-            gp_b = pl.slice(
-                w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_FULL_LOCAL_PAD], [layer_hidden_base + gp_k0, 0],
-            )
-            gp_acc = pl.matmul_acc(gp_acc, gp_a, gp_b)
-        gate_logits = pl.assemble(gate_logits, gp_acc, [gp_b0, 0])
+    # ----- Scope 1.f — head-wise gate matmul: MOVED UP to run immediately after
+    # Scope 1.a (normed_all build), before q/k/v proj + q_norm/k_norm. Empirically
+    # the gate matmul here (last consumer of normed_all) read a stale/reused
+    # normed_all buffer — kernel gate_logits came out ~20x too small (pre-norm
+    # magnitude, varying per-head), so sigmoid never saturated and the gate never
+    # suppressed (rank-5 hot-head ~40x blow-up). Running it first, while normed_all
+    # is freshly live, fixes the value. See the block right after Scope 1.a.
 
     # ----- Scope 2 — partial RoPE + paged KV cache write + fa_fused. -----
     # k_cache / v_cache hold KV_HEADS_LOCAL = 1 KV head's history per rank,
@@ -465,37 +469,44 @@ def attention_full(
                     [cache_row, 0],
                 )
 
+                # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_FULL] slices of
+                # q_proj_norm, mirroring the K path above. This replaces the
+                # earlier reshape(q_proj_norm -> [Q_HEAD_BATCH_FULL, HEAD_DIM])
+                # + [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL] col-offset slice, which
+                # miscompiled the rot_q_hi (cols ROTARY_HALF_FULL..ROTARY_DIM)
+                # write into all_q_padded -> wrong q.k scores for ctx>1 (invisible
+                # at ctx=1 since output=V). Verified via _stage_scope12_qk.py:
+                # per-rank crossrow scores bad_ratio 0.25/0.90 -> ~0.
                 q_base = ki * Q_PER_KV_FULL
-                q_block = pl.reshape(
-                    pl.slice(
-                        q_proj_norm, [1, Q_HEAD_BATCH_FULL * HEAD_DIM],
-                        [b, q_base * HEAD_DIM],
-                    ),
-                    [Q_HEAD_BATCH_FULL, HEAD_DIM],
-                )
-                q_lo = pl.slice(q_block, [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL], [0, 0])
-                q_hi = pl.slice(q_block, [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL], [0, ROTARY_HALF_FULL])
-                rot_q_lo = pl.sub(
-                    pl.col_expand_mul(q_lo, cos_lo),
-                    pl.col_expand_mul(q_hi, sin_lo),
-                )
-                rot_q_hi = pl.add(
-                    pl.col_expand_mul(q_hi, cos_hi),
-                    pl.col_expand_mul(q_lo, sin_hi),
-                )
-                # Cast inline at each store site. This keeps the generated VEC
-                # schedule identical to the passing minimal RoPE repro: full
-                # q_block cast/store first, then the two RoPE half overwrites.
                 pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL + ki * Q_HEAD_PAD_FULL
-                all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(q_block, target_type=pl.BF16), [pad_row_base, 0],
-                )
-                all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(rot_q_lo, target_type=pl.BF16), [pad_row_base, 0],
-                )
-                all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(rot_q_hi, target_type=pl.BF16), [pad_row_base, ROTARY_HALF_FULL],
-                )
+                for qh in pl.range(Q_HEAD_BATCH_FULL):
+                    qh_col = (q_base + qh) * HEAD_DIM
+                    q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col])
+                    q_hi_h = pl.slice(
+                        q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col + ROTARY_HALF_FULL],
+                    )
+                    rot_q_lo_h = pl.sub(
+                        pl.col_expand_mul(q_lo_h, cos_lo),
+                        pl.col_expand_mul(q_hi_h, sin_lo),
+                    )
+                    rot_q_hi_h = pl.add(
+                        pl.col_expand_mul(q_hi_h, cos_hi),
+                        pl.col_expand_mul(q_lo_h, sin_hi),
+                    )
+                    q_row = pad_row_base + qh
+                    all_q_padded = pl.assemble(
+                        all_q_padded,
+                        pl.cast(pl.slice(q_proj_norm, [1, HEAD_DIM], [b, qh_col]),
+                                target_type=pl.BF16),
+                        [q_row, 0],
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
+                        [q_row, ROTARY_HALF_FULL],
+                    )
                 all_q_padded = pl.assemble(
                     all_q_padded,
                     pl.cast(
@@ -687,21 +698,46 @@ def attention_full(
     #   - Upstream issue: pto-isa AIV path needs to either widen the
     #     ``row_expand_mul`` right operand to ≥ 32 B/row or add a
     #     dedicated scalar-broadcast VEC instruction.
-    attn_out_gated = attn_out
-
-    # ----- Scope 3.a — local o_proj (partial result, no residual yet). -----
-    # wo is column-sliced (input dim → HIDDEN_Q_FULL_LOCAL per rank); the
-    # output is a partial [BATCH, HIDDEN] BF16 tensor that must be summed
-    # across the TP group via the all-reduce below before the residual add.
+    # ----- Scope 2.5 — head-wise sigmoid gate (local heads only). -----
+    # Phase 15 BYPASS (still active): identity pass-through.
     #
-    # Phase A (2026-06-11): split the previously-mixed AIC+AIV body into two
-    # sequential spmds. The original form had cube matmul → vec cast → GM
-    # store all inside one `pl.spmd(... name_hint="full_out_proj")` scope,
-    # which PTOAS lowered to a `MixedKernels` dispatch (`mixed_12` in
-    # chip_orch.cpp). That kernel = ``aicore_kernel_0_mix_aic`` — the first
-    # mixed AIC+AIV root in the program — was the deterministic 507018
-    # crash site (VEC UB not-aligned, plog `hash=15033215677169261682`).
-    # Splitting to pure-cube + pure-vec removes the mixed-mode dispatch.
+    # 2026-06-30 attempt: ported prefill_attention_full.py's inlined gate
+    # (per-head `pl.slice(gate_logits, [BATCH_TILE, 1])` + `row_expand_mul`)
+    # here, but it FAILS TO COMPILE in the decode kernel:
+    #   pto-isa TLOAD assert in full_head_gate.cpp:
+    #   "TLOAD(VecTile, GlobalTensor) only support ND2ND/DN2DN/NZ2NZ"
+    # The strided [BATCH_TILE, 1] column load from the [BATCH,
+    # NUM_HEADS_FULL_LOCAL_PAD] FP32 GM tensor violates the layout rule (the
+    # exact pitfall _ops.head_wise_gate_apply's docstring §1/§2 warns about).
+    # Prefill's identical pattern compiles only under its own tiling/layout.
+    #
+    # Proper fix (TASK-30 / pypto task #7): pre-expand sigmoid(gate_logits) to
+    # [BATCH, HIDDEN_Q_FULL_LOCAL] via a cube matmul against a constant
+    # block-diag replication matrix R[NUM_HEADS_FULL_LOCAL, HIDDEN_Q_FULL_LOCAL]
+    # (R[h, h*HEAD_DIM:(h+1)*HEAD_DIM]=1), then a single wide element-wise
+    # `pl.mul` (32-B aligned, no [N,1] broadcast). R is a host-built kernel
+    # weight -> needs kernel signature + weight_loader changes. Scoped separately.
+    #
+    # IMPACT: real step3p5 applies gate=sigmoid(current_hidden@w_g) per head
+    # (config.use_head_wise_attn_gate=True); the bypass = ×1, so live layer-0
+    # pypto attn matches the model's FIRST token then diverges. Decode is
+    # numerically correct ONLY once this gate lands.
+    # ---- gate landed (R-matrix expand): sigmoid(gate_logits) @ gate_r ----
+    # gate_r [NH_PAD, HIDDEN_Q_LOCAL] = block-diag ones (padded rows zero), so
+    # gate_exp[b, h*HEAD_DIM + d] = sigmoid(gate_logits[b, h]). Wide elementwise
+    # multiply — no [BATCH_TILE,1] strided column load (avoids the TLOAD fault).
+    # ----- Head-gate multiplier is the ``gate_r`` input param now. -----
+    # The worker precomputes gate_exp = expand_per_head(sigmoid(RMSNorm(
+    # current_hidden) @ w_g)) as [BATCH, HIDDEN_Q_FULL_LOCAL] BF16 and passes it
+    # through the ``gate_r`` slot (BATCH == NUM_HEADS_FULL_LOCAL_PAD == 16, so the
+    # [16, HIDDEN_Q_FULL_LOCAL] slot fits with no shape change). The on-device
+    # gate_logits matmul + sigmoid + block-diag expand are removed (the N=16
+    # matmul_acc mis-accumulated). o_proj below reads gate_r directly as gate_exp.
+
+    # ----- Scope 3.a — local o_proj with inline head-gate (element-wise). -----
+    # Per (batch_tile, out_chunk): slice gate_r (=gate_exp) per K-chunk, multiply
+    # attn_out * gate_exp inline (VEC, not a cube RHS → no L0 overflow), then
+    # matmul with wo. No intermediate attn_out_gated tensor → no alias.
     partial_attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
         for ob in pl.spmd(
@@ -709,14 +745,33 @@ def attention_full(
             optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
         ):
             o0 = ob * OUT_PROJ_N_CHUNK
-            a_chunk_0 = pl.slice(attn_out_gated, [BATCH_TILE, K_CHUNK], [b0, 0])
+            # First K-chunk (kb=0). Gate applied inline via gate_r (=gate_exp).
+            hg_exp_0 = pl.cast(
+                pl.slice(gate_r, [BATCH_TILE, K_CHUNK], [b0, 0]), target_type=pl.FP32,
+            )
+            a_chunk_raw_0 = pl.slice(
+                attn_out, [BATCH_TILE, K_CHUNK], [b0, 0],
+            )
+            a_gated_fp32_0 = pl.mul(
+                pl.cast(a_chunk_raw_0, target_type=pl.FP32), hg_exp_0,
+            )
+            a_chunk_0 = pl.cast(a_gated_fp32_0, target_type=pl.BF16)
             w_chunk_0 = pl.slice(
                 wo, [K_CHUNK, OUT_PROJ_N_CHUNK], [layer_qhidden_base, o0],
             )
             o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
             for kb in pl.range(1, qhidden_blocks):
                 k0 = kb * K_CHUNK
-                a_chunk = pl.slice(attn_out_gated, [BATCH_TILE, K_CHUNK], [b0, k0])
+                hg_exp = pl.cast(
+                    pl.slice(gate_r, [BATCH_TILE, K_CHUNK], [b0, k0]), target_type=pl.FP32,
+                )
+                a_chunk_raw = pl.slice(
+                    attn_out, [BATCH_TILE, K_CHUNK], [b0, k0],
+                )
+                a_gated_fp32 = pl.mul(
+                    pl.cast(a_chunk_raw, target_type=pl.FP32), hg_exp,
+                )
+                a_chunk = pl.cast(a_gated_fp32, target_type=pl.BF16)
                 w_chunk = pl.slice(
                     wo, [K_CHUNK, OUT_PROJ_N_CHUNK],
                     [layer_qhidden_base + k0, o0],
@@ -883,6 +938,9 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
             wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
             w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS], pl.BF16],
+            gate_r: pl.Tensor[
+                [NUM_HEADS_FULL_LOCAL_PAD, HIDDEN_Q_FULL_LOCAL], pl.BF16
+            ],
             resid1_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
@@ -898,6 +956,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                 rope_cos, rope_sin,
                 k_cache, v_cache,
                 wo, w_g,
+                gate_r,
                 resid1_out,
                 layer_idx,
                 tmp_window,
@@ -929,6 +988,9 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             v_cache: pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
             wo: pl.Tensor[[tp_size, LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
             w_g: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, NUM_HEADS], pl.BF16],
+            gate_r: pl.Tensor[
+                [tp_size, NUM_HEADS_FULL_LOCAL_PAD, HIDDEN_Q_FULL_LOCAL], pl.BF16
+            ],
             resid1_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
             layer_idx: pl.Scalar[pl.INT32],
         ):
@@ -947,6 +1009,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                     rope_cos[r], rope_sin[r],
                     k_cache[r], v_cache[r],
                     wo[r], w_g[r],
+                    gate_r[r],
                     resid1_out[r],
                     tmp_window,
                     signal_window,

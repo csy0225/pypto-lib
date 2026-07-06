@@ -107,6 +107,11 @@ from __future__ import annotations
 
 import pypto.language as pl
 import pypto.language.distributed as pld
+import os as _os
+# Build-time flag: EpTpMoE gate_step takes vLLM fused-router topk (injected
+# via repurposed gate_w) and SKIPS the on-device gate top-k (TSORT32/TMRGSORT
+# hangs on tied logits = PTOAS Blocker 1). Read at import (per fresh process).
+_EPMOE_BYPASS_GATE = _os.environ.get("EPMOE_BYPASS_GATE") == "1"
 
 from .config import (
     BATCH,
@@ -156,7 +161,7 @@ SH_TP_CHUNK = HIDDEN // TP_WORLD_SIZE        # tp_all_reduce per-step chunk
 ROUTER_SCORE_PAD = 512        # next pow-of-two over N_EXPERTS=288
 ROUTER_TOPK_PAD = 16          # 32B-aligned width for the (val, idx) slice
 ROUTER_SORT_PAD = ROUTER_TOPK_PAD * 2  # interleaved (value, index) pair width
-ROUTER_GATE_K_CHUNK = 512     # K-loop step over HIDDEN for the gate matmul
+ROUTER_GATE_K_CHUNK = 256     # K-loop step over HIDDEN for the gate matmul (256: gate_matmul UB fits 188416 for standalone EpTpMoE; 512 overflowed by ~10KB)
 ROUTER_GATE_N_CHUNK = 32      # N-chunk for gate matmul; [K=512,N=32] FP32 = 65536 B (L0B)
 ROUTER_FP32_NEG_INF = -3.4028235e38
 ROUTER_SCALE = MOE_ROUTER_SCALING_FACTOR  # 3.0
@@ -254,100 +259,45 @@ def _build_ep_tp_moe_program(
         def tp_all_reduce(
             self,
             local: pl.Tensor[[T, HIDDEN], pl.BF16],
-            tmp_window: pld.DistributedTensor[[T, SH_TP_CHUNK], pl.BF16],
+            tmp_window: pld.DistributedTensor[[T, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[T, HIDDEN], pl.BF16]:
-            """Pull-side ring all-reduce(sum) across the TP group."""
-            group_size = TP_WORLD_SIZE
-            # Inline shape constants — pypto's tile shape inference cannot
-            # follow Python-level aliases like ``t_rows = T`` past
-            # load/remote_load boundaries (it preserves the alias name in the
-            # tile type, which then mismatches the concrete shape from sibling
-            # pl.load calls).  Using the literals T and SH_TP_CHUNK everywhere
-            # matches tests/st/distributed/test_l3_allreduce.py.
-
-            # Phase 1: reduce-scatter (N-1 ring steps).
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + group_size) % group_size
-                recv_idx = (my_rank - step - 1 + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
-
-                send_tile = pl.load(
-                    local, [0, send_idx * SH_TP_CHUNK], [T, SH_TP_CHUNK],
-                )
-                pl.store(send_tile, [0, 0], tmp_window)
-
-                pld.system.notify(
-                    target=signal_window,
-                    peer=next_rank,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    signal=signal_window,
-                    offsets=[prev_rank, 0],
-                    expected=pl.cast(step + 1, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
-                )
-
-                recv_tile = pld.tile.remote_load(
-                    tmp_window,
-                    peer=prev_rank,
-                    offsets=[0, 0],
-                    shape=[T, SH_TP_CHUNK],
-                )
-                old_tile = pl.load(
-                    local, [0, recv_idx * SH_TP_CHUNK], [T, SH_TP_CHUNK],
-                )
-                # PTOAS A2/A3 ``tadd`` doesn't support bf16; upcast to f32,
-                # add, then downcast for the store.
-                summed_fp32 = pl.add(
-                    pl.cast(old_tile, target_type=pl.FP32),
-                    pl.cast(recv_tile, target_type=pl.FP32),
-                )
+            # Barrier-style all-reduce (mirrors decode_layer.py DenseFull +
+            # tests/st/distributed/test_l3_allreduce.py, PASS TP=8). Replaces the
+            # RING version which deadlocked at TP=8 (lone unconverted survivor of
+            # the dense ring->barrier migration; project_barrier_allreduce_fixes_multicard_507018).
+            group_size = N_RANKS
+            ar_chunk = HIDDEN // 8
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage_tile = pl.load(local, [0, k0], [T, ar_chunk])
+                pl.store(stage_tile, [0, k0], tmp_window)
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [T, ar_chunk])
+                acc = pl.cast(own_tile, target_type=pl.FP32)
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        recv = pld.tile.remote_load(
+                            tmp_window, peer=peer,
+                            offsets=[0, k0], shape=[T, ar_chunk],
+                        )
+                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(
-                    pl.cast(summed_fp32, target_type=pl.BF16),
-                    [0, recv_idx * SH_TP_CHUNK],
-                    local,
+                    pl.cast(acc, target_type=pl.BF16), [0, k0], local,
                 )
-
-            # Phase 2: all-gather (N-1 more ring steps).
-            for step in pl.range(group_size - 1):
-                send_idx = (my_rank - step + 1 + group_size) % group_size
-                recv_idx = (my_rank - step + group_size) % group_size
-                next_rank = (my_rank + 1) % group_size
-                prev_rank = (my_rank - 1 + group_size) % group_size
-
-                send_tile = pl.load(
-                    local, [0, send_idx * SH_TP_CHUNK], [T, SH_TP_CHUNK],
-                )
-                pl.store(send_tile, [0, 0], tmp_window)
-
-                pld.system.notify(
-                    target=signal_window,
-                    peer=next_rank,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-                pld.system.wait(
-                    signal=signal_window,
-                    offsets=[prev_rank, 0],
-                    expected=pl.cast(group_size - 1 + step + 1, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
-                )
-
-                recv_tile = pld.tile.remote_load(
-                    tmp_window,
-                    peer=prev_rank,
-                    offsets=[0, 0],
-                    shape=[T, SH_TP_CHUNK],
-                )
-                pl.store(recv_tile, [0, recv_idx * SH_TP_CHUNK], local)
-
             return local
 
         # ---------- Collective: EP all_to_all (lifted from collectives.py) ----
@@ -360,6 +310,7 @@ def _build_ep_tp_moe_program(
             recv_counts: pl.Tensor[[N_RANKS], pl.INT32],
             send_offsets: pl.Tensor[[N_RANKS], pl.INT32],
             recv_offsets: pl.Tensor[[N_RANKS], pl.INT32],
+            read_offsets: pl.Tensor[[N_RANKS], pl.INT32],
             signal_window: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16]:
@@ -375,11 +326,13 @@ def _build_ep_tp_moe_program(
             n_self = pl.cast(pl.read(send_counts, [my_rank]), pl.INDEX)
             s_off_self = pl.cast(pl.read(send_offsets, [my_rank]), pl.INDEX)
             r_off_self = pl.cast(pl.read(recv_offsets, [my_rank]), pl.INDEX)
-            for r in pl.range(n_self):
-                self_tile = pl.load(
-                    send, [s_off_self + r, 0], [1, d_cols],
-                )
-                pl.store(self_tile, [r_off_self + r, 0], recv)
+            PER_PEER_BOUND = T * TOPK  # 128: LOCAL_RECV_MAX = N_RANKS*T*TOPK
+            for r in pl.range(PER_PEER_BOUND):
+                if r < n_self:
+                    self_tile = pl.load(
+                        send, [s_off_self + r, 0], [1, d_cols],
+                    )
+                    pl.store(self_tile, [r_off_self + r, 0], recv)
 
             # 2) Set(1) notify every peer.
             for peer in pl.range(group_size):
@@ -389,7 +342,7 @@ def _build_ep_tp_moe_program(
                         peer=peer,
                         offsets=[my_rank, 0],
                         value=1,
-                        op=pld.NotifyOp.Set,
+                        op=pld.NotifyOp.AtomicAdd,
                     )
 
             # 3) Ge(1) wait for every peer.
@@ -411,14 +364,20 @@ def _build_ep_tp_moe_program(
                     r_off = pl.cast(
                         pl.read(recv_offsets, [peer]), pl.INDEX,
                     )
-                    for r in pl.range(n_recv):
-                        peer_tile = pld.tile.remote_load(
-                            send,
-                            peer=peer,
-                            offsets=[r_off + r, 0],
-                            shape=[1, d_cols],
-                        )
-                        pl.store(peer_tile, [r_off + r, 0], recv)
+                    # READ from peer's send_buf at PEER's send-offset-for-me
+                    # (peer packs by its own dst layout), NOT my recv_offset.
+                    read_off = pl.cast(
+                        pl.read(read_offsets, [peer]), pl.INDEX,
+                    )
+                    for r in pl.range(T * TOPK):
+                        if r < n_recv:
+                            peer_tile = pld.tile.remote_load(
+                                send,
+                                peer=peer,
+                                offsets=[read_off + r, 0],
+                                shape=[1, d_cols],
+                            )
+                            pl.store(peer_tile, [r_off + r, 0], recv)
 
             return recv
 
@@ -520,8 +479,14 @@ def _build_ep_tp_moe_program(
                         0, [1, ROUTER_SCORE_PAD], dtype=pl.UINT32,
                     )
                     srt = pl.sort32(row, idx_init)
+                    # DeepSeek-style format1 progressive merge (v3_2:
+                    # 64->256->1024->4096, 4-way per stage: block_len N -> 4N).
+                    # The prior format2 2-way merge of two NOT-fully-sorted
+                    # 512-halves hung on distinct scores. srt is 1024 wide
+                    # (512 (val,idx) pairs); sort32->64-runs, mrgsort(64)->256,
+                    # mrgsort(256)->1024 = one fully-sorted run.
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -557,6 +522,29 @@ def _build_ep_tp_moe_program(
             return expert_weights
 
         @pl.function(type=pl.FunctionType.Inline)
+        def _gate_bypass(
+            self,
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            expert_indices: pl.Tensor[[T, TOPK], pl.INT32],
+            expert_weights: pl.Tensor[[T, TOPK], pl.FP32],
+        ):
+            # vLLM fused-router topk injected via repurposed gate_w buffer:
+            # gate_w[tt,k]=float(topk_id), gate_w[tt,TOPK+k]=topk_weight*ROUTE_SCALE.
+            # Skips the hanging TSORT32/TMRGSORT gate top-k (PTOAS Blocker 1).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_bypass"):
+                for tt in pl.range(T):
+                    for k in pl.range(TOPK):
+                        pl.write(
+                            expert_indices, [tt, k],
+                            pl.cast(pl.read(gate_w, [tt, k]), pl.INT32),
+                        )
+                        pl.write(
+                            expert_weights, [tt, k],
+                            pl.read(gate_w, [tt, TOPK + k]),
+                        )
+            return expert_weights
+
+        @pl.function(type=pl.FunctionType.Inline)
         def gate_step(
             self,
             x: pl.Tensor[[T, HIDDEN], pl.BF16],
@@ -568,9 +556,14 @@ def _build_ep_tp_moe_program(
             pl.Tensor[[T, TOPK], pl.INT32],
             pl.Tensor[[T, TOPK], pl.FP32],
         ]:
-            self._gate(
-                x, gate_w, router_bias, expert_indices, expert_weights,
-            )
+            if _EPMOE_BYPASS_GATE:
+                self._gate_bypass(
+                    gate_w, expert_indices, expert_weights,
+                )
+            else:
+                self._gate(
+                    x, gate_w, router_bias, expert_indices, expert_weights,
+                )
             return expert_indices, expert_weights
 
         # ---------- Stage 2: dispatch (EP all-to-all) ----------
@@ -837,7 +830,7 @@ def _build_ep_tp_moe_program(
                         peer=peer,
                         offsets=[my_rank, 0],
                         value=1,
-                        op=pld.NotifyOp.Set,
+                        op=pld.NotifyOp.AtomicAdd,
                     )
             for src in pl.range(N_RANKS):
                 if src != my_rank:
@@ -880,11 +873,25 @@ def _build_ep_tp_moe_program(
                     pl.cast(prev_off + prev_cnt, pl.INT32),
                 )
 
+            # read_offsets[peer] = offset in PEER's send_buf where peer put
+            # MY tokens = sum over dst<my_rank of peer's per-expert counts.
+            # pub_counts is fully published (count_done barrier), so local.
+            read_offsets = pl.create_tensor([N_RANKS_PAD], dtype=pl.INT32)
+            for peer in pl.range(N_RANKS):
+                racc = pl.cast(0, pl.INT32)
+                for d in pl.range(N_RANKS):
+                    if d < my_rank:
+                        for e in pl.range(N_LOCAL_EXPERTS):
+                            racc = racc + pl.read(
+                                pub_counts, [peer * N_RANKS + d, e],
+                            )
+                pl.write(read_offsets, [peer], pl.cast(racc, pl.INT32))
+
             # ---- EP all-to-all push of payload ----
             self.ep_all_to_all(
                 send_buf, recv_x,
                 send_counts_rank, recv_counts,
-                send_offsets_rank, recv_offsets,
+                send_offsets_rank, recv_offsets, read_offsets,
                 data_done_sig, my_rank,
             )
 
@@ -982,150 +989,128 @@ def _build_ep_tp_moe_program(
                     # the active row span.  Use ``pl.min`` for scalar min/max
                     # (``pl.minimum`` is the tensor variant).
                     tile_valid = pl.min(RECV_TILE, valid_rows - tile_row0)
+                    if tile_row0 < valid_rows:
 
-                    # Bridge tensor — lives at tile_idx loop level, shared
-                    # between expert_gate_up and expert_down SPMD dispatches.
-                    # As an Inline-level create_tensor it is in vec (UB) space;
-                    # pl.slice of it in expert_down gives tmov vec→left ✓.
-                    h_bf16 = pl.create_tensor(
-                        [RECV_TILE, INTER], dtype=pl.BF16,
-                    )
+                        # Bridge tensor — lives at tile_idx loop level, shared
+                        # between expert_gate_up and expert_down SPMD dispatches.
+                        # As an Inline-level create_tensor it is in vec (UB) space;
+                        # pl.slice of it in expert_down gives tmov vec→left ✓.
+                        h_bf16 = pl.create_tensor(
+                            [RECV_TILE, INTER], dtype=pl.BF16,
+                        )
 
-                    # Gate+up projection: each SPMD block handles one N-chunk
-                    # of the INTER dimension.
-                    for nb in pl.spmd(
-                        INTER // ROUTED_GATE_N_CHUNK,
-                        name_hint="expert_gate_up",
-                    ):
-                        n0 = nb * ROUTED_GATE_N_CHUNK
-                        x0 = pl.slice(
-                            local_routed_x,
-                            [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                            [tile_offset, 0],
-                            valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
-                        )
-                        wg0_2d = pl.reshape(
-                            pl.slice(
-                                w_gate,
-                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                                [e, 0, n0],
-                            ),
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                        )
-                        wu0_2d = pl.reshape(
-                            pl.slice(
-                                w_up,
-                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                                [e, 0, n0],
-                            ),
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                        )
-                        gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
-                        up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
-                            k0 = kb * ROUTED_GATE_K_CHUNK
-                            xk = pl.slice(
+                        # Gate+up projection: each SPMD block handles one N-chunk
+                        # of the INTER dimension.
+                        for nb in pl.spmd(
+                            INTER // ROUTED_GATE_N_CHUNK,
+                            name_hint="expert_gate_up",
+                        ):
+                            n0 = nb * ROUTED_GATE_N_CHUNK
+                            x0 = pl.slice(
                                 local_routed_x,
                                 [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                                [tile_offset, k0],
-                                valid_shape=[
-                                    tile_valid, ROUTED_GATE_K_CHUNK,
-                                ],
+                                [tile_offset, 0],
+                                valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
                             )
-                            wgk = pl.reshape(
+                            wg0_2d = pl.reshape(
                                 pl.slice(
                                     w_gate,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
                                 ),
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            wuk = pl.reshape(
+                            wu0_2d = pl.reshape(
                                 pl.slice(
                                     w_up,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
                                 ),
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
-                            up_acc = pl.matmul_acc(up_acc, xk, wuk)
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
+                                k0 = kb * ROUTED_GATE_K_CHUNK
+                                xk = pl.slice(
+                                    local_routed_x,
+                                    [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                    [tile_offset, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_GATE_K_CHUNK,
+                                    ],
+                                )
+                                wgk = pl.reshape(
+                                    pl.slice(
+                                        w_gate,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                wuk = pl.reshape(
+                                    pl.slice(
+                                        w_up,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                                up_acc = pl.matmul_acc(up_acc, xk, wuk)
 
-                        sigmoid = pl.recip(
-                            pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
-                        )
-                        silu = pl.mul(gate_acc, sigmoid)
-                        # Compile-time const baked at factory time: only one
-                        # branch is emitted per specialisation.
-                        if _routed_swiglu_step:
-                            silu_c = pl.minimum(silu, _routed_swiglu_limit)
-                            up_c = pl.maximum(
-                                pl.minimum(up_acc, _routed_swiglu_limit),
-                                -_routed_swiglu_limit,
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
                             )
-                            gated = pl.mul(silu_c, up_c)
-                        else:
-                            gated = pl.mul(silu, up_acc)
+                            silu = pl.mul(gate_acc, sigmoid)
+                            # Compile-time const baked at factory time: only one
+                            # branch is emitted per specialisation.
+                            if _routed_swiglu_step:
+                                silu_c = pl.minimum(silu, _routed_swiglu_limit)
+                                up_c = pl.maximum(
+                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    -_routed_swiglu_limit,
+                                )
+                                gated = pl.mul(silu_c, up_c)
+                            else:
+                                gated = pl.mul(silu, up_acc)
 
-                        gated_v = pl.set_validshape(
-                            gated, tile_valid, ROUTED_GATE_N_CHUNK,
-                        )
-                        # No fillpad — gated_v (none-pad mode) matches
-                        # uninitialised h_bf16 subview (none-pad mode);
-                        # expert_down reads h_bf16 with valid_shape= so
-                        # padding rows beyond tile_valid are not used.
-                        h_bf16[
-                            :, n0 : n0 + ROUTED_GATE_N_CHUNK
-                        ] = pl.cast(gated_v, target_type=pl.BF16)
+                            gated_v = pl.set_validshape(
+                                gated, tile_valid, ROUTED_GATE_N_CHUNK,
+                            )
+                            # No fillpad — gated_v (none-pad mode) matches
+                            # uninitialised h_bf16 subview (none-pad mode);
+                            # expert_down reads h_bf16 with valid_shape= so
+                            # padding rows beyond tile_valid are not used.
+                            h_bf16[
+                                :, n0 : n0 + ROUTED_GATE_N_CHUNK
+                            ] = pl.cast(gated_v, target_type=pl.BF16)
 
-                    # Down projection: each SPMD block handles one D-chunk of
-                    # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
-                    # pl.slice of it gives tmov vec→left ✓.
-                    for db in pl.spmd(
-                        HIDDEN // ROUTED_DOWN_N_CHUNK,
-                        name_hint="expert_down",
-                    ):
-                        d0 = db * ROUTED_DOWN_N_CHUNK
-                        h0 = pl.slice(
-                            h_bf16,
-                            [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                            [0, 0],
-                            valid_shape=[
-                                tile_valid, ROUTED_DOWN_K_CHUNK,
-                            ],
-                        )
-                        wd0 = pl.reshape(
-                            pl.slice(
-                                w_down,
-                                [
-                                    1,
-                                    ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
-                                ],
-                                [e, 0, d0],
-                            ),
-                            [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
-                        )
-                        y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
-                        for kb2 in pl.range(1, INTER // ROUTED_DOWN_K_CHUNK):
-                            k0 = kb2 * ROUTED_DOWN_K_CHUNK
-                            hk = pl.slice(
+                        # Down projection: each SPMD block handles one D-chunk of
+                        # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
+                        # pl.slice of it gives tmov vec→left ✓.
+                        for db in pl.spmd(
+                            HIDDEN // ROUTED_DOWN_N_CHUNK,
+                            name_hint="expert_down",
+                        ):
+                            d0 = db * ROUTED_DOWN_N_CHUNK
+                            h0 = pl.slice(
                                 h_bf16,
                                 [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                                [0, k0],
+                                [0, 0],
                                 valid_shape=[
                                     tile_valid, ROUTED_DOWN_K_CHUNK,
                                 ],
                             )
-                            wdk = pl.reshape(
+                            wd0 = pl.reshape(
                                 pl.slice(
                                     w_down,
                                     [
@@ -1133,26 +1118,49 @@ def _build_ep_tp_moe_program(
                                         ROUTED_DOWN_K_CHUNK,
                                         ROUTED_DOWN_N_CHUNK,
                                     ],
-                                    [e, k0, d0],
+                                    [e, 0, d0],
                                 ),
-                                [
-                                    ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
-                                ],
+                                [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
                             )
-                            y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            for kb2 in pl.range(1, INTER // ROUTED_DOWN_K_CHUNK):
+                                k0 = kb2 * ROUTED_DOWN_K_CHUNK
+                                hk = pl.slice(
+                                    h_bf16,
+                                    [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                    [0, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_DOWN_K_CHUNK,
+                                    ],
+                                )
+                                wdk = pl.reshape(
+                                    pl.slice(
+                                        w_down,
+                                        [
+                                            1,
+                                            ROUTED_DOWN_K_CHUNK,
+                                            ROUTED_DOWN_N_CHUNK,
+                                        ],
+                                        [e, k0, d0],
+                                    ),
+                                    [
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                )
+                                y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
-                        y_v = pl.set_validshape(
-                            y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
-                        )
-                        y_m = pl.fillpad(
-                            y_v, pad_value=pl.PadValue.zero,
-                        )
-                        local_routed_y = pl.assemble(
-                            local_routed_y,
-                            pl.cast(y_m, target_type=pl.BF16),
-                            [tile_offset, d0],
-                        )
+                            y_v = pl.set_validshape(
+                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                            )
+                            y_m = pl.fillpad(
+                                y_v, pad_value=pl.PadValue.zero,
+                            )
+                            local_routed_y = pl.assemble(
+                                local_routed_y,
+                                pl.cast(y_m, target_type=pl.BF16),
+                                [tile_offset, d0],
+                            )
 
             return local_routed_y
 
@@ -1308,7 +1316,7 @@ def _build_ep_tp_moe_program(
             w_down_s: pl.Tensor[[SH_INTER_LOCAL, HIDDEN], pl.BF16],
             sh_y: pl.Out[pl.Tensor[[T, HIDDEN], pl.BF16]],
             sh_tmp_window: pld.DistributedTensor[
-                [T, SH_TP_CHUNK], pl.BF16
+                [T, HIDDEN], pl.BF16
             ],
             sh_signal_window: pld.DistributedTensor[
                 [N_RANKS, 1], pl.INT32
@@ -1440,18 +1448,24 @@ def _build_ep_tp_moe_program(
                             pl.cast(e_cursor, pl.INDEX)
                             + pl.cast(src_off, pl.INDEX) + row
                         )
-                        tile = pl.load(
-                            local_routed_y,
-                            [local_row, 0], [1, HIDDEN],
-                        )
                         if src == my_rank:
+                            tile = pl.load(
+                                local_routed_y,
+                                [local_row, 0], [1, HIDDEN],
+                            )
                             pl.store(tile, [r_route, 0], routed_y_buf)
                         else:
-                            pld.tile.remote_store(
-                                tile,
-                                target=routed_y_buf,
+                            # DeepSeek-style push (combine_ep): tensor.put
+                            # GM->peer-GM establishes a RAW dep into the gather
+                            # (remote_store is fire-and-forget -> gather races
+                            # push -> partial sums / sign flips).
+                            pld.tensor.put(
+                                dst=routed_y_buf,
                                 peer=src,
-                                offsets=[r_route, 0],
+                                src=local_routed_y,
+                                dst_offsets=[r_route, 0],
+                                src_offsets=[local_row, 0],
+                                shape=[1, HIDDEN],
                             )
                     src_off = src_off + pl.cast(n, pl.INT32)
                 total_e = pl.cast(0, pl.INT32)
@@ -1461,6 +1475,20 @@ def _build_ep_tp_moe_program(
                     )
                 e_cursor = e_cursor + total_e
 
+            # combine DMA fence (mirrors combine.cpp:177 pipe_barrier between
+            # last TPUT and TNOTIFY): remote_store (TPUT) has no trailing dsb
+            # (pto-isa TPut.hpp), so combine_done can outrun the push DMA ->
+            # consumer gathers stale routed_y_buf. A notify emits
+            # dsb(DSB_DDR)+pipe_barrier(PIPE_ALL) (TNotify.hpp) draining the
+            # TPUTs. combine_done[my_rank,0] is never waited (waiters use
+            # src!=my_rank); AtomicAdd+0 is a pure no-op fence write.
+            pld.system.notify(
+                target=combine_done,
+                peer=my_rank,
+                offsets=[my_rank, 0],
+                value=0,
+                op=pld.NotifyOp.AtomicAdd,
+            )
             for peer in pl.range(N_RANKS):
                 if peer != my_rank:
                     pld.system.notify(
@@ -1468,7 +1496,7 @@ def _build_ep_tp_moe_program(
                         peer=peer,
                         offsets=[my_rank, 0],
                         value=1,
-                        op=pld.NotifyOp.Set,
+                        op=pld.NotifyOp.AtomicAdd,
                     )
             for src in pl.range(N_RANKS):
                 if src != my_rank:
@@ -1534,6 +1562,22 @@ def _build_ep_tp_moe_program(
 
             return moe_out
 
+        @pl.function(type=pl.FunctionType.InCore)
+        def _zero_routed_y_buf(
+            self,
+            routed_y_buf: pld.DistributedTensor[
+                [N_ROUTES_PER_RANK, HIDDEN], pl.BF16
+            ],
+        ):
+            # Zero-init: data windows are NOT auto-zeroed (only signal windows).
+            # _weighted_gather_and_add reads all N_ROUTES_PER_RANK cells; any slot
+            # the combine push misses would read uninitialized ~5e4 garbage.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_routed_y"):
+                for r in pl.range(N_ROUTES_PER_RANK):
+                    routed_y_buf[r : r + 1, :] = pl.full(
+                        [1, HIDDEN], dtype=pl.BF16, value=0.0,
+                    )
+
         @pl.function(type=pl.FunctionType.Inline)
         def combine_step(  # noqa: PLR0913
             self,
@@ -1560,6 +1604,8 @@ def _build_ep_tp_moe_program(
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[T, HIDDEN], pl.BF16]:
             # Step A: publish my r_route table to every dst peer.
+            # zero routed_y_buf before pushes (unwritten cells else = garbage)
+            self._zero_routed_y_buf(routed_y_buf)
             self._publish_src_route_table(
                 expert_indices, src_route_table, my_rank,
             )
@@ -1571,7 +1617,7 @@ def _build_ep_tp_moe_program(
                             peer=peer,
                             offsets=[my_rank, 0],
                             value=1,
-                            op=pld.NotifyOp.Set,
+                            op=pld.NotifyOp.AtomicAdd,
                         )
                 for src in pl.range(N_RANKS):
                     if src != my_rank:
@@ -1597,6 +1643,32 @@ def _build_ep_tp_moe_program(
                 routed_y_buf, expert_weights, sh_y, moe_out,
             )
             return moe_out
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _serialize_after_shared(
+            self,
+            x: pl.Tensor[[T, HIDDEN], pl.BF16],
+            sh_y: pl.Tensor[[T, HIDDEN], pl.BF16],
+            x_out: pl.Out[pl.Tensor[[T, HIDDEN], pl.BF16]],
+        ):
+            # SERIALIZE: numerically identity (x + 0*sh_y) but declares sh_y as
+            # an input so the orchestration forces the shared-expert
+            # tp_all_reduce (produces sh_y) to COMPLETE before the routed
+            # dispatch/combine cross-rank collectives -> breaks the overlapping
+            # cross-rank collective deadlock (func5 tp_all_reduce + func13 _push).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="serialize_dep"):
+                for b in pl.range(T):
+                    xr = pl.cast(
+                        pl.load(x, [b, 0], [1, HIDDEN]), target_type=pl.FP32,
+                    )
+                    yr = pl.cast(
+                        pl.load(sh_y, [b, 0], [1, HIDDEN]), target_type=pl.FP32,
+                    )
+                    z = pl.add(xr, pl.mul(yr, 0.0))
+                    pl.store(
+                        pl.cast(z, target_type=pl.BF16), [b, 0], x_out,
+                    )
+            return x_out
 
         # ---------- Per-rank orchestration ----------
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1631,7 +1703,7 @@ def _build_ep_tp_moe_program(
             data_done_sig: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             send_buf: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
             sh_tmp_window: pld.DistributedTensor[
-                [T, SH_TP_CHUNK], pl.BF16
+                [T, HIDDEN], pl.BF16
             ],
             sh_signal_window: pld.DistributedTensor[
                 [N_RANKS, 1], pl.INT32
@@ -1666,6 +1738,10 @@ def _build_ep_tp_moe_program(
                 x, w_gate_s, w_up_s, w_down_s, sh_y,
                 sh_tmp_window, sh_signal_window, my_rank,
             )
+
+            # SERIALIZE shared tp_all_reduce -> routed dispatch (break overlap deadlock)
+            x_ser_buf = pl.create_tensor([T, HIDDEN], dtype=pl.BF16)
+            x = self._serialize_after_shared(x, sh_y, x_ser_buf)
 
             # 3) Dispatch (EP all-to-all).
             local_routed_x = pl.create_tensor(
@@ -1765,7 +1841,7 @@ def _build_ep_tp_moe_program(
             send_buf_buf = pld.alloc_window_buffer(
                 LOCAL_RECV_MAX * HIDDEN * 2,  # BF16
             )
-            sh_tmp_buf = pld.alloc_window_buffer(T * SH_TP_CHUNK * 2)
+            sh_tmp_buf = pld.alloc_window_buffer(T * HIDDEN * 2)
             sh_sig_buf = pld.alloc_window_buffer(N_RANKS * 4)
             src_route_buf = pld.alloc_window_buffer(
                 N_RANKS * N_LOCAL_EXPERTS * N_ROUTES_PER_RANK * 4,
@@ -1794,7 +1870,7 @@ def _build_ep_tp_moe_program(
                     send_buf_buf, [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
                 )
                 sh_tmp_window = pld.window(
-                    sh_tmp_buf, [T, SH_TP_CHUNK], dtype=pl.BF16,
+                    sh_tmp_buf, [T, HIDDEN], dtype=pl.BF16,
                 )
                 sh_signal_window = pld.window(
                     sh_sig_buf, [N_RANKS, 1], dtype=pl.INT32,

@@ -2,19 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """ST-1: full_dense decode_layer (layer 0) precision validation on device 0.
 
-Covers `select_decode_layer(0)` -> `DecodeLayerDense` @pl.program (the
+Covers `select_decode_layer(0)` -> `DecodeLayerDenseFull` @pl.program (the
 production layer used by Phase 15 single-rank rc=0 / 20-tasks run).
 Adds golden_fn precision validation on top of Phase 15's "runs without
 fault" baseline.
 
-Layer math (head_gate bypassed on both sides per attention_full.py:690):
+Layer math (head_gate applied via gate_r R-matrix expand):
   1. zero-centred input RMSNorm
   2. QKV proj (no bias)
   3. Q/K head-wise zero-centred RMSNorm
   4. partial RoPE (rotary_dim = 64 = HEAD_DIM // 2)
   5. KV cache update at slot_mapping
   6. online-softmax flash attention (per kv-head GQA)
-  7. (head_gate * attn) -- BYPASSED, attn passes through unmodified
+  7. head-wise sigmoid gate: sigmoid(hidden @ w_g) * attn_out (via gate_r)
   8. out_proj + residual1 = hidden + o_proj
   9. zero-centred post-attn RMSNorm of resid1
  10. dense MLP: gate_up matmul -> SiLU(gate)*up -> down matmul
@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -73,8 +74,15 @@ def _torch_attn_no_gate(*, hidden_states, input_rms_weight, wq_full, wk_full,
                        k_cache_full, v_cache_full, num_heads_full,
                        num_kv_heads_full, head_dim, rotary_dim, rotary_half,
                        rotary_pass, q_per_kv, eps, block_size,
-                       max_blocks_per_seq):
-    """Per-token paged-attention without head_gate, matching kernel bypass."""
+                       max_blocks_per_seq, w_g_full=None):
+    """Per-token paged-attention. head_gate applied iff ``w_g_full`` given.
+
+    ``w_g_full`` (``[HIDDEN, num_heads_full]``): when provided, the real step3p5
+    head-wise gate ``sigmoid(hidden_states @ w_g_full)`` is applied per head to
+    attn_out *before* o_proj (config.use_head_wise_attn_gate=True). Default
+    ``None`` keeps the historical no-gate behaviour so existing callers are
+    unchanged.
+    """
     batch = hidden_states.shape[0]
     hidden_q = num_heads_full * head_dim
     scale = 1.0 / math.sqrt(head_dim)
@@ -178,8 +186,21 @@ def _torch_attn_no_gate(*, hidden_states, input_rms_weight, wq_full, wk_full,
             )
         attn_out[b:b + 1, :] = attn_row
 
-    # head_gate BYPASSED: attn_gated = attn_out (no sigmoid).
-    o = attn_out.float() @ wo_full.float()
+    # head_gate: identity when w_g_full is None (bypass), else the real
+    # step3p5 per-head sigmoid gate applied before o_proj. Uses the
+    # POST-input_layernorm hidden (``normed_bf16``, same as q/k/v proj) to
+    # match vLLM's ``Step3p5Attention.g_proj(hidden_states)`` where
+    # ``hidden_states`` is already post-input_layernorm (Step3p5DecoderLayer
+    # applies input_layernorm before calling self_attn).
+    if w_g_full is not None:
+        gate = torch.sigmoid(
+            normed_bf16.float() @ w_g_full.float()
+        )  # [batch, num_heads_full]
+        attn_g = (attn_out.float().view(batch, num_heads_full, head_dim)
+                  * gate.unsqueeze(-1)).reshape(batch, hidden_q)
+        o = attn_g @ wo_full.float()
+    else:
+        o = attn_out.float() @ wo_full.float()
     resid1 = (o + hidden_states.float()).bfloat16()
     return resid1
 
@@ -293,7 +314,7 @@ def main() -> int:
     wk = _randn([n_full, HIDDEN, KV_H])
     wv = _randn([n_full, HIDDEN, KV_H])
     wo = _randn([n_full, H_Q_FULL, HIDDEN])
-    w_g = _randn([n_full, HIDDEN, PAD_FULL])  # head_gate weight (bypassed)
+    w_g = _randn([n_full, HIDDEN, PAD_FULL])  # head_gate weight (sigmoid gate)
     w_gate = _randn([n_dense, HIDDEN, INT_LOC])
     w_up = _randn([n_dense, HIDDEN, INT_LOC])
     w_down = _randn([n_dense, INT_LOC, HIDDEN])
@@ -306,6 +327,17 @@ def main() -> int:
     seq_lens = torch.ones(1, BATCH, dtype=torch.int32)
     block_table = torch.zeros(1, MAX_BLOCKS_PER_SEQ * BATCH, dtype=torch.int32)
     slot_mapping = torch.arange(BATCH, dtype=torch.int32).unsqueeze(0)
+    if os.environ.get("ST_ISO"):
+        # DEBUG isolated multi-position: row 0 ctx_len=ATTN_CTX0 (attends block-0
+        # rows 0..ctx0-1, only row 0 written -> rest zero-K, no cross-row dep);
+        # rows 1..15 decode (ctx=1) writing block-1 slots so block-0 stays clean.
+        _c0 = int(os.environ.get("ATTN_CTX0", "2"))
+        _row = int(os.environ.get("ATTN_ISO_ROW", "0"))
+        seq_lens = torch.ones(1, BATCH, dtype=torch.int32)
+        seq_lens[0, _row] = _c0
+        slot_mapping = (torch.arange(BATCH, dtype=torch.int32) + 128).unsqueeze(0)
+        slot_mapping[0, _row] = 0
+        print(f"[ST_ISO] seq_lens[0]={seq_lens[0].tolist()} iso_row={_row}", flush=True)
 
     # Small random rope tables (NOT zeros - zero rope would make q_rot = 0).
     rope_cos = torch.empty(1, MAX_SEQ_DEFAULT, ROTARY_DIM_FULL).normal_(
@@ -317,6 +349,14 @@ def main() -> int:
     # slots during the layer call).
     k_cache = torch.zeros(1, MAX_SEQ_DEFAULT, HEAD_DIM, dtype=bf16)
     v_cache = torch.zeros(1, MAX_SEQ_DEFAULT, HEAD_DIM, dtype=bf16)
+
+    # gate_r: block-diagonal identity [PAD_FULL, H_Q_FULL] (bf16).
+    # R[h, h*HEAD_DIM:(h+1)*HEAD_DIM] = 1.0 for h in 0..TP1_NH-1; pad rows = 0.
+    # Under TP=1, TP1_NH = Q_PER_KV_FULL (the Q-heads served by the single KV head).
+    TP1_NH = Q_PER_KV_FULL
+    gate_r = torch.zeros(PAD_FULL, H_Q_FULL, dtype=bf16)
+    for _h in range(TP1_NH):
+        gate_r[_h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
 
     def flat3(t):
         """[L, M, N] -> [1, L*M, N] (per Phase 15 layout)."""
@@ -341,6 +381,7 @@ def main() -> int:
         "v_cache": v_cache,
         "wo": flat3(wo),
         "w_g": flat3(w_g),
+        "gate_r": gate_r.unsqueeze(0),
         "post_rms_weight": w_post_rms.float().unsqueeze(0),
         "w_gate": flat3(w_gate),
         "w_up": flat3(w_up),
@@ -371,6 +412,7 @@ def main() -> int:
         _spec("rope_sin", torch.float32),
         _spec("k_cache", bf16), _spec("v_cache", bf16),
         _spec("wo", bf16), _spec("w_g", bf16),
+        _spec("gate_r", bf16),
         _spec("post_rms_weight", torch.float32),
         _spec("w_gate", bf16), _spec("w_up", bf16), _spec("w_down", bf16),
         _spec("next_hidden_out", bf16, is_out=True),
@@ -397,6 +439,8 @@ def main() -> int:
         rs = values["rope_sin"][0]
         kc = values["k_cache"][0]
         vc = values["v_cache"][0]
+        # w_g for head-wise sigmoid gate: [HIDDEN, PAD_FULL]; slice to TP1 heads.
+        w_g_layer = values["w_g"][0][:HIDDEN]
         # Dense MLP weights: layer 0 dense slot = layer_idx 0.
         post_rms_layer = values["post_rms_weight"][0][layer_idx]
         w_gate_layer = values["w_gate"][0][:HIDDEN]
@@ -449,6 +493,7 @@ def main() -> int:
                 rotary_half=ROTARY_HALF_FULL, rotary_pass=ROTARY_PASS_FULL,
                 q_per_kv=Q_PER_KV_FULL, eps=EPS, block_size=BLOCK_SIZE,
                 max_blocks_per_seq=MAX_BLOCKS_PER_SEQ,
+                w_g_full=w_g_layer[:, :TP1_NUM_HEADS],
             )
 
         if args.bisect == "attn_only":
@@ -508,6 +553,9 @@ def main() -> int:
     Orchestrator.allocate_domain = _single_rank_alloc_domain
     try:
         runtime_cfg = dict(platform=args.platform, device_id=args.device)
+        if os.environ.get("ST_DUMP"):
+            runtime_cfg["enable_dump_tensor"] = 1
+            runtime_cfg["output_prefix"] = os.environ["ST_DUMP"]
         if args.smoke or args.platform.endswith("sim"):
             result = run(
                 program=program, specs=specs,

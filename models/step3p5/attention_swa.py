@@ -120,6 +120,8 @@ from .config import (
     LAYER_DYN,
     LAYER_HIDDEN_ROWS_DYN,
     LAYER_ROPE_THETA,
+    LAYER_TYPE_SWA,
+    LAYER_TYPES,
     MAX_BLOCKS_PER_SEQ,
     MAX_SEQ_DEFAULT,
     NUM_HEADS_SWA_LOCAL,
@@ -156,7 +158,15 @@ WIN_BLOCKS = (SLIDING_WINDOW + BLOCK_SIZE - 1) // BLOCK_SIZE
 # hidden in a single chunk.
 KV_OUT_CHUNK_LOCAL = KV_HIDDEN_LOCAL
 
-LAYER_QHIDDEN_ROWS_DYN = pl.dynamic("LAYER_QHIDDEN_ROWS_DYN")
+# Per-layer rows for the o_proj weight: model-bound (= n_sliding_attn ×
+# HIDDEN_Q_SWA_LOCAL). Kept STATIC (not pl.dynamic) so the codegen-emitted L3
+# host_orch does not reference an unresolved ``LAYER_QHIDDEN_ROWS_DYN`` global
+# (pl.dynamic → NameError in the generated host_orch.py under DistributedWorker;
+# same pypto limitation attention_full.py:153 works around with its 12288). It
+# is computed from config so it tracks the per-rank width (HIDDEN_Q_SWA_LOCAL
+# = 1536) and the tp1-unslice width automatically, matching the wo weight stack.
+_N_SWA_LAYERS = sum(1 for _t in LAYER_TYPES if _t == LAYER_TYPE_SWA)
+LAYER_QHIDDEN_ROWS_DYN = _N_SWA_LAYERS * HIDDEN_Q_SWA_LOCAL
 
 assert Q_HEAD_PAD % 4 == 0 and Q_HEAD_PAD // 2 >= Q_HEAD_BATCH
 assert SLIDING_WINDOW % BLOCK_SIZE == 0
@@ -191,6 +201,7 @@ def attention_swa(
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16],
+    gate_r: pl.Tensor[[NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16],
     resid1_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[
@@ -221,11 +232,13 @@ def attention_swa(
     q_proj_norm = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32)
     k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN_LOCAL], dtype=pl.FP32)
     normed_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    # alloc_tile col dim must be a multiple of 16; NUM_HEADS_SWA_LOCAL=12 is not.
-    # Widen gate_logits to 16 cols; the 4 padding cols are written as zeros by
-    # the padded matmul and never read (swa_head_gate iterates only heads 0-11).
-    _GATE_N_PAD = 16
-    gate_logits = pl.create_tensor([BATCH, _GATE_N_PAD], dtype=pl.FP32)
+    # Head-gate is now precomputed off-device and passed through ``gate_r``
+    # (worker computes gate_exp = expand_per_head(sigmoid(RMSNorm(current_hidden)
+    # @ w_g))). The on-device gate_logits matmul was removed: its output N=16
+    # tripped the pypto matmul_acc small-N codegen bug (K-accumulation dropped,
+    # gate ~20x too small). o_proj (Scope 3.a) reads gate_r directly. ``w_g``
+    # stays in the signature (worker still sends it) but is unused here. Mirrors
+    # attention_full.py.
 
     # ----- Scope 1.a — zero-centred input RMSNorm. -----
     # input_rms_weight is replicated across TP ranks (HIDDEN dim is not
@@ -367,35 +380,11 @@ def attention_swa(
         k_normed = pl.col_expand_mul(k_scaled, pl.add(k_gamma, 1.0))
         k_proj_norm = pl.assemble(k_proj_norm, k_normed, [qkn_b0, qkn_k0])
 
-    # ----- Scope 1.f — head-wise gate matmul (current_hidden, NOT normed). -----
-    # w_g is declared with NUM_HEADS_SWA_LOCAL_PAD=16 cols (the physical weight
-    # is zero-padded in the last 4 cols).  Slicing the full 16-col tile avoids
-    # materialising a 12-col Vec tile (12×2=24 bytes < 32-byte row-alignment
-    # requirement).  The extra 4 matmul output cols are garbage but never used:
-    # swa_head_gate reads gate_logits[:, gate_h] for gate_h in 0..11 only.
-    for gp_spmd_idx in pl.spmd(BATCH // BATCH_TILE, name_hint="swa_gate_proj"):
-        gp_b0 = gp_spmd_idx * BATCH_TILE
-        a0 = pl.slice(current_hidden, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [gp_b0, 0])
-        b0t = pl.slice(
-            w_g,
-            [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD],
-            [layer_hidden_base, 0],
-        )
-        gp_acc = pl.matmul(a0, b0t, out_dtype=pl.FP32)
-        for kb in pl.range(1, decode_scope1_hidden_blocks):
-            k0 = kb * INPUT_PROJ_K_CHUNK
-            a = pl.slice(current_hidden, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [gp_b0, k0])
-            b = pl.slice(
-                w_g,
-                [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD],
-                [layer_hidden_base + k0, 0],
-            )
-            gp_acc = pl.matmul_acc(gp_acc, a, b)
-        gate_logits = pl.assemble(
-            gate_logits,
-            pl.set_validshape(gp_acc, BATCH_TILE, NUM_HEADS_SWA_LOCAL),
-            [gp_b0, 0],
-        )
+    # ----- Scope 1.f — head-wise gate matmul REMOVED. -----
+    # The on-device gate_logits matmul (current_hidden @ w_g, output N=16) hit
+    # the pypto matmul_acc small-N codegen bug (K-accumulation dropped). The gate
+    # is now precomputed on the worker and delivered via ``gate_r``; o_proj
+    # (Scope 3.a) applies it inline. Mirrors attention_full.py.
 
     # ----- Scope 2 — full RoPE + paged KV cache write + fa_fused (SWA). -----
     # Full RoPE (rotary_dim == HEAD_DIM, no pass-through tail). The KV cache
@@ -456,32 +445,34 @@ def attention_swa(
                     [cache_row, 0],
                 )
 
+                # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_SWA] slices of
+                # q_proj_norm (mirrors the K path), replacing reshape([.,HEAD_DIM])
+                # + col-offset slice which miscompiled the rot_q_hi write into
+                # all_q_padded. See attention_full.py Scope 2 / _stage_scope12_qk.py.
                 q_base = ki * Q_PER_KV_SWA
-                q_block = pl.reshape(
-                    pl.slice(
-                        q_proj_norm, [1, Q_HEAD_BATCH_SWA * HEAD_DIM],
-                        [b, q_base * HEAD_DIM],
-                    ),
-                    [Q_HEAD_BATCH_SWA, HEAD_DIM],
-                )
-                q_lo = pl.slice(q_block, [Q_HEAD_BATCH_SWA, ROTARY_HALF_SWA], [0, 0])
-                q_hi = pl.slice(q_block, [Q_HEAD_BATCH_SWA, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
-                rot_q_lo = pl.sub(
-                    pl.col_expand_mul(q_lo, cos_lo),
-                    pl.col_expand_mul(q_hi, sin_lo),
-                )
-                rot_q_hi = pl.add(
-                    pl.col_expand_mul(q_hi, cos_hi),
-                    pl.col_expand_mul(q_lo, sin_hi),
-                )
-                rot_q_lo_bf16 = pl.cast(rot_q_lo, target_type=pl.BF16)
-                rot_q_hi_bf16 = pl.cast(rot_q_hi, target_type=pl.BF16)
-
                 pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED + ki * SWA_Q_PAD_ALIGNED
-                all_q_padded = pl.assemble(all_q_padded, rot_q_lo_bf16, [pad_row_base, 0])
-                all_q_padded = pl.assemble(
-                    all_q_padded, rot_q_hi_bf16, [pad_row_base, ROTARY_HALF_SWA],
-                )
+                for qh in pl.range(Q_HEAD_BATCH_SWA):
+                    qh_col = (q_base + qh) * HEAD_DIM
+                    q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col])
+                    q_hi_h = pl.slice(
+                        q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col + ROTARY_HALF_SWA],
+                    )
+                    rot_q_lo_h = pl.sub(
+                        pl.col_expand_mul(q_lo_h, cos_lo),
+                        pl.col_expand_mul(q_hi_h, sin_lo),
+                    )
+                    rot_q_hi_h = pl.add(
+                        pl.col_expand_mul(q_hi_h, cos_hi),
+                        pl.col_expand_mul(q_lo_h, sin_hi),
+                    )
+                    q_row = pad_row_base + qh
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
+                        [q_row, ROTARY_HALF_SWA],
+                    )
                 all_q_padded = pl.assemble(
                     all_q_padded,
                     pl.cast(
@@ -679,22 +670,15 @@ def attention_swa(
         # q_base = kvh * Q_PER_KV_SWA == 0 (KV_HEADS_LOCAL=1, kvh=0).
         attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])
 
-    # ----- Scope 2.5 — head-wise sigmoid gate (local heads only). -----
-    # Phase 15 BYPASS (mirror of attention_full.py:690): the head-gate
-    # `pl.slice(sigmoid_all, [BATCH_TILE, 1], [0, gate_h])` produces a
-    # [N, 1] FP32 VEC tile whose row byte size (1*4=4B) violates pto-isa's
-    # 32B row-alignment rule; runtime fault surfaces as ``errcode 0x800
-    # "UB address not aligned"`` -> 507018. Same root cause as
-    # full_head_gate (see project memory project_p15_fault_is_full_head_gate
-    # and docs/known-pypto-pitfalls.md §1). Proper fix path: pre-expand
-    # sigmoid via cube matmul against constant block-diag R replication
-    # matrix (TASK-L upstream). Bypass = identity pass-through; the gate
-    # normally multiplies by sigmoid(g) ~ 0.5 mean -- bypass = x1.
-    # gate_logits is still computed (used by downstream graph), gate is
-    # simply not applied. Test-side torch_ref already mirrors this bypass.
-    gated_attn_out = attn_out
+    # ----- Scope 2.5 — head-wise gate is applied inline in o_proj below. -----
+    # The worker precomputes gate_exp = expand_per_head(sigmoid(RMSNorm(
+    # current_hidden) @ w_g)) as [BATCH, HIDDEN_Q_SWA_LOCAL] BF16 and passes it
+    # through the ``gate_r`` slot (BATCH == NUM_HEADS_SWA_LOCAL_PAD == 16, so the
+    # [16, HIDDEN_Q_SWA_LOCAL] slot fits with no shape change). The o_proj scope
+    # multiplies attn_out by gate_r per K-chunk (wide element-wise, no [N,1]
+    # broadcast → no UB-align fault). Mirrors attention_full.py Scope 3.a.
 
-    # ----- Scope 3.a — local o_proj (partial result, no residual yet). -----
+    # ----- Scope 3.a — local o_proj with inline head-gate (element-wise). -----
     # wo is column-sliced (input dim → HIDDEN_Q_SWA_LOCAL = 1536 per rank);
     # the output is a partial [BATCH, HIDDEN] BF16 tensor that must be
     # summed across the TP group via the all-reduce below before residual.
@@ -710,18 +694,35 @@ def attention_swa(
             optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
         ):
             o0 = ob * OUT_PROJ_N_CHUNK
-            a_chunk_0 = pl.slice(
-                gated_attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0],
+            # First K-chunk (kb=0). Gate applied inline via gate_r (=gate_exp).
+            hg_exp_0 = pl.cast(
+                pl.slice(gate_r, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0]),
+                target_type=pl.FP32,
             )
+            a_chunk_raw_0 = pl.slice(
+                attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0],
+            )
+            a_gated_fp32_0 = pl.mul(
+                pl.cast(a_chunk_raw_0, target_type=pl.FP32), hg_exp_0,
+            )
+            a_chunk_0 = pl.cast(a_gated_fp32_0, target_type=pl.BF16)
             w_chunk_0 = pl.slice(
                 wo, [OUT_PROJ_K_CHUNK, OUT_PROJ_N_CHUNK], [layer_qhidden_base, o0],
             )
             o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
             for kb in pl.range(1, out_proj_k_blocks):
                 k0 = kb * OUT_PROJ_K_CHUNK
-                a_chunk = pl.slice(
-                    gated_attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0],
+                hg_exp = pl.cast(
+                    pl.slice(gate_r, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0]),
+                    target_type=pl.FP32,
                 )
+                a_chunk_raw = pl.slice(
+                    attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0],
+                )
+                a_gated_fp32 = pl.mul(
+                    pl.cast(a_chunk_raw, target_type=pl.FP32), hg_exp,
+                )
+                a_chunk = pl.cast(a_gated_fp32, target_type=pl.BF16)
                 w_chunk = pl.slice(
                     wo, [OUT_PROJ_K_CHUNK, OUT_PROJ_N_CHUNK],
                     [layer_qhidden_base + k0, o0],
@@ -878,6 +879,7 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
             wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
             w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS], pl.BF16],
+            gate_r: pl.Tensor[[NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16],
             resid1_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
@@ -893,6 +895,7 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                 rope_cos, rope_sin,
                 k_cache, v_cache,
                 wo, w_g,
+                gate_r,
                 resid1_out,
                 layer_idx,
                 tmp_window,
@@ -924,6 +927,9 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             v_cache: pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
             wo: pl.Tensor[[tp_size, LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
             w_g: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, NUM_HEADS], pl.BF16],
+            gate_r: pl.Tensor[
+                [tp_size, NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16
+            ],
             resid1_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
             layer_idx: pl.Scalar[pl.INT32],
         ):
@@ -942,6 +948,7 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                     rope_cos[r], rope_sin[r],
                     k_cache[r], v_cache[r],
                     wo[r], w_g[r],
+                    gate_r[r],
                     resid1_out[r],
                     tmp_window,
                     signal_window,

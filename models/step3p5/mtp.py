@@ -110,6 +110,7 @@ from .config import (
     LAYER_INTER_ROWS_DYN,
     LM_HEAD_K_CHUNK,
     NUM_HEADS_SWA_LOCAL,
+    NUM_HEADS_SWA_LOCAL_PAD,
     NUM_HIDDEN_LAYERS,
     NUM_NEXTN_PREDICT_LAYERS,
     OUT_PROJ_N_CHUNK,
@@ -481,6 +482,7 @@ def mtp_layer(
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN_SWA, HIDDEN], pl.BF16],
     w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL], pl.BF16],
+    gate_r: pl.Tensor[[NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16],
     # TP-sliced dense MLP bundle (per the decode_layer convention).
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE_LOCAL], pl.BF16],
@@ -535,7 +537,7 @@ def mtp_layer(
         seq_lens, block_table, slot_mapping,
         rope_cos, rope_sin,
         k_cache, v_cache,
-        wo, w_g, resid1, global_layer_idx,
+        wo, w_g, gate_r, resid1, global_layer_idx,
         attn_tmp_window, attn_signal_window, my_rank,
     )
 

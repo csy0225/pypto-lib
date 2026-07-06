@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -84,6 +85,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("-d", "--device", type=int, default=0)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--smoke", action="store_true")
+    p.add_argument("--with-lmhead", action="store_true")
+    p.add_argument("--with-dense-mlp", action="store_true")
+    p.add_argument("--two-method", action="store_true")
     p.add_argument(
         "--world-size", type=int, default=1,
         choices=[1, 8],
@@ -309,8 +313,19 @@ def main() -> int:  # noqa: PLR0915
     )
     import models.step3p5.config as cfg_mod  # noqa: PLC0415
     import models.step3p5.decode_layer as decode_layer  # noqa: PLC0415
+    if args.two_method:
+        args.with_dense_mlp = True
 
-    program = getattr(decode_layer, prog_name_key)
+    if args.two_method:
+        program = decode_layer._build_mixed_2method_program(
+            full=full_attn, routed_lim=0.0, shared_lim=0.0,
+        )
+    elif args.with_dense_mlp:
+        program = decode_layer._build_fused_dense_moe_program(
+            full=full_attn, routed_lim=0.0, shared_lim=0.0,
+        )
+    else:
+        program = getattr(decode_layer, prog_name_key)
     prog_name = getattr(program, "name", None) or type(program).__name__
 
     if full_attn:
@@ -344,7 +359,10 @@ def main() -> int:  # noqa: PLR0915
     g = torch.Generator().manual_seed(args.seed)
     bf16 = torch.bfloat16
 
-    n_attn = NUM_HIDDEN_LAYERS  # use full layer table for stacked dim
+    # Match the COMPILED program's stacked bound (LAYER_HIDDEN_ROWS_DYN =
+    # n_full_attn_layers * HIDDEN); NUM_HIDDEN_LAYERS (45) over-provisions
+    # wo to 3GB and OOMs once dense/lm_head weights are added.
+    n_attn = cfg_mod.LAYER_HIDDEN_ROWS_DYN // HIDDEN
     w_input_rms = torch.empty(NUM_HIDDEN_LAYERS, HIDDEN).normal_(
         0.0, 0.05, generator=g)
     w_post_rms = torch.empty(NUM_HIDDEN_LAYERS, HIDDEN).normal_(
@@ -414,6 +432,27 @@ def main() -> int:  # noqa: PLR0915
     v_cache = torch.zeros(1, MAX_SEQ_DEFAULT, HEAD_DIM, dtype=bf16)
 
     next_hidden_out = torch.zeros(1, BATCH, HIDDEN, dtype=bf16)
+    if args.two_method:
+        h_mid_out = torch.zeros(1, BATCH, HIDDEN, dtype=bf16)
+    if args.with_dense_mlp:
+        _LHR = cfg_mod.LAYER_HIDDEN_ROWS_DYN
+        _LIR = cfg_mod.LAYER_INTER_ROWS_DYN
+        _ILC = cfg_mod.INTERMEDIATE_LOCAL
+        post_rms_d = w_post_rms.float().unsqueeze(0)
+        w_gate_d = torch.zeros(1, _LHR, _ILC, dtype=bf16)
+        w_up_d = torch.zeros(1, _LHR, _ILC, dtype=bf16)
+        w_down_d = torch.zeros(1, _LIR, HIDDEN, dtype=bf16)
+    if args.with_lmhead:
+        from models.step3p5.config import VOCAB, VOCAB_LOCAL  # noqa: PLC0415,F401
+        _fnorm = torch.empty(1, HIDDEN).normal_(0.0, 0.05, generator=g)
+        _lmh_full = torch.empty(
+            VOCAB, HIDDEN, dtype=torch.float32,
+        ).normal_(0.0, 0.02, generator=g)
+        final_norm_weight = _fnorm.reshape(1, 1, HIDDEN)
+        lm_head_weight = _lmh_full[:VOCAB_LOCAL].to(bf16).unsqueeze(0)
+        logits_shard_out = torch.zeros(
+            1, BATCH, VOCAB_LOCAL, dtype=torch.float32,
+        )
 
     def flat3(t):
         L, M, N = t.shape
@@ -429,6 +468,7 @@ def main() -> int:  # noqa: PLR0915
         "slot_mapping": slot_mapping, "rope_cos": rope_cos,
         "rope_sin": rope_sin, "k_cache": k_cache, "v_cache": v_cache,
         "wo": flat3(wo), "w_g": flat3(w_g),
+        "gate_r": torch.ones(1, PAD, H_Q, dtype=bf16),
         "post_rms_weight": w_post_rms.float().unsqueeze(0),
         "gate_w": gate_w.unsqueeze(0),
         "router_bias": router_bias.unsqueeze(0),
@@ -440,6 +480,17 @@ def main() -> int:  # noqa: PLR0915
         "w_down_s": w_down_s.unsqueeze(0),
         "next_hidden_out": next_hidden_out,
     }
+    if args.with_dense_mlp:
+        inputs["post_rms_d"] = post_rms_d
+        inputs["w_gate_d"] = w_gate_d
+        inputs["w_up_d"] = w_up_d
+        inputs["w_down_d"] = w_down_d
+    if args.two_method:
+        inputs["h_mid_out"] = h_mid_out
+    if args.with_lmhead:
+        inputs["final_norm_weight"] = final_norm_weight
+        inputs["lm_head_weight"] = lm_head_weight
+        inputs["logits_shard_out"] = logits_shard_out
 
     # Multi-rank: broadcast every host input to [N_RANKS, ...] so the
     # canonical 8-rank host_orch can index tensors[name][r_idx] for
@@ -453,6 +504,14 @@ def main() -> int:  # noqa: PLR0915
                 else v.expand(_NR, *v.shape[1:]).contiguous())
             for k, v in inputs.items()
         }
+        if args.with_lmhead:
+            from models.step3p5.config import VOCAB_LOCAL  # noqa: PLC0415
+            _lmh_d = torch.zeros(_NR, VOCAB_LOCAL, HIDDEN, dtype=bf16)
+            for _r in range(_NR):
+                _lmh_d[_r] = _lmh_full[
+                    _r * VOCAB_LOCAL:(_r + 1) * VOCAB_LOCAL
+                ].to(bf16)
+            inputs["lm_head_weight"] = _lmh_d
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run  # noqa: PLC0415
 
@@ -477,6 +536,7 @@ def main() -> int:  # noqa: PLR0915
         _spec("rope_sin", torch.float32),
         _spec("k_cache", bf16), _spec("v_cache", bf16),
         _spec("wo", bf16), _spec("w_g", bf16),
+        _spec("gate_r", bf16),
         _spec("post_rms_weight", torch.float32),
         _spec("gate_w", torch.float32),
         _spec("router_bias", torch.float32),
@@ -488,6 +548,17 @@ def main() -> int:  # noqa: PLR0915
         ScalarSpec("layer_idx", torch.int32,
                    value=torch.tensor(layer_idx, dtype=torch.int32)),
     ]
+    if args.two_method:
+        specs.insert(-1, _spec("h_mid_out", bf16, is_out=True))
+    if args.with_dense_mlp:
+        specs.insert(-1, _spec("post_rms_d", torch.float32))
+        specs.insert(-1, _spec("w_gate_d", bf16))
+        specs.insert(-1, _spec("w_up_d", bf16))
+        specs.insert(-1, _spec("w_down_d", bf16))
+    if args.with_lmhead:
+        specs.insert(-1, _spec("final_norm_weight", torch.float32))
+        specs.insert(-1, _spec("lm_head_weight", bf16))
+        specs.insert(-1, _spec("logits_shard_out", torch.float32, is_out=True))
 
     def golden_fn(values):
         # Rank-wise slim torch ref. Each rank computes its local attention
@@ -542,6 +613,17 @@ def main() -> int:  # noqa: PLR0915
         expected = (partial_sum + hidden_ref).bfloat16()
         for rank in range(nranks):
             values["next_hidden_out"][rank] = expected
+        if args.two_method:
+            for rank in range(nranks):
+                values["h_mid_out"][rank] = expected
+        if args.with_lmhead:
+            _x = expected.float()
+            _var = _x.pow(2).mean(-1, keepdim=True)
+            _fn = values["final_norm_weight"][0].reshape(-1).float()
+            _fnormed = _x * torch.rsqrt(_var + EPS) * (_fn + 1.0)
+            for rank in range(nranks):
+                _lmh_r = values["lm_head_weight"][rank].float()
+                values["logits_shard_out"][rank] = _fnormed @ _lmh_r.t()
 
     from simpler.orchestrator import Orchestrator  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
@@ -609,8 +691,12 @@ def main() -> int:  # noqa: PLR0915
         from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
             DistributedConfig,
         )
+        # MOE_ST_DEV_OFFSET lets the 8-card run target cards [off..off+7] so it
+        # can run on a free card group (e.g. 8-15) without disturbing an
+        # oracle vLLM on cards 0-7. Default 0 = original behaviour.
+        _dev_off = int(os.environ.get("MOE_ST_DEV_OFFSET", "0"))
         compile_cfg["distributed_config"] = DistributedConfig(
-            device_ids=list(range(args.world_size)),
+            device_ids=[_dev_off + d for d in range(args.world_size)],
             num_sub_workers=0,
         )
 
@@ -626,16 +712,21 @@ def main() -> int:  # noqa: PLR0915
                   flush=True)
             return 0 if result.passed else 1
 
+        _cmp_fns = {
+            "next_hidden_out": ratio_allclose(
+                atol=4e-2, rtol=4e-2, max_error_ratio=0.10,
+            ),
+        }
+        if args.with_lmhead:
+            _cmp_fns["logits_shard_out"] = ratio_allclose(
+                atol=6e-2, rtol=6e-2, max_error_ratio=0.20,
+            )
         result = run(
             program=program, specs=specs,
             golden_fn=golden_fn,
             runtime_cfg=runtime_cfg, rtol=4e-2, atol=4e-2,
             compile_cfg=compile_cfg,
-            compare_fn={
-                "next_hidden_out": ratio_allclose(
-                    atol=4e-2, rtol=4e-2, max_error_ratio=0.10,
-                ),
-            },
+            compare_fn=_cmp_fns,
         )
         print(f"[ST-MoE {args.variant} ws={args.world_size}] {args.platform.upper()}: {result}",
               flush=True)

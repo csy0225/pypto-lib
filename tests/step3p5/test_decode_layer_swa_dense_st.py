@@ -57,8 +57,12 @@ def _torch_swa_attn_no_gate(*, hidden_states, input_rms_weight,
                             num_heads_full, num_kv_heads_full, head_dim,
                             rotary_dim, rotary_half, q_per_kv,
                             eps, block_size, max_blocks_per_seq,
-                            sliding_window):
-    """Per-token sliding-window paged attention without head_gate.
+                            sliding_window, w_g_full=None):
+    """Per-token sliding-window paged attention. head_gate applied iff
+    ``w_g_full`` given (``sigmoid(input_RMSNorm(hidden) @ w_g_full)`` per head,
+    applied to attn_out before o_proj — matches vLLM Step3p5Attention and the
+    kernel's worker-precomputed gate_r). Default ``None`` keeps the no-gate
+    behaviour so existing ST callers are unchanged.
     rotary_dim == head_dim for SWA (no pass-through)."""
     batch = hidden_states.shape[0]
     hidden_q = num_heads_full * head_dim
@@ -156,7 +160,17 @@ def _torch_swa_attn_no_gate(*, hidden_states, input_rms_weight,
             )
         attn_out[b:b + 1, :] = attn_row
 
-    o = attn_out.float() @ wo_full.float()
+    # head_gate: identity when w_g_full is None (ST no-gate path), else the real
+    # step3p5 per-head sigmoid gate applied to attn_out before o_proj. gate uses
+    # normed_bf16 (input-RMSNorm'd hidden), matching vLLM sigmoid(g_proj(
+    # input_layernorm(hidden))) and the kernel's worker-precomputed gate_r.
+    if w_g_full is not None:
+        gate = torch.sigmoid(normed_bf16.float() @ w_g_full.float())
+        attn_g = (attn_out.float().view(batch, num_heads_full, head_dim)
+                  * gate.unsqueeze(-1)).reshape(batch, hidden_q)
+        o = attn_g @ wo_full.float()
+    else:
+        o = attn_out.float() @ wo_full.float()
     resid1 = (o + hidden_states.float()).bfloat16()
     return resid1
 
@@ -261,6 +275,11 @@ def main() -> int:
     wv = _randn([n_swa, HIDDEN, KV_H])
     wo = _randn([n_swa, H_Q_SWA, HIDDEN])
     w_g = _randn([n_swa, HIDDEN, PAD_SWA])
+    # gate_r = ones -> o_proj multiplies attn_out by 1 (identity), matching the
+    # no-gate golden (_torch_swa_attn_no_gate). The kernel now applies the head
+    # gate inline in o_proj via gate_r (worker-precomputed in production); here
+    # we feed ones so this ST keeps validating the un-gated attention path.
+    gate_r = torch.ones(PAD_SWA, H_Q_SWA, dtype=bf16)
     w_gate = _randn([n_dense, HIDDEN, INT_LOC])
     w_up = _randn([n_dense, HIDDEN, INT_LOC])
     w_down = _randn([n_dense, INT_LOC, HIDDEN])
@@ -299,6 +318,7 @@ def main() -> int:
         "v_cache": v_cache,
         "wo": flat3(wo),
         "w_g": flat3(w_g),
+        "gate_r": gate_r.unsqueeze(0),
         "post_rms_weight": w_post_rms.float().unsqueeze(0),
         "w_gate": flat3(w_gate),
         "w_up": flat3(w_up),
@@ -329,6 +349,7 @@ def main() -> int:
         _spec("rope_sin", torch.float32),
         _spec("k_cache", bf16), _spec("v_cache", bf16),
         _spec("wo", bf16), _spec("w_g", bf16),
+        _spec("gate_r", bf16),
         _spec("post_rms_weight", torch.float32),
         _spec("w_gate", bf16), _spec("w_up", bf16), _spec("w_down", bf16),
         _spec("next_hidden_out", bf16, is_out=True),

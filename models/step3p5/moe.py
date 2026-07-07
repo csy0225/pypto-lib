@@ -455,6 +455,14 @@ def _build_ep_tp_moe_program(
                     bias_row_chunk = pl.reshape(
                         bias_chunk, [1, ROUTER_GATE_N_CHUNK],
                     )
+                    # ROUTER-BIAS-BF16: vLLM runs router_bias in BF16; the loader
+                    # gives FP32. BF16-round it (bias~4.79 dominates; its ~0.015
+                    # rounding decides the top-8 tail — wrong tail vs vLLM without
+                    # this). Cast the [1,32] reshaped chunk (2D-safe).
+                    bias_row_chunk = pl.cast(
+                        pl.cast(bias_row_chunk, target_type=pl.BF16),
+                        target_type=pl.FP32,
+                    )
                     biased_n_chunk = pl.add(
                         score_n_chunk,
                         pl.col_expand_mul(

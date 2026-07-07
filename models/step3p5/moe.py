@@ -182,6 +182,8 @@ ROUTED_MAX_TILE = LOCAL_RECV_MAX
 # inner pass, outer ``for tile_idx in pl.range(N_RECV_TILES)`` loop.
 # 32 * 1280 * 4 = 160 KB keeps headroom for intermediates.
 RECV_TILE = 32
+ROUTED_QUANT_T_TILE = 16    # per-token dyn-quant token-tile (RECV_TILE % == 0)
+MOE_IN_QUANT_T_TILE = 16   # per-token input dyn-quant token-tile (T % == 0)
 assert ROUTED_MAX_TILE % RECV_TILE == 0, (
     f"ROUTED_MAX_TILE ({ROUTED_MAX_TILE}) must be divisible by RECV_TILE ({RECV_TILE})"
 )
@@ -1088,6 +1090,81 @@ def _build_ep_tp_moe_program(
                                 :, n0 : n0 + ROUTED_GATE_N_CHUNK
                             ] = pl.cast(gated_m, target_type=pl.BF16)
 
+                        # --- Per-token INT8 dynamic-quant of the CLAMPED swiglu
+                        # intermediate, matching the vLLM-ascend W8A8 oracle
+                        # (npu_dynamic_quant before the INT8 down-proj). Routed
+                        # experts only (shared expert is unquantized BF16). Gated
+                        # by the compile-time _routed_swiglu_step so silu builds
+                        # elide it. Structure mirrors DeepSeek v4 qkv_proj_rope
+                        # per-token act-quant: pl.spmd OVER TOKENS, each block owns
+                        # ROW_Q_TILE rows and reads their FULL INTER feature from the
+                        # h_bf16 bridge (coherent cross-spmd read, like DeepSeek's
+                        # qr_fp32). amax over INTER via inner pl.range; INT32 rint
+                        # rounding (NOT cast-to-INT8-round). scale=amax/127 bounds
+                        # scaled values to +-127 so no INT8 saturation needed.
+                        if _routed_swiglu_step:
+                            for q_tg in pl.spmd(
+                                RECV_TILE // ROUTED_QUANT_T_TILE,
+                                name_hint="routed_dyn_quant",
+                            ):
+                                q_t0 = q_tg * ROUTED_QUANT_T_TILE
+                                q_amax = pl.full(
+                                    [1, ROUTED_QUANT_T_TILE],
+                                    dtype=pl.FP32, value=1e-4,
+                                )
+                                for q_ab in pl.range(INTER // ROUTED_GATE_N_CHUNK):
+                                    q_a0 = q_ab * ROUTED_GATE_N_CHUNK
+                                    q_ac = pl.cast(
+                                        pl.slice(
+                                            h_bf16,
+                                            [ROUTED_QUANT_T_TILE, ROUTED_GATE_N_CHUNK],
+                                            [q_t0, q_a0],
+                                        ),
+                                        target_type=pl.FP32,
+                                    )
+                                    q_abs = pl.maximum(q_ac, pl.neg(q_ac))
+                                    q_amax = pl.maximum(
+                                        q_amax,
+                                        pl.reshape(
+                                            pl.row_max(q_abs),
+                                            [1, ROUTED_QUANT_T_TILE],
+                                        ),
+                                    )
+                                q_inv_row = pl.div(
+                                    pl.full(
+                                        [1, ROUTED_QUANT_T_TILE],
+                                        dtype=pl.FP32, value=127.0,
+                                    ),
+                                    q_amax,
+                                )
+                                q_inv_t = pl.reshape(
+                                    q_inv_row, [ROUTED_QUANT_T_TILE, 1],
+                                )
+                                q_scale_t = pl.reshape(
+                                    pl.recip(q_inv_row), [ROUTED_QUANT_T_TILE, 1],
+                                )
+                                for q_nb in pl.range(INTER // ROUTED_GATE_N_CHUNK):
+                                    q_n0 = q_nb * ROUTED_GATE_N_CHUNK
+                                    q_ch = pl.cast(
+                                        pl.slice(
+                                            h_bf16,
+                                            [ROUTED_QUANT_T_TILE, ROUTED_GATE_N_CHUNK],
+                                            [q_t0, q_n0],
+                                        ),
+                                        target_type=pl.FP32,
+                                    )
+                                    q_scaled = pl.row_expand_mul(q_ch, q_inv_t)
+                                    q_i32 = pl.cast(
+                                        q_scaled, target_type=pl.INT32, mode="rint",
+                                    )
+                                    q_deq = pl.row_expand_mul(
+                                        pl.cast(q_i32, target_type=pl.FP32), q_scale_t,
+                                    )
+                                    h_bf16[
+                                        q_t0 : q_t0 + ROUTED_QUANT_T_TILE,
+                                        q_n0 : q_n0 + ROUTED_GATE_N_CHUNK,
+                                    ] = pl.cast(q_deq, target_type=pl.BF16)
+
                         # Down projection: each SPMD block handles one D-chunk of
                         # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
                         # pl.slice of it gives tmov vec→left ✓.
@@ -1658,6 +1735,74 @@ def _build_ep_tp_moe_program(
                     )
             return x_out
 
+        @pl.function(type=pl.FunctionType.InCore)
+        def _quant_moe_input(
+            self,
+            x: pl.Tensor[[T, HIDDEN], pl.BF16],
+            x_out: pl.Out[pl.Tensor[[T, HIDDEN], pl.BF16]],
+        ):
+            # Per-token INT8 dynamic-quant (dequant->BF16) of the routed-expert
+            # INPUT (oracle npu_dynamic_quant(x) before gate_up). Placed AFTER
+            # gate+shared, BEFORE dispatch, so router + unquantized shared see the
+            # ORIGINAL x and the routed experts consume pre-quantized tokens (gate_up
+            # reads a normal GM slice, NOT a vec-quantized cube-matmul input). Tensor
+            # pl.slice + spmd-over-tokens, mirroring the proven interm-quant. Per-token
+            # over the FULL HIDDEN; INT32-rint; symmetric scale=amax/127.
+            for qtg in pl.spmd(
+                T // MOE_IN_QUANT_T_TILE, name_hint="moe_input_quant"
+            ):
+                qt0 = qtg * MOE_IN_QUANT_T_TILE
+                q_amax = pl.full(
+                    [1, MOE_IN_QUANT_T_TILE], dtype=pl.FP32, value=1e-4,
+                )
+                for qab in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
+                    qa0 = qab * ROUTED_GATE_K_CHUNK
+                    qac = pl.cast(
+                        pl.slice(
+                            x,
+                            [MOE_IN_QUANT_T_TILE, ROUTED_GATE_K_CHUNK],
+                            [qt0, qa0],
+                        ),
+                        target_type=pl.FP32,
+                    )
+                    q_amax = pl.maximum(
+                        q_amax,
+                        pl.reshape(
+                            pl.row_max(pl.maximum(qac, pl.neg(qac))),
+                            [1, MOE_IN_QUANT_T_TILE],
+                        ),
+                    )
+                q_inv_row = pl.div(
+                    pl.full([1, MOE_IN_QUANT_T_TILE], dtype=pl.FP32, value=127.0),
+                    q_amax,
+                )
+                q_inv = pl.reshape(q_inv_row, [MOE_IN_QUANT_T_TILE, 1])
+                q_scale = pl.reshape(
+                    pl.recip(q_inv_row), [MOE_IN_QUANT_T_TILE, 1],
+                )
+                for qnb in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
+                    qn0 = qnb * ROUTED_GATE_K_CHUNK
+                    qch = pl.cast(
+                        pl.slice(
+                            x,
+                            [MOE_IN_QUANT_T_TILE, ROUTED_GATE_K_CHUNK],
+                            [qt0, qn0],
+                        ),
+                        target_type=pl.FP32,
+                    )
+                    qq = pl.cast(
+                        pl.row_expand_mul(qch, q_inv),
+                        target_type=pl.INT32, mode="rint",
+                    )
+                    qdq = pl.row_expand_mul(
+                        pl.cast(qq, target_type=pl.FP32), q_scale,
+                    )
+                    x_out[
+                        qt0 : qt0 + MOE_IN_QUANT_T_TILE,
+                        qn0 : qn0 + ROUTED_GATE_K_CHUNK,
+                    ] = pl.cast(qdq, target_type=pl.BF16)
+            return x_out
+
         # ---------- DEBUG per-stage dump copy (localization only) ----------
         @pl.function(type=pl.FunctionType.InCore)
         def _dbg_copy(
@@ -1756,6 +1901,14 @@ def _build_ep_tp_moe_program(
             x_ser_buf = pl.create_tensor([T, HIDDEN], dtype=pl.BF16)
             x = self._serialize_after_shared(x, sh_y, x_ser_buf)
 
+            # Per-token INT8 input-quant for ROUTED experts (swiglu only). Router
+            # (gate_step) + unquantized shared expert above already used ORIGINAL x.
+            if _routed_swiglu_step:
+                x_moe_q = pl.create_tensor([T, HIDDEN], dtype=pl.BF16)
+                x_disp = self._quant_moe_input(x, x_moe_q)
+            else:
+                x_disp = x
+
             # 3) Dispatch (EP all-to-all).
             local_routed_x = pl.create_tensor(
                 [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
@@ -1773,7 +1926,7 @@ def _build_ep_tp_moe_program(
                 local_expert_count,
                 inverse_map,
             ) = self.dispatch_step(
-                x, expert_indices,
+                x_disp, expert_indices,
                 local_routed_x,
                 local_expert_offset, local_expert_count, inverse_map,
                 send_buf,

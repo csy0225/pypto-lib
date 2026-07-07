@@ -322,17 +322,14 @@ def _build_ep_tp_moe_program(
             group_size = EP_WORLD_SIZE
             d_cols = HIDDEN
 
-            # 1) Local self-bucket copy.
-            n_self = pl.cast(pl.read(send_counts, [my_rank]), pl.INDEX)
-            s_off_self = pl.cast(pl.read(send_offsets, [my_rank]), pl.INDEX)
-            r_off_self = pl.cast(pl.read(recv_offsets, [my_rank]), pl.INDEX)
-            PER_PEER_BOUND = T * TOPK  # 128: LOCAL_RECV_MAX = N_RANKS*T*TOPK
+            # 1) Local self-bucket copy (symmetric fixed slot my_rank*MAX).
+            PER_PEER_BOUND = T * TOPK  # 128 = MAX_PER_RANK per (src,dst) slot
+            _self_base = pl.cast(my_rank * PER_PEER_BOUND, pl.INDEX)
             for r in pl.range(PER_PEER_BOUND):
-                if r < n_self:
-                    self_tile = pl.load(
-                        send, [s_off_self + r, 0], [1, d_cols],
-                    )
-                    pl.store(self_tile, [r_off_self + r, 0], recv)
+                self_tile = pl.load(
+                    send, [_self_base + r, 0], [1, d_cols],
+                )
+                pl.store(self_tile, [_self_base + r, 0], recv)
 
             # 2) Set(1) notify every peer.
             for peer in pl.range(group_size):
@@ -355,29 +352,25 @@ def _build_ep_tp_moe_program(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-            # 4) Pull every peer's bucket-for-me.
+            # 4) Pull every peer's bucket-for-me (symmetric fixed slots).
+            # My block in peer's send_buf is at my_rank*MAX; store into
+            # peer's block in my recv at peer*MAX. Read full MAX rows (gap
+            # rows past the real count are ignored by the re-pack, which
+            # uses the available column-my_rank counts). Indices are
+            # compound-scalar (my_rank*MAX) or loop-var (peer*MAX) -> no
+            # bare [my_rank] index and no cross-rank offset data.
+            _my_base = pl.cast(my_rank * (T * TOPK), pl.INDEX)
             for peer in pl.range(group_size):
                 if peer != my_rank:
-                    n_recv = pl.cast(
-                        pl.read(recv_counts, [peer]), pl.INDEX,
-                    )
-                    r_off = pl.cast(
-                        pl.read(recv_offsets, [peer]), pl.INDEX,
-                    )
-                    # READ from peer's send_buf at PEER's send-offset-for-me
-                    # (peer packs by its own dst layout), NOT my recv_offset.
-                    read_off = pl.cast(
-                        pl.read(read_offsets, [peer]), pl.INDEX,
-                    )
+                    _peer_base = pl.cast(peer * (T * TOPK), pl.INDEX)
                     for r in pl.range(T * TOPK):
-                        if r < n_recv:
-                            peer_tile = pld.tile.remote_load(
-                                send,
-                                peer=peer,
-                                offsets=[read_off + r, 0],
-                                shape=[1, d_cols],
-                            )
-                            pl.store(peer_tile, [r_off + r, 0], recv)
+                        peer_tile = pld.tile.remote_load(
+                            send,
+                            peer=peer,
+                            offsets=[_my_base + r, 0],
+                            shape=[1, d_cols],
+                        )
+                        pl.store(peer_tile, [_peer_base + r, 0], recv)
 
             return recv
 
@@ -631,7 +624,7 @@ def _build_ep_tp_moe_program(
         ):
             """Pack outgoing tokens into ``send_buf`` ordered by (dst, loc_e)."""
             for r in pl.range(N_RANKS):
-                rank_off = pl.read(send_offsets_per_rank, [r])
+                rank_off = pl.cast(r * (T * TOPK), pl.INT32)  # symmetric dst-block base
                 pl.write(
                     bucket_offset, [r * N_LOCAL_EXPERTS],
                     pl.cast(rank_off, pl.INT32),
@@ -911,7 +904,7 @@ def _build_ep_tp_moe_program(
                         pl.read(pub_counts, [src * N_RANKS + my_rank, e]),
                         pl.INDEX,
                     )
-                    src_base = pl.cast(pl.read(recv_offsets, [src]), pl.INDEX)
+                    src_base = pl.cast(src * (T * TOPK), pl.INDEX)  # symmetric src-block base
                     src_e_off = pl.cast(0, pl.INT32)
                     for prev_e in pl.range(N_LOCAL_EXPERTS):
                         if prev_e < e:
@@ -1010,7 +1003,6 @@ def _build_ep_tp_moe_program(
                                 local_routed_x,
                                 [RECV_TILE, ROUTED_GATE_K_CHUNK],
                                 [tile_offset, 0],
-                                valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
                             )
                             wg0_2d = pl.reshape(
                                 pl.slice(
@@ -1036,9 +1028,6 @@ def _build_ep_tp_moe_program(
                                     local_routed_x,
                                     [RECV_TILE, ROUTED_GATE_K_CHUNK],
                                     [tile_offset, k0],
-                                    valid_shape=[
-                                        tile_valid, ROUTED_GATE_K_CHUNK,
-                                    ],
                                 )
                                 wgk = pl.reshape(
                                     pl.slice(
@@ -1086,13 +1075,18 @@ def _build_ep_tp_moe_program(
                             gated_v = pl.set_validshape(
                                 gated, tile_valid, ROUTED_GATE_N_CHUNK,
                             )
+                            # DeepSeek-aligned (v4 expert_routed fillpad): zero the
+                            # gated tile so h_bf16 rows [tile_valid:32] are ZERO not
+                            # uninitialised UB (partial-tile grouped-GEMM fix). New var
+                            # (fillpad resets valid_shape -> cannot reassign gated_v).
+                            gated_m = pl.fillpad(gated_v, pad_value=pl.PadValue.zero)
                             # No fillpad — gated_v (none-pad mode) matches
                             # uninitialised h_bf16 subview (none-pad mode);
                             # expert_down reads h_bf16 with valid_shape= so
                             # padding rows beyond tile_valid are not used.
                             h_bf16[
                                 :, n0 : n0 + ROUTED_GATE_N_CHUNK
-                            ] = pl.cast(gated_v, target_type=pl.BF16)
+                            ] = pl.cast(gated_m, target_type=pl.BF16)
 
                         # Down projection: each SPMD block handles one D-chunk of
                         # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
@@ -1106,9 +1100,6 @@ def _build_ep_tp_moe_program(
                                 h_bf16,
                                 [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                 [0, 0],
-                                valid_shape=[
-                                    tile_valid, ROUTED_DOWN_K_CHUNK,
-                                ],
                             )
                             wd0 = pl.reshape(
                                 pl.slice(
@@ -1129,9 +1120,6 @@ def _build_ep_tp_moe_program(
                                     h_bf16,
                                     [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                     [0, k0],
-                                    valid_shape=[
-                                        tile_valid, ROUTED_DOWN_K_CHUNK,
-                                    ],
                                 )
                                 wdk = pl.reshape(
                                     pl.slice(
@@ -1669,6 +1657,31 @@ def _build_ep_tp_moe_program(
                         pl.cast(z, target_type=pl.BF16), [b, 0], x_out,
                     )
             return x_out
+
+        # ---------- DEBUG per-stage dump copy (localization only) ----------
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dbg_copy(
+            self,
+            src: pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            dst: pl.Out[pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16]],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_copy"):
+                for r in pl.range(LOCAL_RECV_MAX):
+                    tile = pl.load(src, [r, 0], [1, HIDDEN])
+                    pl.store(tile, [r, 0], dst)
+            return dst
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dbg_copy_ybuf(
+            self,
+            src: pld.DistributedTensor[[N_ROUTES_PER_RANK, HIDDEN], pl.BF16],
+            dst: pl.Out[pl.Tensor[[N_ROUTES_PER_RANK, HIDDEN], pl.BF16]],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_copy_ybuf"):
+                for r in pl.range(N_ROUTES_PER_RANK):
+                    tile = pl.load(src, [r, 0], [1, HIDDEN])
+                    pl.store(tile, [r, 0], dst)
+            return dst
 
         # ---------- Per-rank orchestration ----------
         @pl.function(type=pl.FunctionType.Orchestration)

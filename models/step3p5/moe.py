@@ -201,6 +201,11 @@ SHARED_GATE_K_CHUNK = 256
 SHARED_GATE_N_CHUNK = SH_INTER_LOCAL  # 160 — one N tile covers the slice
 SHARED_DOWN_K_CHUNK = SH_INTER_LOCAL  # 160 — one K tile covers the slice
 SHARED_DOWN_N_CHUNK = 256
+# Narrow swiglu N-chunk for the shared-expert clamp: the full [T,160] Vec-tile
+# clamp is miscompiled (wide-tile tmov misprune -> ~45% wrong). Run the clamp
+# on [T,32] chunks (mirrors the working routed path).
+SHARED_SWIGLU_N_CHUNK = 32
+assert SH_INTER_LOCAL == SHARED_SWIGLU_N_CHUNK * 5
 assert HIDDEN % SHARED_GATE_K_CHUNK == 0
 assert HIDDEN % SHARED_DOWN_N_CHUNK == 0
 
@@ -1284,56 +1289,118 @@ def _build_ep_tp_moe_program(
             # expert_shared_step is Inline, and h_tile cannot cross that
             # dispatch boundary.
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_mlp"):
-                h_tile = pl.create_tensor(
-                    [T, SH_INTER_LOCAL], dtype=pl.BF16,
-                )
+                # NCHUNK-CLAMP-FIX v4: swiglu16 clamp on the FULL [T,160] Vec tile is
+                # miscompiled (wide-tile tmov misprune ~45%). Run the clamp on 5 narrow
+                # [T,32] chunks (mirror working routed path) as separate tiles h_c0..h_c4;
+                # they feed the down-proj K-loop directly (cannot recombine into a wide
+                # Vec tile: A2/A3 tmov needs matching src/dst shapes). Straight-line
+                # (parser rejects list.append / bare-for).
 
-                x0 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, 0])
-                wg0 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
-                    [0, 0],
-                )
-                wu0 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
-                    [0, 0],
-                )
-                gate_acc = pl.matmul(x0, wg0, out_dtype=pl.FP32)
-                up_acc = pl.matmul(x0, wu0, out_dtype=pl.FP32)
+                x0_0 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, 0])
+                wg0_0 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 0])
+                wu0_0 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 0])
+                gate_acc_0 = pl.matmul(x0_0, wg0_0, out_dtype=pl.FP32)
+                up_acc_0 = pl.matmul(x0_0, wu0_0, out_dtype=pl.FP32)
                 for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
                     k0 = kb * SHARED_GATE_K_CHUNK
-                    xk = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, k0])
-                    wgk = pl.slice(
-                        w_gate,
-                        [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
-                        [k0, 0],
-                    )
-                    wuk = pl.slice(
-                        w_up,
-                        [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
-                        [k0, 0],
-                    )
-                    gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
-                    up_acc = pl.matmul_acc(up_acc, xk, wuk)
-
-                sigmoid = pl.recip(
-                    pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
-                )
-                silu = pl.mul(gate_acc, sigmoid)
+                    xk_0 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, k0])
+                    wgk_0 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 0])
+                    wuk_0 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 0])
+                    gate_acc_0 = pl.matmul_acc(gate_acc_0, xk_0, wgk_0)
+                    up_acc_0 = pl.matmul_acc(up_acc_0, xk_0, wuk_0)
+                sigmoid_0 = pl.recip(pl.add(pl.exp(pl.neg(gate_acc_0)), 1.0))
+                silu_0 = pl.mul(gate_acc_0, sigmoid_0)
                 if _shared_swiglu_step:
-                    silu_c = pl.minimum(silu, _shared_swiglu_limit)
-                    up_c = pl.maximum(
-                        pl.minimum(up_acc, _shared_swiglu_limit),
-                        -_shared_swiglu_limit,
-                    )
-                    gated = pl.mul(silu_c, up_c)
+                    silu_c_0 = pl.minimum(silu_0, _shared_swiglu_limit)
+                    up_c_0 = pl.maximum(pl.minimum(up_acc_0, _shared_swiglu_limit), -_shared_swiglu_limit)
+                    gated_0 = pl.mul(silu_c_0, up_c_0)
                 else:
-                    gated = pl.mul(silu, up_acc)
-
-                h_tile[:, 0:SHARED_GATE_N_CHUNK] = pl.cast(
-                    gated, target_type=pl.BF16,
-                )
+                    gated_0 = pl.mul(silu_0, up_acc_0)
+                h_c0 = pl.cast(gated_0, target_type=pl.BF16)
+                x0_1 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, 0])
+                wg0_1 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 32])
+                wu0_1 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 32])
+                gate_acc_1 = pl.matmul(x0_1, wg0_1, out_dtype=pl.FP32)
+                up_acc_1 = pl.matmul(x0_1, wu0_1, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_1 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, k0])
+                    wgk_1 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 32])
+                    wuk_1 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 32])
+                    gate_acc_1 = pl.matmul_acc(gate_acc_1, xk_1, wgk_1)
+                    up_acc_1 = pl.matmul_acc(up_acc_1, xk_1, wuk_1)
+                sigmoid_1 = pl.recip(pl.add(pl.exp(pl.neg(gate_acc_1)), 1.0))
+                silu_1 = pl.mul(gate_acc_1, sigmoid_1)
+                if _shared_swiglu_step:
+                    silu_c_1 = pl.minimum(silu_1, _shared_swiglu_limit)
+                    up_c_1 = pl.maximum(pl.minimum(up_acc_1, _shared_swiglu_limit), -_shared_swiglu_limit)
+                    gated_1 = pl.mul(silu_c_1, up_c_1)
+                else:
+                    gated_1 = pl.mul(silu_1, up_acc_1)
+                h_c1 = pl.cast(gated_1, target_type=pl.BF16)
+                x0_2 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, 0])
+                wg0_2 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 64])
+                wu0_2 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 64])
+                gate_acc_2 = pl.matmul(x0_2, wg0_2, out_dtype=pl.FP32)
+                up_acc_2 = pl.matmul(x0_2, wu0_2, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_2 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, k0])
+                    wgk_2 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 64])
+                    wuk_2 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 64])
+                    gate_acc_2 = pl.matmul_acc(gate_acc_2, xk_2, wgk_2)
+                    up_acc_2 = pl.matmul_acc(up_acc_2, xk_2, wuk_2)
+                sigmoid_2 = pl.recip(pl.add(pl.exp(pl.neg(gate_acc_2)), 1.0))
+                silu_2 = pl.mul(gate_acc_2, sigmoid_2)
+                if _shared_swiglu_step:
+                    silu_c_2 = pl.minimum(silu_2, _shared_swiglu_limit)
+                    up_c_2 = pl.maximum(pl.minimum(up_acc_2, _shared_swiglu_limit), -_shared_swiglu_limit)
+                    gated_2 = pl.mul(silu_c_2, up_c_2)
+                else:
+                    gated_2 = pl.mul(silu_2, up_acc_2)
+                h_c2 = pl.cast(gated_2, target_type=pl.BF16)
+                x0_3 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, 0])
+                wg0_3 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 96])
+                wu0_3 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 96])
+                gate_acc_3 = pl.matmul(x0_3, wg0_3, out_dtype=pl.FP32)
+                up_acc_3 = pl.matmul(x0_3, wu0_3, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_3 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, k0])
+                    wgk_3 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 96])
+                    wuk_3 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 96])
+                    gate_acc_3 = pl.matmul_acc(gate_acc_3, xk_3, wgk_3)
+                    up_acc_3 = pl.matmul_acc(up_acc_3, xk_3, wuk_3)
+                sigmoid_3 = pl.recip(pl.add(pl.exp(pl.neg(gate_acc_3)), 1.0))
+                silu_3 = pl.mul(gate_acc_3, sigmoid_3)
+                if _shared_swiglu_step:
+                    silu_c_3 = pl.minimum(silu_3, _shared_swiglu_limit)
+                    up_c_3 = pl.maximum(pl.minimum(up_acc_3, _shared_swiglu_limit), -_shared_swiglu_limit)
+                    gated_3 = pl.mul(silu_c_3, up_c_3)
+                else:
+                    gated_3 = pl.mul(silu_3, up_acc_3)
+                h_c3 = pl.cast(gated_3, target_type=pl.BF16)
+                x0_4 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, 0])
+                wg0_4 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 128])
+                wu0_4 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [0, 128])
+                gate_acc_4 = pl.matmul(x0_4, wg0_4, out_dtype=pl.FP32)
+                up_acc_4 = pl.matmul(x0_4, wu0_4, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_4 = pl.slice(x, [T, SHARED_GATE_K_CHUNK], [0, k0])
+                    wgk_4 = pl.slice(w_gate, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 128])
+                    wuk_4 = pl.slice(w_up, [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK], [k0, 128])
+                    gate_acc_4 = pl.matmul_acc(gate_acc_4, xk_4, wgk_4)
+                    up_acc_4 = pl.matmul_acc(up_acc_4, xk_4, wuk_4)
+                sigmoid_4 = pl.recip(pl.add(pl.exp(pl.neg(gate_acc_4)), 1.0))
+                silu_4 = pl.mul(gate_acc_4, sigmoid_4)
+                if _shared_swiglu_step:
+                    silu_c_4 = pl.minimum(silu_4, _shared_swiglu_limit)
+                    up_c_4 = pl.maximum(pl.minimum(up_acc_4, _shared_swiglu_limit), -_shared_swiglu_limit)
+                    gated_4 = pl.mul(silu_c_4, up_c_4)
+                else:
+                    gated_4 = pl.mul(silu_4, up_acc_4)
+                h_c4 = pl.cast(gated_4, target_type=pl.BF16)
 
                 # Explicit K-chunking for the down projection.
                 # K=160 (SH_INTER_LOCAL) would trigger backend auto-K-split
@@ -1341,33 +1408,22 @@ def _build_ep_tp_moe_program(
                 # at the user level using K_INNER=32 (5 passes of 32) so the
                 # compiler sees a structured pl.matmul + pl.matmul_acc chain
                 # (same pattern as gate/up above) and never needs the copy.
-                _SH_DOWN_K_INNER = 32  # hardware K-tile; 160 // 32 == 5 passes
+                # Down projection: 5 narrow [T,32] chunks are the K-tiles
+                # (no wide Vec h_tile). K accumulation straight-line.
                 for db in pl.range(HIDDEN // SHARED_DOWN_N_CHUNK):
                     d0 = db * SHARED_DOWN_N_CHUNK
-                    h0_k0 = pl.slice(
-                        h_tile, [T, _SH_DOWN_K_INNER], [0, 0],
-                    )
-                    wd0_k0 = pl.slice(
-                        w_down,
-                        [_SH_DOWN_K_INNER, SHARED_DOWN_N_CHUNK],
-                        [0, d0],
-                    )
-                    y_acc = pl.matmul(h0_k0, wd0_k0, out_dtype=pl.FP32)
-                    for kk in pl.range(1, SH_INTER_LOCAL // _SH_DOWN_K_INNER):
-                        kk0 = kk * _SH_DOWN_K_INNER
-                        h0_kk = pl.slice(
-                            h_tile, [T, _SH_DOWN_K_INNER], [0, kk0],
-                        )
-                        wd0_kk = pl.slice(
-                            w_down,
-                            [_SH_DOWN_K_INNER, SHARED_DOWN_N_CHUNK],
-                            [kk0, d0],
-                        )
-                        y_acc = pl.matmul_acc(y_acc, h0_kk, wd0_kk)
+                    wd_c0 = pl.slice(w_down, [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK], [0, d0])
+                    y_acc = pl.matmul(h_c0, wd_c0, out_dtype=pl.FP32)
+                    wd_c1 = pl.slice(w_down, [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK], [32, d0])
+                    y_acc = pl.matmul_acc(y_acc, h_c1, wd_c1)
+                    wd_c2 = pl.slice(w_down, [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK], [64, d0])
+                    y_acc = pl.matmul_acc(y_acc, h_c2, wd_c2)
+                    wd_c3 = pl.slice(w_down, [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK], [96, d0])
+                    y_acc = pl.matmul_acc(y_acc, h_c3, wd_c3)
+                    wd_c4 = pl.slice(w_down, [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK], [128, d0])
+                    y_acc = pl.matmul_acc(y_acc, h_c4, wd_c4)
                     sh_y_shard = pl.assemble(
-                        sh_y_shard,
-                        pl.cast(y_acc, target_type=pl.BF16),
-                        [0, d0],
+                        sh_y_shard, pl.cast(y_acc, target_type=pl.BF16), [0, d0],
                     )
 
             return sh_y_shard

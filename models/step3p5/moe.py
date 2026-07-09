@@ -1701,11 +1701,10 @@ def _build_ep_tp_moe_program(
             # Zero-init: data windows are NOT auto-zeroed (only signal windows).
             # _weighted_gather_and_add reads all N_ROUTES_PER_RANK cells; any slot
             # the combine push misses would read uninitialized ~5e4 garbage.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="zero_routed_y"):
-                for r in pl.range(N_ROUTES_PER_RANK):
-                    routed_y_buf[r : r + 1, :] = pl.full(
-                        [1, HIDDEN], dtype=pl.BF16, value=0.0,
-                    )
+            for r in pl.range(N_ROUTES_PER_RANK):
+                routed_y_buf[r : r + 1, :] = pl.full(
+                    [1, HIDDEN], dtype=pl.BF16, value=0.0,
+                )
 
         @pl.function(type=pl.FunctionType.Inline)
         def combine_step(  # noqa: PLR0913
@@ -1785,18 +1784,17 @@ def _build_ep_tp_moe_program(
             # tp_all_reduce (produces sh_y) to COMPLETE before the routed
             # dispatch/combine cross-rank collectives -> breaks the overlapping
             # cross-rank collective deadlock (func5 tp_all_reduce + func13 _push).
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="serialize_dep"):
-                for b in pl.range(T):
-                    xr = pl.cast(
-                        pl.load(x, [b, 0], [1, HIDDEN]), target_type=pl.FP32,
-                    )
-                    yr = pl.cast(
-                        pl.load(sh_y, [b, 0], [1, HIDDEN]), target_type=pl.FP32,
-                    )
-                    z = pl.add(xr, pl.mul(yr, 0.0))
-                    pl.store(
-                        pl.cast(z, target_type=pl.BF16), [b, 0], x_out,
-                    )
+            for b in pl.range(T):
+                xr = pl.cast(
+                    pl.load(x, [b, 0], [1, HIDDEN]), target_type=pl.FP32,
+                )
+                yr = pl.cast(
+                    pl.load(sh_y, [b, 0], [1, HIDDEN]), target_type=pl.FP32,
+                )
+                z = pl.add(xr, pl.mul(yr, 0.0))
+                pl.store(
+                    pl.cast(z, target_type=pl.BF16), [b, 0], x_out,
+                )
             return x_out
 
         @pl.function(type=pl.FunctionType.InCore)

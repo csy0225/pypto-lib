@@ -203,7 +203,8 @@ def attention_swa(
     w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16],
     gate_r: pl.Tensor[[NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16],
     resid1_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    layer_idx: pl.Scalar[pl.INT32],
+    norm_layer_idx: pl.Scalar[pl.INT32],
+    attn_layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[
         [BATCH, HIDDEN // TP_WORLD_SIZE], pl.BF16
     ],
@@ -222,9 +223,9 @@ def attention_swa(
     bt_stride = pl.tensor.dim(block_table, 0) // user_batch
     batch_padded = BATCH
 
-    layer_hidden_base = layer_idx * HIDDEN
-    layer_qhidden_base = layer_idx * HIDDEN_Q_SWA_LOCAL
-    layer_cache_base = layer_idx * decode_layer_cache_rows
+    layer_hidden_base = attn_layer_idx * HIDDEN
+    layer_qhidden_base = attn_layer_idx * HIDDEN_Q_SWA_LOCAL
+    layer_cache_base = norm_layer_idx * decode_layer_cache_rows
 
     q_proj = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32)
     k_proj = pl.create_tensor([BATCH, KV_HIDDEN_LOCAL], dtype=pl.FP32)
@@ -266,7 +267,7 @@ def attention_swa(
                 pl.slice(current_hidden, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [rms_b0, norm_k0]),
                 target_type=pl.FP32,
             )
-            gamma = pl.slice(input_rms_weight, [1, INPUT_PROJ_K_CHUNK], [layer_idx, norm_k0])
+            gamma = pl.slice(input_rms_weight, [1, INPUT_PROJ_K_CHUNK], [norm_layer_idx, norm_k0])
             scaled = pl.row_expand_mul(norm_chunk, inv_rms)
             normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
             normed_all = pl.assemble(
@@ -350,7 +351,7 @@ def attention_swa(
 
         # Q branch: 2 half-head sub-tiles (Q_HEAD_BATCH_SWA//2 = 6 heads each).
         qkn_q0 = qkn_h * Q_PER_KV_SWA * HEAD_DIM
-        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
         for qh_sub in pl.range(2):
             q_sub_col0 = qkn_q0 + qh_sub * (Q_HEAD_BATCH_SWA // 2) * HEAD_DIM
             q_chunk_sub = pl.reshape(
@@ -373,7 +374,7 @@ def attention_swa(
         # K branch: single head per rank (KV_HEADS_LOCAL = 1).
         qkn_k0 = qkn_h * HEAD_DIM
         k_chunk = pl.slice(k_proj, [BATCH_TILE, HEAD_DIM], [qkn_b0, qkn_k0])
-        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
         k_sq = pl.row_sum(pl.mul(k_chunk, k_chunk))
         k_inv = pl.rsqrt(pl.add(pl.mul(k_sq, HEAD_DIM_INV), EPS))
         k_scaled = pl.row_expand_mul(k_chunk, k_inv)
@@ -883,7 +884,8 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             resid1_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1_out = attention_swa_inline(
@@ -897,7 +899,8 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1_out,
-                layer_idx,
+                norm_layer_idx,
+                attn_layer_idx,
                 tmp_window,
                 signal_window,
                 my_rank,
@@ -931,7 +934,8 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                 [tp_size, NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16
             ],
             resid1_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
         ):
             tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)  # BF16
             sig_buf = pld.alloc_window_buffer(tp_size * 4)           # INT32
@@ -952,7 +956,8 @@ def _build_tp_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                     resid1_out[r],
                     tmp_window,
                     signal_window,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     r,
                     device=r,
                 )

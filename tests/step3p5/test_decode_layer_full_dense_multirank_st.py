@@ -172,7 +172,9 @@ def main() -> int:
         cur_d, irms_d.float(), wq_d, wk_d, wv_d, qn_d.float(), kn_d.float(),
         seq_d, bt_d, sm_d, rcos_d.float(), rsin_d.float(), kc_d, vc_d,
         wo_d, wg_d, prms_d.float(), wgate_d, wup_d, wdown_d, next_out,
-        torch.tensor(0, dtype=torch.int32),
+        torch.tensor(0, dtype=torch.int32),  # norm_layer_idx (L0)
+        torch.tensor(0, dtype=torch.int32),  # attn_layer_idx (L0)
+        torch.tensor(0, dtype=torch.int32),  # mlp_layer_idx (L0)
     ]
 
     # -- Compile canonical TP=8 + run on N_RANKS cards. --

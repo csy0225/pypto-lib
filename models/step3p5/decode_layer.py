@@ -249,7 +249,8 @@ def _dense_mlp_body_tp(
     w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    layer_idx: pl.Scalar[pl.INT32],
+    norm_layer_idx: pl.Scalar[pl.INT32],
+    mlp_layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -270,8 +271,8 @@ def _dense_mlp_body_tp(
     """
     hidden_blocks = HIDDEN // K_CHUNK
     mlp_out_blocks = INTER_LOCAL // MLP_OUT_CHUNK
-    layer_hidden_base = layer_idx * HIDDEN
-    layer_inter_base = layer_idx * INTER_LOCAL
+    layer_hidden_base = mlp_layer_idx * HIDDEN
+    layer_inter_base = mlp_layer_idx * INTER_LOCAL
 
     # ── Step 1: post-attention zero-centred RMSNorm of resid1. ──────────
     dm_post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -306,7 +307,7 @@ def _dense_mlp_body_tp(
                 dm_resid1_fp32, [BATCH, K_CHUNK], [0, k0],
             )
             dm_gamma = pl.slice(
-                post_rms_weight, [1, K_CHUNK], [layer_idx, k0],
+                post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
             )
             dm_scaled = pl.row_expand_mul(dm_norm_chunk, dm_inv_rms_col)
             dm_normed = pl.col_expand_mul(dm_scaled, pl.add(dm_gamma, 1.0))
@@ -444,7 +445,8 @@ def _dense_mlp_body_tp_fused(
     w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    layer_idx: pl.Scalar[pl.INT32],
+    norm_layer_idx: pl.Scalar[pl.INT32],
+    mlp_layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -452,8 +454,8 @@ def _dense_mlp_body_tp_fused(
     """Single-scope-safe dense MLP: no cross-scope post_norm/resid1_fp32 scratch."""
     hidden_blocks = HIDDEN // K_CHUNK
     mlp_out_blocks = INTER_LOCAL // MLP_OUT_CHUNK
-    layer_hidden_base = layer_idx * HIDDEN
-    layer_inter_base = layer_idx * INTER_LOCAL
+    layer_hidden_base = mlp_layer_idx * HIDDEN
+    layer_inter_base = mlp_layer_idx * INTER_LOCAL
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dfz_inv_rms"):
         dfz_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
@@ -472,7 +474,7 @@ def _dense_mlp_body_tp_fused(
     ):
         mo0 = ob * MLP_OUT_CHUNK
         rc0 = pl.cast(pl.slice(resid1, [BATCH, K_CHUNK], [0, 0]), target_type=pl.FP32)
-        gm0 = pl.slice(post_rms_weight, [1, K_CHUNK], [layer_idx, 0])
+        gm0 = pl.slice(post_rms_weight, [1, K_CHUNK], [norm_layer_idx, 0])
         pn0 = pl.cast(
             pl.col_expand_mul(pl.row_expand_mul(rc0, dfz_inv), pl.add(gm0, 1.0)),
             target_type=pl.BF16,
@@ -484,7 +486,7 @@ def _dense_mlp_body_tp_fused(
         for kb in pl.range(1, hidden_blocks):
             k0 = kb * K_CHUNK
             rc = pl.cast(pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]), target_type=pl.FP32)
-            gm = pl.slice(post_rms_weight, [1, K_CHUNK], [layer_idx, k0])
+            gm = pl.slice(post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0])
             pn = pl.cast(
                 pl.col_expand_mul(pl.row_expand_mul(rc, dfz_inv), pl.add(gm, 1.0)),
                 target_type=pl.BF16,
@@ -685,7 +687,9 @@ def _build_decode_layer_dense_program(
                 mlp_signal_window: pld.DistributedTensor[
                     [tp_size, 1], pl.INT32
                 ],
-                layer_idx: pl.Scalar[pl.INT32],
+                norm_layer_idx: pl.Scalar[pl.INT32],
+                attn_layer_idx: pl.Scalar[pl.INT32],
+                mlp_layer_idx: pl.Scalar[pl.INT32],
                 my_rank: pl.Scalar[pl.INT32],
             ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
                 resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -700,7 +704,8 @@ def _build_decode_layer_dense_program(
                     wo, w_g,
                     gate_r,
                     resid1,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     attn_tmp_window,
                     attn_signal_window,
                     my_rank,
@@ -708,7 +713,7 @@ def _build_decode_layer_dense_program(
                 next_hidden_out = dense_mlp_inline(
                     resid1, post_rms_weight,
                     w_gate, w_up, w_down,
-                    next_hidden_out, layer_idx,
+                    next_hidden_out, norm_layer_idx, mlp_layer_idx,
                     mlp_tmp_window, mlp_signal_window, my_rank,
                 )
                 return next_hidden_out
@@ -761,7 +766,9 @@ def _build_decode_layer_dense_program(
                 next_hidden_out: pl.Out[
                     pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
                 ],
-                layer_idx: pl.Scalar[pl.INT32],
+                norm_layer_idx: pl.Scalar[pl.INT32],
+                attn_layer_idx: pl.Scalar[pl.INT32],
+                mlp_layer_idx: pl.Scalar[pl.INT32],
             ):
                 attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
                 attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -796,7 +803,7 @@ def _build_decode_layer_dense_program(
                         next_hidden_out[r],
                         attn_tmp_window, attn_signal_window,
                         mlp_tmp_window, mlp_signal_window,
-                        layer_idx,
+                        norm_layer_idx, attn_layer_idx, mlp_layer_idx,
                         r,
                         device=r,
                     )
@@ -886,7 +893,9 @@ def _build_decode_layer_dense_program(
                 mlp_signal_window: pld.DistributedTensor[
                     [tp_size, 1], pl.INT32
                 ],
-                layer_idx: pl.Scalar[pl.INT32],
+                norm_layer_idx: pl.Scalar[pl.INT32],
+                attn_layer_idx: pl.Scalar[pl.INT32],
+                mlp_layer_idx: pl.Scalar[pl.INT32],
                 my_rank: pl.Scalar[pl.INT32],
             ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
                 resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -901,7 +910,8 @@ def _build_decode_layer_dense_program(
                     wo, w_g,
                     gate_r,
                     resid1,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     attn_tmp_window,
                     attn_signal_window,
                     my_rank,
@@ -909,7 +919,7 @@ def _build_decode_layer_dense_program(
                 next_hidden_out = dense_mlp_inline(
                     resid1, post_rms_weight,
                     w_gate, w_up, w_down,
-                    next_hidden_out, layer_idx,
+                    next_hidden_out, norm_layer_idx, mlp_layer_idx,
                     mlp_tmp_window, mlp_signal_window, my_rank,
                 )
                 return next_hidden_out
@@ -962,7 +972,9 @@ def _build_decode_layer_dense_program(
                 next_hidden_out: pl.Out[
                     pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
                 ],
-                layer_idx: pl.Scalar[pl.INT32],
+                norm_layer_idx: pl.Scalar[pl.INT32],
+                attn_layer_idx: pl.Scalar[pl.INT32],
+                mlp_layer_idx: pl.Scalar[pl.INT32],
             ):
                 attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
                 attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -997,7 +1009,7 @@ def _build_decode_layer_dense_program(
                         next_hidden_out[r],
                         attn_tmp_window, attn_signal_window,
                         mlp_tmp_window, mlp_signal_window,
-                        layer_idx,
+                        norm_layer_idx, attn_layer_idx, mlp_layer_idx,
                         r,
                         device=r,
                     )
@@ -1092,7 +1104,9 @@ def _build_fused_dense_lmhead_program(tp_size: int = TP_WORLD_SIZE):
             attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -1107,7 +1121,8 @@ def _build_fused_dense_lmhead_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                norm_layer_idx,
+                attn_layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -1115,7 +1130,7 @@ def _build_fused_dense_lmhead_program(tp_size: int = TP_WORLD_SIZE):
             next_hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                next_hidden_out, layer_idx,
+                next_hidden_out, norm_layer_idx, mlp_layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return next_hidden_out
@@ -1190,7 +1205,9 @@ def _build_fused_dense_lmhead_program(tp_size: int = TP_WORLD_SIZE):
             logits_shard_out: pl.Out[
                 pl.Tensor[[tp_size, USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
         ):
             attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -1225,7 +1242,8 @@ def _build_fused_dense_lmhead_program(tp_size: int = TP_WORLD_SIZE):
                     next_hidden_out[r],
                     attn_tmp_window, attn_signal_window,
                     mlp_tmp_window, mlp_signal_window,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     r,
                     device=r,
                 )
@@ -1332,7 +1350,9 @@ def _build_dense_chain3_lmhead_program(tp_size: int = TP_WORLD_SIZE):
             attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -1347,7 +1367,8 @@ def _build_dense_chain3_lmhead_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                norm_layer_idx,
+                attn_layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -1355,7 +1376,7 @@ def _build_dense_chain3_lmhead_program(tp_size: int = TP_WORLD_SIZE):
             next_hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                next_hidden_out, layer_idx,
+                next_hidden_out, norm_layer_idx, mlp_layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return next_hidden_out
@@ -1615,7 +1636,9 @@ def _build_dense_chain2_lmhead_program(tp_size: int = TP_WORLD_SIZE):
             attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -1630,7 +1653,8 @@ def _build_dense_chain2_lmhead_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                norm_layer_idx,
+                attn_layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -1638,7 +1662,7 @@ def _build_dense_chain2_lmhead_program(tp_size: int = TP_WORLD_SIZE):
             next_hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                next_hidden_out, layer_idx,
+                next_hidden_out, norm_layer_idx, mlp_layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return next_hidden_out
@@ -1849,13 +1873,14 @@ def _build_dense_mlp_program(tp_size: int = TP_WORLD_SIZE):
             next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             next_hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                next_hidden_out, layer_idx,
+                next_hidden_out, norm_layer_idx, mlp_layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return next_hidden_out
@@ -1877,7 +1902,8 @@ def _build_dense_mlp_program(tp_size: int = TP_WORLD_SIZE):
             next_hidden_out: pl.Out[
                 pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
         ):
             mlp_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             mlp_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -1894,7 +1920,8 @@ def _build_dense_mlp_program(tp_size: int = TP_WORLD_SIZE):
                     w_gate[r], w_up[r], w_down[r],
                     next_hidden_out[r],
                     mlp_tmp_window, mlp_signal_window,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     r,
                     device=r,
                 )
@@ -3325,7 +3352,8 @@ def _build_decode_layer_moe_program(
             combine_done_sig: pld.DistributedTensor[
                 [n_ranks, 1], pl.INT32
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             # ── A: attention + tp_all_reduce -> resid1 (replicated). ───
@@ -3342,7 +3370,8 @@ def _build_decode_layer_moe_program(
                     wo, w_g,
                     gate_r,
                     resid1,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     attn_tmp_window,
                     attn_signal_window,
                     my_rank,
@@ -3359,7 +3388,8 @@ def _build_decode_layer_moe_program(
                     wo, w_g,
                     gate_r,
                     resid1,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     attn_tmp_window,
                     attn_signal_window,
                     my_rank,
@@ -3401,7 +3431,7 @@ def _build_decode_layer_moe_program(
                         resid1_fp32, [BATCH, K_CHUNK], [0, k0],
                     )
                     gamma = pl.slice(
-                        post_rms_weight, [1, K_CHUNK], [layer_idx, k0],
+                        post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
                     )
                     scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
                     normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
@@ -3559,7 +3589,8 @@ def _build_decode_layer_moe_program(
             next_hidden_out: pl.Out[
                 pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
         ):
             attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -3644,7 +3675,7 @@ def _build_decode_layer_moe_program(
                     recv_r_route,
                     sh_tmp_window, sh_signal_window,
                     routed_y_buf, combine_done_sig,
-                    layer_idx,
+                    norm_layer_idx, attn_layer_idx,
                     r,
                     device=r,
                 )
@@ -5049,7 +5080,9 @@ def _build_mixed_2method_program(
             attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -5058,12 +5091,12 @@ def _build_mixed_2method_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, norm_layer_idx, attn_layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             h_mid_out = dense_mlp_inline(
                 resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
-                h_mid_out, layer_idx, mlp_tmp_window,
+                h_mid_out, norm_layer_idx, mlp_layer_idx, mlp_tmp_window,
                 mlp_signal_window, my_rank,
             )
             return h_mid_out
@@ -5125,7 +5158,9 @@ def _build_mixed_2method_program(
             combine_done_sig: pld.DistributedTensor[
                 [n_ranks, 1], pl.INT32
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             # ── A': input IS h_mid (attn+dense_mlp already done in attn_dense_orch). ───
@@ -5338,7 +5373,9 @@ def _build_mixed_2method_program(
             w_gate_d: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
             w_up_d: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
             w_down_d: pl.Tensor[[tp_size, LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
         ):
             attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -6897,7 +6934,9 @@ def _build_fused_dense_moe_program(
             w_down_d: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             # ── A: attention + tp_all_reduce -> resid1 (replicated). ───
@@ -6914,7 +6953,8 @@ def _build_fused_dense_moe_program(
                     wo, w_g,
                     gate_r,
                     resid1,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     attn_tmp_window,
                     attn_signal_window,
                     my_rank,
@@ -6931,7 +6971,8 @@ def _build_fused_dense_moe_program(
                     wo, w_g,
                     gate_r,
                     resid1,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     attn_tmp_window,
                     attn_signal_window,
                     my_rank,
@@ -6940,7 +6981,7 @@ def _build_fused_dense_moe_program(
             dm_next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             dm_next_hidden = dense_mlp_inline(
                 resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
-                dm_next_hidden, layer_idx, mlp_tmp_window,
+                dm_next_hidden, norm_layer_idx, mlp_layer_idx, mlp_tmp_window,
                 mlp_signal_window, my_rank,
             )
             resid1 = dm_next_hidden
@@ -6980,7 +7021,7 @@ def _build_fused_dense_moe_program(
                         resid1_fp32, [BATCH, K_CHUNK], [0, k0],
                     )
                     gamma = pl.slice(
-                        post_rms_weight, [1, K_CHUNK], [layer_idx, k0],
+                        post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
                     )
                     scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
                     normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
@@ -7142,7 +7183,9 @@ def _build_fused_dense_moe_program(
             w_gate_d: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
             w_up_d: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
             w_down_d: pl.Tensor[[tp_size, LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
         ):
             attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -7237,7 +7280,7 @@ def _build_fused_dense_moe_program(
                     routed_y_buf, combine_done_sig,
                     post_rms_d[r], w_gate_d[r], w_up_d[r], w_down_d[r],
                     mlp_tmp_window, mlp_signal_window,
-                    layer_idx,
+                    norm_layer_idx, attn_layer_idx, mlp_layer_idx,
                     r,
                     device=r,
                 )

@@ -1940,6 +1940,1846 @@ def _build_whole_decode_dense_prefix_program(tp_size: int = TP_WORLD_SIZE):
 
 
 
+def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
+    """N=1 fusion: ONE @pl.program chaining 1 dense layer (L0 full attn + dense
+    MLP) + 1 MoE layer (L3 full attn + EP MoE block) + tail (final RMSNorm +
+    LM head). Minimal mixed-chain compile-verify milestone before scaling to
+    all 45 layers.
+
+    Per-protocol split for the MoE layer (team-lead mandate, hw-analyst
+    Wall-2): a TP-only attention method (attn -> resid1) and a SEPARATE EP-only
+    MoE-block method (post_rms -> gate/dispatch/expert_routed/expert_shared/
+    combine -> moe_out -> residual add), each its own host_orch dispatch pass.
+    Fusing attn+MoE into one chip_orch FAILS -- full (FusedDenseMoE) hits
+    TaskMapSize=0 device dispatch fault (pass-37 collapses TP+EP comm-domains);
+    swa hits the attention_swa.py:479 const-fold wall
+    (``tile.full shape element 0 must be ConstInt, but got Sub``) in
+    EP-distributed lowering. This builder reuses Mixed2Method's proven
+    per-protocol template (the inlined EpTpMoE stage methods + tp_all_reduce)
+    plus the WholeDecodeDensePrefix patterns (per-layer weight slabs, resident
+    pl.Out GM handoff, layer_idx=0, multi-pass host_orch).
+
+    Weight indexing -- the 3-scalar problem, solved by per-layer weight slabs
+    + ``layer_idx = 0`` per method (same scheme as WholeDecodeDensePrefix):
+    each method receives its OWN per-layer weight slabs (norm absolute row 0,
+    attn type-local base 0, KV cache base 0, MoE pos 0) so the single
+    ``layer_idx`` baked into the inlined bodies lands every weight class at
+    base 0 for that layer. The host_orch passes one slab per layer per rank;
+    the host/weight-loader slices the absolute/type-local/moe stacks per
+    layer before launch.
+
+    Hidden threading: ``current_hidden`` -> ``h0_out`` (L0) -> ``resid1_out``
+    (L3 attn) -> ``h3_out`` (L3 moe) -> ``logits_shard_out`` (tail) via
+    resident ``pl.Out`` GM tensors. The L3 attention and L3 MoE-block are
+    separate Orchestration methods dispatched in separate host_orch passes
+    (pass 2 = TP attn, pass 3 = EP moe) so each dispatch stays single-protocol.
+    """
+    attention_inline = pl.inline(attention_full._func)
+    dense_mlp_inline = pl.inline(_dense_mlp_body_tp._func)
+    rms_lm_head_inline = pl.inline(rms_lm_head._func)
+
+    # Activation choice baked at build time (silu_silu minimal config).
+    _routed_swiglu_step = False
+    _shared_swiglu_step = False
+    _routed_swiglu_limit = 0.0
+    _shared_swiglu_limit = 0.0
+    tp_chunk = HIDDEN // tp_size
+
+    rotary_dim = 64
+    hidden_q_local = HIDDEN_Q_FULL_LOCAL
+    num_heads_local = NUM_HEADS_FULL_LOCAL
+    num_heads_local_pad = NUM_HEADS_FULL_LOCAL_PAD
+    layer_qhidden_dyn = LAYER_QHIDDEN_ROWS_DYN_FULL
+
+    n_ranks = tp_size
+    n_ranks_pad = N_RANKS_PAD
+    n_local_experts = N_LOCAL_EXPERTS
+    n_local_experts_pad = ((n_local_experts + 7) // 8) * 8
+    idx_pad = 8
+    stage_rows = 8
+    inter = MOE_INTERMEDIATE
+    sh_inter_local = INTER_S_LOCAL
+    sh_tp_chunk = HIDDEN // tp_size
+    local_recv_max = LOCAL_RECV_MAX
+    n_routes_per_rank = BATCH * TOPK
+    per_rank_buckets = PER_RANK_BUCKETS
+
+    @pl.program
+    class WholeDecodeProgram:
+        # ---- Reusable MoE machinery (copied verbatim from Mixed2Method) --
+        # tp_all_reduce (InCore) + ep_all_to_all + the 18 gate/dispatch/
+        # expert_routed/expert_shared/combine stage methods and their Inline
+        # helpers. Self-contained (every helper def is in this block). The
+        # activation choice is captured via the factory closure constants
+        # (_routed_swiglu_step / _shared_swiglu_step / *_limit) above.
+
+        # ---------- Collective: TP all_reduce (lifted from collectives.py) ----
+        # Phase X.2: pull-side ring all-reduce body, baked t_rows=BATCH,
+        # d_cols=HIDDEN, group_size=tp_size from factory closure. Used by the
+        # attention path that's pl.inline()-spliced into chip_orch below.
+        @pl.function(type=pl.FunctionType.InCore)
+        def tp_all_reduce(
+            self,
+            local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            group_size = tp_size
+
+            # Phase 1: stage-in — copy local into my tmp_window slot (full HIDDEN).
+            # All-reduce HIDDEN tiling width: fixed, INDEPENDENT of tp_size.
+            # tp_chunk = HIDDEN // tp_size collapses to HIDDEN (4096) at
+            # tp_size=1 (apply_tp1_patch single-card e2e), so [BATCH, 4096]
+            # FP32 acc tiles (256KB) overflow the 188KB UB limit. A fixed
+            # tile keeps the per-iteration working set bounded for every
+            # tp_size (512 = canonical TP=8 chunk; HIDDEN is divisible by it).
+            ar_chunk = HIDDEN // 8
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
+                pl.store(stage_tile, [0, k0], tmp_window)
+
+            # Phase 2: barrier — notify all peers (one round), then wait on all
+            # peers (one round). Separate loops, matching the pypto own-test
+            # pattern. expected=1 fixed (cells start zero, accumulate to N-1
+            # after all notifies land; we only require >=1 from each peer slot).
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            # Phase 3: load own tmp slot, then for each peer remote_load + tadd
+            # (FP32 — PTOAS bf16 tadd unsupported, cast through f32). Result lands
+            # back in `local` (in-place reduction target).
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
+                acc = pl.cast(own_tile, target_type=pl.FP32)
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        recv = pld.tile.remote_load(
+                            tmp_window, peer=peer,
+                            offsets=[0, k0], shape=[BATCH, ar_chunk],
+                        )
+                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
+                pl.store(
+                    pl.cast(acc, target_type=pl.BF16),
+                    [0, k0], local,
+                )
+            return local
+
+        # ===================================================================
+        # Phase X.8 — inlined EpTpMoE @pl.function methods.
+        # Bodies copied verbatim from ``moe.EpTpMoE`` (Phase X.3+X.4+X.5).
+        # The activation choice (plain SiLU vs. SwigluStep@7/16) is baked at
+        # factory build time via the ``_routed_swiglu_step`` /
+        # ``_shared_swiglu_step`` Python closure constants — only one branch
+        # is emitted per specialisation. Module-level constants from moe.py
+        # (T, N_RANKS, INTER, etc.) are renamed to the local closure names
+        # (BATCH, n_ranks, inter, ...) so the bodies type-check against this
+        # factory's signatures.
+        # ===================================================================
+
+        # ---------- Collective: EP all_to_all ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def ep_all_to_all(
+            self,
+            send: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            send_counts: pl.Tensor[[n_ranks], pl.INT32],
+            recv_counts: pl.Tensor[[n_ranks], pl.INT32],
+            send_offsets: pl.Tensor[[n_ranks], pl.INT32],
+            recv_offsets: pl.Tensor[[n_ranks], pl.INT32],
+            signal_window: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16]:
+            """Pull-side variable-length token-level all-to-all over EP."""
+            group_size = n_ranks
+            d_cols = HIDDEN
+
+            # 1) Local self-bucket copy.
+            n_self = pl.cast(pl.read(send_counts, [my_rank]), pl.INDEX)
+            s_off_self = pl.cast(pl.read(send_offsets, [my_rank]), pl.INDEX)
+            r_off_self = pl.cast(pl.read(recv_offsets, [my_rank]), pl.INDEX)
+            for r in pl.range(n_self):
+                self_tile = pl.load(
+                    send, [s_off_self + r, 0], [1, d_cols],
+                )
+                pl.store(self_tile, [r_off_self + r, 0], recv)
+
+            # 2) Set(1) notify every peer.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+
+            # 3) Ge(1) wait for every peer.
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window,
+                        offsets=[src, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+            # 4) Pull every peer's bucket-for-me.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    n_recv = pl.cast(
+                        pl.read(recv_counts, [peer]), pl.INDEX,
+                    )
+                    r_off = pl.cast(
+                        pl.read(recv_offsets, [peer]), pl.INDEX,
+                    )
+                    for r in pl.range(n_recv):
+                        peer_tile = pld.tile.remote_load(
+                            send,
+                            peer=peer,
+                            offsets=[r_off + r, 0],
+                            shape=[1, d_cols],
+                        )
+                        pl.store(peer_tile, [r_off + r, 0], recv)
+
+            return recv
+
+        # ---------- Stage 1: gate (local, replicated) ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def _gate(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
+        ):
+            score_buf = pl.create_tensor(
+                [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
+            )
+            biased_buf = pl.create_tensor(
+                [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
+            )
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_matmul"):
+                # Initialise output pads once — columns beyond N_EXPERTS
+                # keep 0 / NEG_INF so topk is not tricked by uninitialised values.
+                score_buf[:, :] = pl.full(
+                    [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32, value=0.0,
+                )
+                biased_buf[:, :] = pl.full(
+                    [BATCH, ROUTER_SCORE_PAD],
+                    dtype=pl.FP32, value=ROUTER_FP32_NEG_INF,
+                )
+                for nb in pl.range(N_EXPERTS // ROUTER_GATE_N_CHUNK):
+                    n0 = nb * ROUTER_GATE_N_CHUNK
+                    # Cast x per K-chunk → [BATCH,K] FP32 = 16384 B
+                    # (Site 5 fix: avoids full [BATCH,HIDDEN] FP32 = 262144 B).
+                    x0 = pl.cast(
+                        pl.slice(x, [BATCH, ROUTER_GATE_K_CHUNK], [0, 0]),
+                        target_type=pl.FP32,
+                    )
+                    w0 = pl.slice(
+                        gate_w,
+                        [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
+                        [0, n0],
+                    )
+                    logits_n = pl.matmul(x0, w0, out_dtype=pl.FP32)
+                    for kb in pl.range(1, HIDDEN // ROUTER_GATE_K_CHUNK):
+                        k0 = kb * ROUTER_GATE_K_CHUNK
+                        xk = pl.cast(
+                            pl.slice(
+                                x, [BATCH, ROUTER_GATE_K_CHUNK], [0, k0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        wk = pl.slice(
+                            gate_w,
+                            [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
+                            [k0, n0],
+                        )
+                        logits_n = pl.matmul_acc(logits_n, xk, wk)
+                    # Apply sigmoid per N-chunk — vec ops convert cube→vec
+                    # block layout, avoiding blayout mismatch when storing
+                    # into pre-created score_buf / biased_buf (vec layout).
+                    score_n_chunk = pl.recip(
+                        pl.add(pl.exp(pl.neg(logits_n)), 1.0),
+                    )
+                    bias_chunk = pl.slice(
+                        router_bias, [ROUTER_GATE_N_CHUNK], [n0],
+                    )
+                    bias_row_chunk = pl.reshape(
+                        bias_chunk, [1, ROUTER_GATE_N_CHUNK],
+                    )
+                    biased_n_chunk = pl.add(
+                        score_n_chunk,
+                        pl.col_expand_mul(
+                            pl.full(
+                                [BATCH, ROUTER_GATE_N_CHUNK],
+                                dtype=pl.FP32, value=1.0,
+                            ),
+                            bias_row_chunk,
+                        ),
+                    )
+                    score_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = score_n_chunk
+                    biased_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = biased_n_chunk
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_topk"):
+                topk_idx_tile = pl.create_tensor(
+                    [BATCH, ROUTER_TOPK_PAD], dtype=pl.INT32,
+                )
+                for tt in pl.range(BATCH):
+                    row = biased_buf[tt : tt + 1, :]
+                    idx_init = pl.arange(
+                        0, [1, ROUTER_SCORE_PAD], dtype=pl.UINT32,
+                    )
+                    srt = pl.sort32(row, idx_init)
+                    srt = pl.mrgsort(srt, block_len=64)
+                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    pairs = srt[:, 0:ROUTER_SORT_PAD]
+                    top_idx = pl.gather(
+                        pairs, mask_pattern=pl.tile.MaskPattern.P1010,
+                        output_dtype=pl.INT32,
+                    )
+                    topk_idx_tile[tt : tt + 1, :] = top_idx
+
+                gather_all = pl.gather(
+                    score_buf, dim=-1, index=topk_idx_tile,
+                )
+                gather_valid = pl.set_validshape(gather_all, BATCH, TOPK)
+                topk_vals_pad = pl.fillpad(
+                    gather_valid, pad_value=pl.PadValue.zero,
+                )
+
+                denom = pl.reshape(pl.row_sum(topk_vals_pad), [BATCH, 1])
+                weights_pad = pl.mul(
+                    pl.row_expand_div(topk_vals_pad, denom),
+                    ROUTER_SCALE,
+                )
+
+                for tt in pl.range(BATCH):
+                    for k in pl.range(TOPK):
+                        pl.write(
+                            expert_indices, [tt, k],
+                            pl.read(topk_idx_tile, [tt, k]),
+                        )
+                        pl.write(
+                            expert_weights, [tt, k],
+                            pl.read(weights_pad, [tt, k]),
+                        )
+
+            return expert_weights
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def gate_step(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            expert_indices: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
+            expert_weights: pl.Out[pl.Tensor[[BATCH, TOPK], pl.FP32]],
+        ) -> tuple[
+            pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pl.Tensor[[BATCH, TOPK], pl.FP32]
+        ]:
+            self._gate(
+                x, gate_w, router_bias, expert_indices, expert_weights,
+            )
+            return expert_indices, expert_weights
+
+        # ---------- Stage 2: dispatch (EP all-to-all) ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def _histogram_and_prefix_sum(
+            self,
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            send_counts_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
+            send_counts_per_rank: pl.Tensor[[n_ranks], pl.INT32],
+            send_offsets_per_rank: pl.Tensor[[n_ranks], pl.INT32],
+        ):
+            """Local histogram + per-rank prefix-sum prelude."""
+            for bkt in pl.range(per_rank_buckets):
+                pl.write(
+                    send_counts_per_bucket, [bkt], pl.cast(0, pl.INT32),
+                )
+            for r in pl.range(n_ranks):
+                pl.write(
+                    send_counts_per_rank, [r], pl.cast(0, pl.INT32),
+                )
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    cur = pl.read(send_counts_per_bucket, [bkt])
+                    pl.write(
+                        send_counts_per_bucket, [bkt],
+                        pl.cast(cur + 1, pl.INT32),
+                    )
+                    r_cur = pl.read(send_counts_per_rank, [dst])
+                    pl.write(
+                        send_counts_per_rank, [dst],
+                        pl.cast(r_cur + 1, pl.INT32),
+                    )
+
+            pl.write(send_offsets_per_rank, [0], pl.cast(0, pl.INT32))
+            for r in pl.range(1, n_ranks):
+                prev_off = pl.read(send_offsets_per_rank, [r - 1])
+                prev_cnt = pl.read(send_counts_per_rank, [r - 1])
+                pl.write(
+                    send_offsets_per_rank, [r],
+                    pl.cast(prev_off + prev_cnt, pl.INT32),
+                )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _pack_send_payload(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            send_counts_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
+            send_offsets_per_rank: pl.Tensor[[n_ranks], pl.INT32],
+            send_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            cursor_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
+            bucket_offset: pl.Tensor[[per_rank_buckets], pl.INT32],
+        ):
+            """Pack outgoing tokens into ``send_buf`` ordered by (dst, loc_e)."""
+            for r in pl.range(n_ranks):
+                rank_off = pl.read(send_offsets_per_rank, [r])
+                pl.write(
+                    bucket_offset, [r * n_local_experts],
+                    pl.cast(rank_off, pl.INT32),
+                )
+                pl.write(
+                    cursor_per_bucket, [r * n_local_experts],
+                    pl.cast(rank_off, pl.INT32),
+                )
+                for e in pl.range(1, n_local_experts):
+                    prev_off = pl.read(
+                        bucket_offset, [r * n_local_experts + e - 1],
+                    )
+                    prev_cnt = pl.read(
+                        send_counts_per_bucket,
+                        [r * n_local_experts + e - 1],
+                    )
+                    new_off = pl.cast(prev_off + prev_cnt, pl.INT32)
+                    pl.write(
+                        bucket_offset, [r * n_local_experts + e], new_off,
+                    )
+                    pl.write(
+                        cursor_per_bucket, [r * n_local_experts + e],
+                        new_off,
+                    )
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    slot_i32 = pl.read(cursor_per_bucket, [bkt])
+                    slot = pl.cast(slot_i32, pl.INDEX)
+                    x_tile = pl.load(x, [t, 0], [1, HIDDEN])
+                    pl.store(x_tile, [slot, 0], send_buf)
+                    pl.write(
+                        cursor_per_bucket, [bkt],
+                        pl.cast(slot_i32 + 1, pl.INT32),
+                    )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _build_local_expert_csr(
+            self,
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            """Receiver-side CSR: scan pub_counts for my dst slot."""
+            for e in pl.range(n_local_experts):
+                acc = pl.cast(0, pl.INT32)
+                for s in pl.range(n_ranks):
+                    acc = acc + pl.read(
+                        pub_counts, [s * n_ranks + my_rank, e],
+                    )
+                pl.write(local_expert_count, [e], pl.cast(acc, pl.INT32))
+
+            pl.write(local_expert_offset, [0], pl.cast(0, pl.INT32))
+            for e in pl.range(1, n_local_experts):
+                prev_off = pl.read(local_expert_offset, [e - 1])
+                prev_cnt = pl.read(local_expert_count, [e - 1])
+                pl.write(
+                    local_expert_offset, [e],
+                    pl.cast(prev_off + prev_cnt, pl.INT32),
+                )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _build_inverse_map(
+            self,
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            inverse_map: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            """Encode (dst_rank, dst_row_in_recv_buf) into one INT32 per (t,k)."""
+            cursor = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            for bkt in pl.range(per_rank_buckets):
+                pl.write(cursor, [bkt], pl.cast(0, pl.INT32))
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+
+                    src_off = pl.cast(0, pl.INT32)
+                    for s in pl.range(n_ranks):
+                        if s < my_rank:
+                            src_off = src_off + pl.read(
+                                pub_counts, [s * n_ranks + dst, loc_e],
+                            )
+
+                    loc_e_off = pl.cast(0, pl.INT32)
+                    for prev_e in pl.range(n_local_experts):
+                        if prev_e < loc_e:
+                            for s in pl.range(n_ranks):
+                                loc_e_off = loc_e_off + pl.read(
+                                    pub_counts,
+                                    [s * n_ranks + dst, prev_e],
+                                )
+
+                    my_cursor_val = pl.read(cursor, [bkt])
+                    dst_row = loc_e_off + src_off + my_cursor_val
+                    packed = (
+                        dst * pl.cast(local_recv_max, pl.INT32) + dst_row
+                    )
+                    pl.write(inverse_map, [t, k], pl.cast(packed, pl.INT32))
+                    pl.write(
+                        cursor, [bkt],
+                        pl.cast(my_cursor_val + 1, pl.INT32),
+                    )
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_publish(
+            self,
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            # Dispatch task 1: histogram + AtomicAdd-notify publish of the count
+            # matrix. Its own InCore task so the runtime task boundary DRAINS
+            # these cross-rank notifies before the count_done barrier in
+            # _dispatch_push — the DSL stand-in for the reference kernel's
+            # pipe_barrier(PIPE_ALL) between the two notify groups (dispatch.cpp).
+            send_counts_bkt = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            send_counts_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
+            send_offsets_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
+            self._histogram_and_prefix_sum(
+                expert_indices,
+                send_counts_bkt, send_counts_rank, send_offsets_rank,
+            )
+            for peer in pl.range(n_ranks):
+                for d in pl.range(n_ranks):
+                    for e in pl.range(n_local_experts):
+                        v = pl.read(send_counts_bkt, [d * n_local_experts + e])
+                        if peer == my_rank:
+                            pl.write(
+                                pub_counts, [my_rank * n_ranks + d, e], v,
+                            )
+                        else:
+                            if v != 0:
+                                pld.system.notify(
+                                    target=pub_counts, peer=peer,
+                                    offsets=[my_rank * n_ranks + d, e],
+                                    value=v, op=pld.NotifyOp.AtomicAdd,
+                                )
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_push(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            local_expert_offset: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            local_expert_count: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[n_local_experts], pl.INT32],
+        ]:
+            # Dispatch task 2: count_done barrier (peer publishes are drained by
+            # the task boundary before this) -> per-expert CSR -> push each token
+            # into the destination peer's recv_x / recv_r_route at its CSR row ->
+            # data_done barrier.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=count_done_sig, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=count_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            self._build_local_expert_csr(
+                pub_counts, local_expert_offset, local_expert_count, my_rank,
+            )
+
+            cursor_bkt = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            for i in pl.range(per_rank_buckets):
+                pl.write(cursor_bkt, [i], pl.cast(0, pl.INT32))
+            idx_tile = pl.tile.full([1, idx_pad], dtype=pl.INT32, value=0)
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(expert_indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    loc_e_off = pl.cast(0, pl.INT32)
+                    for prev_e in pl.range(n_local_experts):
+                        if prev_e < loc_e:
+                            for s in pl.range(n_ranks):
+                                loc_e_off = loc_e_off + pl.read(
+                                    pub_counts, [s * n_ranks + dst, prev_e],
+                                )
+                    src_off = pl.cast(0, pl.INT32)
+                    for s in pl.range(n_ranks):
+                        if s < my_rank:
+                            src_off = src_off + pl.read(
+                                pub_counts, [s * n_ranks + dst, loc_e],
+                            )
+                    cur = pl.read(cursor_bkt, [bkt])
+                    dst_row = pl.cast(loc_e_off + src_off + cur, pl.INDEX)
+                    pl.write(cursor_bkt, [bkt], pl.cast(cur + 1, pl.INT32))
+                    pld.tensor.put(
+                        dst=recv_x, peer=dst, src=x,
+                        dst_offsets=[dst_row, 0], src_offsets=[t, 0],
+                        shape=[1, HIDDEN],
+                    )
+                    pl.tile.write(
+                        idx_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32),
+                    )
+                    pld.tile.remote_store(
+                        idx_tile, target=recv_r_route, peer=dst,
+                        offsets=[dst_row, 0],
+                    )
+
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=data_done_sig, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=data_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            return local_expert_offset, local_expert_count
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_stage(  # noqa: PLR0913
+            self,
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            local_routed_x_out: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            pl.Tensor[[local_recv_max], pl.INT32],
+        ]:
+            # Dispatch task 3: stage the pushed recv_x / recv_r_route windows out
+            # to host tensors. Separate task so the push TPUTs from _dispatch_push
+            # are DRAINED at the task boundary before these reads (the reference
+            # kernel's pipe_barrier between the TPUT loop and stage_out). recv_x
+            # is already expert-major CSR -> straight chunked copy.
+            for row in pl.range(0, local_recv_max, stage_rows):
+                tile = pl.load(recv_x, [row, 0], [stage_rows, HIDDEN])
+                pl.store(tile, [row, 0], local_routed_x_out)
+            for e in pl.range(n_local_experts):
+                off = pl.cast(pl.read(local_expert_offset, [e]), pl.INDEX)
+                n = pl.cast(pl.read(local_expert_count, [e]), pl.INDEX)
+                for s in pl.range(n):
+                    pl.write(
+                        recv_r_route_out, [off + s],
+                        pl.read(recv_r_route, [off + s, 0]),
+                    )
+            return local_routed_x_out, recv_r_route_out
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def dispatch_step(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            local_routed_x_out: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+            local_expert_offset: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            local_expert_count: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[local_recv_max], pl.INT32]
+        ]:
+            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
+            # group of cross-rank ops drains at the task boundary — the DSL
+            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
+            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            self._dispatch_publish(expert_indices, pub_counts, my_rank)
+            local_expert_offset, local_expert_count = self._dispatch_push(
+                x, expert_indices,
+                local_expert_offset, local_expert_count,
+                pub_counts, count_done_sig, recv_x, recv_r_route,
+                data_done_sig, my_rank,
+            )
+            local_routed_x_out, recv_r_route_out = self._dispatch_stage(
+                recv_x, recv_r_route,
+                local_expert_offset, local_expert_count,
+                local_routed_x_out, recv_r_route_out, my_rank,
+            )
+            return (
+                local_routed_x_out,
+                local_expert_offset,
+                local_expert_count,
+                recv_r_route_out,
+            )
+
+        # ---------- Stage 3a: expert_routed (local 36 experts) ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def _expert_routed(  # noqa: PLR0913, PLR0915
+            self,
+            local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            w_gate: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_up: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_down: pl.Tensor[
+                [n_local_experts, inter, HIDDEN], pl.BF16
+            ],
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+        ):
+            for e in pl.parallel(n_local_experts):
+                n_rows = pl.read(local_expert_count, [e])
+                offset_i32 = pl.read(local_expert_offset, [e])
+                offset = pl.cast(offset_i32, pl.INDEX)
+                valid_rows = pl.cast(n_rows, pl.INDEX)
+
+                # Row-tile loop — process RECV_TILE rows per outer iteration.
+                # Bridge-tensor pattern (h_bf16 at tile_idx loop level, outside
+                # both moe_gate_up and moe_down pl.at scopes) eliminates the
+                # [32,1280] FP32 h_tile accumulator from each scope's live set
+                # and partitions gate/up from down-proj allocations
+                # (mirrors deepseek/v4/expert_routed.py).
+                #
+                # ``tile_valid`` is min(RECV_TILE, n_rows - tile_row0) so the
+                # trailing tile correctly masks out padding rows past
+                # ``offset + n_rows``.
+                for tile_idx in pl.range(N_RECV_TILES):
+                    tile_row0 = tile_idx * RECV_TILE
+                    tile_offset = offset + tile_row0
+                    # Per-tile valid rows (scalar) — clamps trailing tile to
+                    # the active row span. Use ``pl.min`` for scalar min/max
+                    # (``pl.minimum`` is the tensor variant — frontend rejects
+                    # mixing Scalar + ConstInt operands).
+                    tile_valid = pl.min(RECV_TILE, valid_rows - tile_row0)
+                    if tile_valid > 0:
+
+                        # Bridge tensor — lives at tile_idx loop level, shared
+                        # between expert_gate_up and expert_down SPMD dispatches
+                        # (mirrors deepseek/v4/expert_routed.py bridge pattern).
+                        # As an Inline-level create_tensor it is in vec (UB) space;
+                        # pl.slice of it in expert_down gives tmov vec→left ✓.
+                        h_bf16 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.BF16,
+                        )
+
+                        # Gate+up projection: each SPMD block handles one N-chunk
+                        # of the inter dimension.  pl.slice of external BF16 input
+                        # (local_routed_x) produces tmov mat→left which is valid in
+                        # cube kernels (cube kind = Inline + pl.spmd).
+                        for nb in pl.spmd(
+                            inter // ROUTED_GATE_N_CHUNK,
+                            name_hint="expert_gate_up",
+                        ):
+                            n0 = nb * ROUTED_GATE_N_CHUNK
+                            x0 = pl.slice(
+                                local_routed_x,
+                                [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                [tile_offset, 0],
+                                valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
+                            )
+                            wg0_2d = pl.reshape(
+                                pl.slice(
+                                    w_gate,
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
+                                ),
+                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            )
+                            wu0_2d = pl.reshape(
+                                pl.slice(
+                                    w_up,
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
+                                ),
+                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            )
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
+                                k0 = kb * ROUTED_GATE_K_CHUNK
+                                xk = pl.slice(
+                                    local_routed_x,
+                                    [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                    [tile_offset, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_GATE_K_CHUNK,
+                                    ],
+                                )
+                                wgk = pl.reshape(
+                                    pl.slice(
+                                        w_gate,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                wuk = pl.reshape(
+                                    pl.slice(
+                                        w_up,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                                up_acc = pl.matmul_acc(up_acc, xk, wuk)
+
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
+                            )
+                            silu = pl.mul(gate_acc, sigmoid)
+                            if _routed_swiglu_step:
+                                silu_c = pl.minimum(silu, _routed_swiglu_limit)
+                                up_c = pl.maximum(
+                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    -_routed_swiglu_limit,
+                                )
+                                gated = pl.mul(silu_c, up_c)
+                            else:
+                                gated = pl.mul(silu, up_acc)
+
+                            gated_v = pl.set_validshape(
+                                gated, tile_valid, ROUTED_GATE_N_CHUNK,
+                            )
+                            # No fillpad — gated_v (none-pad mode) matches
+                            # uninitialised h_bf16 subview (none-pad mode);
+                            # expert_down reads h_bf16 with valid_shape= so
+                            # padding rows beyond tile_valid are not used.
+                            h_bf16[
+                                :, n0 : n0 + ROUTED_GATE_N_CHUNK
+                            ] = pl.cast(gated_v, target_type=pl.BF16)
+
+                        # Down projection: each SPMD block handles one D-chunk of
+                        # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
+                        # pl.slice of it gives tmov vec→left ✓.
+                        for db in pl.spmd(
+                            HIDDEN // ROUTED_DOWN_N_CHUNK,
+                            name_hint="expert_down",
+                        ):
+                            d0 = db * ROUTED_DOWN_N_CHUNK
+                            h0 = pl.slice(
+                                h_bf16,
+                                [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                [0, 0],
+                                valid_shape=[
+                                    tile_valid, ROUTED_DOWN_K_CHUNK,
+                                ],
+                            )
+                            wd0 = pl.reshape(
+                                pl.slice(
+                                    w_down,
+                                    [
+                                        1,
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                    [e, 0, d0],
+                                ),
+                                [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
+                            )
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
+                                k0 = kb2 * ROUTED_DOWN_K_CHUNK
+                                hk = pl.slice(
+                                    h_bf16,
+                                    [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                    [0, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_DOWN_K_CHUNK,
+                                    ],
+                                )
+                                wdk = pl.reshape(
+                                    pl.slice(
+                                        w_down,
+                                        [
+                                            1,
+                                            ROUTED_DOWN_K_CHUNK,
+                                            ROUTED_DOWN_N_CHUNK,
+                                        ],
+                                        [e, k0, d0],
+                                    ),
+                                    [
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                )
+                                y_acc = pl.matmul_acc(y_acc, hk, wdk)
+
+                            y_v = pl.set_validshape(
+                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                            )
+                            y_m = pl.fillpad(
+                                y_v, pad_value=pl.PadValue.zero,
+                            )
+                            local_routed_y = pl.assemble(
+                                local_routed_y,
+                                pl.cast(y_m, target_type=pl.BF16),
+                                [tile_offset, d0],
+                            )
+
+            return local_routed_y
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def expert_routed_step(
+            self,
+            local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            w_gate_r: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_up_r: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_down_r: pl.Tensor[
+                [n_local_experts, inter, HIDDEN], pl.BF16
+            ],
+            local_routed_y: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+        ) -> pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]:
+            local_routed_y = self._expert_routed(
+                local_routed_x,
+                local_expert_offset, local_expert_count,
+                w_gate_r, w_up_r, w_down_r,
+                local_routed_y,
+            )
+            return local_routed_y
+
+        # ---------- Stage 3b: expert_shared (TP-sliced + tp_all_reduce) ----
+        @pl.function(type=pl.FunctionType.Inline)
+        def _expert_shared_local(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            w_gate: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        ):
+            # Gate+up and down projections merged into one InCore kernel so that
+            # h_tile (Vec SRAM) is live across both projections in the same
+            # kernel dispatch.  Two separate pl.at(CORE_GROUP) scopes would
+            # become two separate InCore kernel dispatches when expert_shared_step
+            # is Inline, and h_tile cannot cross that dispatch boundary.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_mlp"):
+                h_tile = pl.create_tensor(
+                    [BATCH, sh_inter_local], dtype=pl.BF16,
+                )
+
+                x0 = pl.slice(x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0])
+                wg0 = pl.slice(
+                    w_gate,
+                    [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                    [0, 0],
+                )
+                wu0 = pl.slice(
+                    w_up,
+                    [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                    [0, 0],
+                )
+                gate_acc = pl.matmul(x0, wg0, out_dtype=pl.FP32)
+                up_acc = pl.matmul(x0, wu0, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk = pl.slice(x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0])
+                    wgk = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                        [k0, 0],
+                    )
+                    wuk = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                        [k0, 0],
+                    )
+                    gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                    up_acc = pl.matmul_acc(up_acc, xk, wuk)
+
+                sigmoid = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
+                )
+                silu = pl.mul(gate_acc, sigmoid)
+                if _shared_swiglu_step:
+                    silu_c = pl.minimum(silu, _shared_swiglu_limit)
+                    up_c = pl.maximum(
+                        pl.minimum(up_acc, _shared_swiglu_limit),
+                        -_shared_swiglu_limit,
+                    )
+                    gated = pl.mul(silu_c, up_c)
+                else:
+                    gated = pl.mul(silu, up_acc)
+
+                h_tile[:, 0:SHARED_GATE_N_CHUNK] = pl.cast(
+                    gated, target_type=pl.BF16,
+                )
+
+                # Explicit K-chunking for the down projection.
+                # K=160 (sh_inter_local) would trigger backend auto-K-split
+                # which emits an invalid ``tmov acc→acc``.  Expose the K-loop
+                # at the user level using K_INNER=32 (5 passes of 32) so the
+                # compiler sees a structured pl.matmul + pl.matmul_acc chain
+                # (same pattern as gate/up above) and never needs the copy.
+                _SH_DOWN_K_INNER = 32  # hardware K-tile; 160 // 32 == 5 passes
+                for db in pl.range(HIDDEN // SHARED_DOWN_N_CHUNK):
+                    d0 = db * SHARED_DOWN_N_CHUNK
+                    h0_k0 = pl.slice(
+                        h_tile, [BATCH, _SH_DOWN_K_INNER], [0, 0],
+                    )
+                    wd0_k0 = pl.slice(
+                        w_down,
+                        [_SH_DOWN_K_INNER, SHARED_DOWN_N_CHUNK],
+                        [0, d0],
+                    )
+                    y_acc = pl.matmul(h0_k0, wd0_k0, out_dtype=pl.FP32)
+                    for kk in pl.range(1, sh_inter_local // _SH_DOWN_K_INNER):
+                        kk0 = kk * _SH_DOWN_K_INNER
+                        h0_kk = pl.slice(
+                            h_tile, [BATCH, _SH_DOWN_K_INNER], [0, kk0],
+                        )
+                        wd0_kk = pl.slice(
+                            w_down,
+                            [_SH_DOWN_K_INNER, SHARED_DOWN_N_CHUNK],
+                            [kk0, d0],
+                        )
+                        y_acc = pl.matmul_acc(y_acc, h0_kk, wd0_kk)
+                    sh_y_shard = pl.assemble(
+                        sh_y_shard,
+                        pl.cast(y_acc, target_type=pl.BF16),
+                        [0, d0],
+                    )
+
+            return sh_y_shard
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def expert_shared_step(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            sh_y: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            sh_tmp_window: pld.DistributedTensor[
+                [BATCH, HIDDEN], pl.BF16
+            ],
+            sh_signal_window: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            sh_y = self._expert_shared_local(
+                x, w_gate_s, w_up_s, w_down_s, sh_y,
+            )
+            # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
+            if TP_WORLD_SIZE > 1:
+                self.tp_all_reduce(
+                    sh_y, sh_tmp_window, sh_signal_window, my_rank,
+                )
+            return sh_y
+
+        # ---------- Stage 4: combine (EP a2a back + weighted gather) ------
+        @pl.function(type=pl.FunctionType.InCore)
+        def _publish_src_route_table(
+            self,
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            src_route_table: pld.DistributedTensor[
+                [n_ranks, n_local_experts, n_routes_per_rank], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            cursor = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            for i in pl.range(per_rank_buckets):
+                pl.write(cursor, [i], pl.cast(0, pl.INT32))
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    idx = pl.read(cursor, [bkt])
+                    r_route = pl.cast(t * TOPK + k, pl.INT32)
+
+                    if dst == my_rank:
+                        # Self-rank publish: write the scalar r_route
+                        # directly into the local view of the
+                        # DistributedTensor. Mirrors the self-branch
+                        # used for ``pub_counts`` above; avoids the
+                        # ``tmp = create_tensor; load; store`` dance
+                        # that the InCore tile verifier rejects with
+                        # "tile.load requires TensorType ... got TileType".
+                        pl.write(
+                            src_route_table,
+                            [my_rank, loc_e, pl.cast(idx, pl.INDEX)],
+                            r_route,
+                        )
+                    else:
+                        pld.system.notify(
+                            target=src_route_table,
+                            peer=dst,
+                            offsets=[
+                                my_rank, loc_e, pl.cast(idx, pl.INDEX),
+                            ],
+                            value=r_route,
+                            op=pld.NotifyOp.Set,
+                        )
+                    pl.write(cursor, [bkt], pl.cast(idx + 1, pl.INT32))
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _push_routed_y_to_sources(  # noqa: PLR0913
+            self,
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            e_cursor = pl.cast(0, pl.INT32)
+            for e in pl.range(n_local_experts):
+                src_off = pl.cast(0, pl.INT32)
+                for src in pl.range(n_ranks):
+                    n = pl.cast(
+                        pl.read(
+                            pub_counts, [src * n_ranks + my_rank, e],
+                        ),
+                        pl.INDEX,
+                    )
+                    for row in pl.range(n):
+                        local_row = (
+                            pl.cast(e_cursor, pl.INDEX)
+                            + pl.cast(src_off, pl.INDEX) + row
+                        )
+                        # r_route rode with the token at dispatch (recv_r_route);
+                        # local_row is the same expert-major CSR row order.
+                        r_route = pl.read(recv_r_route_out, [local_row])
+                        tile = pl.load(
+                            local_routed_y,
+                            [local_row, 0], [1, HIDDEN],
+                        )
+                        if src == my_rank:
+                            pl.store(tile, [r_route, 0], routed_y_buf)
+                        else:
+                            pld.tile.remote_store(
+                                tile,
+                                target=routed_y_buf,
+                                peer=src,
+                                offsets=[r_route, 0],
+                            )
+                    src_off = src_off + pl.cast(n, pl.INT32)
+                total_e = pl.cast(0, pl.INT32)
+                for src2 in pl.range(n_ranks):
+                    total_e = total_e + pl.read(
+                        pub_counts, [src2 * n_ranks + my_rank, e],
+                    )
+                e_cursor = e_cursor + total_e
+
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done,
+                        offsets=[src, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _weighted_gather_and_add(
+            self,
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
+            sh_y: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            moe_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_combine"):
+                for b in pl.range(BATCH):
+                    acc = pl.cast(
+                        pl.load(sh_y, [b, 0], [1, HIDDEN]),
+                        target_type=pl.FP32,
+                    )
+                    for k in pl.range(TOPK):
+                        w_fp = pl.read(expert_weights, [b, k])
+
+                        r_route = b * TOPK + k
+                        row_fp32 = pl.cast(
+                            pl.load(
+                                routed_y_buf, [r_route, 0], [1, HIDDEN],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        weighted = pl.mul(row_fp32, w_fp)
+                        acc = pl.add(acc, weighted)
+
+                    pl.store(
+                        pl.cast(acc, target_type=pl.BF16),
+                        [b, 0],
+                        moe_out,
+                    )
+
+            return moe_out
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def combine_step(  # noqa: PLR0913
+            self,
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
+            sh_y: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            moe_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done_sig: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            # Push design: r_route rode with each token into recv_r_route at
+            # dispatch, so combine drops the src_route_table publish + its
+            # barrier and scatters the routed output straight back.
+            self._push_routed_y_to_sources(
+                local_routed_y,
+                pub_counts,
+                routed_y_buf,
+                combine_done_sig,
+                recv_r_route_out,
+                my_rank,
+            )
+
+            moe_out = self._weighted_gather_and_add(
+                routed_y_buf, expert_weights, sh_y, moe_out,
+            )
+            return moe_out
+
+
+        # ---- L0: full attention + dense MLP (separate SSA scope) ----------
+        # Body reused verbatim from WholeDecodeDensePrefix.full_chip_orch:
+        # attention_full_inline (input_rms + attention + tp_all_reduce + head
+        # gate) -> resid1, then _dense_mlp_body_tp (post_rms + gate/up/down +
+        # tp_all_reduce) -> h0_out.
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def full_dense_orch(  # noqa: PLR0913
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16],
+            wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[layer_qhidden_dyn, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16],
+            gate_r: pl.Tensor[[num_heads_local_pad, hidden_q_local], pl.BF16],
+            post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            h0_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1 = attention_inline(
+                current_hidden,
+                input_rms_weight,
+                wq, wk, wv,
+                q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin,
+                k_cache, v_cache,
+                wo, w_g,
+                gate_r,
+                resid1,
+                layer_idx,
+                attn_tmp_window,
+                attn_signal_window,
+                my_rank,
+            )
+            h0_out = dense_mlp_inline(
+                resid1, post_rms_weight,
+                w_gate, w_up, w_down,
+                h0_out, layer_idx,
+                mlp_tmp_window, mlp_signal_window, my_rank,
+            )
+            return h0_out
+
+        # ---- L3 MoE pass 1: TP attention -> resid1 (per-protocol split). ---
+        # Separate Orchestration method (isolated SSA scope) so the MoE
+        # layer's attention runs in a TP-only dispatch pass, decoupled from
+        # the EP MoE-block pass below. This is the attention half of
+        # full_dense_orch (no dense_mlp): attention_full_inline ->
+        # resid1_out. Fusing attn+MoE into one chip_orch FAILS (full ->
+        # TaskMapSize=0; swa -> attention_swa.py:479 const-fold wall).
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def moe_attn_orch(  # noqa: PLR0913
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16],
+            wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[layer_qhidden_dyn, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16],
+            gate_r: pl.Tensor[[num_heads_local_pad, hidden_q_local], pl.BF16],
+            resid1_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1_out = attention_inline(
+                current_hidden,
+                input_rms_weight,
+                wq, wk, wv,
+                q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin,
+                k_cache, v_cache,
+                wo, w_g,
+                gate_r,
+                resid1_out,
+                layer_idx,
+                attn_tmp_window,
+                attn_signal_window,
+                my_rank,
+            )
+            return resid1_out
+
+        # ---- L3 MoE pass 2: EP moe-block (post_rms + moe + residual). --------
+        # Body reused verbatim from Mixed2Method.chip_orch sections A'/B/C/D
+        # (decode_layer.py:5543-5686): A' copies current_hidden (= resid1 from
+        # moe_attn_orch) into a fresh resid1 tile; B applies the post-attention
+        # zero-centred RMSNorm; C runs the inlined EpTpMoE block
+        # (gate/expert_shared/dispatch/expert_routed/combine); D does the
+        # residual add resid1 + moe_out -> next_hidden_out. The signature is
+        # trimmed vs chip_orch: attention weights are unused here (resid1 is
+        # the input) and are omitted.
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def moe_chip_orch(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
+            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
+            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.BF16],
+            w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            sh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            sh_signal_window: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            # ── A': input IS resid1 (attn already done in moe_attn_orch, the separate TP pass). ─
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            for _ac in pl.range(HIDDEN // K_CHUNK):
+                _c0 = _ac * K_CHUNK
+                resid1 = pl.assemble(
+                    resid1,
+                    pl.slice(current_hidden, [BATCH, K_CHUNK], [0, _c0]),
+                    [0, _c0],
+                )
+            # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+            hidden_blocks = HIDDEN // K_CHUNK
+            post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
+            ):
+                for kb in pl.range(hidden_blocks):
+                    k0 = kb * K_CHUNK
+                    rchunk = pl.cast(
+                        pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
+
+                sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+                for kb2 in pl.range(hidden_blocks):
+                    k0 = kb2 * K_CHUNK
+                    ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
+                    sq_sum = pl.add(
+                        sq_sum,
+                        pl.reshape(
+                            pl.row_sum(pl.mul(ck, ck)),
+                            [1, BATCH],
+                        ),
+                    )
+                inv_rms_moe = pl.recip(
+                    pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+                )
+                inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
+                for kb3 in pl.range(hidden_blocks):
+                    k0 = kb3 * K_CHUNK
+                    norm_chunk = pl.slice(
+                        resid1_fp32, [BATCH, K_CHUNK], [0, k0],
+                    )
+                    gamma = pl.slice(
+                        post_rms_weight, [1, K_CHUNK], [layer_idx, k0],
+                    )
+                    scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
+                    normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
+                    post_norm = pl.assemble(
+                        post_norm,
+                        pl.cast(normed, target_type=pl.BF16),
+                        [0, k0],
+                    )
+
+            # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
+            # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
+            # inlined per-stage methods (``self.gate_step`` /
+            # ``self.dispatch_step`` / ``self.expert_routed_step`` /
+            # ``self.expert_shared_step`` / ``self.combine_step``) directly
+            # rather than instantiating a separate ``@pl.program``.
+            moe_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+
+            # 1) Gate (local, replicated).
+            expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
+            expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
+            expert_indices, expert_weights = self.gate_step(
+                post_norm, gate_w, router_bias,
+                expert_indices, expert_weights,
+            )
+
+            # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+            sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            sh_y = self.expert_shared_step(
+                post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
+                sh_tmp_window, sh_signal_window, my_rank,
+            )
+
+            # 3) Dispatch (EP push: tokens remote_store'd into peer recv_x).
+            local_routed_x = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.BF16,
+            )
+            local_expert_offset = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            local_expert_count = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            # Per-recv-row r_route (= source t*TOPK+k), staged from recv_r_route;
+            # combine uses it to scatter the routed output back to the source.
+            recv_r_route_out = pl.create_tensor(
+                [local_recv_max], dtype=pl.INT32,
+            )
+            (
+                local_routed_x,
+                local_expert_offset,
+                local_expert_count,
+                recv_r_route_out,
+            ) = self.dispatch_step(
+                post_norm, expert_indices,
+                local_routed_x,
+                local_expert_offset, local_expert_count, recv_r_route_out,
+                pub_counts, count_done_sig, recv_x, recv_r_route, data_done_sig,
+                my_rank,
+            )
+
+            # 4) Routed experts (local 36).
+            local_routed_y = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.BF16,
+            )
+            local_routed_y = self.expert_routed_step(
+                local_routed_x,
+                local_expert_offset, local_expert_count,
+                w_gate_r, w_up_r, w_down_r,
+                local_routed_y,
+            )
+
+            # 5) Combine (EP push back + weighted gather + sh_y add).
+            moe_out = self.combine_step(
+                local_routed_y,
+                recv_r_route_out, expert_weights, sh_y,
+                moe_out,
+                pub_counts,
+                routed_y_buf, combine_done_sig,
+                my_rank,
+            )
+
+            # ── D: residual add: next_hidden_out = resid1 + moe_out. ───
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_residual_add",
+            ):
+                for kb4 in pl.range(hidden_blocks):
+                    k0 = kb4 * K_CHUNK
+                    m = pl.cast(
+                        pl.slice(moe_out, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    r = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
+                    next_hidden_out = pl.assemble(
+                        next_hidden_out,
+                        pl.cast(pl.add(r, m), target_type=pl.BF16),
+                        [0, k0],
+                    )
+            return next_hidden_out
+
+        # ---- Tail: final RMSNorm + LM head (separate SSA scope) -----------
+        # Body reused verbatim from WholeDecodeDensePrefix.lm_head_orch.
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def lm_head_orch(
+            self,
+            next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+            lm_head_weight: pl.Tensor[[VOCAB_LOCAL, HIDDEN], pl.BF16],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            logits_shard_out: pl.Out[
+                pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
+            ],
+        ) -> pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]:
+            logits_shard_out = rms_lm_head_inline(
+                next_hidden, final_norm_weight, lm_head_weight,
+                seq_lens, logits_shard_out,
+            )
+            return logits_shard_out
+
+        # ---- host_orch: multi-pass dispatch -------------------------------
+        # Pass 1: L0 full dense (attn + dense_mlp) -> h0_out.
+        # Pass 2: L3 MoE attention (TP) -> resid1_out.
+        # Pass 3: L3 MoE block (EP: post_rms + gate/dispatch/experts/combine +
+        #         residual) -> h3_out. Dispatched only after L3 attention's
+        #         tp_all_reduce completes (isolated single-protocol pass).
+        # Pass 4: tail (final RMSNorm + LM head) -> logits_shard_out.
+        # Each layer's all_reduce / EP comm scratch is a dedicated window pair
+        # so concurrent dispatches don't alias. layer_idx=0 for every method
+        # (per-layer weight slabs positioned at base 0 -- see class docstring).
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16],
+            # L0 (full dense) weights -- per-rank slabs positioned at base 0.
+            l0_input_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l0_wq: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16],
+            l0_wk: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l0_wv: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l0_q_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l0_k_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l0_wo: pl.Tensor[[tp_size, layer_qhidden_dyn, HIDDEN], pl.BF16],
+            l0_w_g: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16],
+            l0_gate_r: pl.Tensor[[tp_size, num_heads_local_pad, hidden_q_local], pl.BF16],
+            l0_post_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l0_w_gate: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l0_w_up: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l0_w_down: pl.Tensor[[tp_size, LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            # L3 (full MoE) attention weights -- per-rank slabs.
+            l3_input_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l3_wq: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16],
+            l3_wk: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l3_wv: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l3_q_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l3_k_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l3_wo: pl.Tensor[[tp_size, layer_qhidden_dyn, HIDDEN], pl.BF16],
+            l3_w_g: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16],
+            l3_gate_r: pl.Tensor[[tp_size, num_heads_local_pad, hidden_q_local], pl.BF16],
+            # L3 (full MoE) MoE-block weights.
+            l3_post_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l3_gate_w: pl.Tensor[[tp_size, HIDDEN, N_EXPERTS], pl.FP32],
+            l3_router_bias: pl.Tensor[[tp_size, N_EXPERTS], pl.FP32],
+            l3_w_gate_r: pl.Tensor[[tp_size, n_local_experts, HIDDEN, inter], pl.BF16],
+            l3_w_up_r: pl.Tensor[[tp_size, n_local_experts, HIDDEN, inter], pl.BF16],
+            l3_w_down_r: pl.Tensor[[tp_size, n_local_experts, inter, HIDDEN], pl.BF16],
+            l3_w_gate_s: pl.Tensor[[tp_size, HIDDEN, sh_inter_local], pl.BF16],
+            l3_w_up_s: pl.Tensor[[tp_size, HIDDEN, sh_inter_local], pl.BF16],
+            l3_w_down_s: pl.Tensor[[tp_size, sh_inter_local, HIDDEN], pl.BF16],
+            # Shared runtime tensors (replicated across L0 + L3).
+            seq_lens: pl.Tensor[[tp_size, USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[tp_size, BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[tp_size, USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            rope_sin: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            k_cache: pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            # Resident GM hidden handoff tensors.
+            h0_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
+            resid1_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
+            h3_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
+            # Tail weights.
+            final_norm_weight: pl.Tensor[[tp_size, 1, HIDDEN], pl.FP32],
+            lm_head_weight: pl.Tensor[[tp_size, VOCAB_LOCAL, HIDDEN], pl.BF16],
+            logits_shard_out: pl.Out[
+                pl.Tensor[[tp_size, USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
+            ],
+        ):
+            # L0 dense scratch (attn + mlp all_reduce windows).
+            l0_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l0_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            l0_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l0_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
+            # L3 attention scratch.
+            l3_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l3_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            # L3 MoE EP comm scratch (shared-expert + dispatch/combine windows).
+            l3_sh_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l3_sh_sig = pld.alloc_window_buffer(n_ranks * 4)
+            l3_pub_counts = pld.alloc_window_buffer(
+                n_ranks * n_ranks * n_local_experts_pad * 4,
+            )
+            l3_count_done = pld.alloc_window_buffer(n_ranks * 4)
+            l3_recv_x = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+            l3_recv_r_route = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+            l3_data_done = pld.alloc_window_buffer(n_ranks * 4)
+            l3_routed_y = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+            l3_combine_done = pld.alloc_window_buffer(n_ranks * 4)
+
+            # Pass 1: L0 full dense (attn + dense_mlp) -> h0_out.
+            for r in pl.range(pld.world_size()):
+                self.full_dense_orch(
+                    current_hidden[r],
+                    l0_input_rms[r],
+                    l0_wq[r], l0_wk[r], l0_wv[r],
+                    l0_q_norm[r], l0_k_norm[r],
+                    seq_lens[r], block_table[r], slot_mapping[r],
+                    rope_cos[r], rope_sin[r],
+                    k_cache[r], v_cache[r],
+                    l0_wo[r], l0_w_g[r], l0_gate_r[r],
+                    l0_post_rms[r],
+                    l0_w_gate[r], l0_w_up[r], l0_w_down[r],
+                    h0_out[r],
+                    pld.window(l0_attn_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l0_attn_sig, [tp_size, 1], dtype=pl.INT32),
+                    pld.window(l0_mlp_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l0_mlp_sig, [tp_size, 1], dtype=pl.INT32),
+                    0,
+                    r,
+                    device=r,
+                )
+            # Pass 2: L3 MoE attention (TP) -> resid1_out.
+            for r in pl.range(pld.world_size()):
+                self.moe_attn_orch(
+                    h0_out[r],
+                    l3_input_rms[r],
+                    l3_wq[r], l3_wk[r], l3_wv[r],
+                    l3_q_norm[r], l3_k_norm[r],
+                    seq_lens[r], block_table[r], slot_mapping[r],
+                    rope_cos[r], rope_sin[r],
+                    k_cache[r], v_cache[r],
+                    l3_wo[r], l3_w_g[r], l3_gate_r[r],
+                    resid1_out[r],
+                    pld.window(l3_attn_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l3_attn_sig, [tp_size, 1], dtype=pl.INT32),
+                    0,
+                    r,
+                    device=r,
+                )
+            # Pass 3: L3 MoE block (EP) -> h3_out. Only after L3 attention's
+            # tp_all_reduce completes (isolated single-protocol dispatch).
+            for r in pl.range(pld.world_size()):
+                self.moe_chip_orch(
+                    resid1_out[r],
+                    l3_post_rms[r],
+                    l3_gate_w[r], l3_router_bias[r],
+                    l3_w_gate_r[r], l3_w_up_r[r], l3_w_down_r[r],
+                    l3_w_gate_s[r], l3_w_up_s[r], l3_w_down_s[r],
+                    h3_out[r],
+                    pld.window(l3_sh_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l3_sh_sig, [n_ranks, 1], dtype=pl.INT32),
+                    pld.window(
+                        l3_pub_counts,
+                        [n_ranks * n_ranks, n_local_experts_pad],
+                        dtype=pl.INT32,
+                    ),
+                    pld.window(l3_count_done, [n_ranks, 1], dtype=pl.INT32),
+                    pld.window(l3_recv_x, [local_recv_max, HIDDEN], dtype=pl.BF16),
+                    pld.window(l3_data_done, [n_ranks, 1], dtype=pl.INT32),
+                    pld.window(
+                        l3_recv_r_route, [local_recv_max, idx_pad], dtype=pl.INT32,
+                    ),
+                    pld.window(
+                        l3_routed_y, [n_routes_per_rank, HIDDEN], dtype=pl.BF16,
+                    ),
+                    pld.window(l3_combine_done, [n_ranks, 1], dtype=pl.INT32),
+                    0,
+                    r,
+                    device=r,
+                )
+            # Pass 4: tail (final RMSNorm + LM head) -> logits_shard_out.
+            for r in pl.range(pld.world_size()):
+                self.lm_head_orch(
+                    h3_out[r],
+                    final_norm_weight[r],
+                    lm_head_weight[r],
+                    seq_lens[r],
+                    logits_shard_out[r],
+                    device=r,
+                )
+
+    return WholeDecodeProgram
+
+
 def _build_dense_chain2_lmhead_program(tp_size: int = TP_WORLD_SIZE):
     """Phase 25.1: ONE program = full-dense layer (attention + dense MLP) +
     final RMSNorm + LM head, all inlined into a single chip_orch.
@@ -7669,6 +9509,12 @@ decode_layer_swa_dense = _build_decode_layer_dense_program(full=False)
 # resolve it via getattr(decode_layer, "whole_decode_dense_prefix").
 whole_decode_dense_prefix = _build_whole_decode_dense_prefix_program()
 
+# N=1 whole-net fusion milestone: minimal mixed chain (L0 full dense + L3 full
+# MoE + tail) in ONE @pl.program, per-protocol split (TP attn method + EP moe
+# method). Built eagerly (full + silu_silu). Scales to all 45 layers next.
+whole_decode_program = _build_whole_decode_program()
+
+
 # Phase X.7 — MoE @pl.program builds are deferred via module __getattr__
 # because the inner ``self._embedded_moe_cls().chip_orch(...)`` construction
 # is rejected by the pypto frontend (instantiating a @pl.program at IR-build
@@ -7822,6 +9668,8 @@ __all__ = [
     "_build_decode_layer_moe_program",
     "whole_decode_dense_prefix",
     "_build_whole_decode_dense_prefix_program",
+    "whole_decode_program",
+    "_build_whole_decode_program",
 ]
 
 
@@ -9679,3 +11527,1894 @@ def _build_mixed_moe_tail_program(
                 )
 
     return MixedMoeTail
+
+
+def _build_moe_layer_real_program(
+    *,
+    full: bool,
+    routed_lim: float,
+    shared_lim: float,
+    tp_size: int = TP_WORLD_SIZE,
+):
+    """Return a ``@pl.program`` class = attention + dense MLP + EP+TP MoE
+    layer + tail (final RMSNorm + LM head), all in ONE program.
+
+    N=1 milestone: proves a dense-attn method + the full MoE method-set +
+    the tail (lm_head_orch) coexist in one ``@pl.program`` and chain via a
+    multi-pass host_orch (the exact structure the 45-layer whole-decode
+    program needs). Body is ``Mixed2Method`` verbatim plus ``lm_head_orch``
+    and a pass-3 tail dispatch reading ``next_hidden_out``.
+
+    Phase X.8: the entire ``EpTpMoE`` body (from ``moe.py``) is inlined into
+    ``DecodeLayerMoE`` — every ``@pl.function`` method plus the body of
+    ``EpTpMoE.chip_orch``. The frontend rejects
+    ``self._embedded_moe_cls().chip_orch(...)`` (instantiating a ``@pl.program``
+    inside another ``@pl.program`` body is not supported), so the activation
+    choice is now baked at factory build time via Python closure constants
+    (``_routed_swiglu_step`` / ``_shared_swiglu_step``) rather than via a
+    factory call to a separate program class.
+    """
+    if HIDDEN % tp_size != 0:
+        raise ValueError(
+            f"HIDDEN={HIDDEN} must divide tp_size={tp_size}"
+        )
+    attention_inline = (
+        pl.inline(attention_full._func)
+        if full
+        else pl.inline(attention_swa._func)
+    )
+
+    dense_mlp_inline = pl.inline(_dense_mlp_body_tp._func)
+    rms_lm_head_inline = pl.inline(rms_lm_head._func)
+
+    # Activation choice — compile-time Python constants captured in closure.
+    if routed_lim == 0.0:
+        _routed_swiglu_step = False
+    elif routed_lim == 7.0:
+        _routed_swiglu_step = True
+    else:
+        raise ValueError(
+            f"routed_lim must be 0.0 or 7.0, got {routed_lim}",
+        )
+
+    if shared_lim == 0.0:
+        _shared_swiglu_step = False
+    elif shared_lim == 16.0:
+        _shared_swiglu_step = True
+    else:
+        raise ValueError(
+            f"shared_lim must be 0.0 or 16.0, got {shared_lim}",
+        )
+
+    _routed_swiglu_limit = routed_lim
+    _shared_swiglu_limit = shared_lim
+    tp_chunk = HIDDEN // tp_size
+
+    rotary_dim = 64 if full else 128
+    hidden_q_local = HIDDEN_Q_FULL_LOCAL if full else HIDDEN_Q_SWA_LOCAL
+    num_heads_local = NUM_HEADS_FULL_LOCAL if full else NUM_HEADS_SWA_LOCAL
+    num_heads_local_pad = (
+        NUM_HEADS_FULL_LOCAL_PAD if full else NUM_HEADS_SWA_LOCAL_PAD
+    )
+    layer_qhidden_dyn = (
+        LAYER_QHIDDEN_ROWS_DYN_FULL if full else LAYER_QHIDDEN_ROWS_DYN_SWA
+    )
+
+    n_ranks = tp_size
+    n_ranks_pad = N_RANKS_PAD
+    n_local_experts = N_LOCAL_EXPERTS
+    # pub_counts cols padded to a multiple of 8 so a [n_ranks, n_local_experts_pad]
+    # INT32 tile has 32B-aligned rows (40*4=160B), required by the burst-free
+    # count exchange's remote_load (36*4=144B fails ptoas alloc_tile alignment).
+    # Downstream scalar reads use cols [0, n_local_experts); the pad cols are
+    # storage-only and never read.
+    n_local_experts_pad = ((n_local_experts + 7) // 8) * 8
+    # r_route push channel pad (INT32 8*4=32B, min 32B-aligned tile) and the
+    # recv_x -> local_routed_x stage_out chunk height.
+    idx_pad = 8
+    stage_rows = 8
+    inter = MOE_INTERMEDIATE
+    sh_inter_local = INTER_S_LOCAL
+    sh_tp_chunk = HIDDEN // tp_size
+    local_recv_max = LOCAL_RECV_MAX  # matches dispatch.LOCAL_RECV_MAX (1024)
+    n_routes_per_rank = BATCH * TOPK
+    per_rank_buckets = PER_RANK_BUCKETS  # n_ranks * n_local_experts
+
+    @pl.program
+    class MoeLayerReal:
+        # Phase X.8: the entire ``EpTpMoE`` body (gate / dispatch /
+        # expert_routed / expert_shared / combine plus all Inline helpers and
+        # the chip_orch body) is inlined into this class. The frontend rejects
+        # ``self._embedded_moe_cls().chip_orch(...)`` (instantiating a
+        # ``@pl.program`` inside another ``@pl.program`` body is not a
+        # supported feature). The originals in ``moe.py`` remain intact for
+        # the standalone MoE harness; the bodies are kept in lock-step here.
+
+        # ---------- Collective: TP all_reduce (lifted from collectives.py) ----
+        # Phase X.2: pull-side ring all-reduce body, baked t_rows=BATCH,
+        # d_cols=HIDDEN, group_size=tp_size from factory closure. Used by the
+        # attention path that's pl.inline()-spliced into chip_orch below.
+        @pl.function(type=pl.FunctionType.InCore)
+        def tp_all_reduce(
+            self,
+            local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            group_size = tp_size
+
+            # Phase 1: stage-in — copy local into my tmp_window slot (full HIDDEN).
+            # All-reduce HIDDEN tiling width: fixed, INDEPENDENT of tp_size.
+            # tp_chunk = HIDDEN // tp_size collapses to HIDDEN (4096) at
+            # tp_size=1 (apply_tp1_patch single-card e2e), so [BATCH, 4096]
+            # FP32 acc tiles (256KB) overflow the 188KB UB limit. A fixed
+            # tile keeps the per-iteration working set bounded for every
+            # tp_size (512 = canonical TP=8 chunk; HIDDEN is divisible by it).
+            ar_chunk = HIDDEN // 8
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
+                pl.store(stage_tile, [0, k0], tmp_window)
+
+            # Phase 2: barrier — notify all peers (one round), then wait on all
+            # peers (one round). Separate loops, matching the pypto own-test
+            # pattern. expected=1 fixed (cells start zero, accumulate to N-1
+            # after all notifies land; we only require >=1 from each peer slot).
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            # Phase 3: load own tmp slot, then for each peer remote_load + tadd
+            # (FP32 — PTOAS bf16 tadd unsupported, cast through f32). Result lands
+            # back in `local` (in-place reduction target).
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
+                acc = pl.cast(own_tile, target_type=pl.FP32)
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        recv = pld.tile.remote_load(
+                            tmp_window, peer=peer,
+                            offsets=[0, k0], shape=[BATCH, ar_chunk],
+                        )
+                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
+                pl.store(
+                    pl.cast(acc, target_type=pl.BF16),
+                    [0, k0], local,
+                )
+            return local
+
+        # ===================================================================
+        # Phase X.8 — inlined EpTpMoE @pl.function methods.
+        # Bodies copied verbatim from ``moe.EpTpMoE`` (Phase X.3+X.4+X.5).
+        # The activation choice (plain SiLU vs. SwigluStep@7/16) is baked at
+        # factory build time via the ``_routed_swiglu_step`` /
+        # ``_shared_swiglu_step`` Python closure constants — only one branch
+        # is emitted per specialisation. Module-level constants from moe.py
+        # (T, N_RANKS, INTER, etc.) are renamed to the local closure names
+        # (BATCH, n_ranks, inter, ...) so the bodies type-check against this
+        # factory's signatures.
+        # ===================================================================
+
+        # ---------- Collective: EP all_to_all ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def ep_all_to_all(
+            self,
+            send: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            send_counts: pl.Tensor[[n_ranks], pl.INT32],
+            recv_counts: pl.Tensor[[n_ranks], pl.INT32],
+            send_offsets: pl.Tensor[[n_ranks], pl.INT32],
+            recv_offsets: pl.Tensor[[n_ranks], pl.INT32],
+            signal_window: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16]:
+            """Pull-side variable-length token-level all-to-all over EP."""
+            group_size = n_ranks
+            d_cols = HIDDEN
+
+            # 1) Local self-bucket copy.
+            n_self = pl.cast(pl.read(send_counts, [my_rank]), pl.INDEX)
+            s_off_self = pl.cast(pl.read(send_offsets, [my_rank]), pl.INDEX)
+            r_off_self = pl.cast(pl.read(recv_offsets, [my_rank]), pl.INDEX)
+            for r in pl.range(n_self):
+                self_tile = pl.load(
+                    send, [s_off_self + r, 0], [1, d_cols],
+                )
+                pl.store(self_tile, [r_off_self + r, 0], recv)
+
+            # 2) Set(1) notify every peer.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+
+            # 3) Ge(1) wait for every peer.
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window,
+                        offsets=[src, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+            # 4) Pull every peer's bucket-for-me.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    n_recv = pl.cast(
+                        pl.read(recv_counts, [peer]), pl.INDEX,
+                    )
+                    r_off = pl.cast(
+                        pl.read(recv_offsets, [peer]), pl.INDEX,
+                    )
+                    for r in pl.range(n_recv):
+                        peer_tile = pld.tile.remote_load(
+                            send,
+                            peer=peer,
+                            offsets=[r_off + r, 0],
+                            shape=[1, d_cols],
+                        )
+                        pl.store(peer_tile, [r_off + r, 0], recv)
+
+            return recv
+
+        # ---------- Stage 1: gate (local, replicated) ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def _gate(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
+        ):
+            score_buf = pl.create_tensor(
+                [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
+            )
+            biased_buf = pl.create_tensor(
+                [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
+            )
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_matmul"):
+                # Initialise output pads once — columns beyond N_EXPERTS
+                # keep 0 / NEG_INF so topk is not tricked by uninitialised values.
+                score_buf[:, :] = pl.full(
+                    [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32, value=0.0,
+                )
+                biased_buf[:, :] = pl.full(
+                    [BATCH, ROUTER_SCORE_PAD],
+                    dtype=pl.FP32, value=ROUTER_FP32_NEG_INF,
+                )
+                for nb in pl.range(N_EXPERTS // ROUTER_GATE_N_CHUNK):
+                    n0 = nb * ROUTER_GATE_N_CHUNK
+                    # Cast x per K-chunk → [BATCH,K] FP32 = 16384 B
+                    # (Site 5 fix: avoids full [BATCH,HIDDEN] FP32 = 262144 B).
+                    x0 = pl.cast(
+                        pl.slice(x, [BATCH, ROUTER_GATE_K_CHUNK], [0, 0]),
+                        target_type=pl.FP32,
+                    )
+                    w0 = pl.slice(
+                        gate_w,
+                        [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
+                        [0, n0],
+                    )
+                    logits_n = pl.matmul(x0, w0, out_dtype=pl.FP32)
+                    for kb in pl.range(1, HIDDEN // ROUTER_GATE_K_CHUNK):
+                        k0 = kb * ROUTER_GATE_K_CHUNK
+                        xk = pl.cast(
+                            pl.slice(
+                                x, [BATCH, ROUTER_GATE_K_CHUNK], [0, k0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        wk = pl.slice(
+                            gate_w,
+                            [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
+                            [k0, n0],
+                        )
+                        logits_n = pl.matmul_acc(logits_n, xk, wk)
+                    # Apply sigmoid per N-chunk — vec ops convert cube→vec
+                    # block layout, avoiding blayout mismatch when storing
+                    # into pre-created score_buf / biased_buf (vec layout).
+                    score_n_chunk = pl.recip(
+                        pl.add(pl.exp(pl.neg(logits_n)), 1.0),
+                    )
+                    bias_chunk = pl.slice(
+                        router_bias, [ROUTER_GATE_N_CHUNK], [n0],
+                    )
+                    bias_row_chunk = pl.reshape(
+                        bias_chunk, [1, ROUTER_GATE_N_CHUNK],
+                    )
+                    biased_n_chunk = pl.add(
+                        score_n_chunk,
+                        pl.col_expand_mul(
+                            pl.full(
+                                [BATCH, ROUTER_GATE_N_CHUNK],
+                                dtype=pl.FP32, value=1.0,
+                            ),
+                            bias_row_chunk,
+                        ),
+                    )
+                    score_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = score_n_chunk
+                    biased_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = biased_n_chunk
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_topk"):
+                topk_idx_tile = pl.create_tensor(
+                    [BATCH, ROUTER_TOPK_PAD], dtype=pl.INT32,
+                )
+                for tt in pl.range(BATCH):
+                    row = biased_buf[tt : tt + 1, :]
+                    idx_init = pl.arange(
+                        0, [1, ROUTER_SCORE_PAD], dtype=pl.UINT32,
+                    )
+                    srt = pl.sort32(row, idx_init)
+                    srt = pl.mrgsort(srt, block_len=64)
+                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    pairs = srt[:, 0:ROUTER_SORT_PAD]
+                    top_idx = pl.gather(
+                        pairs, mask_pattern=pl.tile.MaskPattern.P1010,
+                        output_dtype=pl.INT32,
+                    )
+                    topk_idx_tile[tt : tt + 1, :] = top_idx
+
+                gather_all = pl.gather(
+                    score_buf, dim=-1, index=topk_idx_tile,
+                )
+                gather_valid = pl.set_validshape(gather_all, BATCH, TOPK)
+                topk_vals_pad = pl.fillpad(
+                    gather_valid, pad_value=pl.PadValue.zero,
+                )
+
+                denom = pl.reshape(pl.row_sum(topk_vals_pad), [BATCH, 1])
+                weights_pad = pl.mul(
+                    pl.row_expand_div(topk_vals_pad, denom),
+                    ROUTER_SCALE,
+                )
+
+                for tt in pl.range(BATCH):
+                    for k in pl.range(TOPK):
+                        pl.write(
+                            expert_indices, [tt, k],
+                            pl.read(topk_idx_tile, [tt, k]),
+                        )
+                        pl.write(
+                            expert_weights, [tt, k],
+                            pl.read(weights_pad, [tt, k]),
+                        )
+
+            return expert_weights
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def gate_step(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            expert_indices: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
+            expert_weights: pl.Out[pl.Tensor[[BATCH, TOPK], pl.FP32]],
+        ) -> tuple[
+            pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pl.Tensor[[BATCH, TOPK], pl.FP32]
+        ]:
+            self._gate(
+                x, gate_w, router_bias, expert_indices, expert_weights,
+            )
+            return expert_indices, expert_weights
+
+        # ---------- Stage 2: dispatch (EP all-to-all) ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def _histogram_and_prefix_sum(
+            self,
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            send_counts_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
+            send_counts_per_rank: pl.Tensor[[n_ranks], pl.INT32],
+            send_offsets_per_rank: pl.Tensor[[n_ranks], pl.INT32],
+        ):
+            """Local histogram + per-rank prefix-sum prelude."""
+            for bkt in pl.range(per_rank_buckets):
+                pl.write(
+                    send_counts_per_bucket, [bkt], pl.cast(0, pl.INT32),
+                )
+            for r in pl.range(n_ranks):
+                pl.write(
+                    send_counts_per_rank, [r], pl.cast(0, pl.INT32),
+                )
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    cur = pl.read(send_counts_per_bucket, [bkt])
+                    pl.write(
+                        send_counts_per_bucket, [bkt],
+                        pl.cast(cur + 1, pl.INT32),
+                    )
+                    r_cur = pl.read(send_counts_per_rank, [dst])
+                    pl.write(
+                        send_counts_per_rank, [dst],
+                        pl.cast(r_cur + 1, pl.INT32),
+                    )
+
+            pl.write(send_offsets_per_rank, [0], pl.cast(0, pl.INT32))
+            for r in pl.range(1, n_ranks):
+                prev_off = pl.read(send_offsets_per_rank, [r - 1])
+                prev_cnt = pl.read(send_counts_per_rank, [r - 1])
+                pl.write(
+                    send_offsets_per_rank, [r],
+                    pl.cast(prev_off + prev_cnt, pl.INT32),
+                )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _pack_send_payload(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            send_counts_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
+            send_offsets_per_rank: pl.Tensor[[n_ranks], pl.INT32],
+            send_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            cursor_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
+            bucket_offset: pl.Tensor[[per_rank_buckets], pl.INT32],
+        ):
+            """Pack outgoing tokens into ``send_buf`` ordered by (dst, loc_e)."""
+            for r in pl.range(n_ranks):
+                rank_off = pl.read(send_offsets_per_rank, [r])
+                pl.write(
+                    bucket_offset, [r * n_local_experts],
+                    pl.cast(rank_off, pl.INT32),
+                )
+                pl.write(
+                    cursor_per_bucket, [r * n_local_experts],
+                    pl.cast(rank_off, pl.INT32),
+                )
+                for e in pl.range(1, n_local_experts):
+                    prev_off = pl.read(
+                        bucket_offset, [r * n_local_experts + e - 1],
+                    )
+                    prev_cnt = pl.read(
+                        send_counts_per_bucket,
+                        [r * n_local_experts + e - 1],
+                    )
+                    new_off = pl.cast(prev_off + prev_cnt, pl.INT32)
+                    pl.write(
+                        bucket_offset, [r * n_local_experts + e], new_off,
+                    )
+                    pl.write(
+                        cursor_per_bucket, [r * n_local_experts + e],
+                        new_off,
+                    )
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    slot_i32 = pl.read(cursor_per_bucket, [bkt])
+                    slot = pl.cast(slot_i32, pl.INDEX)
+                    x_tile = pl.load(x, [t, 0], [1, HIDDEN])
+                    pl.store(x_tile, [slot, 0], send_buf)
+                    pl.write(
+                        cursor_per_bucket, [bkt],
+                        pl.cast(slot_i32 + 1, pl.INT32),
+                    )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _build_local_expert_csr(
+            self,
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            """Receiver-side CSR: scan pub_counts for my dst slot."""
+            for e in pl.range(n_local_experts):
+                acc = pl.cast(0, pl.INT32)
+                for s in pl.range(n_ranks):
+                    acc = acc + pl.read(
+                        pub_counts, [s * n_ranks + my_rank, e],
+                    )
+                pl.write(local_expert_count, [e], pl.cast(acc, pl.INT32))
+
+            pl.write(local_expert_offset, [0], pl.cast(0, pl.INT32))
+            for e in pl.range(1, n_local_experts):
+                prev_off = pl.read(local_expert_offset, [e - 1])
+                prev_cnt = pl.read(local_expert_count, [e - 1])
+                pl.write(
+                    local_expert_offset, [e],
+                    pl.cast(prev_off + prev_cnt, pl.INT32),
+                )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _build_inverse_map(
+            self,
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            inverse_map: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            """Encode (dst_rank, dst_row_in_recv_buf) into one INT32 per (t,k)."""
+            cursor = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            for bkt in pl.range(per_rank_buckets):
+                pl.write(cursor, [bkt], pl.cast(0, pl.INT32))
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+
+                    src_off = pl.cast(0, pl.INT32)
+                    for s in pl.range(n_ranks):
+                        if s < my_rank:
+                            src_off = src_off + pl.read(
+                                pub_counts, [s * n_ranks + dst, loc_e],
+                            )
+
+                    loc_e_off = pl.cast(0, pl.INT32)
+                    for prev_e in pl.range(n_local_experts):
+                        if prev_e < loc_e:
+                            for s in pl.range(n_ranks):
+                                loc_e_off = loc_e_off + pl.read(
+                                    pub_counts,
+                                    [s * n_ranks + dst, prev_e],
+                                )
+
+                    my_cursor_val = pl.read(cursor, [bkt])
+                    dst_row = loc_e_off + src_off + my_cursor_val
+                    packed = (
+                        dst * pl.cast(local_recv_max, pl.INT32) + dst_row
+                    )
+                    pl.write(inverse_map, [t, k], pl.cast(packed, pl.INT32))
+                    pl.write(
+                        cursor, [bkt],
+                        pl.cast(my_cursor_val + 1, pl.INT32),
+                    )
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_publish(
+            self,
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            # Dispatch task 1: histogram + AtomicAdd-notify publish of the count
+            # matrix. Its own InCore task so the runtime task boundary DRAINS
+            # these cross-rank notifies before the count_done barrier in
+            # _dispatch_push — the DSL stand-in for the reference kernel's
+            # pipe_barrier(PIPE_ALL) between the two notify groups (dispatch.cpp).
+            send_counts_bkt = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            send_counts_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
+            send_offsets_rank = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
+            self._histogram_and_prefix_sum(
+                expert_indices,
+                send_counts_bkt, send_counts_rank, send_offsets_rank,
+            )
+            for peer in pl.range(n_ranks):
+                for d in pl.range(n_ranks):
+                    for e in pl.range(n_local_experts):
+                        v = pl.read(send_counts_bkt, [d * n_local_experts + e])
+                        if peer == my_rank:
+                            pl.write(
+                                pub_counts, [my_rank * n_ranks + d, e], v,
+                            )
+                        else:
+                            if v != 0:
+                                pld.system.notify(
+                                    target=pub_counts, peer=peer,
+                                    offsets=[my_rank * n_ranks + d, e],
+                                    value=v, op=pld.NotifyOp.AtomicAdd,
+                                )
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_push(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            local_expert_offset: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            local_expert_count: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[n_local_experts], pl.INT32],
+        ]:
+            # Dispatch task 2: count_done barrier (peer publishes are drained by
+            # the task boundary before this) -> per-expert CSR -> push each token
+            # into the destination peer's recv_x / recv_r_route at its CSR row ->
+            # data_done barrier.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=count_done_sig, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=count_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            self._build_local_expert_csr(
+                pub_counts, local_expert_offset, local_expert_count, my_rank,
+            )
+
+            cursor_bkt = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            for i in pl.range(per_rank_buckets):
+                pl.write(cursor_bkt, [i], pl.cast(0, pl.INT32))
+            idx_tile = pl.tile.full([1, idx_pad], dtype=pl.INT32, value=0)
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(expert_indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    loc_e_off = pl.cast(0, pl.INT32)
+                    for prev_e in pl.range(n_local_experts):
+                        if prev_e < loc_e:
+                            for s in pl.range(n_ranks):
+                                loc_e_off = loc_e_off + pl.read(
+                                    pub_counts, [s * n_ranks + dst, prev_e],
+                                )
+                    src_off = pl.cast(0, pl.INT32)
+                    for s in pl.range(n_ranks):
+                        if s < my_rank:
+                            src_off = src_off + pl.read(
+                                pub_counts, [s * n_ranks + dst, loc_e],
+                            )
+                    cur = pl.read(cursor_bkt, [bkt])
+                    dst_row = pl.cast(loc_e_off + src_off + cur, pl.INDEX)
+                    pl.write(cursor_bkt, [bkt], pl.cast(cur + 1, pl.INT32))
+                    pld.tensor.put(
+                        dst=recv_x, peer=dst, src=x,
+                        dst_offsets=[dst_row, 0], src_offsets=[t, 0],
+                        shape=[1, HIDDEN],
+                    )
+                    pl.tile.write(
+                        idx_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32),
+                    )
+                    pld.tile.remote_store(
+                        idx_tile, target=recv_r_route, peer=dst,
+                        offsets=[dst_row, 0],
+                    )
+
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=data_done_sig, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=data_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            return local_expert_offset, local_expert_count
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_stage(  # noqa: PLR0913
+            self,
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            local_routed_x_out: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            pl.Tensor[[local_recv_max], pl.INT32],
+        ]:
+            # Dispatch task 3: stage the pushed recv_x / recv_r_route windows out
+            # to host tensors. Separate task so the push TPUTs from _dispatch_push
+            # are DRAINED at the task boundary before these reads (the reference
+            # kernel's pipe_barrier between the TPUT loop and stage_out). recv_x
+            # is already expert-major CSR -> straight chunked copy.
+            for row in pl.range(0, local_recv_max, stage_rows):
+                tile = pl.load(recv_x, [row, 0], [stage_rows, HIDDEN])
+                pl.store(tile, [row, 0], local_routed_x_out)
+            for e in pl.range(n_local_experts):
+                off = pl.cast(pl.read(local_expert_offset, [e]), pl.INDEX)
+                n = pl.cast(pl.read(local_expert_count, [e]), pl.INDEX)
+                for s in pl.range(n):
+                    pl.write(
+                        recv_r_route_out, [off + s],
+                        pl.read(recv_r_route, [off + s, 0]),
+                    )
+            return local_routed_x_out, recv_r_route_out
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def dispatch_step(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            local_routed_x_out: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+            local_expert_offset: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            local_expert_count: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[local_recv_max], pl.INT32]
+        ]:
+            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
+            # group of cross-rank ops drains at the task boundary — the DSL
+            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
+            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            self._dispatch_publish(expert_indices, pub_counts, my_rank)
+            local_expert_offset, local_expert_count = self._dispatch_push(
+                x, expert_indices,
+                local_expert_offset, local_expert_count,
+                pub_counts, count_done_sig, recv_x, recv_r_route,
+                data_done_sig, my_rank,
+            )
+            local_routed_x_out, recv_r_route_out = self._dispatch_stage(
+                recv_x, recv_r_route,
+                local_expert_offset, local_expert_count,
+                local_routed_x_out, recv_r_route_out, my_rank,
+            )
+            return (
+                local_routed_x_out,
+                local_expert_offset,
+                local_expert_count,
+                recv_r_route_out,
+            )
+
+        # ---------- Stage 3a: expert_routed (local 36 experts) ----------
+        @pl.function(type=pl.FunctionType.Inline)
+        def _expert_routed(  # noqa: PLR0913, PLR0915
+            self,
+            local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            w_gate: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_up: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_down: pl.Tensor[
+                [n_local_experts, inter, HIDDEN], pl.BF16
+            ],
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+        ):
+            for e in pl.parallel(n_local_experts):
+                n_rows = pl.read(local_expert_count, [e])
+                offset_i32 = pl.read(local_expert_offset, [e])
+                offset = pl.cast(offset_i32, pl.INDEX)
+                valid_rows = pl.cast(n_rows, pl.INDEX)
+
+                # Row-tile loop — process RECV_TILE rows per outer iteration.
+                # Bridge-tensor pattern (h_bf16 at tile_idx loop level, outside
+                # both moe_gate_up and moe_down pl.at scopes) eliminates the
+                # [32,1280] FP32 h_tile accumulator from each scope's live set
+                # and partitions gate/up from down-proj allocations
+                # (mirrors deepseek/v4/expert_routed.py).
+                #
+                # ``tile_valid`` is min(RECV_TILE, n_rows - tile_row0) so the
+                # trailing tile correctly masks out padding rows past
+                # ``offset + n_rows``.
+                for tile_idx in pl.range(N_RECV_TILES):
+                    tile_row0 = tile_idx * RECV_TILE
+                    tile_offset = offset + tile_row0
+                    # Per-tile valid rows (scalar) — clamps trailing tile to
+                    # the active row span. Use ``pl.min`` for scalar min/max
+                    # (``pl.minimum`` is the tensor variant — frontend rejects
+                    # mixing Scalar + ConstInt operands).
+                    tile_valid = pl.min(RECV_TILE, valid_rows - tile_row0)
+                    if tile_valid > 0:
+
+                        # Bridge tensor — lives at tile_idx loop level, shared
+                        # between expert_gate_up and expert_down SPMD dispatches
+                        # (mirrors deepseek/v4/expert_routed.py bridge pattern).
+                        # As an Inline-level create_tensor it is in vec (UB) space;
+                        # pl.slice of it in expert_down gives tmov vec→left ✓.
+                        h_bf16 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.BF16,
+                        )
+
+                        # Gate+up projection: each SPMD block handles one N-chunk
+                        # of the inter dimension.  pl.slice of external BF16 input
+                        # (local_routed_x) produces tmov mat→left which is valid in
+                        # cube kernels (cube kind = Inline + pl.spmd).
+                        for nb in pl.spmd(
+                            inter // ROUTED_GATE_N_CHUNK,
+                            name_hint="expert_gate_up",
+                        ):
+                            n0 = nb * ROUTED_GATE_N_CHUNK
+                            x0 = pl.slice(
+                                local_routed_x,
+                                [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                [tile_offset, 0],
+                                valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
+                            )
+                            wg0_2d = pl.reshape(
+                                pl.slice(
+                                    w_gate,
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
+                                ),
+                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            )
+                            wu0_2d = pl.reshape(
+                                pl.slice(
+                                    w_up,
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
+                                ),
+                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            )
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
+                                k0 = kb * ROUTED_GATE_K_CHUNK
+                                xk = pl.slice(
+                                    local_routed_x,
+                                    [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                    [tile_offset, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_GATE_K_CHUNK,
+                                    ],
+                                )
+                                wgk = pl.reshape(
+                                    pl.slice(
+                                        w_gate,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                wuk = pl.reshape(
+                                    pl.slice(
+                                        w_up,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                                up_acc = pl.matmul_acc(up_acc, xk, wuk)
+
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
+                            )
+                            silu = pl.mul(gate_acc, sigmoid)
+                            if _routed_swiglu_step:
+                                silu_c = pl.minimum(silu, _routed_swiglu_limit)
+                                up_c = pl.maximum(
+                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    -_routed_swiglu_limit,
+                                )
+                                gated = pl.mul(silu_c, up_c)
+                            else:
+                                gated = pl.mul(silu, up_acc)
+
+                            gated_v = pl.set_validshape(
+                                gated, tile_valid, ROUTED_GATE_N_CHUNK,
+                            )
+                            # No fillpad — gated_v (none-pad mode) matches
+                            # uninitialised h_bf16 subview (none-pad mode);
+                            # expert_down reads h_bf16 with valid_shape= so
+                            # padding rows beyond tile_valid are not used.
+                            h_bf16[
+                                :, n0 : n0 + ROUTED_GATE_N_CHUNK
+                            ] = pl.cast(gated_v, target_type=pl.BF16)
+
+                        # Down projection: each SPMD block handles one D-chunk of
+                        # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
+                        # pl.slice of it gives tmov vec→left ✓.
+                        for db in pl.spmd(
+                            HIDDEN // ROUTED_DOWN_N_CHUNK,
+                            name_hint="expert_down",
+                        ):
+                            d0 = db * ROUTED_DOWN_N_CHUNK
+                            h0 = pl.slice(
+                                h_bf16,
+                                [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                [0, 0],
+                                valid_shape=[
+                                    tile_valid, ROUTED_DOWN_K_CHUNK,
+                                ],
+                            )
+                            wd0 = pl.reshape(
+                                pl.slice(
+                                    w_down,
+                                    [
+                                        1,
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                    [e, 0, d0],
+                                ),
+                                [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
+                            )
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
+                                k0 = kb2 * ROUTED_DOWN_K_CHUNK
+                                hk = pl.slice(
+                                    h_bf16,
+                                    [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                    [0, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_DOWN_K_CHUNK,
+                                    ],
+                                )
+                                wdk = pl.reshape(
+                                    pl.slice(
+                                        w_down,
+                                        [
+                                            1,
+                                            ROUTED_DOWN_K_CHUNK,
+                                            ROUTED_DOWN_N_CHUNK,
+                                        ],
+                                        [e, k0, d0],
+                                    ),
+                                    [
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                )
+                                y_acc = pl.matmul_acc(y_acc, hk, wdk)
+
+                            y_v = pl.set_validshape(
+                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                            )
+                            y_m = pl.fillpad(
+                                y_v, pad_value=pl.PadValue.zero,
+                            )
+                            local_routed_y = pl.assemble(
+                                local_routed_y,
+                                pl.cast(y_m, target_type=pl.BF16),
+                                [tile_offset, d0],
+                            )
+
+            return local_routed_y
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def expert_routed_step(
+            self,
+            local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            w_gate_r: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_up_r: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_down_r: pl.Tensor[
+                [n_local_experts, inter, HIDDEN], pl.BF16
+            ],
+            local_routed_y: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+        ) -> pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]:
+            local_routed_y = self._expert_routed(
+                local_routed_x,
+                local_expert_offset, local_expert_count,
+                w_gate_r, w_up_r, w_down_r,
+                local_routed_y,
+            )
+            return local_routed_y
+
+        # ---------- Stage 3b: expert_shared (TP-sliced + tp_all_reduce) ----
+        @pl.function(type=pl.FunctionType.Inline)
+        def _expert_shared_local(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            w_gate: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        ):
+            # Gate+up and down projections merged into one InCore kernel so that
+            # h_tile (Vec SRAM) is live across both projections in the same
+            # kernel dispatch.  Two separate pl.at(CORE_GROUP) scopes would
+            # become two separate InCore kernel dispatches when expert_shared_step
+            # is Inline, and h_tile cannot cross that dispatch boundary.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_mlp"):
+                h_tile = pl.create_tensor(
+                    [BATCH, sh_inter_local], dtype=pl.BF16,
+                )
+
+                x0 = pl.slice(x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0])
+                wg0 = pl.slice(
+                    w_gate,
+                    [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                    [0, 0],
+                )
+                wu0 = pl.slice(
+                    w_up,
+                    [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                    [0, 0],
+                )
+                gate_acc = pl.matmul(x0, wg0, out_dtype=pl.FP32)
+                up_acc = pl.matmul(x0, wu0, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk = pl.slice(x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0])
+                    wgk = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                        [k0, 0],
+                    )
+                    wuk = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_GATE_N_CHUNK],
+                        [k0, 0],
+                    )
+                    gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                    up_acc = pl.matmul_acc(up_acc, xk, wuk)
+
+                sigmoid = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
+                )
+                silu = pl.mul(gate_acc, sigmoid)
+                if _shared_swiglu_step:
+                    silu_c = pl.minimum(silu, _shared_swiglu_limit)
+                    up_c = pl.maximum(
+                        pl.minimum(up_acc, _shared_swiglu_limit),
+                        -_shared_swiglu_limit,
+                    )
+                    gated = pl.mul(silu_c, up_c)
+                else:
+                    gated = pl.mul(silu, up_acc)
+
+                h_tile[:, 0:SHARED_GATE_N_CHUNK] = pl.cast(
+                    gated, target_type=pl.BF16,
+                )
+
+                # Explicit K-chunking for the down projection.
+                # K=160 (sh_inter_local) would trigger backend auto-K-split
+                # which emits an invalid ``tmov acc→acc``.  Expose the K-loop
+                # at the user level using K_INNER=32 (5 passes of 32) so the
+                # compiler sees a structured pl.matmul + pl.matmul_acc chain
+                # (same pattern as gate/up above) and never needs the copy.
+                _SH_DOWN_K_INNER = 32  # hardware K-tile; 160 // 32 == 5 passes
+                for db in pl.range(HIDDEN // SHARED_DOWN_N_CHUNK):
+                    d0 = db * SHARED_DOWN_N_CHUNK
+                    h0_k0 = pl.slice(
+                        h_tile, [BATCH, _SH_DOWN_K_INNER], [0, 0],
+                    )
+                    wd0_k0 = pl.slice(
+                        w_down,
+                        [_SH_DOWN_K_INNER, SHARED_DOWN_N_CHUNK],
+                        [0, d0],
+                    )
+                    y_acc = pl.matmul(h0_k0, wd0_k0, out_dtype=pl.FP32)
+                    for kk in pl.range(1, sh_inter_local // _SH_DOWN_K_INNER):
+                        kk0 = kk * _SH_DOWN_K_INNER
+                        h0_kk = pl.slice(
+                            h_tile, [BATCH, _SH_DOWN_K_INNER], [0, kk0],
+                        )
+                        wd0_kk = pl.slice(
+                            w_down,
+                            [_SH_DOWN_K_INNER, SHARED_DOWN_N_CHUNK],
+                            [kk0, d0],
+                        )
+                        y_acc = pl.matmul_acc(y_acc, h0_kk, wd0_kk)
+                    sh_y_shard = pl.assemble(
+                        sh_y_shard,
+                        pl.cast(y_acc, target_type=pl.BF16),
+                        [0, d0],
+                    )
+
+            return sh_y_shard
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def expert_shared_step(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            sh_y: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            sh_tmp_window: pld.DistributedTensor[
+                [BATCH, HIDDEN], pl.BF16
+            ],
+            sh_signal_window: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            sh_y = self._expert_shared_local(
+                x, w_gate_s, w_up_s, w_down_s, sh_y,
+            )
+            # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
+            if TP_WORLD_SIZE > 1:
+                self.tp_all_reduce(
+                    sh_y, sh_tmp_window, sh_signal_window, my_rank,
+                )
+            return sh_y
+
+        # ---------- Stage 4: combine (EP a2a back + weighted gather) ------
+        @pl.function(type=pl.FunctionType.InCore)
+        def _publish_src_route_table(
+            self,
+            indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            src_route_table: pld.DistributedTensor[
+                [n_ranks, n_local_experts, n_routes_per_rank], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            cursor = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            for i in pl.range(per_rank_buckets):
+                pl.write(cursor, [i], pl.cast(0, pl.INT32))
+
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    idx = pl.read(cursor, [bkt])
+                    r_route = pl.cast(t * TOPK + k, pl.INT32)
+
+                    if dst == my_rank:
+                        # Self-rank publish: write the scalar r_route
+                        # directly into the local view of the
+                        # DistributedTensor. Mirrors the self-branch
+                        # used for ``pub_counts`` above; avoids the
+                        # ``tmp = create_tensor; load; store`` dance
+                        # that the InCore tile verifier rejects with
+                        # "tile.load requires TensorType ... got TileType".
+                        pl.write(
+                            src_route_table,
+                            [my_rank, loc_e, pl.cast(idx, pl.INDEX)],
+                            r_route,
+                        )
+                    else:
+                        pld.system.notify(
+                            target=src_route_table,
+                            peer=dst,
+                            offsets=[
+                                my_rank, loc_e, pl.cast(idx, pl.INDEX),
+                            ],
+                            value=r_route,
+                            op=pld.NotifyOp.Set,
+                        )
+                    pl.write(cursor, [bkt], pl.cast(idx + 1, pl.INT32))
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _push_routed_y_to_sources(  # noqa: PLR0913
+            self,
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            e_cursor = pl.cast(0, pl.INT32)
+            for e in pl.range(n_local_experts):
+                src_off = pl.cast(0, pl.INT32)
+                for src in pl.range(n_ranks):
+                    n = pl.cast(
+                        pl.read(
+                            pub_counts, [src * n_ranks + my_rank, e],
+                        ),
+                        pl.INDEX,
+                    )
+                    for row in pl.range(n):
+                        local_row = (
+                            pl.cast(e_cursor, pl.INDEX)
+                            + pl.cast(src_off, pl.INDEX) + row
+                        )
+                        # r_route rode with the token at dispatch (recv_r_route);
+                        # local_row is the same expert-major CSR row order.
+                        r_route = pl.read(recv_r_route_out, [local_row])
+                        tile = pl.load(
+                            local_routed_y,
+                            [local_row, 0], [1, HIDDEN],
+                        )
+                        if src == my_rank:
+                            pl.store(tile, [r_route, 0], routed_y_buf)
+                        else:
+                            pld.tile.remote_store(
+                                tile,
+                                target=routed_y_buf,
+                                peer=src,
+                                offsets=[r_route, 0],
+                            )
+                    src_off = src_off + pl.cast(n, pl.INT32)
+                total_e = pl.cast(0, pl.INT32)
+                for src2 in pl.range(n_ranks):
+                    total_e = total_e + pl.read(
+                        pub_counts, [src2 * n_ranks + my_rank, e],
+                    )
+                e_cursor = e_cursor + total_e
+
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done,
+                        offsets=[src, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _weighted_gather_and_add(
+            self,
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
+            sh_y: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            moe_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_combine"):
+                for b in pl.range(BATCH):
+                    acc = pl.cast(
+                        pl.load(sh_y, [b, 0], [1, HIDDEN]),
+                        target_type=pl.FP32,
+                    )
+                    for k in pl.range(TOPK):
+                        w_fp = pl.read(expert_weights, [b, k])
+
+                        r_route = b * TOPK + k
+                        row_fp32 = pl.cast(
+                            pl.load(
+                                routed_y_buf, [r_route, 0], [1, HIDDEN],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        weighted = pl.mul(row_fp32, w_fp)
+                        acc = pl.add(acc, weighted)
+
+                    pl.store(
+                        pl.cast(acc, target_type=pl.BF16),
+                        [b, 0],
+                        moe_out,
+                    )
+
+            return moe_out
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def combine_step(  # noqa: PLR0913
+            self,
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
+            expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
+            sh_y: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            moe_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done_sig: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            # Push design: r_route rode with each token into recv_r_route at
+            # dispatch, so combine drops the src_route_table publish + its
+            # barrier and scatters the routed output straight back.
+            self._push_routed_y_to_sources(
+                local_routed_y,
+                pub_counts,
+                routed_y_buf,
+                combine_done_sig,
+                recv_r_route_out,
+                my_rank,
+            )
+
+            moe_out = self._weighted_gather_and_add(
+                routed_y_buf, expert_weights, sh_y, moe_out,
+            )
+            return moe_out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def attn_dense_orch(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16],
+            wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[layer_qhidden_dyn, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16],
+            gate_r: pl.Tensor[[num_heads_local_pad, hidden_q_local], pl.BF16],
+            post_rms_d: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            w_gate_d: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_up_d: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_down_d: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            h_mid_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1 = attention_inline(
+                current_hidden, input_rms_weight,
+                wq, wk, wv, q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin, k_cache, v_cache,
+                wo, w_g, gate_r, resid1, layer_idx,
+                attn_tmp_window, attn_signal_window, my_rank,
+            )
+            h_mid_out = dense_mlp_inline(
+                resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
+                h_mid_out, layer_idx, mlp_tmp_window,
+                mlp_signal_window, my_rank,
+            )
+            return h_mid_out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16],
+            wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[layer_qhidden_dyn, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16],
+            gate_r: pl.Tensor[[num_heads_local_pad, hidden_q_local], pl.BF16],
+            post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
+            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
+            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.BF16],
+            w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[
+                [tp_size, 1], pl.INT32
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            sh_tmp_window: pld.DistributedTensor[
+                [BATCH, HIDDEN], pl.BF16
+            ],
+            sh_signal_window: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done_sig: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            # ── A': input IS h_mid (attn+dense_mlp already done in attn_dense_orch). ───
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            for _ac in pl.range(HIDDEN // K_CHUNK):
+                _c0 = _ac * K_CHUNK
+                resid1 = pl.assemble(
+                    resid1,
+                    pl.slice(current_hidden, [BATCH, K_CHUNK], [0, _c0]),
+                    [0, _c0],
+                )
+            # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+            hidden_blocks = HIDDEN // K_CHUNK
+            post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
+            ):
+                for kb in pl.range(hidden_blocks):
+                    k0 = kb * K_CHUNK
+                    rchunk = pl.cast(
+                        pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
+
+                sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+                for kb2 in pl.range(hidden_blocks):
+                    k0 = kb2 * K_CHUNK
+                    ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
+                    sq_sum = pl.add(
+                        sq_sum,
+                        pl.reshape(
+                            pl.row_sum(pl.mul(ck, ck)),
+                            [1, BATCH],
+                        ),
+                    )
+                inv_rms_moe = pl.recip(
+                    pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+                )
+                inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
+                for kb3 in pl.range(hidden_blocks):
+                    k0 = kb3 * K_CHUNK
+                    norm_chunk = pl.slice(
+                        resid1_fp32, [BATCH, K_CHUNK], [0, k0],
+                    )
+                    gamma = pl.slice(
+                        post_rms_weight, [1, K_CHUNK], [layer_idx, k0],
+                    )
+                    scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
+                    normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
+                    post_norm = pl.assemble(
+                        post_norm,
+                        pl.cast(normed, target_type=pl.BF16),
+                        [0, k0],
+                    )
+
+            # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
+            # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
+            # inlined per-stage methods (``self.gate_step`` /
+            # ``self.dispatch_step`` / ``self.expert_routed_step`` /
+            # ``self.expert_shared_step`` / ``self.combine_step``) directly
+            # rather than instantiating a separate ``@pl.program``.
+            moe_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+
+            # 1) Gate (local, replicated).
+            expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
+            expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
+            expert_indices, expert_weights = self.gate_step(
+                post_norm, gate_w, router_bias,
+                expert_indices, expert_weights,
+            )
+
+            # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+            sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            sh_y = self.expert_shared_step(
+                post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
+                sh_tmp_window, sh_signal_window, my_rank,
+            )
+
+            # 3) Dispatch (EP push: tokens remote_store'd into peer recv_x).
+            local_routed_x = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.BF16,
+            )
+            local_expert_offset = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            local_expert_count = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            # Per-recv-row r_route (= source t*TOPK+k), staged from recv_r_route;
+            # combine uses it to scatter the routed output back to the source.
+            recv_r_route_out = pl.create_tensor(
+                [local_recv_max], dtype=pl.INT32,
+            )
+            (
+                local_routed_x,
+                local_expert_offset,
+                local_expert_count,
+                recv_r_route_out,
+            ) = self.dispatch_step(
+                post_norm, expert_indices,
+                local_routed_x,
+                local_expert_offset, local_expert_count, recv_r_route_out,
+                pub_counts, count_done_sig, recv_x, recv_r_route, data_done_sig,
+                my_rank,
+            )
+
+            # 4) Routed experts (local 36).
+            local_routed_y = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.BF16,
+            )
+            local_routed_y = self.expert_routed_step(
+                local_routed_x,
+                local_expert_offset, local_expert_count,
+                w_gate_r, w_up_r, w_down_r,
+                local_routed_y,
+            )
+
+            # 5) Combine (EP push back + weighted gather + sh_y add).
+            moe_out = self.combine_step(
+                local_routed_y,
+                recv_r_route_out, expert_weights, sh_y,
+                moe_out,
+                pub_counts,
+                routed_y_buf, combine_done_sig,
+                my_rank,
+            )
+
+            # ── D: residual add: next_hidden_out = resid1 + moe_out. ───
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_residual_add",
+            ):
+                for kb4 in pl.range(hidden_blocks):
+                    k0 = kb4 * K_CHUNK
+                    m = pl.cast(
+                        pl.slice(moe_out, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    r = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
+                    next_hidden_out = pl.assemble(
+                        next_hidden_out,
+                        pl.cast(pl.add(r, m), target_type=pl.BF16),
+                        [0, k0],
+                    )
+            return next_hidden_out
+
+        # ---- Tail: final RMSNorm + LM head (separate SSA scope) ----------
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def lm_head_orch(
+            self,
+            next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+            lm_head_weight: pl.Tensor[[VOCAB_LOCAL, HIDDEN], pl.BF16],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            logits_shard_out: pl.Out[
+                pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
+            ],
+        ) -> pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]:
+            logits_shard_out = rms_lm_head_inline(
+                next_hidden, final_norm_weight, lm_head_weight,
+                seq_lens, logits_shard_out,
+            )
+            return logits_shard_out
+
+        # ---- MoE-layer attention: attention ONLY -> resid1 (no dense). ----
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def swa_attn_only_orch(  # noqa: PLR0913
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16],
+            wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[layer_qhidden_dyn, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16],
+            gate_r: pl.Tensor[[num_heads_local_pad, hidden_q_local], pl.BF16],
+            resid_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1 = attention_inline(
+                current_hidden, input_rms_weight,
+                wq, wk, wv, q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin, k_cache, v_cache,
+                wo, w_g, gate_r, resid1, layer_idx,
+                attn_tmp_window, attn_signal_window, my_rank,
+            )
+            for _rc in pl.range(HIDDEN // K_CHUNK):
+                _c0 = _rc * K_CHUNK
+                resid_out = pl.assemble(
+                    resid_out,
+                    pl.slice(resid1, [BATCH, K_CHUNK], [0, _c0]),
+                    [0, _c0],
+                )
+            return resid_out
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[
+                [tp_size, LAYER_HIDDEN_ROWS_DYN, hidden_q_local], pl.BF16
+            ],
+            wk: pl.Tensor[
+                [tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16
+            ],
+            wv: pl.Tensor[
+                [tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16
+            ],
+            q_norm_weight: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[tp_size, USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[tp_size, BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[tp_size, USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            rope_sin: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim], pl.FP32],
+            k_cache: pl.Tensor[
+                [tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16
+            ],
+            v_cache: pl.Tensor[
+                [tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16
+            ],
+            wo: pl.Tensor[[tp_size, layer_qhidden_dyn, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[
+                [tp_size, LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16
+            ],
+            gate_r: pl.Tensor[
+                [tp_size, num_heads_local_pad, hidden_q_local], pl.BF16
+            ],
+            post_rms_weight: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            gate_w: pl.Tensor[[tp_size, HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[tp_size, N_EXPERTS], pl.FP32],
+            w_gate_r: pl.Tensor[
+                [tp_size, n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_up_r: pl.Tensor[
+                [tp_size, n_local_experts, HIDDEN, inter], pl.BF16
+            ],
+            w_down_r: pl.Tensor[
+                [tp_size, n_local_experts, inter, HIDDEN], pl.BF16
+            ],
+            w_gate_s: pl.Tensor[
+                [tp_size, HIDDEN, sh_inter_local], pl.BF16
+            ],
+            w_up_s: pl.Tensor[
+                [tp_size, HIDDEN, sh_inter_local], pl.BF16
+            ],
+            w_down_s: pl.Tensor[
+                [tp_size, sh_inter_local, HIDDEN], pl.BF16
+            ],
+            next_hidden_out: pl.Out[
+                pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
+            ],
+            h_mid_out: pl.Out[
+                pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
+            ],
+            post_rms_d: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            w_gate_d: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_up_d: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_down_d: pl.Tensor[[tp_size, LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            layer_idx: pl.Scalar[pl.INT32],
+            final_norm_weight: pl.Tensor[[tp_size, 1, HIDDEN], pl.FP32],
+            lm_head_weight: pl.Tensor[[tp_size, VOCAB_LOCAL, HIDDEN], pl.BF16],
+            logits_shard_out: pl.Out[
+                pl.Tensor[[tp_size, USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
+            ],
+        ):
+            attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
+            ad_attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            ad_attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
+            pub_counts_buf = pld.alloc_window_buffer(
+                n_ranks * n_ranks * n_local_experts_pad * 4,
+            )
+            count_done_buf = pld.alloc_window_buffer(n_ranks * 4)
+            recv_x_buf = pld.alloc_window_buffer(
+                local_recv_max * HIDDEN * 2,
+            )
+            recv_r_route_buf = pld.alloc_window_buffer(
+                local_recv_max * idx_pad * 4,
+            )
+            data_done_buf = pld.alloc_window_buffer(n_ranks * 4)
+            sh_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            sh_sig_buf = pld.alloc_window_buffer(n_ranks * 4)
+            routed_y_window_buf = pld.alloc_window_buffer(
+                n_routes_per_rank * HIDDEN * 2,
+            )
+            combine_done_buf = pld.alloc_window_buffer(n_ranks * 4)
+
+            # ── PASS 1: attention + dense_mlp -> h_mid (isolated method). ──
+            for rd in pl.range(pld.world_size()):
+                ad_attn_tmp_window = pld.window(
+                    ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16,
+                )
+                ad_attn_signal_window = pld.window(
+                    ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32,
+                )
+                self.swa_attn_only_orch(
+                    current_hidden[rd],
+                    input_rms_weight[rd],
+                    wq[rd], wk[rd], wv[rd],
+                    q_norm_weight[rd], k_norm_weight[rd],
+                    seq_lens[rd], block_table[rd], slot_mapping[rd],
+                    rope_cos[rd], rope_sin[rd],
+                    k_cache[rd], v_cache[rd],
+                    wo[rd], w_g[rd], gate_r[rd],
+                    h_mid_out[rd],
+                    ad_attn_tmp_window, ad_attn_signal_window,
+                    layer_idx, rd,
+                    device=rd,
+                )
+            # ── PASS 2: MoE-only on h_mid (isolated method). ──
+            for r in pl.range(pld.world_size()):
+                attn_tmp_window = pld.window(
+                    attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16,
+                )
+                attn_signal_window = pld.window(
+                    attn_sig_buf, [tp_size, 1], dtype=pl.INT32,
+                )
+                pub_counts = pld.window(
+                    pub_counts_buf,
+                    [n_ranks * n_ranks, n_local_experts_pad],
+                    dtype=pl.INT32,
+                )
+                count_done_sig = pld.window(
+                    count_done_buf, [n_ranks, 1], dtype=pl.INT32,
+                )
+                recv_x = pld.window(
+                    recv_x_buf,
+                    [local_recv_max, HIDDEN],
+                    dtype=pl.BF16,
+                )
+                data_done_sig = pld.window(
+                    data_done_buf, [n_ranks, 1], dtype=pl.INT32,
+                )
+                recv_r_route = pld.window(
+                    recv_r_route_buf,
+                    [local_recv_max, idx_pad],
+                    dtype=pl.INT32,
+                )
+                sh_tmp_window = pld.window(
+                    sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16,
+                )
+                sh_signal_window = pld.window(
+                    sh_sig_buf, [n_ranks, 1], dtype=pl.INT32,
+                )
+                routed_y_buf = pld.window(
+                    routed_y_window_buf,
+                    [n_routes_per_rank, HIDDEN],
+                    dtype=pl.BF16,
+                )
+                combine_done_sig = pld.window(
+                    combine_done_buf, [n_ranks, 1], dtype=pl.INT32,
+                )
+                self.chip_orch(
+                    h_mid_out[r],
+                    input_rms_weight[r],
+                    wq[r], wk[r], wv[r],
+                    q_norm_weight[r], k_norm_weight[r],
+                    seq_lens[r], block_table[r], slot_mapping[r],
+                    rope_cos[r], rope_sin[r],
+                    k_cache[r], v_cache[r],
+                    wo[r], w_g[r],
+                    gate_r[r],
+                    post_rms_weight[r],
+                    gate_w[r], router_bias[r],
+                    w_gate_r[r], w_up_r[r], w_down_r[r],
+                    w_gate_s[r], w_up_s[r], w_down_s[r],
+                    next_hidden_out[r],
+                    attn_tmp_window, attn_signal_window,
+                    pub_counts, count_done_sig,
+                    recv_x, data_done_sig,
+                    recv_r_route,
+                    sh_tmp_window, sh_signal_window,
+                    routed_y_buf, combine_done_sig,
+                    layer_idx,
+                    r,
+                    device=r,
+                )
+
+            # ── PASS 3: tail (final RMSNorm + LM head) on every rank. ──
+            for rt in pl.range(pld.world_size()):
+                self.lm_head_orch(
+                    next_hidden_out[rt],
+                    final_norm_weight[rt],
+                    lm_head_weight[rt],
+                    seq_lens[rt],
+                    logits_shard_out[rt],
+                    device=rt,
+                )
+
+    return MoeLayerReal

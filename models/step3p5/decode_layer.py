@@ -20796,7 +20796,9 @@ def _build_whole_decode_faithful_program(
             attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -20811,7 +20813,7 @@ def _build_whole_decode_faithful_program(
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx, layer_idx,
+                norm_layer_idx, attn_layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -20819,7 +20821,7 @@ def _build_whole_decode_faithful_program(
             h0_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                h0_out, layer_idx, layer_idx,
+                h0_out, norm_layer_idx, mlp_layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return h0_out
@@ -20853,7 +20855,9 @@ def _build_whole_decode_faithful_program(
             attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            mlp_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -20868,7 +20872,7 @@ def _build_whole_decode_faithful_program(
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx, layer_idx,
+                norm_layer_idx, attn_layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -20876,7 +20880,7 @@ def _build_whole_decode_faithful_program(
             hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                hidden_out, layer_idx, layer_idx,
+                hidden_out, norm_layer_idx, mlp_layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return hidden_out
@@ -21054,7 +21058,7 @@ def _build_whole_decode_faithful_program(
                     pld.window(l0_attn_sig, [tp_size, 1], dtype=pl.INT32),
                     pld.window(l0_mlp_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
                     pld.window(l0_mlp_sig, [tp_size, 1], dtype=pl.INT32),
-                    0,
+                    0, 0, 0,
                     r,
                     device=r,
                 )
@@ -21077,7 +21081,7 @@ def _build_whole_decode_faithful_program(
                     pld.window(l1_attn_sig, [tp_size, 1], dtype=pl.INT32),
                     pld.window(l1_mlp_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
                     pld.window(l1_mlp_sig, [tp_size, 1], dtype=pl.INT32),
-                    0,
+                    1, 0, 1,
                     r,
                     device=r,
                 )
@@ -21100,7 +21104,7 @@ def _build_whole_decode_faithful_program(
                     pld.window(l1_attn_sig, [tp_size, 1], dtype=pl.INT32),
                     pld.window(l1_mlp_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
                     pld.window(l1_mlp_sig, [tp_size, 1], dtype=pl.INT32),
-                    0,
+                    2, 1, 2,
                     r,
                     device=r,
                 )

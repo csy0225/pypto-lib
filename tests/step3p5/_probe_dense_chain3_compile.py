@@ -22,6 +22,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("-p", "--platform", default="a2a3sim", choices=["a2a3", "a2a3sim"])
     p.add_argument("--builder", default="_build_dense_chain3_lmhead_program")
     p.add_argument("--full", action="store_true", default=True)
+    p.add_argument("--swa", action="store_true", help="force full=False (swa attention)")
     p.add_argument("--routed-lim", type=float, default=0.0)
     p.add_argument("--shared-lim", type=float, default=0.0)
     return p.parse_args()
@@ -56,7 +57,7 @@ def main() -> int:
     import inspect  # noqa: PLC0415
     params = inspect.signature(builder).parameters
     if "full" in params:
-        program = builder(full=args.full, routed_lim=args.routed_lim, shared_lim=args.shared_lim)
+        program = builder(full=(not args.swa), routed_lim=args.routed_lim, shared_lim=args.shared_lim)
     else:
         program = builder()
     prog_name = getattr(program, "name", None) or type(program).__name__

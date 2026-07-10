@@ -399,12 +399,12 @@ def _dense_mlp_body_tp(
     partial_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for dob in pl.spmd(hidden_blocks, name_hint="dense_down_cast_tp"):
         d0 = dob * K_CHUNK
-        fp32_chunk = pl.slice(
+        dense_fp32_chunk = pl.slice(
             partial_hidden_fp32, [BATCH, K_CHUNK], [0, d0],
         )
         partial_hidden = pl.assemble(
             partial_hidden,
-            pl.cast(fp32_chunk, target_type=pl.BF16),
+            pl.cast(dense_fp32_chunk, target_type=pl.BF16),
             [0, d0],
         )
 

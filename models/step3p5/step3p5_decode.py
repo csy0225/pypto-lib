@@ -620,7 +620,9 @@ def run_real_npu(args: argparse.Namespace) -> int:
         flat(bundle[KEY_DENSE_UP]),                                                  # [N_RANKS, ND*H, INTER] BF16
         flat(bundle[KEY_DENSE_DOWN]),                                                # [N_RANKS, ND*INTER, H] BF16
         next_hidden_out,                                                             # Out [N_RANKS, B, H] BF16
-        torch.tensor(0, dtype=torch.int32),                                          # layer_idx — LAST (scalar; not per-rank)
+        torch.tensor(0, dtype=torch.int32),                                          # norm_layer_idx (L0 abs)
+        torch.tensor(0, dtype=torch.int32),                                          # attn_layer_idx (L0 = first full)
+        torch.tensor(0, dtype=torch.int32),                                          # mlp_layer_idx (L0 = first dense)
     ]
 
     print(f"  Running layer 0 on device_ids={device_ids} (B={B}, H={H}) ...")

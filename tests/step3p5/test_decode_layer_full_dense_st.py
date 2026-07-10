@@ -416,7 +416,11 @@ def main() -> int:
         _spec("post_rms_weight", torch.float32),
         _spec("w_gate", bf16), _spec("w_up", bf16), _spec("w_down", bf16),
         _spec("next_hidden_out", bf16, is_out=True),
-        ScalarSpec("layer_idx", torch.int32,
+        ScalarSpec("norm_layer_idx", torch.int32,
+                   value=torch.tensor(layer_idx, dtype=torch.int32)),
+        ScalarSpec("attn_layer_idx", torch.int32,
+                   value=torch.tensor(layer_idx, dtype=torch.int32)),
+        ScalarSpec("mlp_layer_idx", torch.int32,
                    value=torch.tensor(layer_idx, dtype=torch.int32)),
     ]
 

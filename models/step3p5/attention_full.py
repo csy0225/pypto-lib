@@ -787,13 +787,13 @@ def attention_full(
             HIDDEN // OUT_PROJ_N_CHUNK, name_hint="full_out_proj_cast",
         ):
             o0 = ob * OUT_PROJ_N_CHUNK
-            fp32_chunk = pl.slice(
+            oproj_fp32_chunk = pl.slice(
                 partial_attn_proj_fp32,
                 [BATCH_TILE, OUT_PROJ_N_CHUNK], [b0, o0],
             )
             partial_attn_proj = pl.assemble(
                 partial_attn_proj,
-                pl.cast(fp32_chunk, target_type=pl.BF16),
+                pl.cast(oproj_fp32_chunk, target_type=pl.BF16),
                 [b0, o0],
             )
 

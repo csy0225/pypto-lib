@@ -291,7 +291,7 @@ KV_OUT_CHUNK = 256
 # Scope 3 tiling (output proj + MLP / MoE).
 K_CHUNK = 256
 OUT_PROJ_K_CHUNK = 256
-OUT_PROJ_N_CHUNK = 256
+OUT_PROJ_N_CHUNK = 64  # 910B: out_proj matmul L0-sized (avoid #1601 Vec-LHS Mat->Mat tmov)
 # MLP_OUT_CHUNK must divide BOTH the world-level INTERMEDIATE (11264, used
 # by the historical single-card drafts) AND the per-card TP-sliced
 # INTERMEDIATE_LOCAL=1408 (used by decode_layer's _dense_mlp_body_tp).

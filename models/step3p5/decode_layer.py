@@ -1697,7 +1697,7 @@ def _build_whole_decode_dense_prefix_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -1705,7 +1705,7 @@ def _build_whole_decode_dense_prefix_program(tp_size: int = TP_WORLD_SIZE):
             h0_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                h0_out, layer_idx,
+                h0_out, layer_idx, layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return h0_out
@@ -1755,7 +1755,7 @@ def _build_whole_decode_dense_prefix_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -1763,7 +1763,7 @@ def _build_whole_decode_dense_prefix_program(tp_size: int = TP_WORLD_SIZE):
             hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                hidden_out, layer_idx,
+                hidden_out, layer_idx, layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return hidden_out
@@ -3359,7 +3359,7 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -3367,7 +3367,7 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
             h0_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                h0_out, layer_idx,
+                h0_out, layer_idx, layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return h0_out
@@ -3416,7 +3416,7 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                 wo, w_g,
                 gate_r,
                 resid1_out,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -5212,12 +5212,12 @@ def _build_whole_decode_mixed_min_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, layer_idx, layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             h_mid_out = dense_mlp_inline(
                 resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
-                h_mid_out, layer_idx, mlp_tmp_window,
+                h_mid_out, layer_idx, layer_idx, mlp_tmp_window,
                 mlp_signal_window, my_rank,
             )
             return h_mid_out
@@ -5491,7 +5491,7 @@ def _build_whole_decode_mixed_min_program(
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -5499,7 +5499,7 @@ def _build_whole_decode_mixed_min_program(
             h0_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                h0_out, layer_idx,
+                h0_out, layer_idx, layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return h0_out
@@ -5548,7 +5548,7 @@ def _build_whole_decode_mixed_min_program(
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -5556,7 +5556,7 @@ def _build_whole_decode_mixed_min_program(
             hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                hidden_out, layer_idx,
+                hidden_out, layer_idx, layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return hidden_out
@@ -5600,7 +5600,7 @@ def _build_whole_decode_mixed_min_program(
                 wo, w_g,
                 gate_r,
                 resid3_out,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -13223,12 +13223,12 @@ def _build_mixed_moe_tail_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, layer_idx, layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             h_mid_out = dense_mlp_inline(
                 resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
-                h_mid_out, layer_idx, mlp_tmp_window,
+                h_mid_out, layer_idx, layer_idx, mlp_tmp_window,
                 mlp_signal_window, my_rank,
             )
             return h_mid_out
@@ -15079,12 +15079,12 @@ def _build_moe_layer_real_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, layer_idx, layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             h_mid_out = dense_mlp_inline(
                 resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
-                h_mid_out, layer_idx, mlp_tmp_window,
+                h_mid_out, layer_idx, layer_idx, mlp_tmp_window,
                 mlp_signal_window, my_rank,
             )
             return h_mid_out
@@ -15345,7 +15345,7 @@ def _build_moe_layer_real_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, layer_idx, layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             for _rc in pl.range(HIDDEN // K_CHUNK):
@@ -16971,12 +16971,12 @@ def _build_whole_decode_all_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, layer_idx, layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             h_mid_out = dense_mlp_inline(
                 resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
-                h_mid_out, layer_idx, mlp_tmp_window,
+                h_mid_out, layer_idx, layer_idx, mlp_tmp_window,
                 mlp_signal_window, my_rank,
             )
             return h_mid_out
@@ -17237,7 +17237,7 @@ def _build_whole_decode_all_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, layer_idx, layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             for _rc in pl.range(HIDDEN // K_CHUNK):
@@ -19179,6 +19179,7 @@ def _build_whole_decode_faithful_program(
     _routed_swiglu_limit = routed_lim
     _shared_swiglu_limit = shared_lim
     tp_chunk = HIDDEN // tp_size
+    _FAITHFUL_MOE_LAYERS = int(__import__('os').environ.get('P_FAITHFUL_MOE_LAYERS', '42'))  # bisect: N MoE layers emitted (default 42 = full)
 
     # L3 is a SWA-MoE layer: chip_orch / attn_dense_orch vestigial
     # attention-shape params resolve to SWA values.
@@ -20531,12 +20532,12 @@ def _build_whole_decode_faithful_program(
                 wq, wk, wv, q_norm_weight, k_norm_weight,
                 seq_lens, block_table, slot_mapping,
                 rope_cos, rope_sin, k_cache, v_cache,
-                wo, w_g, gate_r, resid1, layer_idx,
+                wo, w_g, gate_r, resid1, layer_idx, layer_idx,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             h_mid_out = dense_mlp_inline(
                 resid1, post_rms_d, w_gate_d, w_up_d, w_down_d,
-                h_mid_out, layer_idx, mlp_tmp_window,
+                h_mid_out, layer_idx, layer_idx, mlp_tmp_window,
                 mlp_signal_window, my_rank,
             )
             return h_mid_out
@@ -20810,7 +20811,7 @@ def _build_whole_decode_faithful_program(
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -20818,7 +20819,7 @@ def _build_whole_decode_faithful_program(
             h0_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                h0_out, layer_idx,
+                h0_out, layer_idx, layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return h0_out
@@ -20867,7 +20868,7 @@ def _build_whole_decode_faithful_program(
                 wo, w_g,
                 gate_r,
                 resid1,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -20875,7 +20876,7 @@ def _build_whole_decode_faithful_program(
             hidden_out = dense_mlp_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                hidden_out, layer_idx,
+                hidden_out, layer_idx, layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return hidden_out
@@ -20919,7 +20920,7 @@ def _build_whole_decode_faithful_program(
                 wo, w_g,
                 gate_r,
                 resid3_out,
-                layer_idx,
+                layer_idx, layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -21034,30 +21035,6 @@ def _build_whole_decode_faithful_program(
             l1_attn_sig = pld.alloc_window_buffer(tp_size * 4)
             l1_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
             l1_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
-            # MoE attn-only scratch (swa_attn_only_orch) — reused across L3..44.
-            ad_attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            ad_attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
-            # MoE block chip_orch scratch (9 EP windows) — reused across L3..44.
-            attn_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
-            pub_counts_buf = pld.alloc_window_buffer(
-                n_ranks * n_ranks * n_local_experts_pad * 4,
-            )
-            count_done_buf = pld.alloc_window_buffer(n_ranks * 4)
-            recv_x_buf = pld.alloc_window_buffer(
-                local_recv_max * HIDDEN * 2,
-            )
-            recv_r_route_buf = pld.alloc_window_buffer(
-                local_recv_max * idx_pad * 4,
-            )
-            data_done_buf = pld.alloc_window_buffer(n_ranks * 4)
-            sh_tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            sh_sig_buf = pld.alloc_window_buffer(n_ranks * 4)
-            routed_y_window_buf = pld.alloc_window_buffer(
-                n_routes_per_rank * HIDDEN * 2,
-            )
-            combine_done_buf = pld.alloc_window_buffer(n_ranks * 4)
-
             # ---- L0 full-dense: current_hidden -> next_hidden_out. ----
             for r in pl.range(pld.world_size()):
                 self.full_chip_orch(
@@ -21127,1644 +21104,2232 @@ def _build_whole_decode_faithful_program(
                     r,
                     device=r,
                 )
-            # ---- layer 3: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 3: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 4: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 4: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 5: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 5: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 6: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 6: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 7: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 7: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 8: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 8: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 9: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 9: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 10: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 10: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 11: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 11: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 12: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 12: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 13: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 13: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 14: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 14: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 15: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 15: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 16: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 16: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 17: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 17: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 18: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 18: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 19: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 19: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 20: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 20: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 21: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 21: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 22: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 22: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 23: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 23: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 24: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 24: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 25: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 25: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 26: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 26: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 27: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 27: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 28: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 28: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 29: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 29: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 30: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 30: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 31: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 31: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 32: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 32: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 33: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 33: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 34: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 34: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 35: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 35: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 36: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 36: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 37: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 37: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 38: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 38: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 39: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 39: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 40: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 40: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 41: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 41: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 42: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 42: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 43: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 43: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
-            # ---- layer 44: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
-            for rd in pl.range(pld.world_size()):
-                ad_attn_tmp_window = pld.window(ad_attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                ad_attn_signal_window = pld.window(ad_attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                self.swa_attn_only_orch(
-                    next_hidden_out[rd], ma_input_rms[rd],
-                    ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
-                    seq_lens[rd], block_table[rd], slot_mapping[rd],
-                    rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
-                    ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
-                    ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
-                )
-            # ---- layer 44: MoE-block: h_mid_out -> next_hidden_out. ----
-            for r in pl.range(pld.world_size()):
-                attn_tmp_window = pld.window(attn_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                attn_signal_window = pld.window(attn_sig_buf, [tp_size, 1], dtype=pl.INT32)
-                pub_counts = pld.window(pub_counts_buf, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
-                count_done_sig = pld.window(count_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_x = pld.window(recv_x_buf, [local_recv_max, HIDDEN], dtype=pl.BF16)
-                data_done_sig = pld.window(data_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                recv_r_route = pld.window(recv_r_route_buf, [local_recv_max, idx_pad], dtype=pl.INT32)
-                sh_tmp_window = pld.window(sh_tmp_buf, [BATCH, HIDDEN], dtype=pl.BF16)
-                sh_signal_window = pld.window(sh_sig_buf, [n_ranks, 1], dtype=pl.INT32)
-                routed_y_buf = pld.window(routed_y_window_buf, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
-                combine_done_sig = pld.window(combine_done_buf, [n_ranks, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    h_mid_out[r], ma_input_rms[r],
-                    m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
-                    seq_lens[r], block_table[r], slot_mapping[r],
-                    rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
-                    m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
-                    m_gate_w[r], m_router_bias[r],
-                    m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
-                    m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
-                    attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
-                    recv_x, data_done_sig, recv_r_route,
-                    sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
-                    0, r, device=r,
-                )
+            if 0 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L0 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L0 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L0 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L0 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L0 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L0 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L0 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L0 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L0 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 3: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L0, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L0, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 3: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L0, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L0, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L0, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L0, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L0, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L0, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L0, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L0, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L0, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L0, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L0, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 1 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L1 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L1 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L1 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L1 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L1 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L1 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L1 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L1 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L1 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 4: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L1, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L1, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 4: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L1, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L1, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L1, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L1, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L1, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L1, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L1, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L1, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L1, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L1, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L1, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 2 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L2 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L2 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L2 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L2 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L2 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L2 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L2 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L2 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L2 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 5: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L2, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L2, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 5: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L2, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L2, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L2, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L2, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L2, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L2, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L2, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L2, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L2, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L2, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L2, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 3 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L3 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L3 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L3 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L3 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L3 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L3 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L3 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L3 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L3 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 6: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L3, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L3, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 6: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L3, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L3, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L3, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L3, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L3, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L3, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L3, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L3, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L3, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L3, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L3, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 4 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L4 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L4 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L4 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L4 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L4 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L4 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L4 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L4 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L4 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 7: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L4, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L4, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 7: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L4, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L4, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L4, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L4, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L4, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L4, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L4, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L4, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L4, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L4, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L4, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 5 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L5 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L5 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L5 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L5 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L5 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L5 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L5 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L5 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L5 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 8: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L5, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L5, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 8: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L5, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L5, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L5, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L5, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L5, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L5, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L5, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L5, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L5, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L5, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L5, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 6 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L6 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L6 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L6 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L6 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L6 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L6 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L6 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L6 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L6 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 9: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L6, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L6, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 9: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L6, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L6, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L6, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L6, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L6, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L6, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L6, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L6, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L6, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L6, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L6, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 7 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L7 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L7 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L7 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L7 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L7 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L7 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L7 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L7 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L7 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 10: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L7, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L7, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 10: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L7, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L7, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L7, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L7, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L7, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L7, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L7, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L7, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L7, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L7, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L7, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 8 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L8 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L8 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L8 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L8 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L8 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L8 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L8 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L8 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L8 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 11: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L8, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L8, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 11: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L8, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L8, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L8, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L8, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L8, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L8, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L8, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L8, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L8, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L8, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L8, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 9 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L9 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L9 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L9 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L9 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L9 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L9 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L9 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L9 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L9 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 12: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L9, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L9, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 12: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L9, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L9, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L9, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L9, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L9, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L9, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L9, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L9, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L9, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L9, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L9, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 10 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L10 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L10 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L10 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L10 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L10 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L10 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L10 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L10 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L10 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 13: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L10, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L10, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 13: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L10, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L10, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L10, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L10, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L10, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L10, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L10, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L10, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L10, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L10, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L10, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 11 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L11 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L11 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L11 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L11 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L11 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L11 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L11 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L11 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L11 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 14: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L11, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L11, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 14: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L11, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L11, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L11, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L11, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L11, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L11, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L11, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L11, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L11, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L11, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L11, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 12 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L12 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L12 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L12 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L12 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L12 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L12 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L12 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L12 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L12 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 15: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L12, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L12, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 15: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L12, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L12, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L12, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L12, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L12, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L12, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L12, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L12, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L12, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L12, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L12, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 13 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L13 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L13 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L13 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L13 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L13 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L13 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L13 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L13 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L13 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 16: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L13, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L13, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 16: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L13, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L13, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L13, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L13, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L13, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L13, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L13, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L13, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L13, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L13, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L13, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 14 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L14 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L14 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L14 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L14 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L14 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L14 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L14 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L14 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L14 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 17: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L14, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L14, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 17: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L14, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L14, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L14, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L14, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L14, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L14, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L14, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L14, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L14, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L14, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L14, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 15 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L15 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L15 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L15 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L15 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L15 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L15 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L15 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L15 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L15 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 18: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L15, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L15, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 18: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L15, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L15, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L15, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L15, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L15, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L15, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L15, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L15, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L15, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L15, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L15, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 16 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L16 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L16 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L16 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L16 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L16 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L16 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L16 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L16 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L16 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 19: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L16, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L16, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 19: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L16, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L16, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L16, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L16, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L16, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L16, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L16, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L16, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L16, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L16, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L16, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 17 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L17 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L17 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L17 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L17 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L17 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L17 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L17 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L17 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L17 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 20: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L17, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L17, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 20: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L17, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L17, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L17, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L17, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L17, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L17, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L17, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L17, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L17, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L17, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L17, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 18 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L18 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L18 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L18 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L18 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L18 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L18 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L18 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L18 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L18 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 21: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L18, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L18, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 21: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L18, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L18, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L18, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L18, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L18, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L18, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L18, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L18, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L18, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L18, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L18, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 19 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L19 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L19 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L19 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L19 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L19 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L19 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L19 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L19 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L19 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 22: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L19, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L19, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 22: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L19, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L19, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L19, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L19, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L19, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L19, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L19, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L19, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L19, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L19, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L19, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 20 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L20 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L20 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L20 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L20 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L20 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L20 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L20 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L20 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L20 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 23: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L20, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L20, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 23: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L20, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L20, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L20, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L20, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L20, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L20, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L20, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L20, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L20, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L20, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L20, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 21 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L21 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L21 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L21 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L21 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L21 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L21 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L21 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L21 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L21 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 24: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L21, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L21, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 24: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L21, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L21, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L21, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L21, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L21, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L21, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L21, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L21, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L21, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L21, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L21, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 22 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L22 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L22 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L22 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L22 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L22 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L22 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L22 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L22 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L22 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 25: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L22, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L22, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 25: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L22, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L22, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L22, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L22, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L22, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L22, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L22, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L22, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L22, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L22, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L22, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 23 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L23 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L23 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L23 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L23 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L23 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L23 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L23 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L23 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L23 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 26: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L23, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L23, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 26: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L23, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L23, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L23, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L23, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L23, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L23, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L23, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L23, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L23, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L23, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L23, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 24 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L24 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L24 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L24 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L24 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L24 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L24 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L24 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L24 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L24 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 27: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L24, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L24, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 27: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L24, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L24, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L24, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L24, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L24, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L24, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L24, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L24, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L24, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L24, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L24, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 25 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L25 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L25 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L25 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L25 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L25 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L25 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L25 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L25 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L25 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 28: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L25, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L25, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 28: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L25, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L25, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L25, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L25, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L25, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L25, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L25, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L25, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L25, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L25, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L25, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 26 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L26 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L26 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L26 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L26 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L26 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L26 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L26 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L26 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L26 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 29: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L26, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L26, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 29: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L26, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L26, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L26, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L26, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L26, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L26, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L26, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L26, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L26, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L26, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L26, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 27 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L27 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L27 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L27 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L27 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L27 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L27 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L27 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L27 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L27 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 30: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L27, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L27, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 30: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L27, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L27, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L27, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L27, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L27, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L27, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L27, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L27, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L27, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L27, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L27, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 28 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L28 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L28 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L28 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L28 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L28 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L28 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L28 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L28 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L28 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 31: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L28, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L28, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 31: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L28, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L28, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L28, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L28, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L28, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L28, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L28, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L28, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L28, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L28, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L28, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 29 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L29 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L29 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L29 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L29 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L29 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L29 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L29 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L29 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L29 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 32: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L29, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L29, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 32: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L29, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L29, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L29, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L29, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L29, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L29, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L29, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L29, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L29, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L29, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L29, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 30 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L30 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L30 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L30 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L30 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L30 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L30 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L30 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L30 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L30 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 33: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L30, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L30, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 33: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L30, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L30, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L30, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L30, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L30, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L30, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L30, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L30, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L30, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L30, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L30, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 31 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L31 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L31 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L31 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L31 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L31 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L31 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L31 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L31 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L31 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 34: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L31, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L31, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 34: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L31, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L31, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L31, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L31, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L31, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L31, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L31, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L31, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L31, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L31, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L31, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 32 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L32 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L32 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L32 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L32 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L32 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L32 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L32 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L32 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L32 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 35: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L32, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L32, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 35: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L32, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L32, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L32, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L32, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L32, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L32, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L32, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L32, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L32, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L32, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L32, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 33 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L33 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L33 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L33 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L33 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L33 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L33 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L33 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L33 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L33 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 36: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L33, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L33, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 36: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L33, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L33, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L33, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L33, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L33, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L33, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L33, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L33, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L33, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L33, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L33, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 34 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L34 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L34 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L34 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L34 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L34 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L34 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L34 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L34 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L34 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 37: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L34, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L34, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 37: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L34, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L34, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L34, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L34, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L34, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L34, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L34, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L34, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L34, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L34, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L34, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 35 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L35 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L35 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L35 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L35 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L35 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L35 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L35 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L35 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L35 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 38: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L35, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L35, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 38: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L35, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L35, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L35, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L35, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L35, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L35, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L35, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L35, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L35, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L35, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L35, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 36 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L36 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L36 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L36 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L36 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L36 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L36 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L36 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L36 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L36 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 39: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L36, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L36, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 39: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L36, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L36, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L36, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L36, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L36, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L36, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L36, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L36, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L36, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L36, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L36, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 37 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L37 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L37 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L37 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L37 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L37 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L37 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L37 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L37 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L37 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 40: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L37, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L37, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 40: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L37, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L37, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L37, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L37, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L37, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L37, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L37, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L37, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L37, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L37, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L37, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 38 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L38 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L38 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L38 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L38 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L38 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L38 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L38 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L38 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L38 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 41: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L38, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L38, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 41: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L38, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L38, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L38, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L38, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L38, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L38, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L38, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L38, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L38, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L38, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L38, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 39 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L39 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L39 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L39 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L39 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L39 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L39 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L39 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L39 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L39 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 42: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L39, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L39, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 42: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L39, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L39, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L39, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L39, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L39, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L39, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L39, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L39, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L39, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L39, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L39, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 40 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L40 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L40 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L40 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L40 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L40 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L40 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L40 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L40 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L40 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 43: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L40, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L40, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 43: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L40, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L40, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L40, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L40, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L40, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L40, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L40, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L40, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L40, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L40, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L40, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
+            if 41 < _FAITHFUL_MOE_LAYERS:
+                ad_attn_tmp_buf_L41 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                ad_attn_sig_buf_L41 = pld.alloc_window_buffer(tp_size * 4)
+                attn_tmp_buf_L41 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                attn_sig_buf_L41 = pld.alloc_window_buffer(tp_size * 4)
+                pub_counts_buf_L41 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
+                count_done_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                recv_x_buf_L41 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+                recv_r_route_buf_L41 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
+                data_done_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_tmp_buf_L41 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+                sh_sig_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                routed_y_window_buf_L41 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
+                combine_done_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                # ---- layer 44: MoE attn-only (swa): next_hidden_out -> h_mid_out resid. ----
+                for rd in pl.range(pld.world_size()):
+                    ad_attn_tmp_window = pld.window(ad_attn_tmp_buf_L41, [BATCH, HIDDEN], dtype=pl.BF16)
+                    ad_attn_signal_window = pld.window(ad_attn_sig_buf_L41, [tp_size, 1], dtype=pl.INT32)
+                    self.swa_attn_only_orch(
+                        next_hidden_out[rd], ma_input_rms[rd],
+                        ma_wq[rd], ma_wk[rd], ma_wv[rd], ma_q_norm[rd], ma_k_norm[rd],
+                        seq_lens[rd], block_table[rd], slot_mapping[rd],
+                        rope_cos_swa[rd], rope_sin_swa[rd], k_cache[rd], v_cache[rd],
+                        ma_wo[rd], ma_w_g[rd], ma_gate_r[rd], h_mid_out[rd],
+                        ad_attn_tmp_window, ad_attn_signal_window, 0, rd, device=rd,
+                    )
+                # ---- layer 44: MoE-block: h_mid_out -> next_hidden_out. ----
+                for r in pl.range(pld.world_size()):
+                    attn_tmp_window = pld.window(attn_tmp_buf_L41, [BATCH, HIDDEN], dtype=pl.BF16)
+                    attn_signal_window = pld.window(attn_sig_buf_L41, [tp_size, 1], dtype=pl.INT32)
+                    pub_counts = pld.window(pub_counts_buf_L41, [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32)
+                    count_done_sig = pld.window(count_done_buf_L41, [n_ranks, 1], dtype=pl.INT32)
+                    recv_x = pld.window(recv_x_buf_L41, [local_recv_max, HIDDEN], dtype=pl.BF16)
+                    data_done_sig = pld.window(data_done_buf_L41, [n_ranks, 1], dtype=pl.INT32)
+                    recv_r_route = pld.window(recv_r_route_buf_L41, [local_recv_max, idx_pad], dtype=pl.INT32)
+                    sh_tmp_window = pld.window(sh_tmp_buf_L41, [BATCH, HIDDEN], dtype=pl.BF16)
+                    sh_signal_window = pld.window(sh_sig_buf_L41, [n_ranks, 1], dtype=pl.INT32)
+                    routed_y_buf = pld.window(routed_y_window_buf_L41, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)
+                    combine_done_sig = pld.window(combine_done_buf_L41, [n_ranks, 1], dtype=pl.INT32)
+                    self.chip_orch(
+                        h_mid_out[r], ma_input_rms[r],
+                        m_wq[r], m_wk[r], m_wv[r], m_q_norm[r], m_k_norm[r],
+                        seq_lens[r], block_table[r], slot_mapping[r],
+                        rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
+                        m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
+                        m_gate_w[r], m_router_bias[r],
+                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
+                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
+                        recv_x, data_done_sig, recv_r_route,
+                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,
+                        0, r, device=r,
+                    )
             # ── Tail: final RMSNorm + LM head on every rank. ──
             for rt in pl.range(pld.world_size()):
                 self.lm_head_orch(

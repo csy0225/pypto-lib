@@ -1528,6 +1528,418 @@ def _build_dense_chain3_lmhead_program(tp_size: int = TP_WORLD_SIZE):
 
 
 
+def _build_whole_decode_dense_prefix_program(tp_size: int = TP_WORLD_SIZE):
+    """N=1 fusion milestone: ONE ``@pl.program`` running the dense decode
+    prefix — layer 0 (full attention + dense MLP), layer 1 (SWA + dense MLP),
+    layer 2 (SWA + dense MLP) — followed by the tail (final RMSNorm + LM head).
+
+    Generalizes ``_build_fused_dense_lmhead_program`` (single dense layer +
+    tail) from one layer to three, using the **two-method pattern** proven in
+    ``Mixed2Method``: each layer is a *separate* Orchestration method (isolated
+    SSA scope — inlining lm_head into the layer body corrupts the dense output,
+    verified on the single-layer spine) and a two-pass ``host_orch`` dispatches
+    all layer bodies first, then all tail bodies.
+
+    Why two layer methods (``full_chip_orch`` + ``swa_chip_orch``) and not one:
+    ``attention_full`` (22 params, rotary_dim=64, HIDDEN_Q_FULL_LOCAL) and
+    ``attention_swa`` (21 params, rotary_dim=128, HIDDEN_Q_SWA_LOCAL) have
+    incompatible signatures. The pypto SSA type-checker processes BOTH branches
+    of an ``if`` inside a ``@pl.function`` body (see
+    ``_build_decode_layer_dense_program``), so the attention flavour MUST be
+    selected at Python build scope by baking a distinct method per flavour.
+
+    Weight indexing — the 3-index-class problem. The inlined
+    ``attention_full`` / ``attention_swa`` / ``_dense_mlp_body_tp`` bodies all
+    use ONE ``layer_idx`` Scalar for four coupled purposes:
+      * norm row   — ``input_rms_weight[layer_idx]``  (45-row ABSOLUTE stack)
+      * attn base  — ``layer_idx * HIDDEN``            (type-local full/swa stack)
+      * KV cache   — ``layer_idx * decode_layer_cache_rows`` (per-layer)
+      * mlp base   — ``layer_idx * INTER_LOCAL``       (3-row dense-order stack)
+    For layers 0/1/2 these diverge across classes (L1 is abs=1, swa-order=0,
+    dense-order=1), so a single shared ``layer_idx`` fed to a *stacked* weight
+    tensor is wrong — exactly the flaw in ``_build_dense_chain3_lmhead_program``
+    (which also wrongly runs ``attention_full`` for L1/L2).
+
+    Resolution: each layer method receives its OWN per-layer weight slabs and
+    its OWN per-layer KV cache, and is driven with ``layer_idx = 0``. This
+    positions every weight class at base 0 for that layer, decoupling the four
+    uses of ``layer_idx`` without modifying the proven inline bodies. The
+    ``host_orch`` passes one slab per layer per rank (the host/weight-loader
+    slices the absolute/type-local/dense stacks per layer before launch). The
+    declared tensor shapes match the inline signatures (``[LAYER_HIDDEN_ROWS_DYN,
+    ...]`` etc.) so the inline call type-checks; at runtime the leading dim is
+    read dynamically via ``pl.tensor.dim`` and only row/block 0 is accessed.
+
+    Hidden is threaded layer-to-layer through resident ``pl.Out`` GM tensors
+    (``h0_out`` L0->L1, ``h1_out`` L1->L2, ``next_hidden_out`` L2->tail).
+    """
+    attention_full_inline = pl.inline(attention_full._func)
+    attention_swa_inline = pl.inline(attention_swa._func)
+    dense_mlp_inline = pl.inline(_dense_mlp_body_tp._func)
+    rms_lm_head_inline = pl.inline(rms_lm_head._func)
+
+    rotary_dim_full = ROTARY_HALF_FULL * 2      # 64
+    rotary_dim_swa = ROTARY_HALF_SWA * 2        # 128
+    hidden_q_full = HIDDEN_Q_FULL_LOCAL
+    hidden_q_swa = HIDDEN_Q_SWA_LOCAL
+    nh_full_pad = NUM_HEADS_FULL_LOCAL_PAD
+    nh_swa_pad = NUM_HEADS_SWA_LOCAL_PAD
+    layer_qhidden_full = LAYER_QHIDDEN_ROWS_DYN_FULL
+    layer_qhidden_swa = LAYER_QHIDDEN_ROWS_DYN_SWA
+
+    @pl.program
+    class WholeDecodeDensePrefix:
+        # ---- Collective: barrier-style TP all_reduce (shared by all layers) -
+        # Same body as the proven single-layer spine; invoked per layer with
+        # that layer's own window pair so concurrent all-reduces don't alias.
+        @pl.function(type=pl.FunctionType.InCore)
+        def tp_all_reduce(
+            self,
+            local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            group_size = tp_size
+            ar_chunk = HIDDEN // 8
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
+                pl.store(stage_tile, [0, k0], tmp_window)
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            for k0 in pl.range(0, HIDDEN, ar_chunk):
+                own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
+                acc = pl.cast(own_tile, target_type=pl.FP32)
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        recv = pld.tile.remote_load(
+                            tmp_window, peer=peer,
+                            offsets=[0, k0], shape=[BATCH, ar_chunk],
+                        )
+                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
+                pl.store(pl.cast(acc, target_type=pl.BF16), [0, k0], local)
+            return local
+
+        # ---- L0: full attention + dense MLP (separate SSA scope) -----------
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def full_chip_orch(  # noqa: PLR0913
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, hidden_q_full], pl.BF16],
+            wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_full], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_full], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[layer_qhidden_full, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, nh_full_pad], pl.BF16],
+            gate_r: pl.Tensor[[nh_full_pad, hidden_q_full], pl.BF16],
+            post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            h0_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1 = attention_full_inline(
+                current_hidden,
+                input_rms_weight,
+                wq, wk, wv,
+                q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin,
+                k_cache, v_cache,
+                wo, w_g,
+                gate_r,
+                resid1,
+                layer_idx,
+                attn_tmp_window,
+                attn_signal_window,
+                my_rank,
+            )
+            h0_out = dense_mlp_inline(
+                resid1, post_rms_weight,
+                w_gate, w_up, w_down,
+                h0_out, layer_idx,
+                mlp_tmp_window, mlp_signal_window, my_rank,
+            )
+            return h0_out
+
+        # ---- L1 / L2: SWA attention + dense MLP (separate SSA scope) -------
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def swa_chip_orch(  # noqa: PLR0913
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, hidden_q_swa], pl.BF16],
+            wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_swa], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_swa], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[layer_qhidden_swa, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, nh_swa_pad], pl.BF16],
+            gate_r: pl.Tensor[[nh_swa_pad, hidden_q_swa], pl.BF16],
+            post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1 = attention_swa_inline(
+                current_hidden,
+                input_rms_weight,
+                wq, wk, wv,
+                q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin,
+                k_cache, v_cache,
+                wo, w_g,
+                gate_r,
+                resid1,
+                layer_idx,
+                attn_tmp_window,
+                attn_signal_window,
+                my_rank,
+            )
+            hidden_out = dense_mlp_inline(
+                resid1, post_rms_weight,
+                w_gate, w_up, w_down,
+                hidden_out, layer_idx,
+                mlp_tmp_window, mlp_signal_window, my_rank,
+            )
+            return hidden_out
+
+        # ---- Tail: final RMSNorm + LM head (separate SSA scope) ------------
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def lm_head_orch(
+            self,
+            next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+            lm_head_weight: pl.Tensor[[VOCAB_LOCAL, HIDDEN], pl.BF16],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            logits_shard_out: pl.Out[
+                pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
+            ],
+        ) -> pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]:
+            logits_shard_out = rms_lm_head_inline(
+                next_hidden, final_norm_weight, lm_head_weight,
+                seq_lens, logits_shard_out,
+            )
+            return logits_shard_out
+
+        # ---- host_orch: pass 1 = L0/L1/L2 layer bodies, pass 2 = tail -------
+        # Each layer gets its own attn/mlp window pair (all_reduce scratch);
+        # layers are dispatched in order so the resident GM hidden tensors
+        # (h0_out -> h1_out -> next_hidden_out) carry the residual forward.
+        # layer_idx=0 for every layer: each method reads its own per-layer
+        # weight slabs / KV cache at base 0 (see class docstring).
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16],
+            # L0 (full) weights — per-rank slabs positioned at base 0.
+            l0_input_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l0_wq: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, hidden_q_full], pl.BF16],
+            l0_wk: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l0_wv: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l0_q_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l0_k_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l0_wo: pl.Tensor[[tp_size, layer_qhidden_full, HIDDEN], pl.BF16],
+            l0_w_g: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, nh_full_pad], pl.BF16],
+            l0_gate_r: pl.Tensor[[tp_size, nh_full_pad, hidden_q_full], pl.BF16],
+            l0_post_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l0_w_gate: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l0_w_up: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l0_w_down: pl.Tensor[[tp_size, LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            # L1 (swa) weights.
+            l1_input_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l1_wq: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, hidden_q_swa], pl.BF16],
+            l1_wk: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l1_wv: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l1_q_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l1_k_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l1_wo: pl.Tensor[[tp_size, layer_qhidden_swa, HIDDEN], pl.BF16],
+            l1_w_g: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, nh_swa_pad], pl.BF16],
+            l1_gate_r: pl.Tensor[[tp_size, nh_swa_pad, hidden_q_swa], pl.BF16],
+            l1_post_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l1_w_gate: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l1_w_up: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l1_w_down: pl.Tensor[[tp_size, LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            # L2 (swa) weights.
+            l2_input_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l2_wq: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, hidden_q_swa], pl.BF16],
+            l2_wk: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l2_wv: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN_LOCAL], pl.BF16],
+            l2_q_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l2_k_norm: pl.Tensor[[tp_size, LAYER_DYN, HEAD_DIM], pl.FP32],
+            l2_wo: pl.Tensor[[tp_size, layer_qhidden_swa, HIDDEN], pl.BF16],
+            l2_w_g: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, nh_swa_pad], pl.BF16],
+            l2_gate_r: pl.Tensor[[tp_size, nh_swa_pad, hidden_q_swa], pl.BF16],
+            l2_post_rms: pl.Tensor[[tp_size, LAYER_DYN, HIDDEN], pl.FP32],
+            l2_w_gate: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l2_w_up: pl.Tensor[[tp_size, LAYER_HIDDEN_ROWS_DYN, INTER_LOCAL], pl.BF16],
+            l2_w_down: pl.Tensor[[tp_size, LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+            # Shared runtime tensors (replicated across the 3 layers).
+            seq_lens: pl.Tensor[[tp_size, USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[tp_size, BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[tp_size, USER_BATCH_DYN], pl.INT32],
+            rope_cos_full: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim_full], pl.FP32],
+            rope_sin_full: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim_full], pl.FP32],
+            rope_cos_swa: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim_swa], pl.FP32],
+            rope_sin_swa: pl.Tensor[[tp_size, ROPE_SEQ_DYN, rotary_dim_swa], pl.FP32],
+            k_cache: pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            # Resident GM hidden handoff tensors.
+            h0_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
+            h1_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
+            next_hidden_out: pl.Out[
+                pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
+            ],
+            # Tail weights.
+            final_norm_weight: pl.Tensor[[tp_size, 1, HIDDEN], pl.FP32],
+            lm_head_weight: pl.Tensor[[tp_size, VOCAB_LOCAL, HIDDEN], pl.BF16],
+            logits_shard_out: pl.Out[
+                pl.Tensor[[tp_size, USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
+            ],
+        ):
+            # Per-layer all_reduce scratch windows (each layer's attn + mlp
+            # reduce needs its own pair so concurrent dispatches don't alias).
+            l0_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l0_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            l0_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l0_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
+            l1_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l1_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            l1_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l1_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
+            l2_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l2_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            l2_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
+            l2_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
+
+            # Pass 1a: L0 (full) on every rank.
+            for r in pl.range(pld.world_size()):
+                self.full_chip_orch(
+                    current_hidden[r],
+                    l0_input_rms[r],
+                    l0_wq[r], l0_wk[r], l0_wv[r],
+                    l0_q_norm[r], l0_k_norm[r],
+                    seq_lens[r], block_table[r], slot_mapping[r],
+                    rope_cos_full[r], rope_sin_full[r],
+                    k_cache[r], v_cache[r],
+                    l0_wo[r], l0_w_g[r],
+                    l0_gate_r[r],
+                    l0_post_rms[r],
+                    l0_w_gate[r], l0_w_up[r], l0_w_down[r],
+                    h0_out[r],
+                    pld.window(l0_attn_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l0_attn_sig, [tp_size, 1], dtype=pl.INT32),
+                    pld.window(l0_mlp_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l0_mlp_sig, [tp_size, 1], dtype=pl.INT32),
+                    0,
+                    r,
+                    device=r,
+                )
+            # Pass 1b: L1 (swa) on every rank — reads h0_out.
+            for r in pl.range(pld.world_size()):
+                self.swa_chip_orch(
+                    h0_out[r],
+                    l1_input_rms[r],
+                    l1_wq[r], l1_wk[r], l1_wv[r],
+                    l1_q_norm[r], l1_k_norm[r],
+                    seq_lens[r], block_table[r], slot_mapping[r],
+                    rope_cos_swa[r], rope_sin_swa[r],
+                    k_cache[r], v_cache[r],
+                    l1_wo[r], l1_w_g[r],
+                    l1_gate_r[r],
+                    l1_post_rms[r],
+                    l1_w_gate[r], l1_w_up[r], l1_w_down[r],
+                    h1_out[r],
+                    pld.window(l1_attn_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l1_attn_sig, [tp_size, 1], dtype=pl.INT32),
+                    pld.window(l1_mlp_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l1_mlp_sig, [tp_size, 1], dtype=pl.INT32),
+                    0,
+                    r,
+                    device=r,
+                )
+            # Pass 1c: L2 (swa) on every rank — reads h1_out, writes next_hidden.
+            for r in pl.range(pld.world_size()):
+                self.swa_chip_orch(
+                    h1_out[r],
+                    l2_input_rms[r],
+                    l2_wq[r], l2_wk[r], l2_wv[r],
+                    l2_q_norm[r], l2_k_norm[r],
+                    seq_lens[r], block_table[r], slot_mapping[r],
+                    rope_cos_swa[r], rope_sin_swa[r],
+                    k_cache[r], v_cache[r],
+                    l2_wo[r], l2_w_g[r],
+                    l2_gate_r[r],
+                    l2_post_rms[r],
+                    l2_w_gate[r], l2_w_up[r], l2_w_down[r],
+                    next_hidden_out[r],
+                    pld.window(l2_attn_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l2_attn_sig, [tp_size, 1], dtype=pl.INT32),
+                    pld.window(l2_mlp_tmp, [BATCH, HIDDEN], dtype=pl.BF16),
+                    pld.window(l2_mlp_sig, [tp_size, 1], dtype=pl.INT32),
+                    0,
+                    r,
+                    device=r,
+                )
+            # Pass 2: tail (final RMSNorm + LM head) on every rank — only after
+            # all three layers' all-reduces complete.
+            for r in pl.range(pld.world_size()):
+                self.lm_head_orch(
+                    next_hidden_out[r],
+                    final_norm_weight[r],
+                    lm_head_weight[r],
+                    seq_lens[r],
+                    logits_shard_out[r],
+                    device=r,
+                )
+
+    return WholeDecodeDensePrefix
+
+
+
 def _build_dense_chain2_lmhead_program(tp_size: int = TP_WORLD_SIZE):
     """Phase 25.1: ONE program = full-dense layer (attention + dense MLP) +
     final RMSNorm + LM head, all inlined into a single chip_orch.
@@ -7251,6 +7663,12 @@ def _build_fused_dense_moe_program(
 decode_layer_full_dense = _build_decode_layer_dense_program(full=True)
 decode_layer_swa_dense = _build_decode_layer_dense_program(full=False)
 
+# N=1 whole-net fusion milestone: ONE @pl.program running the dense decode
+# prefix (L0 full + L1 swa + L2 swa) + tail (final RMSNorm + LM head). Built
+# eagerly (dense-only, no MoE embedded-program dependency) so the probe can
+# resolve it via getattr(decode_layer, "whole_decode_dense_prefix").
+whole_decode_dense_prefix = _build_whole_decode_dense_prefix_program()
+
 # Phase X.7 — MoE @pl.program builds are deferred via module __getattr__
 # because the inner ``self._embedded_moe_cls().chip_orch(...)`` construction
 # is rejected by the pypto frontend (instantiating a @pl.program at IR-build
@@ -7402,4 +7820,6 @@ __all__ = [
     "_dense_mlp_body_tp",
     "_build_decode_layer_dense_program",
     "_build_decode_layer_moe_program",
+    "whole_decode_dense_prefix",
+    "_build_whole_decode_dense_prefix_program",
 ]

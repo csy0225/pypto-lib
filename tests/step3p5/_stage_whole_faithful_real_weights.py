@@ -1,6 +1,28 @@
 # Copyright (c) PyPTO Contributors.
 # SPDX-License-Identifier: Apache-2.0
-"""Real-weight 8-card device run of WholeDecodeFaithfulReal.
+"""DEPRECATED — DO NOT USE. Kept only as a negative example.
+
+Wrong architecture on two counts:
+  1. It loads the checkpoint itself, sequentially, for all 8 ranks in ONE
+     driver process (8x serial cold jfs reads → 40-min timeout, rc=124).
+     Production loads per-rank INSIDE each forked chip process, in parallel,
+     each reading only its own TP/EP slice (see step3p5_decode.py:275-293).
+  2. More fundamentally, the whole-decode program is NOT supposed to load
+     weights from a checkpoint at all. The intended design is the vLLM-IPC
+     handoff: vLLM loads the weights into HBM per rank, and pypto zero-copy
+     IPC-imports them (the "47GiB single-key weight IPC" of Task#3, same
+     pattern as the zero-copy KV handoff). Real-weight execution + per-layer
+     numeric alignment vs vLLM therefore only happen in the LIVE path
+     (8001 pypto whole-net vs 8000 vanilla), which is gated on the HCCL
+     same-card co-tenancy blocker (HcclCommInitRootInfo failed:7 — the
+     forked whole-decode worker's HCCL world conflicts with vLLM's).
+
+Use the dummy-weight device harness `_stage_whole_faithful_real_device.py`
+for structure/dispatch validation; pursue real weights only via the live
+vLLM-IPC integration.
+
+--- original (flawed) docstring below ---
+Real-weight 8-card device run of WholeDecodeFaithfulReal.
 
 Loads the real W8A8 step3p5 checkpoint per rank via weight_loader, stacks each
 bundle key over the rank axis (1:1 with the host_orch unified-stack signature —

@@ -424,6 +424,52 @@ class WeightIpcMap:
 
 
 # =============================================================================
+# G5b import_ipc_all path (N=1 whole-decode weight residency, mirrors
+# pypto_kv_ipc.build_stacked_kv). The orphaned WeightIpcMap.from_files uses
+# rt.import_ipc (missing C++ facade); the WORKING path is the pure-Python batch
+# import_ipc_all (distributed_runner.py:1086) + direct WeightIpcMap(peer_base=va).
+# =============================================================================
+def import_weights_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List["WeightIpcMap"]:
+    """Batch-import all ``tp`` per-rank weight pools via ``DistributedWorker.import_ipc_all``.
+
+    Reads ``pypto_weight.key.rank{r}`` + ``pypto_weight_map.rank{r}.json`` from
+    ``out_dir`` (written by ``WeightIpcExporter.export``), imports every rank's pool
+    ONCE into the resident worker's chip children (device ``dev_offset + r``), and
+    returns per-rank ``WeightIpcMap`` (peer_base = imported VA). Mirrors the KV path
+    in ``_stage_whole_decode_run.py`` (device_key_map -> import_ipc_all -> per-rank Map).
+    """
+    device_key_map: Dict[int, bytes] = {}
+    maps_json: List[Dict[str, Any]] = []
+    for r in range(tp):
+        with open(os.path.join(out_dir, f"pypto_weight.key.rank{r}"), "rb") as f:
+            device_key_map[dev_offset + r] = f.read()
+        with open(os.path.join(out_dir, f"pypto_weight_map.rank{r}.json")) as f:
+            maps_json.append(json.load(f))
+    vas = rt.import_ipc_all(device_key_map)  # {device_id: peer VA}
+    print(
+        "[weight-ipc importer] import_ipc_all peer_bases="
+        + str([hex(vas[dev_offset + r]) for r in range(tp)]),
+        flush=True,
+    )
+    return [WeightIpcMap(vas[dev_offset + r], maps_json[r]) for r in range(tp)]
+
+
+def build_stacked_weight(weight_maps: List["WeightIpcMap"], key: str):
+    """Build a ``StackedDeviceTensor`` for one host_orch weight param across ranks.
+
+    ``weight_maps[r]`` imported for chip ``r`` (its DeviceTensors resident on chip r).
+    Returns a StackedDeviceTensor whose leading dim == tp, matching the whole-decode
+    host_orch ``[tp, ...]`` weight signature (host_orch slices ``[r]`` per rank),
+    zero-copy. Mirrors ``pypto_kv_ipc.build_stacked_kv``.
+    """
+    from pypto.runtime.device_tensor import StackedDeviceTensor  # noqa: PLC0415
+    tp = len(weight_maps)
+    shards = [weight_maps[r].device_tensor(key) for r in range(tp)]
+    full = (tp, *tuple(shards[0].shape))
+    return StackedDeviceTensor(shards, full, list(range(tp)))
+
+
+# =============================================================================
 # OPEN_DEVICE_QUESTION (4): LIVE vLLM-resident weight path (design only).
 # =============================================================================
 # The checkpoint convenience path above H2D-copies host tensors into the pool.

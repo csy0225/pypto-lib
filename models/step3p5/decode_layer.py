@@ -19925,14 +19925,17 @@ def _build_whole_decode_faithful_program(
             local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
             local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
             w_gate: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_gate_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_up: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_up_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_down: pl.Tensor[
-                [n_local_experts, inter, HIDDEN], pl.BF16
+                [n_local_experts, inter, HIDDEN], pl.INT8
             ],
+            w_down_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
             local_routed_y: pl.Tensor[
                 [local_recv_max, HIDDEN], pl.BF16
             ],
@@ -19972,6 +19975,71 @@ def _build_whole_decode_faithful_program(
                             [RECV_TILE, inter], dtype=pl.BF16,
                         )
 
+                        # In-kernel per-token INT8 quant of the routed input tile
+                        # (DeepSeek v4 cast chain FP32->INT32 rint->FP16 round->
+                        # INT8 trunc, pl.at CORE_GROUP).  x_scale_dq (per-token
+                        # dequant scale) SSA-carried into the gate/up dequant.
+                        x_i8 = pl.create_tensor(
+                            [RECV_TILE, HIDDEN], dtype=pl.INT8,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP, name_hint="routed_x_quant",
+                        ):
+                            xe_amax = pl.full(
+                                [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                            )
+                            for xka in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
+                                xka0 = xka * ROUTED_GATE_K_CHUNK
+                                xe_a = pl.cast(
+                                    pl.slice(
+                                        local_routed_x,
+                                        [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                        [tile_offset, xka0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                xe_amax = pl.maximum(
+                                    xe_amax,
+                                    pl.reshape(
+                                        pl.row_max(
+                                            pl.maximum(xe_a, pl.neg(xe_a)),
+                                        ),
+                                        [1, RECV_TILE],
+                                    ),
+                                )
+                            xe_sq_row = pl.div(
+                                pl.full(
+                                    [1, RECV_TILE], dtype=pl.FP32, value=127.0,
+                                ),
+                                xe_amax,
+                            )
+                            x_scale_dq = pl.reshape(
+                                pl.recip(xe_sq_row), [RECV_TILE, 1],
+                            )
+                            xe_sq_col = pl.reshape(xe_sq_row, [RECV_TILE, 1])
+                            for xkn in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
+                                xkn0 = xkn * ROUTED_GATE_K_CHUNK
+                                xe_q = pl.cast(
+                                    pl.slice(
+                                        local_routed_x,
+                                        [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                        [tile_offset, xkn0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                xe_scaled = pl.row_expand_mul(xe_q, xe_sq_col)
+                                xe_i32 = pl.cast(
+                                    xe_scaled, target_type=pl.INT32, mode="rint",
+                                )
+                                xe_half = pl.cast(
+                                    xe_i32, target_type=pl.FP16, mode="round",
+                                )
+                                x_i8[
+                                    :, xkn0 : xkn0 + ROUTED_GATE_K_CHUNK
+                                ] = pl.cast(
+                                    xe_half, target_type=pl.INT8, mode="trunc",
+                                )
+
                         # Gate+up projection: each SPMD block handles one N-chunk
                         # of the inter dimension.  pl.slice of external BF16 input
                         # (local_routed_x) produces tmov mat→left which is valid in
@@ -19982,9 +20050,9 @@ def _build_whole_decode_faithful_program(
                         ):
                             n0 = nb * ROUTED_GATE_N_CHUNK
                             x0 = pl.slice(
-                                local_routed_x,
+                                x_i8,
                                 [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                                [tile_offset, 0],
+                                [0, 0],
                                 valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
                             )
                             wg0_2d = pl.reshape(
@@ -20003,14 +20071,14 @@ def _build_whole_decode_faithful_program(
                                 ),
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
-                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.INT32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.INT32)
                             for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
                                 k0 = kb * ROUTED_GATE_K_CHUNK
                                 xk = pl.slice(
-                                    local_routed_x,
+                                    x_i8,
                                     [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                                    [tile_offset, k0],
+                                    [0, k0],
                                     valid_shape=[
                                         tile_valid, ROUTED_GATE_K_CHUNK,
                                     ],
@@ -20042,19 +20110,45 @@ def _build_whole_decode_faithful_program(
                                 gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
                                 up_acc = pl.matmul_acc(up_acc, xk, wuk)
 
-                            sigmoid = pl.recip(
-                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
+                            # Dequant INT32 -> FP32: per-token act scale (row) x
+                            # per-output-channel weight scale (col).
+                            wg_scale_row = pl.slice(
+                                w_gate_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
                             )
-                            silu = pl.mul(gate_acc, sigmoid)
+                            wu_scale_row = pl.slice(
+                                w_up_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
+                            )
+                            gate_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        gate_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_dq,
+                                ),
+                                wg_scale_row,
+                            )
+                            up_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        up_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_dq,
+                                ),
+                                wu_scale_row,
+                            )
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
+                            )
+                            silu = pl.mul(gate_2d, sigmoid)
                             if _routed_swiglu_step:
                                 silu_c = pl.minimum(silu, _routed_swiglu_limit)
                                 up_c = pl.maximum(
-                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    pl.minimum(up_2d, _routed_swiglu_limit),
                                     -_routed_swiglu_limit,
                                 )
                                 gated = pl.mul(silu_c, up_c)
                             else:
-                                gated = pl.mul(silu, up_acc)
+                                gated = pl.mul(silu, up_2d)
 
                             gated_v = pl.set_validshape(
                                 gated, tile_valid, ROUTED_GATE_N_CHUNK,
@@ -20067,6 +20161,69 @@ def _build_whole_decode_faithful_program(
                                 :, n0 : n0 + ROUTED_GATE_N_CHUNK
                             ] = pl.cast(gated_v, target_type=pl.BF16)
 
+                        # Per-token INT8 requant of the swiglu intermediate for the
+                        # INT8 down-proj (DeepSeek v4 h_tile_i8 cast chain).
+                        h_i8 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.INT8,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP, name_hint="routed_h_quant",
+                        ):
+                            eh_amax = pl.full(
+                                [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                            )
+                            for hqa in pl.range(inter // ROUTED_GATE_N_CHUNK):
+                                hqa0 = hqa * ROUTED_GATE_N_CHUNK
+                                eh_a = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqa0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                eh_amax = pl.maximum(
+                                    eh_amax,
+                                    pl.reshape(
+                                        pl.row_max(
+                                            pl.maximum(eh_a, pl.neg(eh_a)),
+                                        ),
+                                        [1, RECV_TILE],
+                                    ),
+                                )
+                            eh_sq_row = pl.div(
+                                pl.full(
+                                    [1, RECV_TILE], dtype=pl.FP32, value=127.0,
+                                ),
+                                eh_amax,
+                            )
+                            h_scale_dq = pl.reshape(
+                                pl.recip(eh_sq_row), [RECV_TILE, 1],
+                            )
+                            eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                            for hqn in pl.range(inter // ROUTED_GATE_N_CHUNK):
+                                hqn0 = hqn * ROUTED_GATE_N_CHUNK
+                                eh_q = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqn0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                eh_scaled = pl.row_expand_mul(eh_q, eh_sq_col)
+                                eh_i32 = pl.cast(
+                                    eh_scaled, target_type=pl.INT32, mode="rint",
+                                )
+                                eh_half = pl.cast(
+                                    eh_i32, target_type=pl.FP16, mode="round",
+                                )
+                                h_i8[
+                                    :, hqn0 : hqn0 + ROUTED_GATE_N_CHUNK
+                                ] = pl.cast(
+                                    eh_half, target_type=pl.INT8, mode="trunc",
+                                )
+
                         # Down projection: each SPMD block handles one D-chunk of
                         # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
                         # pl.slice of it gives tmov vec→left ✓.
@@ -20076,7 +20233,7 @@ def _build_whole_decode_faithful_program(
                         ):
                             d0 = db * ROUTED_DOWN_N_CHUNK
                             h0 = pl.slice(
-                                h_bf16,
+                                h_i8,
                                 [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                 [0, 0],
                                 valid_shape=[
@@ -20095,11 +20252,11 @@ def _build_whole_decode_faithful_program(
                                 ),
                                 [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
                             )
-                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.INT32)
                             for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
                                 k0 = kb2 * ROUTED_DOWN_K_CHUNK
                                 hk = pl.slice(
-                                    h_bf16,
+                                    h_i8,
                                     [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                     [0, k0],
                                     valid_shape=[
@@ -20123,8 +20280,20 @@ def _build_whole_decode_faithful_program(
                                 )
                                 y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
+                            wd_scale_row = pl.slice(
+                                w_down_scale, [1, ROUTED_DOWN_N_CHUNK], [e, d0],
+                            )
+                            y_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        y_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    h_scale_dq,
+                                ),
+                                wd_scale_row,
+                            )
                             y_v = pl.set_validshape(
-                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                                y_2d, tile_valid, ROUTED_DOWN_N_CHUNK,
                             )
                             y_m = pl.fillpad(
                                 y_v, pad_value=pl.PadValue.zero,
@@ -20144,14 +20313,17 @@ def _build_whole_decode_faithful_program(
             local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
             local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
             w_gate_r: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_up_r: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_down_r: pl.Tensor[
-                [n_local_experts, inter, HIDDEN], pl.BF16
+                [n_local_experts, inter, HIDDEN], pl.INT8
             ],
+            w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
             local_routed_y: pl.Out[
                 pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
             ],
@@ -20159,7 +20331,9 @@ def _build_whole_decode_faithful_program(
             local_routed_y = self._expert_routed(
                 local_routed_x,
                 local_expert_offset, local_expert_count,
-                w_gate_r, w_up_r, w_down_r,
+                w_gate_r, w_gate_r_scale,
+                w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
                 local_routed_y,
             )
             return local_routed_y
@@ -20565,9 +20739,12 @@ def _build_whole_decode_faithful_program(
             post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
-            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
-            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.BF16],
+            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
+            w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
             w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
             w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
             w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
@@ -20715,7 +20892,8 @@ def _build_whole_decode_faithful_program(
             local_routed_y = self.expert_routed_step(
                 local_routed_x,
                 local_expert_offset, local_expert_count,
-                w_gate_r, w_up_r, w_down_r,
+                w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
                 local_routed_y,
             )
 
@@ -21004,9 +21182,12 @@ def _build_whole_decode_faithful_program(
             m_gate_r: pl.Tensor[[tp_size, nh_swa_pad, hidden_q_swa], pl.BF16],
             m_gate_w: pl.Tensor[[tp_size, HIDDEN, N_EXPERTS], pl.FP32],
             m_router_bias: pl.Tensor[[tp_size, N_EXPERTS], pl.FP32],
-            m_w_gate_r: pl.Tensor[[tp_size, n_local_experts, HIDDEN, inter], pl.BF16],
-            m_w_up_r: pl.Tensor[[tp_size, n_local_experts, HIDDEN, inter], pl.BF16],
-            m_w_down_r: pl.Tensor[[tp_size, n_local_experts, inter, HIDDEN], pl.BF16],
+            m_w_gate_r: pl.Tensor[[tp_size, n_local_experts, HIDDEN, inter], pl.INT8],
+            m_w_gate_r_scale: pl.Tensor[[tp_size, n_local_experts, inter], pl.FP32],
+            m_w_up_r: pl.Tensor[[tp_size, n_local_experts, HIDDEN, inter], pl.INT8],
+            m_w_up_r_scale: pl.Tensor[[tp_size, n_local_experts, inter], pl.FP32],
+            m_w_down_r: pl.Tensor[[tp_size, n_local_experts, inter, HIDDEN], pl.INT8],
+            m_w_down_r_scale: pl.Tensor[[tp_size, n_local_experts, HIDDEN], pl.FP32],
             m_w_gate_s: pl.Tensor[[tp_size, HIDDEN, sh_inter_local], pl.BF16],
             m_w_up_s: pl.Tensor[[tp_size, HIDDEN, sh_inter_local], pl.BF16],
             m_w_down_s: pl.Tensor[[tp_size, sh_inter_local, HIDDEN], pl.BF16],
@@ -21154,7 +21335,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21207,7 +21388,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21260,7 +21441,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21313,7 +21494,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21366,7 +21547,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21419,7 +21600,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21472,7 +21653,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21525,7 +21706,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21578,7 +21759,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21631,7 +21812,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21684,7 +21865,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21737,7 +21918,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21790,7 +21971,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21843,7 +22024,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21896,7 +22077,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -21949,7 +22130,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22002,7 +22183,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22055,7 +22236,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22108,7 +22289,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22161,7 +22342,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22214,7 +22395,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22267,7 +22448,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22320,7 +22501,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22373,7 +22554,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22426,7 +22607,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22479,7 +22660,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22532,7 +22713,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22585,7 +22766,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22638,7 +22819,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22691,7 +22872,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22744,7 +22925,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22797,7 +22978,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22850,7 +23031,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22903,7 +23084,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -22956,7 +23137,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -23009,7 +23190,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -23062,7 +23243,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -23115,7 +23296,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -23168,7 +23349,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -23221,7 +23402,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -23274,7 +23455,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -23327,7 +23508,7 @@ def _build_whole_decode_faithful_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         m_wo[r], m_w_g[r], m_gate_r[r], m_post_rms[r],
                         m_gate_w[r], m_router_bias[r],
-                        m_w_gate_r[r], m_w_up_r[r], m_w_down_r[r],
+                        m_w_gate_r[r], m_w_gate_r_scale[r], m_w_up_r[r], m_w_up_r_scale[r], m_w_down_r[r], m_w_down_r_scale[r],
                         m_w_gate_s[r], m_w_up_s[r], m_w_down_s[r], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -24163,14 +24344,17 @@ def _build_whole_decode_faithful_real_program(
             local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
             local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
             w_gate: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_gate_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_up: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_up_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_down: pl.Tensor[
-                [n_local_experts, inter, HIDDEN], pl.BF16
+                [n_local_experts, inter, HIDDEN], pl.INT8
             ],
+            w_down_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
             local_routed_y: pl.Tensor[
                 [local_recv_max, HIDDEN], pl.BF16
             ],
@@ -24210,6 +24394,71 @@ def _build_whole_decode_faithful_real_program(
                             [RECV_TILE, inter], dtype=pl.BF16,
                         )
 
+                        # In-kernel per-token INT8 quant of the routed input tile
+                        # (DeepSeek v4 cast chain FP32->INT32 rint->FP16 round->
+                        # INT8 trunc, pl.at CORE_GROUP).  x_scale_dq (per-token
+                        # dequant scale) SSA-carried into the gate/up dequant.
+                        x_i8 = pl.create_tensor(
+                            [RECV_TILE, HIDDEN], dtype=pl.INT8,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP, name_hint="routed_x_quant",
+                        ):
+                            xe_amax = pl.full(
+                                [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                            )
+                            for xka in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
+                                xka0 = xka * ROUTED_GATE_K_CHUNK
+                                xe_a = pl.cast(
+                                    pl.slice(
+                                        local_routed_x,
+                                        [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                        [tile_offset, xka0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                xe_amax = pl.maximum(
+                                    xe_amax,
+                                    pl.reshape(
+                                        pl.row_max(
+                                            pl.maximum(xe_a, pl.neg(xe_a)),
+                                        ),
+                                        [1, RECV_TILE],
+                                    ),
+                                )
+                            xe_sq_row = pl.div(
+                                pl.full(
+                                    [1, RECV_TILE], dtype=pl.FP32, value=127.0,
+                                ),
+                                xe_amax,
+                            )
+                            x_scale_dq = pl.reshape(
+                                pl.recip(xe_sq_row), [RECV_TILE, 1],
+                            )
+                            xe_sq_col = pl.reshape(xe_sq_row, [RECV_TILE, 1])
+                            for xkn in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
+                                xkn0 = xkn * ROUTED_GATE_K_CHUNK
+                                xe_q = pl.cast(
+                                    pl.slice(
+                                        local_routed_x,
+                                        [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                        [tile_offset, xkn0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                xe_scaled = pl.row_expand_mul(xe_q, xe_sq_col)
+                                xe_i32 = pl.cast(
+                                    xe_scaled, target_type=pl.INT32, mode="rint",
+                                )
+                                xe_half = pl.cast(
+                                    xe_i32, target_type=pl.FP16, mode="round",
+                                )
+                                x_i8[
+                                    :, xkn0 : xkn0 + ROUTED_GATE_K_CHUNK
+                                ] = pl.cast(
+                                    xe_half, target_type=pl.INT8, mode="trunc",
+                                )
+
                         # Gate+up projection: each SPMD block handles one N-chunk
                         # of the inter dimension.  pl.slice of external BF16 input
                         # (local_routed_x) produces tmov mat→left which is valid in
@@ -24220,9 +24469,9 @@ def _build_whole_decode_faithful_real_program(
                         ):
                             n0 = nb * ROUTED_GATE_N_CHUNK
                             x0 = pl.slice(
-                                local_routed_x,
+                                x_i8,
                                 [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                                [tile_offset, 0],
+                                [0, 0],
                                 valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
                             )
                             wg0_2d = pl.reshape(
@@ -24241,14 +24490,14 @@ def _build_whole_decode_faithful_real_program(
                                 ),
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
-                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.INT32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.INT32)
                             for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
                                 k0 = kb * ROUTED_GATE_K_CHUNK
                                 xk = pl.slice(
-                                    local_routed_x,
+                                    x_i8,
                                     [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                                    [tile_offset, k0],
+                                    [0, k0],
                                     valid_shape=[
                                         tile_valid, ROUTED_GATE_K_CHUNK,
                                     ],
@@ -24280,19 +24529,45 @@ def _build_whole_decode_faithful_real_program(
                                 gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
                                 up_acc = pl.matmul_acc(up_acc, xk, wuk)
 
-                            sigmoid = pl.recip(
-                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
+                            # Dequant INT32 -> FP32: per-token act scale (row) x
+                            # per-output-channel weight scale (col).
+                            wg_scale_row = pl.slice(
+                                w_gate_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
                             )
-                            silu = pl.mul(gate_acc, sigmoid)
+                            wu_scale_row = pl.slice(
+                                w_up_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
+                            )
+                            gate_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        gate_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_dq,
+                                ),
+                                wg_scale_row,
+                            )
+                            up_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        up_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_dq,
+                                ),
+                                wu_scale_row,
+                            )
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
+                            )
+                            silu = pl.mul(gate_2d, sigmoid)
                             if _routed_swiglu_step:
                                 silu_c = pl.minimum(silu, _routed_swiglu_limit)
                                 up_c = pl.maximum(
-                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    pl.minimum(up_2d, _routed_swiglu_limit),
                                     -_routed_swiglu_limit,
                                 )
                                 gated = pl.mul(silu_c, up_c)
                             else:
-                                gated = pl.mul(silu, up_acc)
+                                gated = pl.mul(silu, up_2d)
 
                             gated_v = pl.set_validshape(
                                 gated, tile_valid, ROUTED_GATE_N_CHUNK,
@@ -24305,6 +24580,69 @@ def _build_whole_decode_faithful_real_program(
                                 :, n0 : n0 + ROUTED_GATE_N_CHUNK
                             ] = pl.cast(gated_v, target_type=pl.BF16)
 
+                        # Per-token INT8 requant of the swiglu intermediate for the
+                        # INT8 down-proj (DeepSeek v4 h_tile_i8 cast chain).
+                        h_i8 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.INT8,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP, name_hint="routed_h_quant",
+                        ):
+                            eh_amax = pl.full(
+                                [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                            )
+                            for hqa in pl.range(inter // ROUTED_GATE_N_CHUNK):
+                                hqa0 = hqa * ROUTED_GATE_N_CHUNK
+                                eh_a = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqa0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                eh_amax = pl.maximum(
+                                    eh_amax,
+                                    pl.reshape(
+                                        pl.row_max(
+                                            pl.maximum(eh_a, pl.neg(eh_a)),
+                                        ),
+                                        [1, RECV_TILE],
+                                    ),
+                                )
+                            eh_sq_row = pl.div(
+                                pl.full(
+                                    [1, RECV_TILE], dtype=pl.FP32, value=127.0,
+                                ),
+                                eh_amax,
+                            )
+                            h_scale_dq = pl.reshape(
+                                pl.recip(eh_sq_row), [RECV_TILE, 1],
+                            )
+                            eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                            for hqn in pl.range(inter // ROUTED_GATE_N_CHUNK):
+                                hqn0 = hqn * ROUTED_GATE_N_CHUNK
+                                eh_q = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqn0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                eh_scaled = pl.row_expand_mul(eh_q, eh_sq_col)
+                                eh_i32 = pl.cast(
+                                    eh_scaled, target_type=pl.INT32, mode="rint",
+                                )
+                                eh_half = pl.cast(
+                                    eh_i32, target_type=pl.FP16, mode="round",
+                                )
+                                h_i8[
+                                    :, hqn0 : hqn0 + ROUTED_GATE_N_CHUNK
+                                ] = pl.cast(
+                                    eh_half, target_type=pl.INT8, mode="trunc",
+                                )
+
                         # Down projection: each SPMD block handles one D-chunk of
                         # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
                         # pl.slice of it gives tmov vec→left ✓.
@@ -24314,7 +24652,7 @@ def _build_whole_decode_faithful_real_program(
                         ):
                             d0 = db * ROUTED_DOWN_N_CHUNK
                             h0 = pl.slice(
-                                h_bf16,
+                                h_i8,
                                 [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                 [0, 0],
                                 valid_shape=[
@@ -24333,11 +24671,11 @@ def _build_whole_decode_faithful_real_program(
                                 ),
                                 [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
                             )
-                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.INT32)
                             for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
                                 k0 = kb2 * ROUTED_DOWN_K_CHUNK
                                 hk = pl.slice(
-                                    h_bf16,
+                                    h_i8,
                                     [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                     [0, k0],
                                     valid_shape=[
@@ -24361,8 +24699,20 @@ def _build_whole_decode_faithful_real_program(
                                 )
                                 y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
+                            wd_scale_row = pl.slice(
+                                w_down_scale, [1, ROUTED_DOWN_N_CHUNK], [e, d0],
+                            )
+                            y_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        y_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    h_scale_dq,
+                                ),
+                                wd_scale_row,
+                            )
                             y_v = pl.set_validshape(
-                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                                y_2d, tile_valid, ROUTED_DOWN_N_CHUNK,
                             )
                             y_m = pl.fillpad(
                                 y_v, pad_value=pl.PadValue.zero,
@@ -24382,14 +24732,17 @@ def _build_whole_decode_faithful_real_program(
             local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
             local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
             w_gate_r: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_up_r: pl.Tensor[
-                [n_local_experts, HIDDEN, inter], pl.BF16
+                [n_local_experts, HIDDEN, inter], pl.INT8
             ],
+            w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
             w_down_r: pl.Tensor[
-                [n_local_experts, inter, HIDDEN], pl.BF16
+                [n_local_experts, inter, HIDDEN], pl.INT8
             ],
+            w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
             local_routed_y: pl.Out[
                 pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
             ],
@@ -24397,7 +24750,9 @@ def _build_whole_decode_faithful_real_program(
             local_routed_y = self._expert_routed(
                 local_routed_x,
                 local_expert_offset, local_expert_count,
-                w_gate_r, w_up_r, w_down_r,
+                w_gate_r, w_gate_r_scale,
+                w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
                 local_routed_y,
             )
             return local_routed_y
@@ -24803,9 +25158,12 @@ def _build_whole_decode_faithful_real_program(
             post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
-            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.BF16],
-            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.BF16],
+            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
+            w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
             w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
             w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
             w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
@@ -24953,7 +25311,8 @@ def _build_whole_decode_faithful_real_program(
             local_routed_y = self.expert_routed_step(
                 local_routed_x,
                 local_expert_offset, local_expert_count,
-                w_gate_r, w_up_r, w_down_r,
+                w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
                 local_routed_y,
             )
 
@@ -25212,9 +25571,12 @@ def _build_whole_decode_faithful_real_program(
             dense_w_down: pl.Tensor[[tp_size, 3, INTER_LOCAL, HIDDEN], pl.BF16],
             moe_gate_w: pl.Tensor[[tp_size, 42, HIDDEN, N_EXPERTS], pl.FP32],
             moe_router_bias: pl.Tensor[[tp_size, 42, N_EXPERTS], pl.FP32],
-            moe_w_gate_r: pl.Tensor[[tp_size, 42, n_local_experts, HIDDEN, inter], pl.BF16],
-            moe_w_up_r: pl.Tensor[[tp_size, 42, n_local_experts, HIDDEN, inter], pl.BF16],
-            moe_w_down_r: pl.Tensor[[tp_size, 42, n_local_experts, inter, HIDDEN], pl.BF16],
+            moe_w_gate_r: pl.Tensor[[tp_size, 42, n_local_experts, HIDDEN, inter], pl.INT8],
+            moe_w_gate_r_scale: pl.Tensor[[tp_size, 42, n_local_experts, inter], pl.FP32],
+            moe_w_up_r: pl.Tensor[[tp_size, 42, n_local_experts, HIDDEN, inter], pl.INT8],
+            moe_w_up_r_scale: pl.Tensor[[tp_size, 42, n_local_experts, inter], pl.FP32],
+            moe_w_down_r: pl.Tensor[[tp_size, 42, n_local_experts, inter, HIDDEN], pl.INT8],
+            moe_w_down_r_scale: pl.Tensor[[tp_size, 42, n_local_experts, HIDDEN], pl.FP32],
             moe_w_gate_s: pl.Tensor[[tp_size, 42, HIDDEN, sh_inter_local], pl.BF16],
             moe_w_up_s: pl.Tensor[[tp_size, 42, HIDDEN, sh_inter_local], pl.BF16],
             moe_w_down_s: pl.Tensor[[tp_size, 42, sh_inter_local, HIDDEN], pl.BF16],
@@ -25338,7 +25700,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 0], moe_router_bias[r, 0],
-                        moe_w_gate_r[r, 0], moe_w_up_r[r, 0], moe_w_down_r[r, 0],
+                        moe_w_gate_r[r, 0], moe_w_gate_r_scale[r, 0], moe_w_up_r[r, 0], moe_w_up_r_scale[r, 0], moe_w_down_r[r, 0], moe_w_down_r_scale[r, 0],
                         moe_w_gate_s[r, 0], moe_w_up_s[r, 0], moe_w_down_s[r, 0], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25391,7 +25753,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 1], moe_router_bias[r, 1],
-                        moe_w_gate_r[r, 1], moe_w_up_r[r, 1], moe_w_down_r[r, 1],
+                        moe_w_gate_r[r, 1], moe_w_gate_r_scale[r, 1], moe_w_up_r[r, 1], moe_w_up_r_scale[r, 1], moe_w_down_r[r, 1], moe_w_down_r_scale[r, 1],
                         moe_w_gate_s[r, 1], moe_w_up_s[r, 1], moe_w_down_s[r, 1], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25444,7 +25806,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 2], moe_router_bias[r, 2],
-                        moe_w_gate_r[r, 2], moe_w_up_r[r, 2], moe_w_down_r[r, 2],
+                        moe_w_gate_r[r, 2], moe_w_gate_r_scale[r, 2], moe_w_up_r[r, 2], moe_w_up_r_scale[r, 2], moe_w_down_r[r, 2], moe_w_down_r_scale[r, 2],
                         moe_w_gate_s[r, 2], moe_w_up_s[r, 2], moe_w_down_s[r, 2], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25497,7 +25859,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 3], moe_router_bias[r, 3],
-                        moe_w_gate_r[r, 3], moe_w_up_r[r, 3], moe_w_down_r[r, 3],
+                        moe_w_gate_r[r, 3], moe_w_gate_r_scale[r, 3], moe_w_up_r[r, 3], moe_w_up_r_scale[r, 3], moe_w_down_r[r, 3], moe_w_down_r_scale[r, 3],
                         moe_w_gate_s[r, 3], moe_w_up_s[r, 3], moe_w_down_s[r, 3], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25550,7 +25912,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 4], moe_router_bias[r, 4],
-                        moe_w_gate_r[r, 4], moe_w_up_r[r, 4], moe_w_down_r[r, 4],
+                        moe_w_gate_r[r, 4], moe_w_gate_r_scale[r, 4], moe_w_up_r[r, 4], moe_w_up_r_scale[r, 4], moe_w_down_r[r, 4], moe_w_down_r_scale[r, 4],
                         moe_w_gate_s[r, 4], moe_w_up_s[r, 4], moe_w_down_s[r, 4], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25603,7 +25965,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 5], moe_router_bias[r, 5],
-                        moe_w_gate_r[r, 5], moe_w_up_r[r, 5], moe_w_down_r[r, 5],
+                        moe_w_gate_r[r, 5], moe_w_gate_r_scale[r, 5], moe_w_up_r[r, 5], moe_w_up_r_scale[r, 5], moe_w_down_r[r, 5], moe_w_down_r_scale[r, 5],
                         moe_w_gate_s[r, 5], moe_w_up_s[r, 5], moe_w_down_s[r, 5], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25656,7 +26018,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 6], moe_router_bias[r, 6],
-                        moe_w_gate_r[r, 6], moe_w_up_r[r, 6], moe_w_down_r[r, 6],
+                        moe_w_gate_r[r, 6], moe_w_gate_r_scale[r, 6], moe_w_up_r[r, 6], moe_w_up_r_scale[r, 6], moe_w_down_r[r, 6], moe_w_down_r_scale[r, 6],
                         moe_w_gate_s[r, 6], moe_w_up_s[r, 6], moe_w_down_s[r, 6], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25709,7 +26071,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 7], moe_router_bias[r, 7],
-                        moe_w_gate_r[r, 7], moe_w_up_r[r, 7], moe_w_down_r[r, 7],
+                        moe_w_gate_r[r, 7], moe_w_gate_r_scale[r, 7], moe_w_up_r[r, 7], moe_w_up_r_scale[r, 7], moe_w_down_r[r, 7], moe_w_down_r_scale[r, 7],
                         moe_w_gate_s[r, 7], moe_w_up_s[r, 7], moe_w_down_s[r, 7], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25762,7 +26124,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 8], moe_router_bias[r, 8],
-                        moe_w_gate_r[r, 8], moe_w_up_r[r, 8], moe_w_down_r[r, 8],
+                        moe_w_gate_r[r, 8], moe_w_gate_r_scale[r, 8], moe_w_up_r[r, 8], moe_w_up_r_scale[r, 8], moe_w_down_r[r, 8], moe_w_down_r_scale[r, 8],
                         moe_w_gate_s[r, 8], moe_w_up_s[r, 8], moe_w_down_s[r, 8], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25815,7 +26177,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 9], moe_router_bias[r, 9],
-                        moe_w_gate_r[r, 9], moe_w_up_r[r, 9], moe_w_down_r[r, 9],
+                        moe_w_gate_r[r, 9], moe_w_gate_r_scale[r, 9], moe_w_up_r[r, 9], moe_w_up_r_scale[r, 9], moe_w_down_r[r, 9], moe_w_down_r_scale[r, 9],
                         moe_w_gate_s[r, 9], moe_w_up_s[r, 9], moe_w_down_s[r, 9], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25868,7 +26230,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 10], moe_router_bias[r, 10],
-                        moe_w_gate_r[r, 10], moe_w_up_r[r, 10], moe_w_down_r[r, 10],
+                        moe_w_gate_r[r, 10], moe_w_gate_r_scale[r, 10], moe_w_up_r[r, 10], moe_w_up_r_scale[r, 10], moe_w_down_r[r, 10], moe_w_down_r_scale[r, 10],
                         moe_w_gate_s[r, 10], moe_w_up_s[r, 10], moe_w_down_s[r, 10], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25921,7 +26283,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 11], moe_router_bias[r, 11],
-                        moe_w_gate_r[r, 11], moe_w_up_r[r, 11], moe_w_down_r[r, 11],
+                        moe_w_gate_r[r, 11], moe_w_gate_r_scale[r, 11], moe_w_up_r[r, 11], moe_w_up_r_scale[r, 11], moe_w_down_r[r, 11], moe_w_down_r_scale[r, 11],
                         moe_w_gate_s[r, 11], moe_w_up_s[r, 11], moe_w_down_s[r, 11], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -25974,7 +26336,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 12], moe_router_bias[r, 12],
-                        moe_w_gate_r[r, 12], moe_w_up_r[r, 12], moe_w_down_r[r, 12],
+                        moe_w_gate_r[r, 12], moe_w_gate_r_scale[r, 12], moe_w_up_r[r, 12], moe_w_up_r_scale[r, 12], moe_w_down_r[r, 12], moe_w_down_r_scale[r, 12],
                         moe_w_gate_s[r, 12], moe_w_up_s[r, 12], moe_w_down_s[r, 12], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26027,7 +26389,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 13], moe_router_bias[r, 13],
-                        moe_w_gate_r[r, 13], moe_w_up_r[r, 13], moe_w_down_r[r, 13],
+                        moe_w_gate_r[r, 13], moe_w_gate_r_scale[r, 13], moe_w_up_r[r, 13], moe_w_up_r_scale[r, 13], moe_w_down_r[r, 13], moe_w_down_r_scale[r, 13],
                         moe_w_gate_s[r, 13], moe_w_up_s[r, 13], moe_w_down_s[r, 13], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26080,7 +26442,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 14], moe_router_bias[r, 14],
-                        moe_w_gate_r[r, 14], moe_w_up_r[r, 14], moe_w_down_r[r, 14],
+                        moe_w_gate_r[r, 14], moe_w_gate_r_scale[r, 14], moe_w_up_r[r, 14], moe_w_up_r_scale[r, 14], moe_w_down_r[r, 14], moe_w_down_r_scale[r, 14],
                         moe_w_gate_s[r, 14], moe_w_up_s[r, 14], moe_w_down_s[r, 14], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26133,7 +26495,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 15], moe_router_bias[r, 15],
-                        moe_w_gate_r[r, 15], moe_w_up_r[r, 15], moe_w_down_r[r, 15],
+                        moe_w_gate_r[r, 15], moe_w_gate_r_scale[r, 15], moe_w_up_r[r, 15], moe_w_up_r_scale[r, 15], moe_w_down_r[r, 15], moe_w_down_r_scale[r, 15],
                         moe_w_gate_s[r, 15], moe_w_up_s[r, 15], moe_w_down_s[r, 15], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26186,7 +26548,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 16], moe_router_bias[r, 16],
-                        moe_w_gate_r[r, 16], moe_w_up_r[r, 16], moe_w_down_r[r, 16],
+                        moe_w_gate_r[r, 16], moe_w_gate_r_scale[r, 16], moe_w_up_r[r, 16], moe_w_up_r_scale[r, 16], moe_w_down_r[r, 16], moe_w_down_r_scale[r, 16],
                         moe_w_gate_s[r, 16], moe_w_up_s[r, 16], moe_w_down_s[r, 16], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26239,7 +26601,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 17], moe_router_bias[r, 17],
-                        moe_w_gate_r[r, 17], moe_w_up_r[r, 17], moe_w_down_r[r, 17],
+                        moe_w_gate_r[r, 17], moe_w_gate_r_scale[r, 17], moe_w_up_r[r, 17], moe_w_up_r_scale[r, 17], moe_w_down_r[r, 17], moe_w_down_r_scale[r, 17],
                         moe_w_gate_s[r, 17], moe_w_up_s[r, 17], moe_w_down_s[r, 17], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26292,7 +26654,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 18], moe_router_bias[r, 18],
-                        moe_w_gate_r[r, 18], moe_w_up_r[r, 18], moe_w_down_r[r, 18],
+                        moe_w_gate_r[r, 18], moe_w_gate_r_scale[r, 18], moe_w_up_r[r, 18], moe_w_up_r_scale[r, 18], moe_w_down_r[r, 18], moe_w_down_r_scale[r, 18],
                         moe_w_gate_s[r, 18], moe_w_up_s[r, 18], moe_w_down_s[r, 18], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26345,7 +26707,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 19], moe_router_bias[r, 19],
-                        moe_w_gate_r[r, 19], moe_w_up_r[r, 19], moe_w_down_r[r, 19],
+                        moe_w_gate_r[r, 19], moe_w_gate_r_scale[r, 19], moe_w_up_r[r, 19], moe_w_up_r_scale[r, 19], moe_w_down_r[r, 19], moe_w_down_r_scale[r, 19],
                         moe_w_gate_s[r, 19], moe_w_up_s[r, 19], moe_w_down_s[r, 19], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26398,7 +26760,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 20], moe_router_bias[r, 20],
-                        moe_w_gate_r[r, 20], moe_w_up_r[r, 20], moe_w_down_r[r, 20],
+                        moe_w_gate_r[r, 20], moe_w_gate_r_scale[r, 20], moe_w_up_r[r, 20], moe_w_up_r_scale[r, 20], moe_w_down_r[r, 20], moe_w_down_r_scale[r, 20],
                         moe_w_gate_s[r, 20], moe_w_up_s[r, 20], moe_w_down_s[r, 20], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26451,7 +26813,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 21], moe_router_bias[r, 21],
-                        moe_w_gate_r[r, 21], moe_w_up_r[r, 21], moe_w_down_r[r, 21],
+                        moe_w_gate_r[r, 21], moe_w_gate_r_scale[r, 21], moe_w_up_r[r, 21], moe_w_up_r_scale[r, 21], moe_w_down_r[r, 21], moe_w_down_r_scale[r, 21],
                         moe_w_gate_s[r, 21], moe_w_up_s[r, 21], moe_w_down_s[r, 21], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26504,7 +26866,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 22], moe_router_bias[r, 22],
-                        moe_w_gate_r[r, 22], moe_w_up_r[r, 22], moe_w_down_r[r, 22],
+                        moe_w_gate_r[r, 22], moe_w_gate_r_scale[r, 22], moe_w_up_r[r, 22], moe_w_up_r_scale[r, 22], moe_w_down_r[r, 22], moe_w_down_r_scale[r, 22],
                         moe_w_gate_s[r, 22], moe_w_up_s[r, 22], moe_w_down_s[r, 22], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26557,7 +26919,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 23], moe_router_bias[r, 23],
-                        moe_w_gate_r[r, 23], moe_w_up_r[r, 23], moe_w_down_r[r, 23],
+                        moe_w_gate_r[r, 23], moe_w_gate_r_scale[r, 23], moe_w_up_r[r, 23], moe_w_up_r_scale[r, 23], moe_w_down_r[r, 23], moe_w_down_r_scale[r, 23],
                         moe_w_gate_s[r, 23], moe_w_up_s[r, 23], moe_w_down_s[r, 23], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26610,7 +26972,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 24], moe_router_bias[r, 24],
-                        moe_w_gate_r[r, 24], moe_w_up_r[r, 24], moe_w_down_r[r, 24],
+                        moe_w_gate_r[r, 24], moe_w_gate_r_scale[r, 24], moe_w_up_r[r, 24], moe_w_up_r_scale[r, 24], moe_w_down_r[r, 24], moe_w_down_r_scale[r, 24],
                         moe_w_gate_s[r, 24], moe_w_up_s[r, 24], moe_w_down_s[r, 24], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26663,7 +27025,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 25], moe_router_bias[r, 25],
-                        moe_w_gate_r[r, 25], moe_w_up_r[r, 25], moe_w_down_r[r, 25],
+                        moe_w_gate_r[r, 25], moe_w_gate_r_scale[r, 25], moe_w_up_r[r, 25], moe_w_up_r_scale[r, 25], moe_w_down_r[r, 25], moe_w_down_r_scale[r, 25],
                         moe_w_gate_s[r, 25], moe_w_up_s[r, 25], moe_w_down_s[r, 25], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26716,7 +27078,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 26], moe_router_bias[r, 26],
-                        moe_w_gate_r[r, 26], moe_w_up_r[r, 26], moe_w_down_r[r, 26],
+                        moe_w_gate_r[r, 26], moe_w_gate_r_scale[r, 26], moe_w_up_r[r, 26], moe_w_up_r_scale[r, 26], moe_w_down_r[r, 26], moe_w_down_r_scale[r, 26],
                         moe_w_gate_s[r, 26], moe_w_up_s[r, 26], moe_w_down_s[r, 26], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26769,7 +27131,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 27], moe_router_bias[r, 27],
-                        moe_w_gate_r[r, 27], moe_w_up_r[r, 27], moe_w_down_r[r, 27],
+                        moe_w_gate_r[r, 27], moe_w_gate_r_scale[r, 27], moe_w_up_r[r, 27], moe_w_up_r_scale[r, 27], moe_w_down_r[r, 27], moe_w_down_r_scale[r, 27],
                         moe_w_gate_s[r, 27], moe_w_up_s[r, 27], moe_w_down_s[r, 27], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26822,7 +27184,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 28], moe_router_bias[r, 28],
-                        moe_w_gate_r[r, 28], moe_w_up_r[r, 28], moe_w_down_r[r, 28],
+                        moe_w_gate_r[r, 28], moe_w_gate_r_scale[r, 28], moe_w_up_r[r, 28], moe_w_up_r_scale[r, 28], moe_w_down_r[r, 28], moe_w_down_r_scale[r, 28],
                         moe_w_gate_s[r, 28], moe_w_up_s[r, 28], moe_w_down_s[r, 28], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26875,7 +27237,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 29], moe_router_bias[r, 29],
-                        moe_w_gate_r[r, 29], moe_w_up_r[r, 29], moe_w_down_r[r, 29],
+                        moe_w_gate_r[r, 29], moe_w_gate_r_scale[r, 29], moe_w_up_r[r, 29], moe_w_up_r_scale[r, 29], moe_w_down_r[r, 29], moe_w_down_r_scale[r, 29],
                         moe_w_gate_s[r, 29], moe_w_up_s[r, 29], moe_w_down_s[r, 29], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26928,7 +27290,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 30], moe_router_bias[r, 30],
-                        moe_w_gate_r[r, 30], moe_w_up_r[r, 30], moe_w_down_r[r, 30],
+                        moe_w_gate_r[r, 30], moe_w_gate_r_scale[r, 30], moe_w_up_r[r, 30], moe_w_up_r_scale[r, 30], moe_w_down_r[r, 30], moe_w_down_r_scale[r, 30],
                         moe_w_gate_s[r, 30], moe_w_up_s[r, 30], moe_w_down_s[r, 30], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -26981,7 +27343,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 31], moe_router_bias[r, 31],
-                        moe_w_gate_r[r, 31], moe_w_up_r[r, 31], moe_w_down_r[r, 31],
+                        moe_w_gate_r[r, 31], moe_w_gate_r_scale[r, 31], moe_w_up_r[r, 31], moe_w_up_r_scale[r, 31], moe_w_down_r[r, 31], moe_w_down_r_scale[r, 31],
                         moe_w_gate_s[r, 31], moe_w_up_s[r, 31], moe_w_down_s[r, 31], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27034,7 +27396,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 32], moe_router_bias[r, 32],
-                        moe_w_gate_r[r, 32], moe_w_up_r[r, 32], moe_w_down_r[r, 32],
+                        moe_w_gate_r[r, 32], moe_w_gate_r_scale[r, 32], moe_w_up_r[r, 32], moe_w_up_r_scale[r, 32], moe_w_down_r[r, 32], moe_w_down_r_scale[r, 32],
                         moe_w_gate_s[r, 32], moe_w_up_s[r, 32], moe_w_down_s[r, 32], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27087,7 +27449,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 33], moe_router_bias[r, 33],
-                        moe_w_gate_r[r, 33], moe_w_up_r[r, 33], moe_w_down_r[r, 33],
+                        moe_w_gate_r[r, 33], moe_w_gate_r_scale[r, 33], moe_w_up_r[r, 33], moe_w_up_r_scale[r, 33], moe_w_down_r[r, 33], moe_w_down_r_scale[r, 33],
                         moe_w_gate_s[r, 33], moe_w_up_s[r, 33], moe_w_down_s[r, 33], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27140,7 +27502,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 34], moe_router_bias[r, 34],
-                        moe_w_gate_r[r, 34], moe_w_up_r[r, 34], moe_w_down_r[r, 34],
+                        moe_w_gate_r[r, 34], moe_w_gate_r_scale[r, 34], moe_w_up_r[r, 34], moe_w_up_r_scale[r, 34], moe_w_down_r[r, 34], moe_w_down_r_scale[r, 34],
                         moe_w_gate_s[r, 34], moe_w_up_s[r, 34], moe_w_down_s[r, 34], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27193,7 +27555,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 35], moe_router_bias[r, 35],
-                        moe_w_gate_r[r, 35], moe_w_up_r[r, 35], moe_w_down_r[r, 35],
+                        moe_w_gate_r[r, 35], moe_w_gate_r_scale[r, 35], moe_w_up_r[r, 35], moe_w_up_r_scale[r, 35], moe_w_down_r[r, 35], moe_w_down_r_scale[r, 35],
                         moe_w_gate_s[r, 35], moe_w_up_s[r, 35], moe_w_down_s[r, 35], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27246,7 +27608,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 36], moe_router_bias[r, 36],
-                        moe_w_gate_r[r, 36], moe_w_up_r[r, 36], moe_w_down_r[r, 36],
+                        moe_w_gate_r[r, 36], moe_w_gate_r_scale[r, 36], moe_w_up_r[r, 36], moe_w_up_r_scale[r, 36], moe_w_down_r[r, 36], moe_w_down_r_scale[r, 36],
                         moe_w_gate_s[r, 36], moe_w_up_s[r, 36], moe_w_down_s[r, 36], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27299,7 +27661,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 37], moe_router_bias[r, 37],
-                        moe_w_gate_r[r, 37], moe_w_up_r[r, 37], moe_w_down_r[r, 37],
+                        moe_w_gate_r[r, 37], moe_w_gate_r_scale[r, 37], moe_w_up_r[r, 37], moe_w_up_r_scale[r, 37], moe_w_down_r[r, 37], moe_w_down_r_scale[r, 37],
                         moe_w_gate_s[r, 37], moe_w_up_s[r, 37], moe_w_down_s[r, 37], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27352,7 +27714,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 38], moe_router_bias[r, 38],
-                        moe_w_gate_r[r, 38], moe_w_up_r[r, 38], moe_w_down_r[r, 38],
+                        moe_w_gate_r[r, 38], moe_w_gate_r_scale[r, 38], moe_w_up_r[r, 38], moe_w_up_r_scale[r, 38], moe_w_down_r[r, 38], moe_w_down_r_scale[r, 38],
                         moe_w_gate_s[r, 38], moe_w_up_s[r, 38], moe_w_down_s[r, 38], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27405,7 +27767,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 39], moe_router_bias[r, 39],
-                        moe_w_gate_r[r, 39], moe_w_up_r[r, 39], moe_w_down_r[r, 39],
+                        moe_w_gate_r[r, 39], moe_w_gate_r_scale[r, 39], moe_w_up_r[r, 39], moe_w_up_r_scale[r, 39], moe_w_down_r[r, 39], moe_w_down_r_scale[r, 39],
                         moe_w_gate_s[r, 39], moe_w_up_s[r, 39], moe_w_down_s[r, 39], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27458,7 +27820,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 40], moe_router_bias[r, 40],
-                        moe_w_gate_r[r, 40], moe_w_up_r[r, 40], moe_w_down_r[r, 40],
+                        moe_w_gate_r[r, 40], moe_w_gate_r_scale[r, 40], moe_w_up_r[r, 40], moe_w_up_r_scale[r, 40], moe_w_down_r[r, 40], moe_w_down_r_scale[r, 40],
                         moe_w_gate_s[r, 40], moe_w_up_s[r, 40], moe_w_down_s[r, 40], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,
@@ -27511,7 +27873,7 @@ def _build_whole_decode_faithful_real_program(
                         rope_cos_swa[r], rope_sin_swa[r], k_cache[r], v_cache[r],
                         swa_wo[r, 0], swa_w_g[r, 0], swa_gate_r[r, 0], post_rms[r],
                         moe_gate_w[r, 41], moe_router_bias[r, 41],
-                        moe_w_gate_r[r, 41], moe_w_up_r[r, 41], moe_w_down_r[r, 41],
+                        moe_w_gate_r[r, 41], moe_w_gate_r_scale[r, 41], moe_w_up_r[r, 41], moe_w_up_r_scale[r, 41], moe_w_down_r[r, 41], moe_w_down_r_scale[r, 41],
                         moe_w_gate_s[r, 41], moe_w_up_s[r, 41], moe_w_down_s[r, 41], next_hidden_out[r],
                         attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,
                         recv_x, data_done_sig, recv_r_route,

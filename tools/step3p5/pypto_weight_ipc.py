@@ -346,8 +346,18 @@ def export_from_checkpoint(
         load_step3p5_weights_for_rank,
         verify_bundle_shapes,
     )
+    import torch  # noqa: PLC0415
     bundle = load_step3p5_weights_for_rank(ckpt_dir, rank, tp_world_size)
     verify_bundle_shapes(bundle, tp_world_size)
+    # The whole_decode host_orch expects FP32 for the norm weights + final_norm
+    # (matching the dummy device harness), but weight_loader stores norms as bf16.
+    # Zero-copy IPC cannot cast at read time, so materialize FP32 bytes here so the
+    # exported pool + map dtype are FP32 (moe_gate_w/moe_router_bias already FP32).
+    _PROG_FP32 = ("input_rms_weight", "post_attn_rms_weight", "q_norm_weight",
+                  "k_norm_weight", "final_norm_weight")
+    for _k in _PROG_FP32:
+        if _k in bundle and str(bundle[_k].dtype) != "torch.float32":
+            bundle[_k] = bundle[_k].to(torch.float32)
     exp = WeightIpcExporter(dev)
     return exp.export(
         bundle, out_dir=out_dir, rank=rank, tp_world_size=tp_world_size,

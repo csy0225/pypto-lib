@@ -167,6 +167,12 @@ KEY_MOE_ROUTER_BIAS = "moe_router_bias"
 KEY_MOE_W_GATE_R = "moe_w_gate_r"
 KEY_MOE_W_UP_R = "moe_w_up_r"
 KEY_MOE_W_DOWN_R = "moe_w_down_r"
+# INT8-native routed-expert scales (present only when the bundle is built with
+# ``int8_routed=True``): one FP32 per output channel, aligned to the routed
+# weight's trailing (N/output) dim after ``_transpose_routed_block``.
+KEY_MOE_W_GATE_R_SCALE = "moe_w_gate_r_scale"
+KEY_MOE_W_UP_R_SCALE = "moe_w_up_r_scale"
+KEY_MOE_W_DOWN_R_SCALE = "moe_w_down_r_scale"
 KEY_MOE_W_GATE_S = "moe_w_gate_s"
 KEY_MOE_W_UP_S = "moe_w_up_s"
 KEY_MOE_W_DOWN_S = "moe_w_down_s"
@@ -484,6 +490,40 @@ def _load_quantized_expert_projector(
     offset = cache.get(offset_key) if offset_key in cache.weight_map else None
     return _dequant_w8a8_dynamic_weight(weight, scale, offset)
 
+
+def _load_quantized_expert_projector_int8(
+    cache: _ShardCache,
+    layer_idx: int,
+    expert_idx: int,
+    proj: str,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """INT8-native variant of :func:`_load_quantized_expert_projector`.
+
+    Returns ``(int8_weight, fp32_scale)`` WITHOUT dequantizing, so the routed
+    weight pool stays INT8 (~half the BF16 bytes) and the kernel dequantizes
+    per-tile on-chip. ``int8_weight`` is ``[out, in]`` (HF orientation, one INT8
+    per element); ``fp32_scale`` is ``[out]`` (one FP32 per output row). The
+    W8A8_DYNAMIC ``_offset`` is currently all-zeros in the checkpoint; a nonzero
+    offset would require folding into the INT8 pool and is rejected here.
+    """
+    import torch  # noqa: PLC0415
+
+    key = _quant_expert_prefix(layer_idx, expert_idx, proj)
+    weight = cache.get(key)
+    scale = cache.get(f"{key}_scale")
+    offset_key = f"{key}_offset"
+    if offset_key in cache.weight_map:
+        offset = cache.get(offset_key)
+        if bool(offset.any()):
+            raise ValueError(
+                f"int8_routed path requires zero W8A8 offset; {offset_key} is nonzero"
+            )
+    if weight.dtype != torch.int8:
+        raise ValueError(
+            f"int8_routed expects INT8 checkpoint weight for {key}, got {weight.dtype}"
+        )
+    return weight.contiguous(), scale.to(torch.float32).contiguous()
+
 def _to_bf16(t: "torch.Tensor") -> "torch.Tensor":
     import torch  # noqa: PLC0415
 
@@ -621,6 +661,8 @@ def load_step3p5_weights_for_rank(
     ckpt_dir: str,
     rank: int,
     tp_world_size: int = TP_WORLD_SIZE,
+    *,
+    int8_routed: bool = False,
 ) -> dict[str, "torch.Tensor"]:
     """Construct rank ``rank``'s weight bundle from the HF safetensors ckpt.
 
@@ -787,6 +829,13 @@ def load_step3p5_weights_for_rank(
         routed_gate_rows: list[torch.Tensor] = []
         routed_up_rows: list[torch.Tensor] = []
         routed_down_rows: list[torch.Tensor] = []
+        # INT8-native routed collectors (used only when int8_routed=True).
+        routed_gate_rows_i8: list[torch.Tensor] = []
+        routed_up_rows_i8: list[torch.Tensor] = []
+        routed_down_rows_i8: list[torch.Tensor] = []
+        routed_gate_scale_rows: list[torch.Tensor] = []
+        routed_up_scale_rows: list[torch.Tensor] = []
+        routed_down_scale_rows: list[torch.Tensor] = []
         share_gate_rows: list[torch.Tensor] = []
         share_up_rows: list[torch.Tensor] = []
         share_down_rows: list[torch.Tensor] = []
@@ -815,33 +864,57 @@ def load_step3p5_weights_for_rank(
             #   model.layers.L.moe.experts.E.{gate,up,down}_proj.weight
             # We dequantize only this rank's EP-owned experts and then reuse
             # the exact BF16 bundle layout expected by existing kernels.
-            if _has_quantized_routed_experts(weight_map, li):
-                gate_slab = torch.stack([
-                    _load_quantized_expert_projector(cache, li, eid, "gate_proj")
-                    for eid in range(ep_lo, ep_hi)
-                ], dim=0)
-                up_slab = torch.stack([
-                    _load_quantized_expert_projector(cache, li, eid, "up_proj")
-                    for eid in range(ep_lo, ep_hi)
-                ], dim=0)
-                down_slab = torch.stack([
-                    _load_quantized_expert_projector(cache, li, eid, "down_proj")
-                    for eid in range(ep_lo, ep_hi)
-                ], dim=0)
+            if int8_routed:
+                # INT8-native: keep INT8 weight + per-output-row FP32 scale
+                # (requires a W8A8 checkpoint). After _transpose_routed_block the
+                # output dim is trailing (N), so the scale is per-N.
+                if not _has_quantized_routed_experts(weight_map, li):
+                    raise ValueError(
+                        f"int8_routed=True requires quantized routed experts; layer {li} is not W8A8"
+                    )
+                gate_pairs = [_load_quantized_expert_projector_int8(cache, li, eid, "gate_proj")
+                              for eid in range(ep_lo, ep_hi)]
+                up_pairs = [_load_quantized_expert_projector_int8(cache, li, eid, "up_proj")
+                            for eid in range(ep_lo, ep_hi)]
+                down_pairs = [_load_quantized_expert_projector_int8(cache, li, eid, "down_proj")
+                              for eid in range(ep_lo, ep_hi)]
+                routed_gate_rows_i8.append(_transpose_routed_block(
+                    torch.stack([w for w, _ in gate_pairs], dim=0)))
+                routed_up_rows_i8.append(_transpose_routed_block(
+                    torch.stack([w for w, _ in up_pairs], dim=0)))
+                routed_down_rows_i8.append(_transpose_routed_block(
+                    torch.stack([w for w, _ in down_pairs], dim=0)))
+                routed_gate_scale_rows.append(torch.stack([s for _, s in gate_pairs], dim=0))
+                routed_up_scale_rows.append(torch.stack([s for _, s in up_pairs], dim=0))
+                routed_down_scale_rows.append(torch.stack([s for _, s in down_pairs], dim=0))
             else:
-                # Full HF block is [NUM_EXPERTS, *, *]; slice the per-rank
-                # expert window and transpose to kernel orientation below.
-                gate_full = cache.get(moe["gate_proj"])    # [E, MOE_INTER, HIDDEN]
-                up_full = cache.get(moe["up_proj"])
-                down_full = cache.get(moe["down_proj"])    # [E, HIDDEN, MOE_INTER]
+                if _has_quantized_routed_experts(weight_map, li):
+                    gate_slab = torch.stack([
+                        _load_quantized_expert_projector(cache, li, eid, "gate_proj")
+                        for eid in range(ep_lo, ep_hi)
+                    ], dim=0)
+                    up_slab = torch.stack([
+                        _load_quantized_expert_projector(cache, li, eid, "up_proj")
+                        for eid in range(ep_lo, ep_hi)
+                    ], dim=0)
+                    down_slab = torch.stack([
+                        _load_quantized_expert_projector(cache, li, eid, "down_proj")
+                        for eid in range(ep_lo, ep_hi)
+                    ], dim=0)
+                else:
+                    # Full HF block is [NUM_EXPERTS, *, *]; slice the per-rank
+                    # expert window and transpose to kernel orientation below.
+                    gate_full = cache.get(moe["gate_proj"])    # [E, MOE_INTER, HIDDEN]
+                    up_full = cache.get(moe["up_proj"])
+                    down_full = cache.get(moe["down_proj"])    # [E, HIDDEN, MOE_INTER]
 
-                gate_slab = gate_full[ep_lo:ep_hi].contiguous()
-                up_slab = up_full[ep_lo:ep_hi].contiguous()
-                down_slab = down_full[ep_lo:ep_hi].contiguous()
+                    gate_slab = gate_full[ep_lo:ep_hi].contiguous()
+                    up_slab = up_full[ep_lo:ep_hi].contiguous()
+                    down_slab = down_full[ep_lo:ep_hi].contiguous()
 
-            routed_gate_rows.append(_to_bf16(_transpose_routed_block(gate_slab)))
-            routed_up_rows.append(_to_bf16(_transpose_routed_block(up_slab)))
-            routed_down_rows.append(_to_bf16(_transpose_routed_block(down_slab)))
+                routed_gate_rows.append(_to_bf16(_transpose_routed_block(gate_slab)))
+                routed_up_rows.append(_to_bf16(_transpose_routed_block(up_slab)))
+                routed_down_rows.append(_to_bf16(_transpose_routed_block(down_slab)))
 
             # Shared expert: TP-sliced like dense MLP.
             share_gate_rows.append(_slice_mlp_col(
@@ -856,9 +929,17 @@ def load_step3p5_weights_for_rank(
 
         bundle[KEY_MOE_GATE_W] = torch.stack(gate_w_rows, dim=0)
         bundle[KEY_MOE_ROUTER_BIAS] = torch.stack(router_bias_rows, dim=0)
-        bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows, dim=0)
-        bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows, dim=0)
-        bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows, dim=0)
+        if int8_routed:
+            bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows_i8, dim=0)
+            bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows_i8, dim=0)
+            bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows_i8, dim=0)
+            bundle[KEY_MOE_W_GATE_R_SCALE] = torch.stack(routed_gate_scale_rows, dim=0)
+            bundle[KEY_MOE_W_UP_R_SCALE] = torch.stack(routed_up_scale_rows, dim=0)
+            bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(routed_down_scale_rows, dim=0)
+        else:
+            bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows, dim=0)
+            bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows, dim=0)
+            bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows, dim=0)
         bundle[KEY_MOE_W_GATE_S] = torch.stack(share_gate_rows, dim=0)
         bundle[KEY_MOE_W_UP_S] = torch.stack(share_up_rows, dim=0)
         bundle[KEY_MOE_W_DOWN_S] = torch.stack(share_down_rows, dim=0)

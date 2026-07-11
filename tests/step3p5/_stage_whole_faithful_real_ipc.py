@@ -153,9 +153,30 @@ def _do_worker(args) -> int:
         N_SWA = cfg.NUM_HIDDEN_LAYERS - N_FULL
         bf16, f32, i32 = torch.bfloat16, torch.float32, torch.int32
 
+        # VOCAB from the exported map (available now; no rt needed).
+        import json as _json  # noqa: PLC0415
+        with open(os.path.join(args.out, "pypto_weight_map.rank0.json")) as _mf:
+            VOCAB_LOCAL = int(_json.load(_mf)["map"][K.KEY_LM_HEAD]["shape"][0])
+
+        # DistributedWorker contract: host tensors must be .share_memory_() AND
+        # allocated BEFORE prepare() (so forked chips can see them). Weights come
+        # in as DeviceTensor (import_ipc, after prepare) so they are exempt.
+        def zsh(*shape, dtype=bf16):
+            return torch.zeros(shape, dtype=dtype).share_memory_()
+        current_hidden = zsh(tp, BATCH, HIDDEN)
+        gate_r_full = zsh(tp, N_FULL, NHF_PAD, HQ_FULL)
+        gate_r_swa = zsh(tp, N_SWA, NHS_PAD, HQ_SWA)
+        seq_lens = torch.ones(tp, UBD, dtype=i32).share_memory_()
+        block_table = torch.zeros(tp, BTF, dtype=i32).share_memory_()
+        slot_mapping = torch.arange(UBD, dtype=i32).unsqueeze(0).repeat(tp, 1).contiguous().share_memory_()
+        rope_cf, rope_sf = zsh(tp, RSD, ROT_FULL, dtype=f32), zsh(tp, RSD, ROT_FULL, dtype=f32)
+        rope_cs, rope_ss = zsh(tp, RSD, ROT_SWA, dtype=f32), zsh(tp, RSD, ROT_SWA, dtype=f32)
+        k_cache, v_cache = zsh(tp, KVC, HEAD_DIM), zsh(tp, KVC, HEAD_DIM)
+        h_mid_out, next_hidden_out = zsh(tp, BATCH, HIDDEN), zsh(tp, BATCH, HIDDEN)
+        logits_shard_out = torch.zeros(tp, UBD, VOCAB_LOCAL, dtype=f32).share_memory_()
+
         with compiled.prepare() as rt:
             wmaps = import_weights_all(rt, args.out, tp=tp, dev_offset=dev_offset)
-            VOCAB_LOCAL = int(wmaps[0]._map[K.KEY_LM_HEAD]["shape"][0])
 
             def W(key):
                 return build_stacked_weight(wmaps, key)
@@ -165,29 +186,20 @@ def _do_worker(args) -> int:
                                        tuple(per_rank_shape), dtype) for r in range(tp)]
                 return StackedDeviceTensor(shards, (tp, *per_rank_shape), list(range(tp)))
 
-            def z(*shape, dtype=bf16):
-                return torch.zeros(shape, dtype=dtype)
-
-            args_list = [z(tp, BATCH, HIDDEN)]  # current_hidden (dummy)
+            args_list = [current_hidden]  # dummy host, shared
             args_list += [W(K.KEY_INPUT_RMS), W(K.KEY_POST_ATTN_RMS), W(K.KEY_Q_NORM), W(K.KEY_K_NORM)]
             args_list += [W(K.KEY_WQ_FULL), W(K.KEY_WK_FULL), W(K.KEY_WV_FULL), W(K.KEY_WO_FULL), W(K.KEY_WG_FULL),
-                          z(tp, N_FULL, NHF_PAD, HQ_FULL)]
+                          gate_r_full]
             args_list += [W(K.KEY_WQ_SWA), W(K.KEY_WK_SWA), W(K.KEY_WV_SWA), W(K.KEY_WO_SWA), W(K.KEY_WG_SWA),
-                          z(tp, N_SWA, NHS_PAD, HQ_SWA)]
+                          gate_r_swa]
             args_list += [W(K.KEY_DENSE_GATE), W(K.KEY_DENSE_UP), W(K.KEY_DENSE_DOWN)]
             args_list += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS), W(K.KEY_MOE_W_GATE_R),
                           W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_GATE_S),
                           W(K.KEY_MOE_W_UP_S), W(K.KEY_MOE_W_DOWN_S)]
-            args_list += [torch.ones(tp, UBD, dtype=i32), torch.zeros(tp, BTF, dtype=i32),
-                          torch.arange(UBD, dtype=i32).unsqueeze(0).repeat(tp, 1),
-                          z(tp, RSD, ROT_FULL, dtype=f32), z(tp, RSD, ROT_FULL, dtype=f32),
-                          z(tp, RSD, ROT_SWA, dtype=f32), z(tp, RSD, ROT_SWA, dtype=f32),
-                          z(tp, KVC, HEAD_DIM), z(tp, KVC, HEAD_DIM)]
-            h_mid_out = z(tp, BATCH, HIDDEN)
-            next_hidden_out = z(tp, BATCH, HIDDEN)
+            args_list += [seq_lens, block_table, slot_mapping, rope_cf, rope_sf, rope_cs, rope_ss,
+                          k_cache, v_cache]
             args_list += [h_mid_out, next_hidden_out]
             args_list += [W_reshape(K.KEY_FINAL_NORM, (1, HIDDEN), f32), W(K.KEY_LM_HEAD)]
-            logits_shard_out = torch.zeros(tp, UBD, VOCAB_LOCAL, dtype=f32)
             args_list += [logits_shard_out]
 
             print(f"[worker] built {len(args_list)} args (weights via IPC); VOCAB_LOCAL={VOCAB_LOCAL}; running ...", flush=True)

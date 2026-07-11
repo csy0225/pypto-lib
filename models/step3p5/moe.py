@@ -184,6 +184,11 @@ ROUTED_MAX_TILE = LOCAL_RECV_MAX
 RECV_TILE = 32
 ROUTED_QUANT_T_TILE = 16    # per-token dyn-quant token-tile (RECV_TILE % == 0)
 MOE_IN_QUANT_T_TILE = 16   # per-token input dyn-quant token-tile (T % == 0)
+# INT8-native W8A8: per-token activation dequant scale carried alongside the
+# INT8 recv_x through dispatch.  Padded to 8 FP32 cols (=32B, the min UB/GM
+# tile row) so the scale window's remote_load tiles are 32B-aligned, mirroring
+# DeepSeek v4 dispatch W_PAD.  Column 0 holds the scale; columns 1..7 are pad.
+SCALE_W_PAD = 8
 assert ROUTED_MAX_TILE % RECV_TILE == 0, (
     f"ROUTED_MAX_TILE ({ROUTED_MAX_TILE}) must be divisible by RECV_TILE ({RECV_TILE})"
 )
@@ -311,8 +316,14 @@ def _build_ep_tp_moe_program(
         @pl.function(type=pl.FunctionType.Inline)
         def ep_all_to_all(
             self,
-            send: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
-            recv: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            send: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+            recv: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+            ],
+            recv_scale: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+            ],
             send_counts: pl.Tensor[[N_RANKS], pl.INT32],
             recv_counts: pl.Tensor[[N_RANKS], pl.INT32],
             send_offsets: pl.Tensor[[N_RANKS], pl.INT32],
@@ -320,11 +331,14 @@ def _build_ep_tp_moe_program(
             read_offsets: pl.Tensor[[N_RANKS], pl.INT32],
             signal_window: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-        ) -> pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16]:
+        ) -> pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8]:
             """Pull-side variable-length token-level all-to-all over EP.
 
             Static dims (group_size=EP_WORLD_SIZE, d_cols=HIDDEN) baked
-            from module-scope constants.
+            from module-scope constants.  The per-token FP32 dequant scale
+            (``send_scale`` / ``recv_scale``) is fused into the SAME loops
+            as the INT8 activation so no extra notify/wait barrier is
+            needed for the scale movement.
             """
             group_size = EP_WORLD_SIZE
             d_cols = HIDDEN
@@ -337,6 +351,11 @@ def _build_ep_tp_moe_program(
                     send, [_self_base + r, 0], [1, d_cols],
                 )
                 pl.store(self_tile, [_self_base + r, 0], recv)
+                # Fused scale self-copy: same row index, SCALE_W_PAD-wide tile.
+                s_self = pl.load(
+                    send_scale, [_self_base + r, 0], [1, SCALE_W_PAD],
+                )
+                pl.store(s_self, [_self_base + r, 0], recv_scale)
 
             # 2) Set(1) notify every peer.
             for peer in pl.range(group_size):
@@ -378,6 +397,14 @@ def _build_ep_tp_moe_program(
                             shape=[1, d_cols],
                         )
                         pl.store(peer_tile, [_peer_base + r, 0], recv)
+                        # Fused scale pull: same peer/row, SCALE_W_PAD-wide tile.
+                        s_peer = pld.tile.remote_load(
+                            send_scale,
+                            peer=peer,
+                            offsets=[_my_base + r, 0],
+                            shape=[1, SCALE_W_PAD],
+                        )
+                        pl.store(s_peer, [_peer_base + r, 0], recv_scale)
 
             return recv
 
@@ -629,11 +656,15 @@ def _build_ep_tp_moe_program(
         @pl.function(type=pl.FunctionType.Inline)
         def _pack_send_payload(
             self,
-            x: pl.Tensor[[T, HIDDEN], pl.BF16],
+            x: pl.Tensor[[T, HIDDEN], pl.INT8],
+            x_scale: pl.Tensor[[T, SCALE_W_PAD], pl.FP32],
             indices: pl.Tensor[[T, TOPK], pl.INT32],
             send_counts_per_bucket: pl.Tensor[[PER_RANK_BUCKETS], pl.INT32],
             send_offsets_per_rank: pl.Tensor[[N_RANKS], pl.INT32],
-            send_buf: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            send_buf: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+            ],
             cursor_per_bucket: pl.Tensor[[PER_RANK_BUCKETS], pl.INT32],
             bucket_offset: pl.Tensor[[PER_RANK_BUCKETS], pl.INT32],
         ):
@@ -675,6 +706,12 @@ def _build_ep_tp_moe_program(
                     slot = pl.cast(slot_i32, pl.INDEX)
                     x_tile = pl.load(x, [t, 0], [1, HIDDEN])
                     pl.store(x_tile, [slot, 0], send_buf)
+                    # Carry the per-token dequant scale alongside the INT8
+                    # activation so the receiver can dequantize in the routed
+                    # expert.  Full SCALE_W_PAD-wide tile (col 0 = scale,
+                    # cols 1..7 = pad) keeps the remote_load tile 32B-aligned.
+                    s_tile = pl.load(x_scale, [t, 0], [1, SCALE_W_PAD])
+                    pl.store(s_tile, [slot, 0], send_scale)
                     pl.write(
                         cursor_per_bucket, [bkt],
                         pl.cast(slot_i32 + 1, pl.INT32),
@@ -765,10 +802,14 @@ def _build_ep_tp_moe_program(
         @pl.function(type=pl.FunctionType.InCore)
         def dispatch_step(  # noqa: PLR0913
             self,
-            x: pl.Tensor[[T, HIDDEN], pl.BF16],
+            x: pl.Tensor[[T, HIDDEN], pl.INT8],
+            x_scale: pl.Tensor[[T, SCALE_W_PAD], pl.FP32],
             expert_indices: pl.Tensor[[T, TOPK], pl.INT32],
             local_routed_x_out: pl.Out[
-                pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16]
+                pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8]
+            ],
+            local_routed_x_scale_out: pl.Out[
+                pl.Tensor[[LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32]
             ],
             local_expert_offset: pl.Out[
                 pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32]
@@ -778,22 +819,29 @@ def _build_ep_tp_moe_program(
             ],
             inverse_map: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
             # ``send_buf`` is a DistributedTensor window allocated by the
-            # orchestration caller (DDR-backed, ~8 MB BF16).  Using
+            # orchestration caller (DDR-backed, ~4 MB INT8).  Using
             # DistributedTensor allows ep_all_to_all's pld.tile.remote_load
             # on it for cross-rank pull.
-            send_buf: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            send_buf: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+            ],
             # Windows:
             pub_counts: pld.DistributedTensor[
                 [N_RANKS * N_RANKS, N_LOCAL_EXPERTS], pl.INT32
             ],
             count_done_sig: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             recv_x: pld.DistributedTensor[
-                [LOCAL_RECV_MAX, HIDDEN], pl.BF16
+                [LOCAL_RECV_MAX, HIDDEN], pl.INT8
+            ],
+            recv_scale: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
             ],
             data_done_sig: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> tuple[
-            pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+            pl.Tensor[[LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32],
             pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             pl.Tensor[[T, TOPK], pl.INT32],
@@ -857,9 +905,9 @@ def _build_ep_tp_moe_program(
                 [PER_RANK_BUCKETS], dtype=pl.INT32,
             )
             self._pack_send_payload(
-                x, expert_indices,
+                x, x_scale, expert_indices,
                 send_counts_bkt, send_offsets_rank,
-                send_buf, cursor_bkt, bucket_offset,
+                send_buf, send_scale, cursor_bkt, bucket_offset,
             )
 
             # ---- Build send/recv counts/offsets for ep_all_to_all ----
@@ -897,7 +945,7 @@ def _build_ep_tp_moe_program(
 
             # ---- EP all-to-all push of payload ----
             self.ep_all_to_all(
-                send_buf, recv_x,
+                send_buf, recv_x, send_scale, recv_scale,
                 send_counts_rank, recv_counts,
                 send_offsets_rank, recv_offsets, read_offsets,
                 data_done_sig, my_rank,
@@ -911,7 +959,9 @@ def _build_ep_tp_moe_program(
             )
             # Re-pack recv_x (src-rank-major) into local_routed_x_out
             # (loc_e-major, src-rank-secondary) so expert_routed sees
-            # contiguous CSR rows per local expert.
+            # contiguous CSR rows per local expert.  The matching scale row
+            # is re-packed in lockstep so the per-token dequant scale stays
+            # aligned with its INT8 activation row.
             running = pl.cast(0, pl.INT32)
             for e in pl.range(N_LOCAL_EXPERTS):
                 for src in pl.range(N_RANKS):
@@ -935,6 +985,12 @@ def _build_ep_tp_moe_program(
                         dst_row = pl.cast(running, pl.INDEX) + row
                         tile = pl.load(recv_x, [src_row, 0], [1, HIDDEN])
                         pl.store(tile, [dst_row, 0], local_routed_x_out)
+                        s = pl.load(
+                            recv_scale, [src_row, 0], [1, SCALE_W_PAD],
+                        )
+                        pl.store(
+                            s, [dst_row, 0], local_routed_x_scale_out,
+                        )
                     running = running + pl.cast(n, pl.INT32)
 
             # ---- Inverse-map for combine ----
@@ -944,6 +1000,7 @@ def _build_ep_tp_moe_program(
 
             return (
                 local_routed_x_out,
+                local_routed_x_scale_out,
                 local_expert_offset,
                 local_expert_count,
                 inverse_map,
@@ -959,18 +1016,31 @@ def _build_ep_tp_moe_program(
         @pl.function(type=pl.FunctionType.Inline)
         def _expert_routed(  # noqa: PLR0913, PLR0915
             self,
-            local_routed_x: pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            # INT8-native routed experts (true W8A8, math mirrors DeepSeek v4
+            # expert_routed.py and matches the vLLM-ascend W8A8 oracle):
+            #   * local_routed_x arrives INT8 (per-token quantised in dispatch),
+            #     paired with local_routed_x_scale (per-token FP32 dequant scale).
+            #   * gate/up/down weights are INT8 with per-output-channel FP32
+            #     scale (step3p5 [K,N] layout -> scale on trailing N dim, applied
+            #     via col_expand_mul; the per-token act scale via row_expand_mul).
+            local_routed_x: pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+            local_routed_x_scale: pl.Tensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+            ],
             local_expert_offset: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             local_expert_count: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             w_gate: pl.Tensor[
-                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
             ],
+            w_gate_scale: pl.Tensor[[N_LOCAL_EXPERTS, INTER], pl.FP32],
             w_up: pl.Tensor[
-                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
             ],
+            w_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, INTER], pl.FP32],
             w_down: pl.Tensor[
-                [N_LOCAL_EXPERTS, INTER, HIDDEN], pl.BF16
+                [N_LOCAL_EXPERTS, INTER, HIDDEN], pl.INT8
             ],
+            w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, HIDDEN], pl.FP32],
             local_routed_y: pl.Tensor[
                 [LOCAL_RECV_MAX, HIDDEN], pl.BF16
             ],
@@ -1035,8 +1105,8 @@ def _build_ep_tp_moe_program(
                                 ),
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
-                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.INT32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.INT32)
                             for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
                                 k0 = kb * ROUTED_GATE_K_CHUNK
                                 xk = pl.slice(
@@ -1071,21 +1141,54 @@ def _build_ep_tp_moe_program(
                                 gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
                                 up_acc = pl.matmul_acc(up_acc, xk, wuk)
 
-                            sigmoid = pl.recip(
-                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
+                            # Dequant INT32 -> FP32: per-token activation scale
+                            # (row_expand_mul) x per-output-channel weight scale
+                            # (col_expand_mul), matching DeepSeek v4 expert_routed
+                            # and the vLLM-ascend W8A8 oracle.  step3p5 weight is
+                            # [K,N] so the output channel is the trailing N dim.
+                            x_scale_col = pl.slice(
+                                local_routed_x_scale,
+                                [RECV_TILE, 1], [tile_offset, 0],
                             )
-                            silu = pl.mul(gate_acc, sigmoid)
+                            wg_scale_row = pl.slice(
+                                w_gate_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
+                            )
+                            wu_scale_row = pl.slice(
+                                w_up_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
+                            )
+                            gate_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        gate_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_col,
+                                ),
+                                wg_scale_row,
+                            )
+                            up_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        up_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_col,
+                                ),
+                                wu_scale_row,
+                            )
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
+                            )
+                            silu = pl.mul(gate_2d, sigmoid)
                             # Compile-time const baked at factory time: only one
                             # branch is emitted per specialisation.
                             if _routed_swiglu_step:
                                 silu_c = pl.minimum(silu, _routed_swiglu_limit)
                                 up_c = pl.maximum(
-                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    pl.minimum(up_2d, _routed_swiglu_limit),
                                     -_routed_swiglu_limit,
                                 )
                                 gated = pl.mul(silu_c, up_c)
                             else:
-                                gated = pl.mul(silu, up_acc)
+                                gated = pl.mul(silu, up_2d)
 
                             gated_v = pl.set_validshape(
                                 gated, tile_valid, ROUTED_GATE_N_CHUNK,
@@ -1103,80 +1206,82 @@ def _build_ep_tp_moe_program(
                                 :, n0 : n0 + ROUTED_GATE_N_CHUNK
                             ] = pl.cast(gated_m, target_type=pl.BF16)
 
-                        # --- Per-token INT8 dynamic-quant of the CLAMPED swiglu
-                        # intermediate, matching the vLLM-ascend W8A8 oracle
-                        # (npu_dynamic_quant before the INT8 down-proj). Routed
-                        # experts only (shared expert is unquantized BF16). Gated
-                        # by the compile-time _routed_swiglu_step so silu builds
-                        # elide it. Structure mirrors DeepSeek v4 qkv_proj_rope
-                        # per-token act-quant: pl.spmd OVER TOKENS, each block owns
-                        # ROW_Q_TILE rows and reads their FULL INTER feature from the
-                        # h_bf16 bridge (coherent cross-spmd read, like DeepSeek's
-                        # qr_fp32). amax over INTER via inner pl.range; INT32 rint
-                        # rounding (NOT cast-to-INT8-round). scale=amax/127 bounds
-                        # scaled values to +-127 so no INT8 saturation needed.
-                        if _routed_swiglu_step:
-                            for q_tg in pl.spmd(
-                                RECV_TILE // ROUTED_QUANT_T_TILE,
-                                name_hint="routed_dyn_quant",
-                            ):
-                                q_t0 = q_tg * ROUTED_QUANT_T_TILE
-                                q_amax = pl.full(
-                                    [1, ROUTED_QUANT_T_TILE],
-                                    dtype=pl.FP32, value=1e-4,
-                                )
-                                for q_ab in pl.range(INTER // ROUTED_GATE_N_CHUNK):
-                                    q_a0 = q_ab * ROUTED_GATE_N_CHUNK
-                                    q_ac = pl.cast(
-                                        pl.slice(
-                                            h_bf16,
-                                            [ROUTED_QUANT_T_TILE, ROUTED_GATE_N_CHUNK],
-                                            [q_t0, q_a0],
-                                        ),
-                                        target_type=pl.FP32,
-                                    )
-                                    q_abs = pl.maximum(q_ac, pl.neg(q_ac))
-                                    q_amax = pl.maximum(
-                                        q_amax,
-                                        pl.reshape(
-                                            pl.row_max(q_abs),
-                                            [1, ROUTED_QUANT_T_TILE],
-                                        ),
-                                    )
-                                q_inv_row = pl.div(
-                                    pl.full(
-                                        [1, ROUTED_QUANT_T_TILE],
-                                        dtype=pl.FP32, value=127.0,
+                        # --- Per-token INT8 requant of the swiglu intermediate.
+                        # Produces an INT8 h tile fed straight into the INT8
+                        # down-proj (true W8A8, matches the vLLM-ascend oracle's
+                        # npu_dynamic_quant before the INT8 down-proj).  Math +
+                        # cast chain copy DeepSeek v4 expert_routed h_tile_i8
+                        # (FP32 -> INT32 rint -> FP16 round -> INT8 trunc inside a
+                        # pl.at(CORE_GROUP) scope) so the in-kernel INT8 tile is
+                        # cube-consumable (avoids the gap-5 tcvt->cube layout bug).
+                        # UNCONDITIONAL: every routed layer is W8A8; the swiglu
+                        # clamp above (gated by _routed_swiglu_step) is orthogonal.
+                        # h_scale_dq (per-token FP32 dequant scale) is an SSA value
+                        # produced here and consumed in the down spmd below, exactly
+                        # like DeepSeek's h_tile_scale_dq (exp_h_q -> exp_w2).
+                        h_i8 = pl.create_tensor(
+                            [RECV_TILE, INTER], dtype=pl.INT8,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP, name_hint="routed_h_quant",
+                        ):
+                            eh_amax = pl.full(
+                                [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                            )
+                            for hqa in pl.range(INTER // ROUTED_GATE_N_CHUNK):
+                                hqa0 = hqa * ROUTED_GATE_N_CHUNK
+                                eh_a = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqa0],
                                     ),
-                                    q_amax,
+                                    target_type=pl.FP32,
                                 )
-                                q_inv_t = pl.reshape(
-                                    q_inv_row, [ROUTED_QUANT_T_TILE, 1],
-                                )
-                                q_scale_t = pl.reshape(
-                                    pl.recip(q_inv_row), [ROUTED_QUANT_T_TILE, 1],
-                                )
-                                for q_nb in pl.range(INTER // ROUTED_GATE_N_CHUNK):
-                                    q_n0 = q_nb * ROUTED_GATE_N_CHUNK
-                                    q_ch = pl.cast(
-                                        pl.slice(
-                                            h_bf16,
-                                            [ROUTED_QUANT_T_TILE, ROUTED_GATE_N_CHUNK],
-                                            [q_t0, q_n0],
+                                eh_amax = pl.maximum(
+                                    eh_amax,
+                                    pl.reshape(
+                                        pl.row_max(
+                                            pl.maximum(eh_a, pl.neg(eh_a)),
                                         ),
-                                        target_type=pl.FP32,
-                                    )
-                                    q_scaled = pl.row_expand_mul(q_ch, q_inv_t)
-                                    q_i32 = pl.cast(
-                                        q_scaled, target_type=pl.INT32, mode="rint",
-                                    )
-                                    q_deq = pl.row_expand_mul(
-                                        pl.cast(q_i32, target_type=pl.FP32), q_scale_t,
-                                    )
-                                    h_bf16[
-                                        q_t0 : q_t0 + ROUTED_QUANT_T_TILE,
-                                        q_n0 : q_n0 + ROUTED_GATE_N_CHUNK,
-                                    ] = pl.cast(q_deq, target_type=pl.BF16)
+                                        [1, RECV_TILE],
+                                    ),
+                                )
+                            eh_sq_row = pl.div(
+                                pl.full(
+                                    [1, RECV_TILE], dtype=pl.FP32, value=127.0,
+                                ),
+                                eh_amax,
+                            )
+                            # Per-token dequant scale (recip of quant scale) for
+                            # the down-proj dequant.  SSA value carried into the
+                            # down spmd (DeepSeek h_tile_scale_dq pattern).
+                            h_scale_dq = pl.reshape(
+                                pl.recip(eh_sq_row), [RECV_TILE, 1],
+                            )
+                            eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                            for hqn in pl.range(INTER // ROUTED_GATE_N_CHUNK):
+                                hqn0 = hqn * ROUTED_GATE_N_CHUNK
+                                eh_q = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqn0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                eh_scaled = pl.row_expand_mul(eh_q, eh_sq_col)
+                                eh_i32 = pl.cast(
+                                    eh_scaled, target_type=pl.INT32, mode="rint",
+                                )
+                                eh_half = pl.cast(
+                                    eh_i32, target_type=pl.FP16, mode="round",
+                                )
+                                h_i8[
+                                    :, hqn0 : hqn0 + ROUTED_GATE_N_CHUNK
+                                ] = pl.cast(
+                                    eh_half, target_type=pl.INT8, mode="trunc",
+                                )
 
                         # Down projection: each SPMD block handles one D-chunk of
                         # the HIDDEN output dimension.  h_bf16 is vec (UB) space so
@@ -1187,7 +1292,7 @@ def _build_ep_tp_moe_program(
                         ):
                             d0 = db * ROUTED_DOWN_N_CHUNK
                             h0 = pl.slice(
-                                h_bf16,
+                                h_i8,
                                 [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                 [0, 0],
                             )
@@ -1203,11 +1308,11 @@ def _build_ep_tp_moe_program(
                                 ),
                                 [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
                             )
-                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.INT32)
                             for kb2 in pl.range(1, INTER // ROUTED_DOWN_K_CHUNK):
                                 k0 = kb2 * ROUTED_DOWN_K_CHUNK
                                 hk = pl.slice(
-                                    h_bf16,
+                                    h_i8,
                                     [RECV_TILE, ROUTED_DOWN_K_CHUNK],
                                     [0, k0],
                                 )
@@ -1228,8 +1333,25 @@ def _build_ep_tp_moe_program(
                                 )
                                 y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
+                            # Dequant INT32 -> FP32: per-token h scale
+                            # (row_expand_mul) x per-output-channel down-weight
+                            # scale (col_expand_mul).  Routing weight is NOT
+                            # applied here (step3p5 applies it in combine reduce,
+                            # unlike DeepSeek which folds it into row_scale).
+                            wd_scale_row = pl.slice(
+                                w_down_scale, [1, ROUTED_DOWN_N_CHUNK], [e, d0],
+                            )
+                            y_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        y_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    h_scale_dq,
+                                ),
+                                wd_scale_row,
+                            )
                             y_v = pl.set_validshape(
-                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                                y_2d, tile_valid, ROUTED_DOWN_N_CHUNK,
                             )
                             y_m = pl.fillpad(
                                 y_v, pad_value=pl.PadValue.zero,
@@ -1245,26 +1367,34 @@ def _build_ep_tp_moe_program(
         @pl.function(type=pl.FunctionType.Inline)
         def expert_routed_step(
             self,
-            local_routed_x: pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            local_routed_x: pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
+            local_routed_x_scale: pl.Tensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+            ],
             local_expert_offset: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             local_expert_count: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             w_gate_r: pl.Tensor[
-                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
             ],
+            w_gate_r_scale: pl.Tensor[[N_LOCAL_EXPERTS, INTER], pl.FP32],
             w_up_r: pl.Tensor[
-                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
             ],
+            w_up_r_scale: pl.Tensor[[N_LOCAL_EXPERTS, INTER], pl.FP32],
             w_down_r: pl.Tensor[
-                [N_LOCAL_EXPERTS, INTER, HIDDEN], pl.BF16
+                [N_LOCAL_EXPERTS, INTER, HIDDEN], pl.INT8
             ],
+            w_down_r_scale: pl.Tensor[[N_LOCAL_EXPERTS, HIDDEN], pl.FP32],
             local_routed_y: pl.Out[
                 pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16]
             ],
         ) -> pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16]:
             local_routed_y = self._expert_routed(
-                local_routed_x,
+                local_routed_x, local_routed_x_scale,
                 local_expert_offset, local_expert_count,
-                w_gate_r, w_up_r, w_down_r,
+                w_gate_r, w_gate_r_scale,
+                w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
                 local_routed_y,
             )
             return local_routed_y
@@ -1797,22 +1927,36 @@ def _build_ep_tp_moe_program(
                 )
             return x_out
 
+        # InCore scheduled kernel (mirrors _serialize_after_shared: InCore +
+        # pl.range + Out params).  It is NOT inlined into the Orchestration
+        # caller, so its two Out buffers (x_i8_out, x_scale_out) are written and
+        # read by the caller directly.  Uses pl.range (NOT pl.spmd): a top-level
+        # pl.spmd carries its own InCore scope, and an InCore function wrapping a
+        # top-level spmd leaves a nested InCore ScopeStmt that the SplitIncoreOrch
+        # precondition (pypto #1828) rejects.
         @pl.function(type=pl.FunctionType.InCore)
         def _quant_moe_input(
             self,
             x: pl.Tensor[[T, HIDDEN], pl.BF16],
-            x_out: pl.Out[pl.Tensor[[T, HIDDEN], pl.BF16]],
+            x_i8_out: pl.Out[pl.Tensor[[T, HIDDEN], pl.INT8]],
+            x_scale_out: pl.Out[
+                pl.Tensor[[T, SCALE_W_PAD], pl.FP32]
+            ],
         ):
-            # Per-token INT8 dynamic-quant (dequant->BF16) of the routed-expert
-            # INPUT (oracle npu_dynamic_quant(x) before gate_up). Placed AFTER
-            # gate+shared, BEFORE dispatch, so router + unquantized shared see the
-            # ORIGINAL x and the routed experts consume pre-quantized tokens (gate_up
-            # reads a normal GM slice, NOT a vec-quantized cube-matmul input). Tensor
-            # pl.slice + spmd-over-tokens, mirroring the proven interm-quant. Per-token
-            # over the FULL HIDDEN; INT32-rint; symmetric scale=amax/127.
-            for qtg in pl.spmd(
-                T // MOE_IN_QUANT_T_TILE, name_hint="moe_input_quant"
-            ):
+            # Per-token INT8 dynamic-quant of the routed-expert INPUT (oracle
+            # npu_dynamic_quant(x) before gate_up). Placed AFTER gate+shared,
+            # BEFORE dispatch, so router + unquantized shared see the ORIGINAL x
+            # and the routed experts consume pre-quantized tokens (gate_up reads
+            # a normal GM slice, NOT a vec-quantized cube-matmul input). Tensor
+            # pl.slice + spmd-over-tokens, mirroring the proven interm-quant.
+            # Per-token over the FULL HIDDEN; INT32-rint; symmetric
+            # scale=amax/127 (dequant scale = recip(q_inv) = amax/127).
+            #
+            # Output: x_i8_out holds INT8 quantized activations, x_scale_out
+            # holds the per-token dequant scale (amax/127) in column 0 of the
+            # SCALE_W_PAD-wide FP32 window (cols 1..7 are pad, mirror DeepSeek
+            # v4 dispatch W_PAD).
+            for qtg in pl.range(T // MOE_IN_QUANT_T_TILE):
                 qt0 = qtg * MOE_IN_QUANT_T_TILE
                 q_amax = pl.full(
                     [1, MOE_IN_QUANT_T_TILE], dtype=pl.FP32, value=1e-4,
@@ -1842,6 +1986,11 @@ def _build_ep_tp_moe_program(
                 q_scale = pl.reshape(
                     pl.recip(q_inv_row), [MOE_IN_QUANT_T_TILE, 1],
                 )
+                # Write per-token dequant scale ONCE per T-tile into col 0 of
+                # the SCALE_W_PAD-wide window (cols 1..7 stay zero-init pad).
+                x_scale_out[
+                    qt0 : qt0 + MOE_IN_QUANT_T_TILE, 0:1
+                ] = q_scale
                 for qnb in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
                     qn0 = qnb * ROUTED_GATE_K_CHUNK
                     qch = pl.cast(
@@ -1856,14 +2005,18 @@ def _build_ep_tp_moe_program(
                         pl.row_expand_mul(qch, q_inv),
                         target_type=pl.INT32, mode="rint",
                     )
-                    qdq = pl.row_expand_mul(
-                        pl.cast(qq, target_type=pl.FP32), q_scale,
-                    )
-                    x_out[
+                    # INT8 cast chain mirrors the oracle npu_dynamic_quant:
+                    # rint INT32 -> round FP16 -> trunc INT8.
+                    qf = pl.cast(qq, target_type=pl.FP16, mode="round")
+                    qi8 = pl.cast(qf, target_type=pl.INT8, mode="trunc")
+                    x_i8_out[
                         qt0 : qt0 + MOE_IN_QUANT_T_TILE,
                         qn0 : qn0 + ROUTED_GATE_K_CHUNK,
-                    ] = pl.cast(qdq, target_type=pl.BF16)
-            return x_out
+                    ] = qi8
+            # Scheduled InCore kernel with two Out buffers -> two return values,
+            # captured by the caller via tuple assignment (InOut discipline
+            # requires reading the post-call return, not the pre-call variable).
+            return x_i8_out, x_scale_out
 
         # ---------- DEBUG per-stage dump copy (localization only) ----------
         @pl.function(type=pl.FunctionType.InCore)
@@ -1899,13 +2052,22 @@ def _build_ep_tp_moe_program(
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
             w_gate_r: pl.Tensor[
-                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
+            ],
+            w_gate_r_scale: pl.Tensor[
+                [N_LOCAL_EXPERTS, INTER], pl.FP32
             ],
             w_up_r: pl.Tensor[
-                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
+            ],
+            w_up_r_scale: pl.Tensor[
+                [N_LOCAL_EXPERTS, INTER], pl.FP32
             ],
             w_down_r: pl.Tensor[
-                [N_LOCAL_EXPERTS, INTER, HIDDEN], pl.BF16
+                [N_LOCAL_EXPERTS, INTER, HIDDEN], pl.INT8
+            ],
+            w_down_r_scale: pl.Tensor[
+                [N_LOCAL_EXPERTS, HIDDEN], pl.FP32
             ],
             w_gate_s: pl.Tensor[[HIDDEN, SH_INTER_LOCAL], pl.BF16],
             w_up_s: pl.Tensor[[HIDDEN, SH_INTER_LOCAL], pl.BF16],
@@ -1918,10 +2080,18 @@ def _build_ep_tp_moe_program(
             ],
             count_done_sig: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
             recv_x: pld.DistributedTensor[
-                [LOCAL_RECV_MAX, HIDDEN], pl.BF16
+                [LOCAL_RECV_MAX, HIDDEN], pl.INT8
+            ],
+            recv_scale: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
             ],
             data_done_sig: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-            send_buf: pld.DistributedTensor[[LOCAL_RECV_MAX, HIDDEN], pl.BF16],
+            send_buf: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, HIDDEN], pl.INT8
+            ],
+            send_scale: pld.DistributedTensor[
+                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+            ],
             sh_tmp_window: pld.DistributedTensor[
                 [T, HIDDEN], pl.BF16
             ],
@@ -1963,17 +2133,25 @@ def _build_ep_tp_moe_program(
             x_ser_buf = pl.create_tensor([T, HIDDEN], dtype=pl.BF16)
             x = self._serialize_after_shared(x, sh_y, x_ser_buf)
 
-            # Per-token INT8 input-quant for ROUTED experts (swiglu only). Router
-            # (gate_step) + unquantized shared expert above already used ORIGINAL x.
-            if _routed_swiglu_step:
-                x_moe_q = pl.create_tensor([T, HIDDEN], dtype=pl.BF16)
-                x_disp = self._quant_moe_input(x, x_moe_q)
-            else:
-                x_disp = x
+            # Per-token INT8 input-quant for ROUTED experts (all routed layers
+            # are W8A8). Router (gate_step) + unquantized shared expert above
+            # already used ORIGINAL x.  Outputs INT8 activations + a per-token
+            # FP32 dequant scale carried through dispatch alongside the INT8
+            # recv_x.
+            x_disp_i8 = pl.create_tensor([T, HIDDEN], dtype=pl.INT8)
+            x_disp_scale = pl.create_tensor(
+                [T, SCALE_W_PAD], dtype=pl.FP32,
+            )
+            (x_disp_i8, x_disp_scale) = self._quant_moe_input(
+                x, x_disp_i8, x_disp_scale,
+            )
 
             # 3) Dispatch (EP all-to-all).
             local_routed_x = pl.create_tensor(
-                [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+            )
+            local_routed_x_scale = pl.create_tensor(
+                [LOCAL_RECV_MAX, SCALE_W_PAD], dtype=pl.FP32,
             )
             local_expert_offset = pl.create_tensor(
                 [N_LOCAL_EXPERTS], dtype=pl.INT32,
@@ -1984,15 +2162,16 @@ def _build_ep_tp_moe_program(
             inverse_map = pl.create_tensor([T, TOPK], dtype=pl.INT32)
             (
                 local_routed_x,
+                local_routed_x_scale,
                 local_expert_offset,
                 local_expert_count,
                 inverse_map,
             ) = self.dispatch_step(
-                x_disp, expert_indices,
-                local_routed_x,
+                x_disp_i8, x_disp_scale, expert_indices,
+                local_routed_x, local_routed_x_scale,
                 local_expert_offset, local_expert_count, inverse_map,
-                send_buf,
-                pub_counts, count_done_sig, recv_x, data_done_sig,
+                send_buf, send_scale,
+                pub_counts, count_done_sig, recv_x, recv_scale, data_done_sig,
                 my_rank,
             )
 
@@ -2002,8 +2181,11 @@ def _build_ep_tp_moe_program(
             )
             local_routed_y = self.expert_routed_step(
                 local_routed_x,
+                local_routed_x_scale,
                 local_expert_offset, local_expert_count,
-                w_gate_r, w_up_r, w_down_r,
+                w_gate_r, w_gate_r_scale,
+                w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
                 local_routed_y,
             )
 
@@ -2026,13 +2208,22 @@ def _build_ep_tp_moe_program(
             gate_w: pl.Tensor[[N_RANKS, HIDDEN, N_EXPERTS], pl.FP32],
             router_bias: pl.Tensor[[N_RANKS, N_EXPERTS], pl.FP32],
             w_gate_r: pl.Tensor[
-                [N_RANKS, N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_RANKS, N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
+            ],
+            w_gate_r_scale: pl.Tensor[
+                [N_RANKS, N_LOCAL_EXPERTS, INTER], pl.FP32
             ],
             w_up_r: pl.Tensor[
-                [N_RANKS, N_LOCAL_EXPERTS, HIDDEN, INTER], pl.BF16
+                [N_RANKS, N_LOCAL_EXPERTS, HIDDEN, INTER], pl.INT8
+            ],
+            w_up_r_scale: pl.Tensor[
+                [N_RANKS, N_LOCAL_EXPERTS, INTER], pl.FP32
             ],
             w_down_r: pl.Tensor[
-                [N_RANKS, N_LOCAL_EXPERTS, INTER, HIDDEN], pl.BF16
+                [N_RANKS, N_LOCAL_EXPERTS, INTER, HIDDEN], pl.INT8
+            ],
+            w_down_r_scale: pl.Tensor[
+                [N_RANKS, N_LOCAL_EXPERTS, HIDDEN], pl.FP32
             ],
             w_gate_s: pl.Tensor[
                 [N_RANKS, HIDDEN, SH_INTER_LOCAL], pl.BF16
@@ -2063,11 +2254,17 @@ def _build_ep_tp_moe_program(
             )
             count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
             recv_x_buf = pld.alloc_window_buffer(
-                LOCAL_RECV_MAX * HIDDEN * 2,  # BF16
+                LOCAL_RECV_MAX * HIDDEN * 1,  # INT8
+            )
+            recv_scale_buf = pld.alloc_window_buffer(
+                LOCAL_RECV_MAX * SCALE_W_PAD * 4,  # FP32
             )
             data_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
             send_buf_buf = pld.alloc_window_buffer(
-                LOCAL_RECV_MAX * HIDDEN * 2,  # BF16
+                LOCAL_RECV_MAX * HIDDEN * 1,  # INT8
+            )
+            send_scale_buf = pld.alloc_window_buffer(
+                LOCAL_RECV_MAX * SCALE_W_PAD * 4,  # FP32
             )
             sh_tmp_buf = pld.alloc_window_buffer(T * HIDDEN * 2)
             sh_sig_buf = pld.alloc_window_buffer(N_RANKS * 4)
@@ -2089,13 +2286,21 @@ def _build_ep_tp_moe_program(
                     count_done_buf, [N_RANKS, 1], dtype=pl.INT32,
                 )
                 recv_x = pld.window(
-                    recv_x_buf, [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    recv_x_buf, [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                )
+                recv_scale = pld.window(
+                    recv_scale_buf,
+                    [LOCAL_RECV_MAX, SCALE_W_PAD], dtype=pl.FP32,
                 )
                 data_done_sig = pld.window(
                     data_done_buf, [N_RANKS, 1], dtype=pl.INT32,
                 )
                 send_x = pld.window(
-                    send_buf_buf, [LOCAL_RECV_MAX, HIDDEN], dtype=pl.BF16,
+                    send_buf_buf, [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
+                )
+                send_scale = pld.window(
+                    send_scale_buf,
+                    [LOCAL_RECV_MAX, SCALE_W_PAD], dtype=pl.FP32,
                 )
                 sh_tmp_window = pld.window(
                     sh_tmp_buf, [T, HIDDEN], dtype=pl.BF16,
@@ -2120,12 +2325,14 @@ def _build_ep_tp_moe_program(
                 )
                 self.chip_orch(
                     x[r], gate_w[r], router_bias[r],
-                    w_gate_r[r], w_up_r[r], w_down_r[r],
+                    w_gate_r[r], w_gate_r_scale[r],
+                    w_up_r[r], w_up_r_scale[r],
+                    w_down_r[r], w_down_r_scale[r],
                     w_gate_s[r], w_up_s[r], w_down_s[r],
                     moe_out[r],
                     pub_counts, count_done_sig,
-                    recv_x, data_done_sig,
-                    send_x,
+                    recv_x, recv_scale, data_done_sig,
+                    send_x, send_scale,
                     sh_tmp_window, sh_signal_window,
                     src_route_table, route_pub_sig,
                     routed_y_buf, combine_done_sig,

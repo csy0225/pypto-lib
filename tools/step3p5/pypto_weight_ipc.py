@@ -326,6 +326,7 @@ def export_from_checkpoint(
     tp_world_size: int = 8,
     out_dir: str,
     dev: int = 0,
+    int8_routed: bool = False,
 ) -> Dict[str, Any]:
     """Convenience: load a rank bundle from a checkpoint + export it.
 
@@ -347,7 +348,9 @@ def export_from_checkpoint(
         verify_bundle_shapes,
     )
     import torch  # noqa: PLC0415
-    bundle = load_step3p5_weights_for_rank(ckpt_dir, rank, tp_world_size)
+    bundle = load_step3p5_weights_for_rank(
+        ckpt_dir, rank, tp_world_size, int8_routed=int8_routed,
+    )
     verify_bundle_shapes(bundle, tp_world_size)
     # The whole_decode host_orch expects FP32 for the norm weights + final_norm
     # (matching the dummy device harness), but weight_loader stores norms as bf16.

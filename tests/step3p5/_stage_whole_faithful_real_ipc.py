@@ -57,7 +57,7 @@ def _do_export(args) -> int:
     from tools.step3p5.pypto_weight_ipc import export_from_checkpoint  # noqa: PLC0415
     r = args.export_rank
     os.makedirs(args.out, exist_ok=True)
-    export_from_checkpoint(args.ckpt, rank=r, tp_world_size=8, out_dir=args.out, dev=args.dev)
+    export_from_checkpoint(args.ckpt, rank=r, tp_world_size=8, out_dir=args.out, dev=args.dev, int8_routed=True)
     # Signal readiness; hold the pool mapped until the worker writes STOP.
     Path(os.path.join(args.out, f"ready.rank{r}")).write_text("1")
     print(f"[export-rank {r}] holding pool on dev {args.dev}; waiting for STOP", flush=True)
@@ -193,8 +193,11 @@ def _do_worker(args) -> int:
             args_list += [W(K.KEY_WQ_SWA), W(K.KEY_WK_SWA), W(K.KEY_WV_SWA), W(K.KEY_WO_SWA), W(K.KEY_WG_SWA),
                           gate_r_swa]
             args_list += [W(K.KEY_DENSE_GATE), W(K.KEY_DENSE_UP), W(K.KEY_DENSE_DOWN)]
-            args_list += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS), W(K.KEY_MOE_W_GATE_R),
-                          W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_GATE_S),
+            args_list += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS),
+                          W(K.KEY_MOE_W_GATE_R), W(K.KEY_MOE_W_GATE_R_SCALE),
+                          W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_UP_R_SCALE),
+                          W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_DOWN_R_SCALE),
+                          W(K.KEY_MOE_W_GATE_S),
                           W(K.KEY_MOE_W_UP_S), W(K.KEY_MOE_W_DOWN_S)]
             args_list += [seq_lens, block_table, slot_mapping, rope_cf, rope_sf, rope_cs, rope_ss,
                           k_cache, v_cache]

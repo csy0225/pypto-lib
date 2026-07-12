@@ -230,6 +230,22 @@ class WeightIpcExporter:
             )
 
         # Allocate ONE contiguous device buffer for the whole rank bundle.
+        # Blocker-B experiment (env PYPTO_WEIGHT_IPC_VA_SHIFT_GB): pre-allocate a
+        # throwaway block first so the exported pool VA lands ABOVE the runtime's
+        # comm-window region on peers, avoiding the MoE ep_all_to_all x IPC-pool
+        # peer-access VA overlap that stalls the whole-net e2e.  Kept alive (never
+        # freed) so the low VA stays occupied.  Default 0 = disabled (no shift).
+        import os as _os  # noqa: PLC0415
+        _shift_gb = float(_os.environ.get("PYPTO_WEIGHT_IPC_VA_SHIFT_GB", "0"))
+        if _shift_gb > 0:
+            _shift_bytes = int(_shift_gb * (1 << 30))
+            _sp = ctypes.c_void_p()
+            _rc = self._acl.aclrtMalloc(ctypes.byref(_sp), _shift_bytes, _HUGE_FIRST)
+            if _rc != 0:
+                raise RuntimeError(f"VA-shift aclrtMalloc rc={_rc} bytes={_shift_bytes}")
+            self._va_shift_ptr = _sp  # keep alive
+            print(f"[weight-ipc exporter] VA-shift {_shift_gb} GiB pre-alloc @ "
+                  f"0x{int(_sp.value or 0):x}", flush=True)
         dptr = ctypes.c_void_p()
         rc = self._acl.aclrtMalloc(ctypes.byref(dptr), pool_bytes, _HUGE_FIRST)
         if rc != 0:

@@ -54,6 +54,10 @@ def _parse_args() -> argparse.Namespace:
     # KV cache also via IPC (user hard constraint): exporter carves dummy
     # k/v_cache into the pool; worker binds them as add_inout DeviceTensors.
     p.add_argument("--kv-ipc", action="store_true")
+    # ctx=1 token-exact A/B: feed current_hidden = embed(token) so the whole-net
+    # decodes position-0 (self-attention over 1 token, rope identity) and its
+    # argmax = the next token to compare vs vLLM's completion for prompt=[token].
+    p.add_argument("--hidden-token", type=int, default=-1)
     return p.parse_args()
 
 
@@ -193,6 +197,18 @@ def _do_worker(args) -> int:
         def zsh(*shape, dtype=bf16):
             return torch.zeros(shape, dtype=dtype).share_memory_()
         current_hidden = zsh(tp, BATCH, HIDDEN)
+        if args.hidden_token >= 0:
+            # embed(token) into row 0 of every rank (replicated); ctx=1 (seq_lens=ones)
+            # -> whole-net decodes position-0, argmax(logits) = next token vs vLLM.
+            import safetensors.torch as _st  # noqa: PLC0415
+            import json as _json2  # noqa: PLC0415
+            _idx = _json2.load(open(os.path.join(args.ckpt, "quant_model_weights.safetensors.index.json")))
+            _shard = _idx["weight_map"]["model.embed_tokens.weight"]
+            with _st.safe_open(os.path.join(args.ckpt, _shard), framework="pt") as _f:
+                _emb_row = _f.get_slice("model.embed_tokens.weight")[args.hidden_token, :].to(torch.bfloat16)
+            current_hidden[:, 0, :] = _emb_row
+            print(f"[worker] ctx=1 A/B: current_hidden row0 = embed(token={args.hidden_token}) "
+                  f"|emb|max={_emb_row.float().abs().max():.4f}", flush=True)
         gate_r_full = zsh(tp, N_FULL, NHF_PAD, HQ_FULL)
         gate_r_swa = zsh(tp, N_SWA, NHS_PAD, HQ_SWA)
         seq_lens = torch.ones(tp, UBD, dtype=i32).share_memory_()
@@ -200,6 +216,9 @@ def _do_worker(args) -> int:
         slot_mapping = torch.arange(UBD, dtype=i32).unsqueeze(0).repeat(tp, 1).contiguous().share_memory_()
         rope_cf, rope_sf = zsh(tp, RSD, ROT_FULL, dtype=f32), zsh(tp, RSD, ROT_FULL, dtype=f32)
         rope_cs, rope_ss = zsh(tp, RSD, ROT_SWA, dtype=f32), zsh(tp, RSD, ROT_SWA, dtype=f32)
+        if args.hidden_token >= 0:
+            # position-0 rope = identity (angle 0 -> cos=1, sin=0).
+            rope_cf.fill_(1.0); rope_cs.fill_(1.0)  # sin stays 0
         k_cache, v_cache = zsh(tp, KVC, HEAD_DIM), zsh(tp, KVC, HEAD_DIM)
         h_mid_out, next_hidden_out = zsh(tp, BATCH, HIDDEN), zsh(tp, BATCH, HIDDEN)
         logits_shard_out = torch.zeros(tp, UBD, VOCAB_LOCAL, dtype=f32).share_memory_()

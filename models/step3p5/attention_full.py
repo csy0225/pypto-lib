@@ -668,7 +668,11 @@ def attention_full(
         attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])
 
     # ----- Scope 2.5 — head-wise sigmoid gate (local heads only). -----
-    # Phase 15 BYPASS: gate is currently disabled (identity pass-through).
+    # STALE-NOTE: the "BYPASS" rationale below is SUPERSEDED. The head-gate is
+    # LANDED — applied via the worker-fed ``gate_r`` slot (= gate_exp) in the
+    # o_proj Scope 3.a. See the "gate landed (R-matrix expand)" note further
+    # down. The bypass text is kept only as historical context for the [N,1]
+    # row_expand_mul pitfall that motivated the gate_r-slot approach.
     #
     # Why bypassed:
     #   The head-wise gate is intrinsically a *per-(batch, head) scalar

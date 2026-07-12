@@ -227,15 +227,16 @@ def main() -> int:
         print(f"[moe-prec] RUN-ONLY: {res}", flush=True)
         return 0 if res.passed else 1
 
-    if args.target in ("moe_parts_shared", "moe_parts_routed"):
-        _pk = "shared_output" if args.target == "moe_parts_shared" else "routed_output"
-        tgt = _load_dump_tensor(args.dump, args.layer, "moe_parts", rank=0, inner_key=_pk)
-    else:
-        _tgt_inner = "ffn_output" if args.target == "ffn_out" else None
-        tgt = _load_dump_tensor(args.dump, args.layer, args.target, rank=0, inner_key=_tgt_inner)
-    tgt = tgt.reshape(-1, HIDDEN)[:T].to(torch.float32)
-    if tgt.shape[0] < T:
-        tgt = torch.cat([tgt, torch.zeros(T - tgt.shape[0], HIDDEN)], 0)
+    if not args.torch_golden:
+        if args.target in ("moe_parts_shared", "moe_parts_routed"):
+            _pk = "shared_output" if args.target == "moe_parts_shared" else "routed_output"
+            tgt = _load_dump_tensor(args.dump, args.layer, "moe_parts", rank=0, inner_key=_pk)
+        else:
+            _tgt_inner = "ffn_output" if args.target == "ffn_out" else None
+            tgt = _load_dump_tensor(args.dump, args.layer, args.target, rank=0, inner_key=_tgt_inner)
+        tgt = tgt.reshape(-1, HIDDEN)[:T].to(torch.float32)
+        if tgt.shape[0] < T:
+            tgt = torch.cat([tgt, torch.zeros(T - tgt.shape[0], HIDDEN)], 0)
 
     if args.torch_golden:
         import torch.nn.functional as _F  # noqa: PLC0415

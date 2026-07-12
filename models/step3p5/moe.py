@@ -809,7 +809,7 @@ def _build_ep_tp_moe_program(
                 pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8]
             ],
             local_routed_x_scale_out: pl.Out[
-                pl.Tensor[[LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32]
+                pl.Tensor[[1, LOCAL_RECV_MAX], pl.FP32]
             ],
             local_expert_offset: pl.Out[
                 pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32]
@@ -841,7 +841,7 @@ def _build_ep_tp_moe_program(
             my_rank: pl.Scalar[pl.INT32],
         ) -> tuple[
             pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
-            pl.Tensor[[LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32],
+            pl.Tensor[[1, LOCAL_RECV_MAX], pl.FP32],
             pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             pl.Tensor[[T, TOPK], pl.INT32],
@@ -985,12 +985,11 @@ def _build_ep_tp_moe_program(
                         dst_row = pl.cast(running, pl.INDEX) + row
                         tile = pl.load(recv_x, [src_row, 0], [1, HIDDEN])
                         pl.store(tile, [dst_row, 0], local_routed_x_out)
-                        s = pl.load(
-                            recv_scale, [src_row, 0], [1, SCALE_W_PAD],
-                        )
-                        pl.store(
-                            s, [dst_row, 0], local_routed_x_scale_out,
-                        )
+                        # Un-pad the per-token scale: scalar col-0 read from the
+                        # SCALE_W_PAD-wide a2a window -> contiguous [1,LOCAL_RECV_MAX]
+                        # so the expert reads a clean ND2ND [1,RECV_TILE] row-slice.
+                        sv = pl.read(recv_scale, [src_row, 0])
+                        pl.write(local_routed_x_scale_out, [0, dst_row], sv)
                     running = running + pl.cast(n, pl.INT32)
 
             # ---- Inverse-map for combine ----
@@ -1025,7 +1024,7 @@ def _build_ep_tp_moe_program(
             #     via col_expand_mul; the per-token act scale via row_expand_mul).
             local_routed_x: pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
             local_routed_x_scale: pl.Tensor[
-                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+                [1, LOCAL_RECV_MAX], pl.FP32
             ],
             local_expert_offset: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             local_expert_count: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
@@ -1146,9 +1145,19 @@ def _build_ep_tp_moe_program(
                             # (col_expand_mul), matching DeepSeek v4 expert_routed
                             # and the vLLM-ascend W8A8 oracle.  step3p5 weight is
                             # [K,N] so the output channel is the trailing N dim.
-                            x_scale_col = pl.slice(
-                                local_routed_x_scale,
-                                [RECV_TILE, 1], [tile_offset, 0],
+                            # Read per-token scale as a CONTIGUOUS [1,RECV_TILE]
+                            # row-slice then reshape to [RECV_TILE,1] (DeepSeek
+                            # recv_scale_dq pattern).  A [RECV_TILE,1] col-slice of
+                            # a [.,SCALE_W_PAD]-padded tensor is a strided ColMajor
+                            # VecTile that ccec's TLOAD rejects (ND2ND only,
+                            # gap5_stagec); the un-padded [1,LOCAL_RECV_MAX] layout
+                            # makes this a clean ND2ND load.
+                            x_scale_col = pl.reshape(
+                                pl.slice(
+                                    local_routed_x_scale,
+                                    [1, RECV_TILE], [0, tile_offset],
+                                ),
+                                [RECV_TILE, 1],
                             )
                             wg_scale_row = pl.slice(
                                 w_gate_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
@@ -1369,7 +1378,7 @@ def _build_ep_tp_moe_program(
             self,
             local_routed_x: pl.Tensor[[LOCAL_RECV_MAX, HIDDEN], pl.INT8],
             local_routed_x_scale: pl.Tensor[
-                [LOCAL_RECV_MAX, SCALE_W_PAD], pl.FP32
+                [1, LOCAL_RECV_MAX], pl.FP32
             ],
             local_expert_offset: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
             local_expert_count: pl.Tensor[[N_LOCAL_EXPERTS], pl.INT32],
@@ -2151,7 +2160,7 @@ def _build_ep_tp_moe_program(
                 [LOCAL_RECV_MAX, HIDDEN], dtype=pl.INT8,
             )
             local_routed_x_scale = pl.create_tensor(
-                [LOCAL_RECV_MAX, SCALE_W_PAD], dtype=pl.FP32,
+                [1, LOCAL_RECV_MAX], dtype=pl.FP32,
             )
             local_expert_offset = pl.create_tensor(
                 [N_LOCAL_EXPERTS], dtype=pl.INT32,

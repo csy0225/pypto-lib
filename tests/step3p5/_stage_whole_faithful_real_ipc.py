@@ -47,6 +47,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="/tmp/n1_weight_ipc")
     p.add_argument("--export-rank", type=int, default=-1)
     p.add_argument("--dev", type=int, default=0)
+    # Reuse externally-launched, still-holding exporters: skip cleanup/launch of
+    # exporter children and do NOT write STOP at exit, so the IPC pools stay
+    # mapped for a subsequent worker run (fast bisect: compile+run only).
+    p.add_argument("--reuse-exporters", action="store_true")
     return p.parse_args()
 
 
@@ -83,16 +87,21 @@ def _stop(out_dir, procs):
 def _do_worker(args) -> int:
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
+    # Surface the runtime's LOG_INFO_V0 VA-layout diagnostics (comm domain
+    # window base/size vs IPC pool). simpler maps python log level <=15 -> info_v=0.
+    import logging  # noqa: PLC0415
+    logging.getLogger("simpler").setLevel(15)
     device_ids = [int(d) for d in str(args.device).split(",")]
     tp = len(device_ids)
     dev_offset = device_ids[0]
     os.makedirs(args.out, exist_ok=True)
-    for f in os.listdir(args.out):
-        if f.startswith(("ready.rank", "pypto_weight.")) or f == "STOP":
-            try:
-                os.remove(os.path.join(args.out, f))
-            except OSError:
-                pass
+    if not args.reuse_exporters:
+        for f in os.listdir(args.out):
+            if f.startswith(("ready.rank", "pypto_weight.")) or f == "STOP":
+                try:
+                    os.remove(os.path.join(args.out, f))
+                except OSError:
+                    pass
 
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415
     set_backend_type(BackendType.Ascend910B)
@@ -106,24 +115,32 @@ def _do_worker(args) -> int:
 
     print(f"[worker] launching {tp} exporters dev_offset={dev_offset} ...", flush=True)
     procs = []
-    for r in range(tp):
-        procs.append(subprocess.Popen(
-            [sys.executable, "-m", "tests.step3p5._stage_whole_faithful_real_ipc",
-             "--export-rank", str(r), "--dev", str(dev_offset + r),
-             "--out", args.out, "--ckpt", args.ckpt],
-            cwd=str(repo_root),
-        ))
-    deadline = time.time() + 2400  # 40 min for cold jfs loads
-    while time.time() < deadline:
-        if all(os.path.exists(os.path.join(args.out, f"ready.rank{r}")) for r in range(tp)):
-            break
-        if any(pp.poll() not in (None, 0) for pp in procs):
-            _stop(args.out, procs)
-            raise RuntimeError("an exporter child died before readiness")
-        time.sleep(3)
+    if args.reuse_exporters:
+        # Attach to externally-launched exporters that are already holding.
+        print("[worker] reuse-exporters: expecting existing ready.rank* keys", flush=True)
+        for r in range(tp):
+            rp = os.path.join(args.out, f"ready.rank{r}")
+            if not os.path.exists(rp):
+                raise RuntimeError(f"reuse-exporters: missing {rp}; launch exporters first")
     else:
-        _stop(args.out, procs)
-        raise RuntimeError("exporters not ready within deadline")
+        for r in range(tp):
+            procs.append(subprocess.Popen(
+                [sys.executable, "-m", "tests.step3p5._stage_whole_faithful_real_ipc",
+                 "--export-rank", str(r), "--dev", str(dev_offset + r),
+                 "--out", args.out, "--ckpt", args.ckpt],
+                cwd=str(repo_root),
+            ))
+        deadline = time.time() + 2400  # 40 min for cold jfs loads
+        while time.time() < deadline:
+            if all(os.path.exists(os.path.join(args.out, f"ready.rank{r}")) for r in range(tp)):
+                break
+            if any(pp.poll() not in (None, 0) for pp in procs):
+                _stop(args.out, procs)
+                raise RuntimeError("an exporter child died before readiness")
+            time.sleep(3)
+        else:
+            _stop(args.out, procs)
+            raise RuntimeError("exporters not ready within deadline")
     print("[worker] all exporters ready; compiling program ...", flush=True)
 
     try:
@@ -132,10 +149,18 @@ def _do_worker(args) -> int:
         from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor  # noqa: PLC0415
         os.environ["PYPTO_PROG_BUILD_DIR"] = "/data/chensiyu/hw_project/pypto/workspace/build_output"
         program = getattr(dl, args.layer_name)
+        # Diagnostic knob: PYPTO_MEM_PLANNER=ptoas skips PyPTO MemoryReuse +
+        # AllocateMemoryAddr (ptoas owns reuse) — used to test whether the
+        # 42-layer gate_topk stall is a cross-chip buffer-aliasing artifact.
+        _mplan = None
+        if os.environ.get("PYPTO_MEM_PLANNER", "").lower() == "ptoas":
+            from pypto.pypto_core import passes as _passes  # noqa: PLC0415
+            _mplan = _passes.MemoryPlanner.PTOAS
+            print("[worker] memory_planner=PTOAS (skip PyPTO MemoryReuse)", flush=True)
         compiled = ir.compile(
             program, platform=args.platform,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-            skip_ptoas=False, dump_passes=False,
+            skip_ptoas=False, dump_passes=False, memory_planner=_mplan,
         )
         print(f"[worker] compile OK => {compiled.output_dir}", flush=True)
 
@@ -214,7 +239,10 @@ def _do_worker(args) -> int:
                   f"max|logits|={logits_shard_out.abs().max():.4f} argmax={int(full_logits.argmax())}", flush=True)
             print("[worker] RESULT=REAL_WEIGHT_IPC_RUN_CLEAN", flush=True)
     finally:
-        _stop(args.out, procs)
+        if args.reuse_exporters:
+            print("[worker] reuse-exporters: leaving pools mapped (no STOP)", flush=True)
+        else:
+            _stop(args.out, procs)
     return 0
 
 

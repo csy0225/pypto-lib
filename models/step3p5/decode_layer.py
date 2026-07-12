@@ -2268,7 +2268,7 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -4133,7 +4133,7 @@ def _build_whole_decode_mixed_min_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -6594,7 +6594,7 @@ def _build_decode_layer_moe_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -8350,7 +8350,7 @@ def _build_mixed_2method_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -10170,7 +10170,7 @@ def _build_fused_dense_moe_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -12144,7 +12144,7 @@ def _build_mixed_moe_tail_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -14000,7 +14000,7 @@ def _build_moe_layer_real_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -15892,7 +15892,7 @@ def _build_whole_decode_all_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -19453,7 +19453,7 @@ def _build_whole_decode_faithful_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,
@@ -23872,7 +23872,7 @@ def _build_whole_decode_faithful_real_program(
                     )
                     srt = pl.sort32(row, idx_init)
                     srt = pl.mrgsort(srt, block_len=64)
-                    srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+                    srt = pl.mrgsort(srt, block_len=256)
                     pairs = srt[:, 0:ROUTER_SORT_PAD]
                     top_idx = pl.gather(
                         pairs, mask_pattern=pl.tile.MaskPattern.P1010,

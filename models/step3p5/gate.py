@@ -177,8 +177,8 @@ def gate(
             row = biased_buf[tt : tt + 1, :]
             idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
             srt = pl.sort32(row, idx_init)              # [1, 2*SCORE_PAD]
-            srt = pl.mrgsort(srt, block_len=64)         # 64 -> 256-pos runs
-            srt = pl.mrgsort(srt[:, 0:512], srt[:, 512:1024])
+            srt = pl.mrgsort(srt, block_len=64)         # 16 runs of 64 -> 4 runs of 256
+            srt = pl.mrgsort(srt, block_len=256)        # 4 runs of 256 -> 1 sorted run of 1024
             pairs = srt[:, 0:SORT_PAD]
             top_idx = pl.gather(
                 pairs, mask_pattern=pl.tile.MaskPattern.P1010,

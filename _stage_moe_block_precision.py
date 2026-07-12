@@ -149,9 +149,14 @@ def main() -> int:
     print(f"[moe-prec] input {in_label} -> x{tuple(x.shape)}", flush=True)
 
     # ---- per-rank weights: load each rank's bundle, slice layer-L, free ----
-    wg_r = torch.empty(TP, N_LOC, HIDDEN, INTER, dtype=bf16)
-    wu_r = torch.empty(TP, N_LOC, HIDDEN, INTER, dtype=bf16)
-    wd_r = torch.empty(TP, N_LOC, INTER, HIDDEN, dtype=bf16)
+    # INT8-native routed experts + per-output-channel FP32 scales (matches the
+    # INT8 moe.py EpTpMoE signature; dispatch-side quant happens on-device).
+    wg_r = torch.empty(TP, N_LOC, HIDDEN, INTER, dtype=torch.int8)
+    wu_r = torch.empty(TP, N_LOC, HIDDEN, INTER, dtype=torch.int8)
+    wd_r = torch.empty(TP, N_LOC, INTER, HIDDEN, dtype=torch.int8)
+    wg_r_s = torch.empty(TP, N_LOC, INTER, dtype=torch.float32)
+    wu_r_s = torch.empty(TP, N_LOC, INTER, dtype=torch.float32)
+    wd_r_s = torch.empty(TP, N_LOC, HIDDEN, dtype=torch.float32)
     wg_s = torch.empty(TP, HIDDEN, SH, dtype=bf16)
     wu_s = torch.empty(TP, HIDDEN, SH, dtype=bf16)
     wd_s = torch.empty(TP, SH, HIDDEN, dtype=bf16)
@@ -168,18 +173,14 @@ def main() -> int:
     router_bias0 = None
     post_rms0 = None  # post_attention_layernorm weight (replicated across TP)
     for r in range(TP):
-        print(f"[moe-prec] loading rank {r} bundle ...", flush=True)
-        b = wl.load_step3p5_weights_for_rank(args.ckpt, r, TP, w8a8_native=args.w8a8_native)
-        wg_r[r] = b[wl.KEY_MOE_W_GATE_R][pos].to(bf16)
-        wu_r[r] = b[wl.KEY_MOE_W_UP_R][pos].to(bf16)
-        wd_r[r] = b[wl.KEY_MOE_W_DOWN_R][pos].to(bf16)
-        if args.w8a8_native:
-            wg_r_i8[r] = b[wl.KEY_MOE_W_GATE_R_I8][pos]
-            wu_r_i8[r] = b[wl.KEY_MOE_W_UP_R_I8][pos]
-            wd_r_i8[r] = b[wl.KEY_MOE_W_DOWN_R_I8][pos]
-            wg_r_sc[r] = b[wl.KEY_MOE_W_GATE_R_SCALE][pos].to(torch.float32)
-            wu_r_sc[r] = b[wl.KEY_MOE_W_UP_R_SCALE][pos].to(torch.float32)
-            wd_r_sc[r] = b[wl.KEY_MOE_W_DOWN_R_SCALE][pos].to(torch.float32)
+        print(f"[moe-prec] loading rank {r} bundle (int8_routed) ...", flush=True)
+        b = wl.load_step3p5_weights_for_rank(args.ckpt, r, TP, int8_routed=True)
+        wg_r[r] = b[wl.KEY_MOE_W_GATE_R][pos]
+        wu_r[r] = b[wl.KEY_MOE_W_UP_R][pos]
+        wd_r[r] = b[wl.KEY_MOE_W_DOWN_R][pos]
+        wg_r_s[r] = b[wl.KEY_MOE_W_GATE_R_SCALE][pos]
+        wu_r_s[r] = b[wl.KEY_MOE_W_UP_R_SCALE][pos]
+        wd_r_s[r] = b[wl.KEY_MOE_W_DOWN_R_SCALE][pos]
         wg_s[r] = b[wl.KEY_MOE_W_GATE_S][pos].to(bf16)
         wu_s[r] = b[wl.KEY_MOE_W_UP_S][pos].to(bf16)
         wd_s[r] = b[wl.KEY_MOE_W_DOWN_S][pos].to(bf16)
@@ -288,14 +289,18 @@ def main() -> int:
 
     inputs = {
         "x": x, "gate_w": gate_w, "router_bias": router_bias,
-        "w_gate_r": wg_r, "w_up_r": wu_r, "w_down_r": wd_r,
+        "w_gate_r": wg_r, "w_gate_r_scale": wg_r_s,
+        "w_up_r": wu_r, "w_up_r_scale": wu_r_s,
+        "w_down_r": wd_r, "w_down_r_scale": wd_r_s,
         "w_gate_s": wg_s, "w_up_s": wu_s, "w_down_s": wd_s,
         "moe_out": moe_out,
     }
     order = [
         ("x", bf16, False), ("gate_w", torch.float32, False),
         ("router_bias", torch.float32, False),
-        ("w_gate_r", bf16, False), ("w_up_r", bf16, False), ("w_down_r", bf16, False),
+        ("w_gate_r", torch.int8, False), ("w_gate_r_scale", torch.float32, False),
+        ("w_up_r", torch.int8, False), ("w_up_r_scale", torch.float32, False),
+        ("w_down_r", torch.int8, False), ("w_down_r_scale", torch.float32, False),
         ("w_gate_s", bf16, False), ("w_up_s", bf16, False), ("w_down_s", bf16, False),
         ("moe_out", bf16, True),
     ]

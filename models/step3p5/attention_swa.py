@@ -233,13 +233,14 @@ def attention_swa(
     q_proj_norm = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32)
     k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN_LOCAL], dtype=pl.FP32)
     normed_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    # Head-gate is now precomputed off-device and passed through ``gate_r``
-    # (worker computes gate_exp = expand_per_head(sigmoid(RMSNorm(current_hidden)
-    # @ w_g))). The on-device gate_logits matmul was removed: its output N=16
-    # tripped the pypto matmul_acc small-N codegen bug (K-accumulation dropped,
-    # gate ~20x too small). o_proj (Scope 3.a) reads gate_r directly. ``w_g``
-    # stays in the signature (worker still sends it) but is unused here. Mirrors
-    # attention_full.py.
+    gate_score_t = pl.create_tensor([BATCH, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.BF16)
+    gate_exp = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
+    # Head-gate is computed on-device in Scope 1.f below (RESTORED, path (a)):
+    # gate_exp = expand_per_head(sigmoid(normed_all @ w_g)) via block-diag R
+    # (= gate_r input, layer-independent). The N=16 matmul_acc codegen bug that
+    # once forced this worker-side is fixed on the current stack. Mirrors
+    # attention_full.py. gate_r now holds R [NUM_HEADS_SWA_LOCAL_PAD,
+    # HIDDEN_Q_SWA_LOCAL]; w_g is the per-attn-layer stacked gate weight.
 
     # ----- Scope 1.a — zero-centred input RMSNorm. -----
     # input_rms_weight is replicated across TP ranks (HIDDEN dim is not
@@ -273,6 +274,33 @@ def attention_swa(
             normed_all = pl.assemble(
                 normed_all, pl.cast(normed, target_type=pl.BF16), [rms_b0, norm_k0],
             )
+
+    # ----- Scope 1.f — on-device head-gate (RESTORED, path (a)). -----
+    # gate_exp[b, h*HEAD_DIM + d] = sigmoid(normed_all @ w_g)[b, h], expanded
+    # across HEAD_DIM via the block-diag constant R (= gate_r). Matches vLLM
+    # modeling_step3p5 L489 + L527-531. Two scopes bound the UB working set.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_head_gate_logits"):
+        hg_x0 = pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, 0])
+        hg_w0 = pl.slice(
+            w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD], [layer_hidden_base, 0],
+        )
+        hg_logits = pl.matmul(hg_x0, hg_w0, out_dtype=pl.FP32)
+        for kb in pl.range(1, decode_scope1_hidden_blocks):
+            hg_k0 = kb * INPUT_PROJ_K_CHUNK
+            hg_xk = pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, hg_k0])
+            hg_wk = pl.slice(
+                w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD],
+                [layer_hidden_base + hg_k0, 0],
+            )
+            hg_logits = pl.matmul_acc(hg_logits, hg_xk, hg_wk)
+        hg_score = pl.recip(pl.add(pl.exp(pl.neg(hg_logits)), 1.0))
+        gate_score_t[:, :] = pl.cast(hg_score, target_type=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_head_gate_expand"):
+        for nb in pl.range(0, HIDDEN_Q_SWA_LOCAL // K_CHUNK):
+            hg_n0 = nb * K_CHUNK
+            hg_r = pl.slice(gate_r, [NUM_HEADS_SWA_LOCAL_PAD, K_CHUNK], [0, hg_n0])
+            hg_ge = pl.matmul(gate_score_t, hg_r, out_dtype=pl.FP32)
+            gate_exp[:, hg_n0:hg_n0 + K_CHUNK] = pl.cast(hg_ge, target_type=pl.BF16)
 
     # ----- Scope 1.b — Q projection. -----
     # wq is row-sliced (output dim → HIDDEN_Q_SWA_LOCAL = 1536 per rank).
@@ -381,11 +409,9 @@ def attention_swa(
         k_normed = pl.col_expand_mul(k_scaled, pl.add(k_gamma, 1.0))
         k_proj_norm = pl.assemble(k_proj_norm, k_normed, [qkn_b0, qkn_k0])
 
-    # ----- Scope 1.f — head-wise gate matmul REMOVED. -----
-    # The on-device gate_logits matmul (current_hidden @ w_g, output N=16) hit
-    # the pypto matmul_acc small-N codegen bug (K-accumulation dropped). The gate
-    # is now precomputed on the worker and delivered via ``gate_r``; o_proj
-    # (Scope 3.a) applies it inline. Mirrors attention_full.py.
+    # ----- Scope 1.f head-gate is now computed above (RESTORED, path (a)). ----
+    # gate_exp was computed on-device right after Scope 1.a; o_proj (Scope 3.a)
+    # applies it inline. Mirrors attention_full.py.
 
     # ----- Scope 2 — full RoPE + paged KV cache write + fa_fused (SWA). -----
     # Full RoPE (rotary_dim == HEAD_DIM, no pass-through tail). The KV cache
@@ -672,12 +698,10 @@ def attention_swa(
         attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])
 
     # ----- Scope 2.5 — head-wise gate is applied inline in o_proj below. -----
-    # The worker precomputes gate_exp = expand_per_head(sigmoid(RMSNorm(
-    # current_hidden) @ w_g)) as [BATCH, HIDDEN_Q_SWA_LOCAL] BF16 and passes it
-    # through the ``gate_r`` slot (BATCH == NUM_HEADS_SWA_LOCAL_PAD == 16, so the
-    # [16, HIDDEN_Q_SWA_LOCAL] slot fits with no shape change). The o_proj scope
-    # multiplies attn_out by gate_r per K-chunk (wide element-wise, no [N,1]
-    # broadcast → no UB-align fault). Mirrors attention_full.py Scope 3.a.
+    # gate_exp was computed on-device in Scope 1.f (gate_exp = sigmoid(normed_all
+    # @ w_g) @ R). The o_proj scope below multiplies attn_out by gate_exp per
+    # K-chunk (wide element-wise, no [N,1] broadcast → no UB-align fault).
+    # Mirrors attention_full.py Scope 3.a.
 
     # ----- Scope 3.a — local o_proj with inline head-gate (element-wise). -----
     # wo is column-sliced (input dim → HIDDEN_Q_SWA_LOCAL = 1536 per rank);
@@ -695,9 +719,9 @@ def attention_swa(
             optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
         ):
             o0 = ob * OUT_PROJ_N_CHUNK
-            # First K-chunk (kb=0). Gate applied inline via gate_r (=gate_exp).
+            # First K-chunk (kb=0). Gate applied inline via on-device gate_exp.
             hg_exp_0 = pl.cast(
-                pl.slice(gate_r, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0]),
+                pl.slice(gate_exp, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0]),
                 target_type=pl.FP32,
             )
             a_chunk_raw_0 = pl.slice(
@@ -714,7 +738,7 @@ def attention_swa(
             for kb in pl.range(1, out_proj_k_blocks):
                 k0 = kb * OUT_PROJ_K_CHUNK
                 hg_exp = pl.cast(
-                    pl.slice(gate_r, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0]),
+                    pl.slice(gate_exp, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0]),
                     target_type=pl.FP32,
                 )
                 a_chunk_raw = pl.slice(

@@ -211,6 +211,15 @@ def _do_worker(args) -> int:
                   f"|emb|max={_emb_row.float().abs().max():.4f}", flush=True)
         gate_r_full = zsh(tp, N_FULL, NHF_PAD, HQ_FULL)
         gate_r_swa = zsh(tp, N_SWA, NHS_PAD, HQ_SWA)
+        # Fill gate_r with the block-diag R constant (layer-independent). The
+        # on-device head-gate (attention_full/swa Scope 1.f) computes
+        # gate_exp = sigmoid(normed_all @ w_g) @ R, so R[h, h*HEAD_DIM+d] = 1
+        # for real local heads (count = HQ//HEAD_DIM: full=8, swa=12); padded
+        # rows [real_heads : NHF_PAD] stay zero.
+        for _h in range(HQ_FULL // HEAD_DIM):
+            gate_r_full[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
+        for _h in range(HQ_SWA // HEAD_DIM):
+            gate_r_swa[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
         seq_lens = torch.ones(tp, UBD, dtype=i32).share_memory_()
         block_table = torch.zeros(tp, BTF, dtype=i32).share_memory_()
         slot_mapping = torch.arange(UBD, dtype=i32).unsqueeze(0).repeat(tp, 1).contiguous().share_memory_()

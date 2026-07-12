@@ -125,7 +125,12 @@ def _dtype_for(key: str) -> str:
 
 def _torch_dtype(name: str):
     import torch  # noqa: PLC0415
-    return torch.float32 if name == "float32" else torch.bfloat16
+    return {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "int8": torch.int8,
+        "float16": torch.float16,
+    }.get(name, torch.bfloat16)
 
 
 def _align_up(n: int, a: int = _ALIGN) -> int:
@@ -191,7 +196,7 @@ class WeightIpcExporter:
             # Defensive: honor the tensor's own dtype if it disagrees with the
             # canonical rule (e.g. a checkpoint that ships gate_w in bf16).
             td = str(t.dtype).removeprefix("torch.")
-            if td in ("float32", "bfloat16"):
+            if td in ("float32", "bfloat16", "int8", "float16"):
                 dtype_name = td
             nbytes = int(t.numel() * t.element_size())
             layout.append((key, offset, shape, dtype_name, nbytes))

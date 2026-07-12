@@ -933,9 +933,12 @@ def load_step3p5_weights_for_rank(
             bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows_i8, dim=0)
             bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows_i8, dim=0)
             bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows_i8, dim=0)
-            bundle[KEY_MOE_W_GATE_R_SCALE] = torch.stack(routed_gate_scale_rows, dim=0)
-            bundle[KEY_MOE_W_UP_R_SCALE] = torch.stack(routed_up_scale_rows, dim=0)
-            bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(routed_down_scale_rows, dim=0)
+            # Per-output-channel scale is [.., N] (2D per expert); the projector
+            # returns a [.., N, 1] column, so squeeze the trailing singleton to
+            # match the kernel/program signature [tp_size, N_MOE, EXPL, N].
+            bundle[KEY_MOE_W_GATE_R_SCALE] = torch.stack(routed_gate_scale_rows, dim=0).squeeze(-1)
+            bundle[KEY_MOE_W_UP_R_SCALE] = torch.stack(routed_up_scale_rows, dim=0).squeeze(-1)
+            bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(routed_down_scale_rows, dim=0).squeeze(-1)
         else:
             bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows, dim=0)
             bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows, dim=0)

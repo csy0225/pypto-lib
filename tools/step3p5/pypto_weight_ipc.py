@@ -348,6 +348,7 @@ def export_from_checkpoint(
     out_dir: str,
     dev: int = 0,
     int8_routed: bool = False,
+    kv_ipc: bool = False,
 ) -> Dict[str, Any]:
     """Convenience: load a rank bundle from a checkpoint + export it.
 
@@ -382,6 +383,16 @@ def export_from_checkpoint(
     for _k in _PROG_FP32:
         if _k in bundle and str(bundle[_k].dtype) != "torch.float32":
             bundle[_k] = bundle[_k].to(torch.float32)
+    if kv_ipc:
+        # KV cache also via IPC (user hard constraint): carve per-rank k/v_cache
+        # slots into the same pool so the forked chip imports them zero-copy as
+        # add_inout DeviceTensors (attention reads context + writes new K/V into
+        # this shared peer memory). Values are dummy here (mechanism validation);
+        # a live exporter would map vLLM's resident KV pool instead.
+        import models.step3p5.config as _cfg  # noqa: PLC0415
+        _kvc, _hd = int(_cfg.KV_CACHE_ROWS_DYN), int(_cfg.HEAD_DIM)
+        bundle["k_cache"] = torch.zeros([_kvc, _hd], dtype=torch.bfloat16)
+        bundle["v_cache"] = torch.zeros([_kvc, _hd], dtype=torch.bfloat16)
     exp = WeightIpcExporter(dev)
     return exp.export(
         bundle, out_dir=out_dir, rank=rank, tp_world_size=tp_world_size,

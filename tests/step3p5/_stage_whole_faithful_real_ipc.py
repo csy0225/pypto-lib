@@ -51,6 +51,9 @@ def _parse_args() -> argparse.Namespace:
     # exporter children and do NOT write STOP at exit, so the IPC pools stay
     # mapped for a subsequent worker run (fast bisect: compile+run only).
     p.add_argument("--reuse-exporters", action="store_true")
+    # KV cache also via IPC (user hard constraint): exporter carves dummy
+    # k/v_cache into the pool; worker binds them as add_inout DeviceTensors.
+    p.add_argument("--kv-ipc", action="store_true")
     return p.parse_args()
 
 
@@ -61,7 +64,7 @@ def _do_export(args) -> int:
     from tools.step3p5.pypto_weight_ipc import export_from_checkpoint  # noqa: PLC0415
     r = args.export_rank
     os.makedirs(args.out, exist_ok=True)
-    export_from_checkpoint(args.ckpt, rank=r, tp_world_size=8, out_dir=args.out, dev=args.dev, int8_routed=True)
+    export_from_checkpoint(args.ckpt, rank=r, tp_world_size=8, out_dir=args.out, dev=args.dev, int8_routed=True, kv_ipc=args.kv_ipc)
     # Signal readiness; hold the pool mapped until the worker writes STOP.
     Path(os.path.join(args.out, f"ready.rank{r}")).write_text("1")
     print(f"[export-rank {r}] holding pool on dev {args.dev}; waiting for STOP", flush=True)
@@ -127,7 +130,8 @@ def _do_worker(args) -> int:
             procs.append(subprocess.Popen(
                 [sys.executable, "-m", "tests.step3p5._stage_whole_faithful_real_ipc",
                  "--export-rank", str(r), "--dev", str(dev_offset + r),
-                 "--out", args.out, "--ckpt", args.ckpt],
+                 "--out", args.out, "--ckpt", args.ckpt]
+                + (["--kv-ipc"] if args.kv_ipc else []),
                 cwd=str(repo_root),
             ))
         deadline = time.time() + 2400  # 40 min for cold jfs loads
@@ -210,6 +214,14 @@ def _do_worker(args) -> int:
                 shards = [DeviceTensor(wmaps[r].peer_base + wmaps[r].offset(key),
                                        tuple(per_rank_shape), dtype) for r in range(tp)]
                 return StackedDeviceTensor(shards, (tp, *per_rank_shape), list(range(tp)))
+
+            if args.kv_ipc:
+                # KV via IPC (user hard constraint): rebind k/v_cache from the
+                # pool as add_inout DeviceTensors (attention reads context + writes
+                # new K/V into this shared peer memory), replacing the dummy host
+                # tensors allocated pre-prepare above.
+                k_cache, v_cache = W("k_cache"), W("v_cache")
+                print("[worker] KV cache via IPC (k_cache/v_cache bound from pool)", flush=True)
 
             args_list = [current_hidden]  # dummy host, shared
             args_list += [W(K.KEY_INPUT_RMS), W(K.KEY_POST_ATTN_RMS), W(K.KEY_Q_NORM), W(K.KEY_K_NORM)]

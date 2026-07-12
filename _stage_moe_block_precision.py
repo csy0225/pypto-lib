@@ -35,7 +35,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
     p.add_argument("--layer", type=int, default=3, help="MoE layer index (3..44)")
     p.add_argument("--dev-offset", type=int, default=8, help="first card (uses off..off+7)")
-    p.add_argument("--dump", required=True, help="vLLM golden dump dir (beijing_1tok/dump)")
+    p.add_argument("--dump", default=None, help="vLLM golden dump dir (beijing_1tok/dump); omit for synthetic --run-only")
     p.add_argument("--ckpt", required=True, help="W8A8 checkpoint dir")
     p.add_argument("--target", default="ffn_out",
                    choices=["ffn_out", "moe_after_allreduce", "moe_parts_shared", "moe_parts_routed"],
@@ -118,12 +118,17 @@ def main() -> int:
     print(f"[moe-prec] layer={args.layer} program={prog_name} TP={TP} "
           f"T={T} HIDDEN={HIDDEN} INTER={INTER} N_LOC={N_LOC} SH={SH}", flush=True)
 
-    # ---- input: dumped post_attn_residual[0:T], broadcast to [TP,T,HIDDEN] ----
-    resid = _load_dump_tensor(args.dump, args.layer, "post_attn_norm", rank=0,
-                              inner_key="hidden_states")
-    resid = resid.reshape(-1, HIDDEN)[:T].to(bf16)
-    if resid.shape[0] < T:
-        resid = torch.cat([resid, torch.zeros(T - resid.shape[0], HIDDEN, dtype=bf16)], 0)
+    # ---- input: dumped post_attn_residual[0:T] (or synthetic when no dump) ----
+    if args.dump is None:
+        torch.manual_seed(0)
+        resid = (torch.randn(T, HIDDEN) * 0.1).to(bf16)
+        print("[moe-prec] SYNTHETIC input (no --dump): randn*0.1", flush=True)
+    else:
+        resid = _load_dump_tensor(args.dump, args.layer, "post_attn_norm", rank=0,
+                                  inner_key="hidden_states")
+        resid = resid.reshape(-1, HIDDEN)[:T].to(bf16)
+        if resid.shape[0] < T:
+            resid = torch.cat([resid, torch.zeros(T - resid.shape[0], HIDDEN, dtype=bf16)], 0)
     x = resid.unsqueeze(0).expand(TP, T, HIDDEN).contiguous()
     print(f"[moe-prec] input post_attn_residual -> x{tuple(x.shape)}", flush=True)
 
@@ -162,10 +167,16 @@ def main() -> int:
     if args.bypass_gate:
         from models.step3p5.config import MOE_TOP_K as _TOPK  # noqa: PLC0415
         ROUTE_SCALE = 1.0  # vLLM topk_weights already sum to ROUTER_SCALE=3.0
-        tk_ids = _load_dump_tensor(args.dump, args.layer, "moe_router", rank=0,
-                                   inner_key="topk_ids").reshape(-1, _TOPK)[:T].to(torch.int64)
-        tk_w = _load_dump_tensor(args.dump, args.layer, "moe_router", rank=0,
-                                 inner_key="topk_weights").reshape(-1, _TOPK)[:T].to(torch.float32)
+        if args.dump is None:
+            torch.manual_seed(1)
+            tk_ids = torch.randint(0, MOE_NUM_EXPERTS, (T, _TOPK), dtype=torch.int64)
+            tk_w = torch.softmax(torch.randn(T, _TOPK), dim=-1).to(torch.float32) * 3.0
+            print("[moe-prec] SYNTHETIC topk (no --dump)", flush=True)
+        else:
+            tk_ids = _load_dump_tensor(args.dump, args.layer, "moe_router", rank=0,
+                                       inner_key="topk_ids").reshape(-1, _TOPK)[:T].to(torch.int64)
+            tk_w = _load_dump_tensor(args.dump, args.layer, "moe_router", rank=0,
+                                     inner_key="topk_weights").reshape(-1, _TOPK)[:T].to(torch.float32)
         if tk_ids.shape[0] < T:
             tk_ids = torch.cat([tk_ids, torch.zeros(T - tk_ids.shape[0], _TOPK, dtype=torch.int64)], 0)
             tk_w = torch.cat([tk_w, torch.zeros(T - tk_w.shape[0], _TOPK)], 0)
@@ -229,6 +240,9 @@ def main() -> int:
     if args.torch_golden:
         import torch.nn.functional as _F  # noqa: PLC0415
         xf = x[0].float()  # [T,HIDDEN] replicated
+
+        def _deq(wi8, ws):  # [K,N] int8 * [N] fp32 (per-output-channel) -> [K,N] fp32
+            return wi8.float() * ws.unsqueeze(0)
         sh_ref = torch.zeros(T, HIDDEN, dtype=torch.float32)
         if not args.zero_shared:
             for r in range(TP):
@@ -236,16 +250,20 @@ def main() -> int:
                 sh_ref += (_F.silu(g) * u) @ wd_s[r].float()
         ro_ref = torch.zeros(T, HIDDEN, dtype=torch.float32)
         if not args.zero_routed:
-            tk_ids = _load_dump_tensor(args.dump, args.layer, 'moe_router', rank=0, inner_key='topk_ids').reshape(-1, 8)[:T].long()
-            tk_w = _load_dump_tensor(args.dump, args.layer, 'moe_router', rank=0, inner_key='topk_weights').reshape(-1, 8)[:T].float()
+            if args.dump is None:
+                _tki, _tkw = tk_ids, tk_w  # reuse synthetic topk from bypass-gate
+            else:
+                _tki = _load_dump_tensor(args.dump, args.layer, 'moe_router', rank=0, inner_key='topk_ids').reshape(-1, 8)[:T].long()
+                _tkw = _load_dump_tensor(args.dump, args.layer, 'moe_router', rank=0, inner_key='topk_weights').reshape(-1, 8)[:T].float()
             for t in range(T):
                 for kk in range(8):
-                    eid = int(tk_ids[t, kk]); w = float(tk_w[t, kk])
+                    eid = int(_tki[t, kk]); w = float(_tkw[t, kk])
                     dst = eid // N_LOC; le = eid % N_LOC
-                    g = xf[t:t+1] @ wg_r[dst, le].float(); u = xf[t:t+1] @ wu_r[dst, le].float()
-                    ro_ref[t:t+1] += w * ((_F.silu(g) * u) @ wd_r[dst, le].float())
+                    g = xf[t:t+1] @ _deq(wg_r[dst, le], wg_r_s[dst, le])
+                    u = xf[t:t+1] @ _deq(wu_r[dst, le], wu_r_s[dst, le])
+                    ro_ref[t:t+1] += w * ((_F.silu(g) * u) @ _deq(wd_r[dst, le], wd_r_s[dst, le]))
         tgt = (sh_ref + ro_ref)
-        print(f'[moe-prec] TORCH-GOLDEN: sh_ref|max|={float(sh_ref.abs().max()):.3f} ro_ref|max|={float(ro_ref.abs().max()):.3f}', flush=True)
+        print(f'[moe-prec] TORCH-GOLDEN(INT8-dequant): sh|max|={float(sh_ref.abs().max()):.3f} ro|max|={float(ro_ref.abs().max()):.3f}', flush=True)
     def golden_fn(values):
         for r in range(TP):
             values["moe_out"][r] = tgt.to(bf16)

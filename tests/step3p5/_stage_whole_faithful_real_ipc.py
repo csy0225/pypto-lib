@@ -207,6 +207,14 @@ def _do_worker(args) -> int:
             with _st.safe_open(os.path.join(args.ckpt, _shard), framework="pt") as _f:
                 _emb_row = _f.get_slice("model.embed_tokens.weight")[args.hidden_token, :].to(torch.bfloat16)
             current_hidden[:, 0, :] = _emb_row
+            if int(os.environ.get("P_FILL_BATCH", "0")) > 0:
+                # E1 diagnostic: fill ALL BATCH rows with embed(token) so there
+                # are no zero-embedding rows. Isolates whether the MoE ~1e11 is
+                # driven by degenerate zero rows (INT8 amax quant divide-by-tiny
+                # / combine reading unwritten routed cells) vs an input-agnostic
+                # bug (buffer aliasing / collective).
+                current_hidden[:, :, :] = _emb_row
+                print("[worker] E1: P_FILL_BATCH — all BATCH rows = embed(token)", flush=True)
             print(f"[worker] ctx=1 A/B: current_hidden row0 = embed(token={args.hidden_token}) "
                   f"|emb|max={_emb_row.float().abs().max():.4f}", flush=True)
         gate_r_full = zsh(tp, N_FULL, NHF_PAD, HQ_FULL)
@@ -230,6 +238,7 @@ def _do_worker(args) -> int:
             rope_cf.fill_(1.0); rope_cs.fill_(1.0)  # sin stays 0
         k_cache, v_cache = zsh(tp, KVC, HEAD_DIM), zsh(tp, KVC, HEAD_DIM)
         h_mid_out, next_hidden_out = zsh(tp, BATCH, HIDDEN), zsh(tp, BATCH, HIDDEN)
+        dbg_out = zsh(tp, BATCH, HIDDEN)  # E2 op-level stage dump (P_DBG_STAGE)
         logits_shard_out = torch.zeros(tp, UBD, VOCAB_LOCAL, dtype=f32).share_memory_()
 
         with compiled.prepare() as rt:
@@ -267,6 +276,7 @@ def _do_worker(args) -> int:
             args_list += [seq_lens, block_table, slot_mapping, rope_cf, rope_sf, rope_cs, rope_ss,
                           k_cache, v_cache]
             args_list += [h_mid_out, next_hidden_out]
+            args_list += [dbg_out]
             args_list += [W_reshape(K.KEY_FINAL_NORM, (1, HIDDEN), f32), W(K.KEY_LM_HEAD)]
             args_list += [logits_shard_out]
 
@@ -275,8 +285,33 @@ def _do_worker(args) -> int:
             rt.run(compiled, *args_list)
             dt = time.time() - t0
             full_logits = torch.cat([logits_shard_out[r, 0] for r in range(tp)], dim=0)
+            # Row-0 = the single valid ctx=1 token; rows 1..15 are batch padding and
+            # unused expert slots are garbage (data windows not auto-zeroed). Report
+            # BOTH the whole-buffer max (confounded by garbage) and the row-0 (valid
+            # token) magnitude so the valid-token signal is not masked by padding.
+            nh_row0 = next_hidden_out[:, 0, :].float().abs().max()
+            dbg_row0 = dbg_out[:, 0, :].float().abs().max()
             print(f"[worker] RUN done {dt:.2f}s max|next_hidden|={next_hidden_out.float().abs().max():.4f} "
+                  f"row0|next_hidden|={nh_row0:.4f} "
+                  f"max|h_mid|={h_mid_out.float().abs().max():.4f} "
+                  f"max|dbg|={dbg_out.float().abs().max():.4f} row0|dbg|={dbg_row0:.4f} "
                   f"max|logits|={logits_shard_out.abs().max():.4f} argmax={int(full_logits.argmax())}", flush=True)
+            _t5 = torch.topk(full_logits.float(), 5)
+            print(f"[worker] TOP5 ids={_t5.indices.tolist()} "
+                  f"vals={[round(float(v), 3) for v in _t5.values.tolist()]} "
+                  f"(vLLM golden next-token argmax=303)", flush=True)
+            _pdir = os.environ.get("N1_DUMP_DIR", "")
+            if _pdir:
+                os.makedirs(_pdir, exist_ok=True)
+                _P = os.environ.get("P_FAITHFUL_MOE_LAYERS", "42")
+                _S = os.environ.get("P_DBG_STAGE", "0")
+                torch.save(next_hidden_out[:, 0, :].float().cpu(),
+                           os.path.join(_pdir, f"P{_P}_nh_row0.pt"))
+                torch.save(h_mid_out[:, 0, :].float().cpu(),
+                           os.path.join(_pdir, f"P{_P}_hmid_row0.pt"))
+                torch.save(dbg_out[:, 0, :].float().cpu(),
+                           os.path.join(_pdir, f"P{_P}_S{_S}_dbg_row0.pt"))
+                print(f"[worker] DUMPED vectors P={_P} S={_S} -> {_pdir}", flush=True)
             print("[worker] RESULT=REAL_WEIGHT_IPC_RUN_CLEAN", flush=True)
     finally:
         if args.reuse_exporters:

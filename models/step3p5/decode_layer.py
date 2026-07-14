@@ -671,6 +671,24 @@ def _build_decode_layer_dense_program(
                         pl.cast(acc, target_type=pl.BF16),
                         [0, k0], local,
                     )
+                # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+                # rank finished Phase 3 reads before returning, so the next layer's
+                # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+                # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+                # threshold escalated 1 -> 2.
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=signal_window, peer=peer,
+                            offsets=[my_rank, 0], value=1,
+                            op=pld.NotifyOp.AtomicAdd,
+                        )
+                for src in pl.range(group_size):
+                    if src != my_rank:
+                        pld.system.wait(
+                            signal=signal_window, offsets=[src, 0],
+                            expected=2, cmp=pld.WaitCmp.Ge,
+                        )
                 return local
 
             # ---- full=True: chip_orch with gate_r, calls attention_full ----
@@ -877,6 +895,24 @@ def _build_decode_layer_dense_program(
                         pl.cast(acc, target_type=pl.BF16),
                         [0, k0], local,
                     )
+                # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+                # rank finished Phase 3 reads before returning, so the next layer's
+                # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+                # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+                # threshold escalated 1 -> 2.
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=signal_window, peer=peer,
+                            offsets=[my_rank, 0], value=1,
+                            op=pld.NotifyOp.AtomicAdd,
+                        )
+                for src in pl.range(group_size):
+                    if src != my_rank:
+                        pld.system.wait(
+                            signal=signal_window, offsets=[src, 0],
+                            expected=2, cmp=pld.WaitCmp.Ge,
+                        )
                 return local
 
             # ---- full=False: chip_orch with gate_r, calls attention_swa ----
@@ -1093,6 +1129,24 @@ def _build_fused_dense_lmhead_program(tp_size: int = TP_WORLD_SIZE):
                         )
                         acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(pl.cast(acc, target_type=pl.BF16), [0, k0], local)
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1339,6 +1393,24 @@ def _build_dense_chain3_lmhead_program(tp_size: int = TP_WORLD_SIZE):
                         )
                         acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(pl.cast(acc, target_type=pl.BF16), [0, k0], local)
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1670,6 +1742,24 @@ def _build_whole_decode_dense_prefix_program(tp_size: int = TP_WORLD_SIZE):
                         )
                         acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(pl.cast(acc, target_type=pl.BF16), [0, k0], local)
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ---- L0: full attention + dense MLP (separate SSA scope) -----------
@@ -2115,6 +2205,24 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -3206,6 +3314,25 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -3268,7 +3395,7 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -4064,6 +4191,24 @@ def _build_whole_decode_mixed_min_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -5155,6 +5300,25 @@ def _build_whole_decode_mixed_min_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -5217,7 +5381,7 @@ def _build_whole_decode_mixed_min_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -6133,6 +6297,24 @@ def _build_dense_chain2_lmhead_program(tp_size: int = TP_WORLD_SIZE):
                         )
                         acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(pl.cast(acc, target_type=pl.BF16), [0, k0], local)
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -6388,6 +6570,24 @@ def _build_dense_mlp_program(tp_size: int = TP_WORLD_SIZE):
                         )
                         acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
                 pl.store(pl.cast(acc, target_type=pl.BF16), [0, k0], local)
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -6609,6 +6809,24 @@ def _build_decode_layer_moe_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -7700,6 +7918,25 @@ def _build_decode_layer_moe_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -7762,7 +7999,7 @@ def _build_decode_layer_moe_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -8449,6 +8686,24 @@ def _build_mixed_2method_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -9540,6 +9795,25 @@ def _build_mixed_2method_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -9602,7 +9876,7 @@ def _build_mixed_2method_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -10353,6 +10627,24 @@ def _build_fused_dense_moe_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -11444,6 +11736,25 @@ def _build_fused_dense_moe_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -11506,7 +11817,7 @@ def _build_fused_dense_moe_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -12411,6 +12722,24 @@ def _build_mixed_moe_tail_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -13502,6 +13831,25 @@ def _build_mixed_moe_tail_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -13564,7 +13912,7 @@ def _build_mixed_moe_tail_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -14351,6 +14699,24 @@ def _build_moe_layer_real_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -15442,6 +15808,25 @@ def _build_moe_layer_real_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -15504,7 +15889,7 @@ def _build_moe_layer_real_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -16327,6 +16712,24 @@ def _build_whole_decode_all_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -17418,6 +17821,25 @@ def _build_whole_decode_all_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -17480,7 +17902,7 @@ def _build_whole_decode_all_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -19972,6 +20394,24 @@ def _build_whole_decode_faithful_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -21261,6 +21701,25 @@ def _build_whole_decode_faithful_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -21323,7 +21782,7 @@ def _build_whole_decode_faithful_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 
@@ -24499,6 +24958,24 @@ def _build_whole_decode_faithful_real_program(
                     pl.cast(acc, target_type=pl.BF16),
                     [0, k0], local,
                 )
+            # Phase 4: completion barrier (framework two-wave protocol). Ensures every
+            # rank finished Phase 3 reads before returning, so the next layer's
+            # collective cannot race this one's reads. Single-wave (Phase 2 only) hung
+            # at >=41 pipelined layers (507018 / S1:running-stalled). Same signal_window,
+            # threshold escalated 1 -> 2.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
             return local
 
         # ===================================================================
@@ -25736,6 +26213,25 @@ def _build_whole_decode_faithful_real_program(
             recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             e_cursor = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 src_off = pl.cast(0, pl.INT32)
@@ -25802,7 +26298,7 @@ def _build_whole_decode_faithful_real_program(
                     pld.system.wait(
                         signal=combine_done,
                         offsets=[src, 0],
-                        expected=1,
+                        expected=2,
                         cmp=pld.WaitCmp.Ge,
                     )
 

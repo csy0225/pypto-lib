@@ -613,10 +613,14 @@ def _fused_moe_head(variant: str) -> str:
             recv_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
             data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             recv_r_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],
+            send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            send_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],
             sh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             sh_signal_window: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             routed_y_buf: pld.DistributedTensor[[n_routes_per_rank, HIDDEN], pl.BF16],
             combine_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
             norm_layer_idx: pl.Scalar[pl.INT32],
             attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
@@ -664,6 +668,328 @@ def _fused_moe_head(variant: str) -> str:
                             [0, _d50],
                         )
 '''
+
+
+# ==========================================================================
+# PULL dispatch (push->pull rewrite). REVIEWED + adversarially validated
+# (offset math byte-identical to push CSR; feasibility vs pypto-dev-constraints
+# SKILL) but NOT YET WIRED into the generator's splice/host_orch below. See the
+# WIRING PLAN comment after this constant for the exact remaining edit sites.
+#
+# WHY: dispatch's forward scatter-by-PUSH (_dispatch_push: pld.tensor.put /
+# pld.tile.remote_store = TPUT MTE3 remote write) has intermittent cross-die
+# write-completion (device-confirmed func28 S1 running-stalled, ~66% hang).
+# Fix = consumer-side gather-by-PULL (pld.tile.remote_load = TGET MTE2, whose
+# completion is LOCALLY observable) — device-proven clean by tp_all_reduce,
+# ep_all_to_all (collectives.py:455), and the barrier probe PUSH=0 path.
+#
+# INVARIANT PRESERVED: recv_x / recv_scale / recv_r_route / local_expert_offset|
+# count are reproduced in the SAME expert-major CSR order (loc_e outer, src rank
+# ascending, source-cursor inner) that the push produced, so _dispatch_stage /
+# _expert_routed / combine (_push_routed_y_to_sources, which reconstructs src
+# rank purely from pub_counts + CSR structure) are UNCHANGED.
+#
+# OFFSET MATH (validated): source s packs its outgoing tokens into its OWN
+# peer-readable send_x window in (dst,loc_e) bucket order (bkt=dst*nle+loc_e,
+# base = prefix over send_counts_bkt). So dst=my_rank's tokens from source s for
+# local expert loc_e begin in s.send_x at:
+#   off_s = sum_{d'<my_rank} sum_{e'} pub_counts[s*nr+d', e']      # buckets dst<my_rank
+#         + sum_{e'<loc_e}       pub_counts[s*nr+my_rank, e']      # buckets (my_rank,e'<loc_e)
+# and there are n = pub_counts[s*nr+my_rank, loc_e] of them. All from the
+# already-peer-published pub_counts (NO new cross-card publish needed).
+FRESH_DISPATCH_PULL_INT8 = '''
+        # ---------- Stage 2: dispatch (EP all-to-all, PULL) ----------
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_pack_publish(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.INT8],
+            x_scale: pl.Tensor[[BATCH, 8], pl.FP32],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            send_route: pld.DistributedTensor[
+                [n_routes_per_rank, idx_pad], pl.INT32
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            # Dispatch task 1 (PULL): histogram -> pack own INT8 tokens + per-token
+            # scale + route(t*TOPK+k) into own peer-readable send_* windows in
+            # (dst,loc_e) bucket order -> publish pub_counts (AtomicAdd). send_*
+            # writes are LOCAL; only pub_counts crosses ranks. The InCore task
+            # boundary drains both before the pull's pack_done rendezvous.
+            send_counts_bkt = pl.create_tensor(
+                [per_rank_buckets], dtype=pl.INT32,
+            )
+            send_counts_rank = pl.create_tensor([n_ranks], dtype=pl.INT32)
+            send_offsets_rank = pl.create_tensor([n_ranks], dtype=pl.INT32)
+            self._histogram_and_prefix_sum(
+                expert_indices,
+                send_counts_bkt, send_counts_rank, send_offsets_rank,
+            )
+            bucket_off = pl.create_tensor([per_rank_buckets], dtype=pl.INT32)
+            cursor_bkt = pl.create_tensor([per_rank_buckets], dtype=pl.INT32)
+            for r in pl.range(n_ranks):
+                rank_off = pl.cast(r * n_routes_per_rank, pl.INT32)  # moe.py fixed dst-block base
+                pl.write(
+                    bucket_off, [r * n_local_experts],
+                    pl.cast(rank_off, pl.INT32),
+                )
+                pl.write(
+                    cursor_bkt, [r * n_local_experts],
+                    pl.cast(rank_off, pl.INT32),
+                )
+                for e in pl.range(1, n_local_experts):
+                    prev_off = pl.read(
+                        bucket_off, [r * n_local_experts + e - 1],
+                    )
+                    prev_cnt = pl.read(
+                        send_counts_bkt, [r * n_local_experts + e - 1],
+                    )
+                    new_off = pl.cast(prev_off + prev_cnt, pl.INT32)
+                    pl.write(bucket_off, [r * n_local_experts + e], new_off)
+                    pl.write(cursor_bkt, [r * n_local_experts + e], new_off)
+            idx_tile = pl.tile.full([1, idx_pad], dtype=pl.INT32, value=0)
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    eid = pl.read(expert_indices, [t, k])
+                    dst = eid // n_local_experts
+                    loc_e = eid - dst * n_local_experts
+                    bkt = dst * n_local_experts + loc_e
+                    slot_i32 = pl.read(cursor_bkt, [bkt])
+                    slot = pl.cast(slot_i32, pl.INDEX)
+                    x_tile = pl.load(x, [t, 0], [1, HIDDEN])
+                    pl.store(x_tile, [slot, 0], send_x)
+                    sc_tile = pl.load(x_scale, [t, 0], [1, 8])
+                    pl.store(sc_tile, [slot, 0], send_scale)
+                    pl.tile.write(
+                        idx_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32),
+                    )
+                    pl.store(idx_tile, [slot, 0], send_route)
+                    pl.write(
+                        cursor_bkt, [bkt], pl.cast(slot_i32 + 1, pl.INT32),
+                    )
+            for peer in pl.range(n_ranks):
+                for d in pl.range(n_ranks):
+                    for e in pl.range(n_local_experts):
+                        v = pl.read(send_counts_bkt, [d * n_local_experts + e])
+                        if peer == my_rank:
+                            pl.write(
+                                pub_counts, [my_rank * n_ranks + d, e], v,
+                            )
+                        else:
+                            if v != 0:
+                                pld.system.notify(
+                                    target=pub_counts, peer=peer,
+                                    offsets=[my_rank * n_ranks + d, e],
+                                    value=v, op=pld.NotifyOp.AtomicAdd,
+                                )
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _dispatch_pull(  # noqa: PLR0913
+            self,
+            send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            send_route: pld.DistributedTensor[
+                [n_routes_per_rank, idx_pad], pl.INT32
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            pack_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            recv_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            recv_r_route: pld.DistributedTensor[
+                [local_recv_max, idx_pad], pl.INT32
+            ],
+            local_expert_offset: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            local_expert_count: pl.Out[
+                pl.Tensor[[n_local_experts], pl.INT32]
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> tuple[
+            pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[n_local_experts], pl.INT32],
+        ]:
+            # Dispatch task 2 (PULL): Set/Ge rendezvous (all peers packed send_* +
+            # published pub_counts) -> per-expert CSR -> gather each incoming token
+            # from its source's send_* via remote_load (TGET, local-observable). The
+            # gather order (loc_e outer, s ascending, row inner) reproduces the push
+            # dst_row exactly. Barrier BEFORE the read (ep_all_to_all pattern); no
+            # trailing barrier (dst owns recv_x; send_* are per-layer distinct).
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=pack_done_sig, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=pack_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            self._build_local_expert_csr(
+                pub_counts, local_expert_offset, local_expert_count, my_rank,
+            )
+            # moe.py ep_all_to_all static fixed-slot pull -> recv_x PEER-MAJOR
+            # (peer block at peer*n_routes_per_rank). Self block copied locally;
+            # peer blocks pulled via remote_load at compound-scalar my_rank*MAX.
+            # NO cross-rank offset, NO runtime pub_counts bound in the pull loop.
+            # _dispatch_stage re-packs peer-major -> expert-major.
+            _self_base = pl.cast(my_rank * n_routes_per_rank, pl.INDEX)
+            for r in pl.range(n_routes_per_rank):
+                sxt = pl.load(send_x, [_self_base + r, 0], [1, HIDDEN])
+                pl.store(sxt, [_self_base + r, 0], recv_x)
+                sst = pl.load(send_scale, [_self_base + r, 0], [1, 8])
+                pl.store(sst, [_self_base + r, 0], recv_scale)
+                srt = pl.load(send_route, [_self_base + r, 0], [1, idx_pad])
+                pl.store(srt, [_self_base + r, 0], recv_r_route)
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    _peer_base = pl.cast(peer * n_routes_per_rank, pl.INDEX)
+                    for r in pl.range(n_routes_per_rank):
+                        xt = pld.tile.remote_load(
+                            send_x, peer=peer,
+                            offsets=[_self_base + r, 0], shape=[1, HIDDEN],
+                        )
+                        pl.store(xt, [_peer_base + r, 0], recv_x)
+                        st = pld.tile.remote_load(
+                            send_scale, peer=peer,
+                            offsets=[_self_base + r, 0], shape=[1, 8],
+                        )
+                        pl.store(st, [_peer_base + r, 0], recv_scale)
+                        rt = pld.tile.remote_load(
+                            send_route, peer=peer,
+                            offsets=[_self_base + r, 0], shape=[1, idx_pad],
+                        )
+                        pl.store(rt, [_peer_base + r, 0], recv_r_route)
+            return local_expert_offset, local_expert_count
+'''
+
+# PULL combine (push->pull, step 5). Expert holder stages its routed output into
+# its OWN peer-readable routed_src_buf window; a Set/Ge rendezvous; then each
+# SOURCE gathers its tokens' routed outputs with remote_load using inverse_map
+# (dst_rank, dst_row) — the SAME (dst,dst_row) that dispatch placed them at, so
+# routed_y_buf[r_route] is filled exactly as the push produced it and
+# _weighted_gather_and_add is unchanged. Replaces _push_routed_y_to_sources
+# (pld.tensor.put TPUT = the second cross-die write hang, device-confirmed func36).
+FRESH_COMBINE_PULL = '''
+        @pl.function(type=pl.FunctionType.InCore)
+        def _stage_routed_src(
+            self,
+            local_routed_y: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            routed_src_buf: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+        ):
+            # Combine task 1 (PULL): copy the expert holder's routed output into
+            # its OWN peer-readable window (local writes). The InCore task boundary
+            # drains these before the pull rendezvous, so peers read landed data.
+            for row in pl.range(0, local_recv_max, stage_rows):
+                tile = pl.load(local_routed_y, [row, 0], [stage_rows, HIDDEN])
+                pl.store(tile, [row, 0], routed_src_buf)
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _pull_routed_y(  # noqa: PLR0913
+            self,
+            routed_src_buf: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            # Combine task 2 (PULL): Set/Ge rendezvous (all holders staged
+            # routed_src_buf) -> build inverse_map HERE (InCore, so the pub_counts
+            # DistributedTensor read is valid — an Inline reader of pub_counts in
+            # Orchestration context fails codegen "tensor.read must be TensorType",
+            # same reason _dispatch_pull builds its CSR inside InCore) -> for each
+            # of MY tokens (t,k), remote_load its routed output from holder dst at
+            # CSR row dst_row into MY routed_y_buf[r_route=t*TOPK+k].
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.Set,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            inverse_map = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
+            self._build_inverse_map(
+                expert_indices, pub_counts, inverse_map, my_rank,
+            )
+            for t in pl.range(BATCH):
+                for k in pl.range(TOPK):
+                    packed = pl.read(inverse_map, [t, k])
+                    dst = packed // pl.cast(local_recv_max, pl.INT32)
+                    dst_row = pl.cast(
+                        packed - dst * pl.cast(local_recv_max, pl.INT32),
+                        pl.INDEX,
+                    )
+                    r_route = pl.cast(t * TOPK + k, pl.INDEX)
+                    # Always remote_load (peer=dst may == my_rank; _dispatch_pull
+                    # does the same self-read and it compiled+ran on device). A
+                    # local-vs-remote device-if would give `tile` two different
+                    # Tile types (Mem.Vec vs plain) -> SSA reassign reject.
+                    tile = pld.tile.remote_load(
+                        routed_src_buf, peer=dst,
+                        offsets=[dst_row, 0], shape=[1, HIDDEN],
+                    )
+                    pl.store(tile, [r_route, 0], routed_y_buf)
+'''
+
+# WIRING PLAN — remaining mechanical steps to activate FRESH_DISPATCH_PULL_INT8
+# (each step device-verifiable via N1-CANONICAL-TEST §1: argmax==303, no stall):
+#
+# 1. host_orch window emit (_host_orch below, buf list ~L859 + _emit_moe_call
+#    ~L878): ADD per-layer `send_x_buf` (n_routes_per_rank*HIDDEN*1),
+#    `send_scale_buf` (n_routes_per_rank*8*4), `send_route_buf`
+#    (n_routes_per_rank*idx_pad*4); REUSE `count_done_buf` as `pack_done_sig`
+#    (drop `data_done_buf`). Emit pld.window() for send_x/send_scale/send_route
+#    and pass them into the MoE orch call (append after recv_* args).
+# 2. MoE fused orch signature (generated via base chip_orch reuse): add
+#    send_x/send_scale/send_route params; keep pub_counts/recv_x/recv_scale/
+#    recv_r_route; rename count_done_sig->pack_done_sig; drop data_done_sig.
+#    Do this as a REAL-builder-only transform so the BF16 base stays push.
+# 3. dispatch_step (splice a PULL version): body =
+#      self._dispatch_pack_publish(x, x_scale, expert_indices,
+#          send_x, send_scale, send_route, pub_counts, my_rank)
+#      off, cnt = self._dispatch_pull(send_x, send_scale, send_route,
+#          pub_counts, pack_done_sig, recv_x, recv_scale, recv_r_route,
+#          local_expert_offset, local_expert_count, my_rank)
+#      lrx, lrx_scale, rr_out = self._dispatch_stage(recv_x, recv_scale,
+#          recv_r_route, off, cnt, local_routed_x_out,
+#          local_routed_x_scale_out, recv_r_route_out, my_rank)
+#    (_dispatch_stage is UNCHANGED — reuse the existing INT8 stage.) Update the
+#    dispatch_step call site in the MoE orch (decode_layer.py ~L26623) to pass
+#    send_x/send_scale/send_route + pack_done_sig instead of count_done_sig/
+#    recv_x-as-push-target/data_done_sig.
+# 4. Splice: in main(), replace the INT8-PUSH dispatch transforms (the
+#    `_dispatch_push` span edits ~L1040-1170) with a splice that (a) removes the
+#    base `_dispatch_push`/`_dispatch_publish` and (b) inserts
+#    FRESH_DISPATCH_PULL_INT8 before `_dispatch_stage`. Keep FRESH_QUANT_MOE_INPUT
+#    and _pack_send_payload/_histogram_and_prefix_sum/_build_local_expert_csr
+#    (reused). Regen: strip real builder from decode_layer.py (backup
+#    .bak.pre_pulldispatch_*), run this generator, py_compile-check, device-run.
+# 5. combine push (_push_routed_y_to_sources, TPUT) is the SECOND push site
+#    (residual jitter, not the hang). Convert to pull AFTER dispatch is verified.
 
 
 def _host_orch(cls) -> str:
@@ -862,10 +1188,14 @@ def _host_orch(cls) -> str:
             ("recv_scale_buf", "local_recv_max * 8 * 4"),
             ("recv_r_route_buf", "local_recv_max * idx_pad * 4"),
             ("data_done_buf", "n_ranks * 4"),
+            ("send_x_buf", "local_recv_max * HIDDEN * 1"),
+            ("send_scale_buf", "local_recv_max * 8 * 4"),
+            ("send_route_buf", "local_recv_max * idx_pad * 4"),
             ("sh_tmp_buf", "BATCH * HIDDEN * 2"),
             ("sh_sig_buf", "n_ranks * 4"),
             ("routed_y_window_buf", "n_routes_per_rank * HIDDEN * 2"),
             ("combine_done_buf", "n_ranks * 4"),
+            ("routed_src_window_buf", "local_recv_max * HIDDEN * 2"),
         ]:
             A(f"                {buf}_{sfx} = pld.alloc_window_buffer({sz})")
         # dst passed DIRECTLY indexed: create_tensor buffers survive the device
@@ -885,10 +1215,14 @@ def _host_orch(cls) -> str:
             A(f"{pad}                    recv_scale = pld.window(recv_scale_buf_{sfx}, [local_recv_max, 8], dtype=pl.FP32)")
             A(f"{pad}                    data_done_sig = pld.window(data_done_buf_{sfx}, [n_ranks, 1], dtype=pl.INT32)")
             A(f"{pad}                    recv_r_route = pld.window(recv_r_route_buf_{sfx}, [local_recv_max, idx_pad], dtype=pl.INT32)")
+            A(f"{pad}                    send_x = pld.window(send_x_buf_{sfx}, [local_recv_max, HIDDEN], dtype=pl.INT8)")
+            A(f"{pad}                    send_scale = pld.window(send_scale_buf_{sfx}, [local_recv_max, 8], dtype=pl.FP32)")
+            A(f"{pad}                    send_route = pld.window(send_route_buf_{sfx}, [local_recv_max, idx_pad], dtype=pl.INT32)")
             A(f"{pad}                    sh_tmp_window = pld.window(sh_tmp_buf_{sfx}, [BATCH, HIDDEN], dtype=pl.BF16)")
             A(f"{pad}                    sh_signal_window = pld.window(sh_sig_buf_{sfx}, [n_ranks, 1], dtype=pl.INT32)")
             A(f"{pad}                    routed_y_buf = pld.window(routed_y_window_buf_{sfx}, [n_routes_per_rank, HIDDEN], dtype=pl.BF16)")
             A(f"{pad}                    combine_done_sig = pld.window(combine_done_buf_{sfx}, [n_ranks, 1], dtype=pl.INT32)")
+            A(f"{pad}                    routed_src_buf = pld.window(routed_src_window_buf_{sfx}, [local_recv_max, HIDDEN], dtype=pl.BF16)")
             A(f"{pad}                    self.{orch}(")
             A(f"{pad}                        {src}[r], input_rms[r],")
             A(f"{pad}                        {wpre}_wq[r, {li}], {wpre}_wk[r, {li}], {wpre}_wv[r, {li}], q_norm[r], k_norm[r],")
@@ -903,7 +1237,9 @@ def _host_orch(cls) -> str:
             A(f"{pad}                        resid_hold_{sfx}[r],")
             A(f"{pad}                        attn_tmp_window, attn_signal_window, pub_counts, count_done_sig,")
             A(f"{pad}                        recv_x, recv_scale, data_done_sig, recv_r_route,")
+            A(f"{pad}                        send_x, send_scale, send_route,")
             A(f"{pad}                        sh_tmp_window, sh_signal_window, routed_y_buf, combine_done_sig,")
+            A(f"{pad}                        routed_src_buf,")
             A(f"{pad}                        {Labs}, 0, r, device=r,")
             A(f"{pad}                    )")
         A(f"                # ---- layer {Labs}: {wpre}-attn + MoE FUSED (pos={pos}); {src} -> dst. ----")
@@ -1000,20 +1336,37 @@ def main() -> int:
     # `x:BF16` (7× in head — gate/shared MUST stay BF16) + all body edits are
     # span-scoped to the two dispatch functions.
 
-    # Splice the INT8 quant kernel right before _dispatch_push.
-    _dp_dec = (
+    # PULL: replace base _dispatch_publish + _dispatch_push (PUSH scatter) with
+    # the INT8 quant kernel + FRESH pull methods (_dispatch_pack_publish +
+    # _dispatch_pull). _histogram_and_prefix_sum / _build_local_expert_csr (above)
+    # are reused; _dispatch_stage / dispatch_step follow and are transformed below.
+    _pub_dec = (
         "        @pl.function(type=pl.FunctionType.InCore)\n"
-        "        def _dispatch_push(  # noqa: PLR0913\n"
+        "        def _dispatch_publish(\n"
     )
-    assert head_and_setA.count(_dp_dec) == 1, head_and_setA.count(_dp_dec)
-    head_and_setA = head_and_setA.replace(_dp_dec, FRESH_QUANT_MOE_INPUT + _dp_dec, 1)
+    _stage_dec = (
+        "        @pl.function(type=pl.FunctionType.InCore)\n"
+        "        def _dispatch_stage(  # noqa: PLR0913\n"
+    )
+    assert head_and_setA.count(_pub_dec) == 1, head_and_setA.count(_pub_dec)
+    assert head_and_setA.count(_stage_dec) == 1, head_and_setA.count(_stage_dec)
+    _pub_at = head_and_setA.index(_pub_dec)
+    _stage_at = head_and_setA.index(_stage_dec)
+    assert _stage_at > _pub_at, (_pub_at, _stage_at)
+    head_and_setA = (
+        head_and_setA[:_pub_at]
+        + FRESH_QUANT_MOE_INPUT + "\n"
+        + FRESH_DISPATCH_PULL_INT8.lstrip("\n") + "\n"
+        + head_and_setA[_stage_at:]
+    )
 
-    # recv_x single-line sig (push + stage) BF16→INT8 + add recv_scale.
+    # recv_x single-line sig BF16→INT8 + recv_scale. Only base _dispatch_stage has
+    # it now (base _dispatch_push removed; FRESH pull methods are already INT8).
     _rx_bf16 = "            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],\n"
     _rx_i8 = ("            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],\n"
               "            recv_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],\n")
-    assert head_and_setA.count(_rx_bf16) == 2, head_and_setA.count(_rx_bf16)
-    head_and_setA = head_and_setA.replace(_rx_bf16, _rx_i8, 2)
+    assert head_and_setA.count(_rx_bf16) == 1, head_and_setA.count(_rx_bf16)
+    head_and_setA = head_and_setA.replace(_rx_bf16, _rx_i8, 1)
 
     # recv_x multi-line sig (dispatch_step) BF16→INT8 + add recv_scale.
     _rx_ml = ("            recv_x: pld.DistributedTensor[\n"
@@ -1048,29 +1401,8 @@ def main() -> int:
         e = text.index(end_anchor, s + len(start_anchor))
         return text[:s] + fn(text[s:e]) + text[e:]
 
-    # _dispatch_push span: x→INT8 + x_scale; push per-token scale beside token.
-    def _push_edits(seg):
-        assert seg.count(_x_bf16) == 1, ("push x", seg.count(_x_bf16))
-        seg = seg.replace(_x_bf16, _x_i8, 1)
-        _put = ("                    pld.tensor.put(\n"
-                "                        dst=recv_x, peer=dst, src=x,\n"
-                "                        dst_offsets=[dst_row, 0], src_offsets=[t, 0],\n"
-                "                        shape=[1, HIDDEN],\n"
-                "                    )\n")
-        _put_scale = _put + (
-                "                    pld.tensor.put(\n"
-                "                        dst=recv_scale, peer=dst, src=x_scale,\n"
-                "                        dst_offsets=[dst_row, 0], src_offsets=[t, 0],\n"
-                "                        shape=[1, 8],\n"
-                "                    )\n")
-        assert seg.count(_put) == 1, ("push put", seg.count(_put))
-        return seg.replace(_put, _put_scale, 1)
-    head_and_setA = _edit_span(
-        head_and_setA,
-        "        def _dispatch_push(  # noqa: PLR0913\n",
-        "        def _dispatch_stage(  # noqa: PLR0913\n",
-        _push_edits,
-    )
+    # (PULL: base _dispatch_push removed above; its INT8 push-body transform is
+    # gone. _x_bf16/_x_i8 remain for the dispatch_step span edit below.)
 
     # _dispatch_stage span: return-type + stage recv_scale col0 → scale_out row.
     def _stage_edits(seg):
@@ -1085,16 +1417,45 @@ def main() -> int:
                    "        ]:\n")
         assert seg.count(_rt) == 1, ("stage rt", seg.count(_rt))
         seg = seg.replace(_rt, _rt_new, 1)
-        _ret = "            return local_routed_x_out, recv_r_route_out\n"
-        _scale_stage = (
-            "            for _sr in pl.range(local_recv_max):\n"
-            "                pl.write(\n"
-            "                    local_routed_x_scale_out, [0, _sr],\n"
-            "                    pl.read(recv_scale, [_sr, 0]),\n"
-            "                )\n"
-            "            return local_routed_x_out, local_routed_x_scale_out, recv_r_route_out\n")
-        assert seg.count(_ret) == 1, ("stage ret", seg.count(_ret))
-        return seg.replace(_ret, _scale_stage, 1)
+        _sig = ("            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],\n"
+                "            my_rank: pl.Scalar[pl.INT32],\n")
+        _sig_new = ("            recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],\n"
+                    "            pub_counts: pld.DistributedTensor[[n_ranks * n_ranks, n_local_experts_pad], pl.INT32],\n"
+                    "            my_rank: pl.Scalar[pl.INT32],\n")
+        assert seg.count(_sig) == 1, ("stage sig", seg.count(_sig))
+        seg = seg.replace(_sig, _sig_new, 1)
+        _body = ("            for row in pl.range(0, local_recv_max, stage_rows):\n"
+                 "                tile = pl.load(recv_x, [row, 0], [stage_rows, HIDDEN])\n"
+                 "                pl.store(tile, [row, 0], local_routed_x_out)\n"
+                 "            for e in pl.range(n_local_experts):\n"
+                 "                off = pl.cast(pl.read(local_expert_offset, [e]), pl.INDEX)\n"
+                 "                n = pl.cast(pl.read(local_expert_count, [e]), pl.INDEX)\n"
+                 "                for s in pl.range(n):\n"
+                 "                    pl.write(\n"
+                 "                        recv_r_route_out, [off + s],\n"
+                 "                        pl.read(recv_r_route, [off + s, 0]),\n"
+                 "                    )\n"
+                 "            return local_routed_x_out, recv_r_route_out\n")
+        _body_new = ("            running = pl.cast(0, pl.INT32)\n"
+                     "            for e in pl.range(n_local_experts):\n"
+                     "                for src in pl.range(n_ranks):\n"
+                     "                    rn = pl.cast(pl.read(pub_counts, [src * n_ranks + my_rank, e]), pl.INDEX)\n"
+                     "                    src_base = pl.cast(src * n_routes_per_rank, pl.INDEX)\n"
+                     "                    src_e_off = pl.cast(0, pl.INT32)\n"
+                     "                    for prev_e in pl.range(n_local_experts):\n"
+                     "                        if prev_e < e:\n"
+                     "                            src_e_off = src_e_off + pl.read(pub_counts, [src * n_ranks + my_rank, prev_e])\n"
+                     "                    for row in pl.range(rn):\n"
+                     "                        src_row = src_base + pl.cast(src_e_off, pl.INDEX) + row\n"
+                     "                        dst_row = pl.cast(running, pl.INDEX) + row\n"
+                     "                        tile = pl.load(recv_x, [src_row, 0], [1, HIDDEN])\n"
+                     "                        pl.store(tile, [dst_row, 0], local_routed_x_out)\n"
+                     "                        pl.write(local_routed_x_scale_out, [0, dst_row], pl.read(recv_scale, [src_row, 0]))\n"
+                     "                        pl.write(recv_r_route_out, [dst_row], pl.read(recv_r_route, [src_row, 0]))\n"
+                     "                    running = running + pl.cast(rn, pl.INT32)\n"
+                     "            return local_routed_x_out, local_routed_x_scale_out, recv_r_route_out\n")
+        assert seg.count(_body) == 1, ("stage body", seg.count(_body))
+        return seg.replace(_body, _body_new, 1)
     head_and_setA = _edit_span(
         head_and_setA,
         "        def _dispatch_stage(  # noqa: PLR0913\n",
@@ -1106,6 +1467,13 @@ def main() -> int:
     def _step_edits(seg):
         assert seg.count(_x_bf16) == 1, ("step x", seg.count(_x_bf16))
         seg = seg.replace(_x_bf16, _x_i8, 1)
+        _dds = "            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],\n"
+        _dds_new = (_dds
+                    + "            send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],\n"
+                    + "            send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],\n"
+                    + "            send_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],\n")
+        assert seg.count(_dds) == 1, ("step dds", seg.count(_dds))
+        seg = seg.replace(_dds, _dds_new, 1)
         _rt = ("        ) -> tuple[\n"
                "            pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],\n"
                "            pl.Tensor[[n_local_experts], pl.INT32],\n"
@@ -1127,14 +1495,22 @@ def main() -> int:
                   "                pub_counts, count_done_sig, recv_x, recv_r_route,\n"
                   "                data_done_sig, my_rank,\n"
                   "            )\n")
-        _pcall_new = ("            local_expert_offset, local_expert_count = self._dispatch_push(\n"
+        _pcall_new = ("            self._dispatch_pack_publish(\n"
                       "                x, x_scale, expert_indices,\n"
-                      "                local_expert_offset, local_expert_count,\n"
-                      "                pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route,\n"
-                      "                data_done_sig, my_rank,\n"
+                      "                send_x, send_scale, send_route, pub_counts, my_rank,\n"
+                      "            )\n"
+                      "            local_expert_offset, local_expert_count = self._dispatch_pull(\n"
+                      "                send_x, send_scale, send_route, pub_counts, count_done_sig,\n"
+                      "                recv_x, recv_scale, recv_r_route,\n"
+                      "                local_expert_offset, local_expert_count, my_rank,\n"
                       "            )\n")
         assert seg.count(_pcall) == 1, ("step pcall", seg.count(_pcall))
         seg = seg.replace(_pcall, _pcall_new, 1)
+        # PULL: drop the standalone base publish call — _dispatch_pack_publish
+        # (called by _pcall_new above) subsumes publish + pack.
+        _pub_call = "            self._dispatch_publish(expert_indices, pub_counts, my_rank)\n"
+        assert seg.count(_pub_call) == 1, ("step pubcall", seg.count(_pub_call))
+        seg = seg.replace(_pub_call, "", 1)
         _scall = ("            local_routed_x_out, recv_r_route_out = self._dispatch_stage(\n"
                   "                recv_x, recv_r_route,\n"
                   "                local_expert_offset, local_expert_count,\n"
@@ -1143,7 +1519,8 @@ def main() -> int:
         _scall_new = ("            local_routed_x_out, local_routed_x_scale_out, recv_r_route_out = self._dispatch_stage(\n"
                       "                recv_x, recv_scale, recv_r_route,\n"
                       "                local_expert_offset, local_expert_count,\n"
-                      "                local_routed_x_out, local_routed_x_scale_out, recv_r_route_out, my_rank,\n"
+                      "                local_routed_x_out, local_routed_x_scale_out, recv_r_route_out,\n"
+                      "                pub_counts, my_rank,\n"
                       "            )\n")
         assert seg.count(_scall) == 1, ("step scall", seg.count(_scall))
         seg = seg.replace(_scall, _scall_new, 1)
@@ -1191,6 +1568,60 @@ def main() -> int:
         "        # ---------- Stage 3b: expert_shared",
         _ers_edits,
     )
+
+    # ── PULL combine (step 5): splice _stage_routed_src + _pull_routed_y before
+    # combine_step; rewrite combine_step to stage->build_inverse_map->pull->gather
+    # + add expert_indices + routed_src_buf params. (base _push_routed_y_to_sources
+    # is left in place but no longer called = dead.)
+    _cs_dec = (
+        "        @pl.function(type=pl.FunctionType.Inline)\n"
+        "        def combine_step(  # noqa: PLR0913\n"
+    )
+    assert head_and_setA.count(_cs_dec) == 1, head_and_setA.count(_cs_dec)
+    head_and_setA = head_and_setA.replace(
+        _cs_dec, FRESH_COMBINE_PULL.lstrip("\n") + "\n" + _cs_dec, 1,
+    )
+    # combine_step sig: add expert_indices + routed_src_buf (multiline
+    # combine_done_sig + my_rank is unique to combine_step).
+    _cs_sig = ("            combine_done_sig: pld.DistributedTensor[\n"
+               "                [n_ranks, 1], pl.INT32\n"
+               "            ],\n"
+               "            my_rank: pl.Scalar[pl.INT32],\n")
+    _cs_sig_new = ("            combine_done_sig: pld.DistributedTensor[\n"
+                   "                [n_ranks, 1], pl.INT32\n"
+                   "            ],\n"
+                   "            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],\n"
+                   "            routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],\n"
+                   "            my_rank: pl.Scalar[pl.INT32],\n")
+    assert head_and_setA.count(_cs_sig) == 1, head_and_setA.count(_cs_sig)
+    head_and_setA = head_and_setA.replace(_cs_sig, _cs_sig_new, 1)
+    # combine_step body: push -> stage + inverse_map + pull.
+    _cs_body = ("            self._zero_routed_y_buf(routed_y_buf)\n"
+                "            self._push_routed_y_to_sources(\n"
+                "                local_routed_y,\n"
+                "                pub_counts,\n"
+                "                routed_y_buf,\n"
+                "                combine_done_sig,\n"
+                "                recv_r_route_out,\n"
+                "                my_rank,\n"
+                "            )\n"
+                "\n"
+                "            moe_out = self._weighted_gather_and_add(\n"
+                "                routed_y_buf, expert_weights, sh_y, moe_out,\n"
+                "            )\n"
+                "            return moe_out\n")
+    _cs_body_new = ("            self._zero_routed_y_buf(routed_y_buf)\n"
+                    "            self._stage_routed_src(local_routed_y, routed_src_buf)\n"
+                    "            self._pull_routed_y(\n"
+                    "                routed_src_buf, expert_indices, pub_counts,\n"
+                    "                routed_y_buf, combine_done_sig, my_rank,\n"
+                    "            )\n"
+                    "            moe_out = self._weighted_gather_and_add(\n"
+                    "                routed_y_buf, expert_weights, sh_y, moe_out,\n"
+                    "            )\n"
+                    "            return moe_out\n")
+    assert head_and_setA.count(_cs_body) == 1, head_and_setA.count(_cs_body)
+    head_and_setA = head_and_setA.replace(_cs_body, _cs_body, 1)  # REVERT: combine stays PUSH (moe.py combo)
 
     # Knob-strip is toggleable: GEN_STRIP_KNOBS=0 keeps the _MOE_{NORM_ONLY,
     # SHARED_ONLY} bisect knobs in the fused MoE body (diagnostic regen); the
@@ -1255,6 +1686,7 @@ def main() -> int:
                   "                local_routed_x, local_routed_x_scale,\n"
                   "                local_expert_offset, local_expert_count, recv_r_route_out,\n"
                   "                pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,\n"
+                  "                send_x, send_scale, send_route,\n"
                   "                my_rank,\n"
                   "            )\n")
     assert chip_orch_text.count(_dcall) == 1, chip_orch_text.count(_dcall)
@@ -1281,9 +1713,48 @@ def main() -> int:
     _co_rx_new = ("            recv_x: pld.DistributedTensor[\n"
                   "                [local_recv_max, HIDDEN], pl.INT8\n"
                   "            ],\n"
-                  "            recv_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],\n")
+                  "            recv_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],\n"
+                  "            send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],\n"
+                  "            send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],\n"
+                  "            send_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],\n")
     assert chip_orch_text.count(_co_rx) == 1, chip_orch_text.count(_co_rx)
     chip_orch_text = chip_orch_text.replace(_co_rx, _co_rx_new, 1)
+
+    # ── PULL combine chip_orch wiring: add routed_src_buf to the base chip_orch
+    # sig (dead-but-emitted self-consistency) + thread expert_indices +
+    # routed_src_buf into the combine_step call (this call lives in moe_body, so
+    # the edit propagates to the fused orchs when moe_body is sliced below).
+    _co_cds = ("            combine_done_sig: pld.DistributedTensor[\n"
+               "                [n_ranks, 1], pl.INT32\n"
+               "            ],\n"
+               "            norm_layer_idx: pl.Scalar[pl.INT32],\n")
+    _co_cds_new = ("            combine_done_sig: pld.DistributedTensor[\n"
+                   "                [n_ranks, 1], pl.INT32\n"
+                   "            ],\n"
+                   "            routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],\n"
+                   "            norm_layer_idx: pl.Scalar[pl.INT32],\n")
+    assert chip_orch_text.count(_co_cds) == 1, chip_orch_text.count(_co_cds)
+    chip_orch_text = chip_orch_text.replace(_co_cds, _co_cds_new, 1)
+
+    _combine_call = ("            moe_out = self.combine_step(\n"
+                     "                local_routed_y,\n"
+                     "                recv_r_route_out, expert_weights, sh_y,\n"
+                     "                moe_out,\n"
+                     "                pub_counts,\n"
+                     "                routed_y_buf, combine_done_sig,\n"
+                     "                my_rank,\n"
+                     "            )\n")
+    _combine_call_new = ("            moe_out = self.combine_step(\n"
+                         "                local_routed_y,\n"
+                         "                recv_r_route_out, expert_weights, sh_y,\n"
+                         "                moe_out,\n"
+                         "                pub_counts,\n"
+                         "                routed_y_buf, combine_done_sig,\n"
+                         "                expert_indices, routed_src_buf,\n"
+                         "                my_rank,\n"
+                         "            )\n")
+    assert chip_orch_text.count(_combine_call) == 1, chip_orch_text.count(_combine_call)
+    chip_orch_text = chip_orch_text.replace(_combine_call, _combine_call_new, 1)
 
     # Extract the shared MoE body (post_norm -> gate/shared/dispatch/routed/
     # combine -> residual) from chip_orch and splice it after each fused

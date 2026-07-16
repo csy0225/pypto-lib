@@ -1048,7 +1048,6 @@ def _build_ep_tp_moe_program(
                 n_rows = pl.read(local_expert_count, [e])
                 offset_i32 = pl.read(local_expert_offset, [e])
                 offset = pl.cast(offset_i32, pl.INDEX)
-                valid_rows = pl.cast(n_rows, pl.INDEX)
 
                 # Row-tile loop — process RECV_TILE rows per outer iteration.
                 # Bridge-tensor pattern (h_bf16 at tile_idx loop level, outside
@@ -1060,13 +1059,18 @@ def _build_ep_tp_moe_program(
                 # trailing tile correctly masks out padding rows past
                 # ``offset + n_rows``.
                 for tile_idx in pl.range(N_RECV_TILES):
-                    tile_row0 = tile_idx * RECV_TILE
-                    tile_offset = offset + tile_row0
-                    # Per-tile valid rows (scalar) — clamps trailing tile to
-                    # the active row span.  Use ``pl.min`` for scalar min/max
-                    # (``pl.minimum`` is the tensor variant).
-                    tile_valid = pl.min(RECV_TILE, valid_rows - tile_row0)
-                    if tile_row0 < valid_rows:
+                    tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
+                    tile_rem = n_rows - tile_row0_i32
+                    if tile_rem > 0:
+                        tile_row0 = pl.cast(tile_row0_i32, pl.INDEX)
+                        tile_offset = offset + tile_row0
+                        # Per-tile valid rows (scalar) — clamps trailing tile to
+                        # the active row span. Use a signed remainder so empty
+                        # tail tiles never underflow INDEX before the guard.
+                        tile_valid = pl.cast(
+                            pl.min(pl.cast(RECV_TILE, pl.INT32), tile_rem),
+                            pl.INDEX,
+                        )
 
                         # Bridge tensor — lives at tile_idx loop level, shared
                         # between expert_gate_up and expert_down SPMD dispatches.

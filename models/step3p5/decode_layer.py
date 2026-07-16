@@ -2658,21 +2658,14 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                 expert_indices,
                 send_counts_bkt, send_counts_rank, send_offsets_rank,
             )
-            for peer in pl.range(n_ranks):
-                for d in pl.range(n_ranks):
-                    for e in pl.range(n_local_experts):
-                        v = pl.read(send_counts_bkt, [d * n_local_experts + e])
-                        if peer == my_rank:
-                            pl.write(
-                                pub_counts, [my_rank * n_ranks + d, e], v,
-                            )
-                        else:
-                            if v != 0:
-                                pld.system.notify(
-                                    target=pub_counts, peer=peer,
-                                    offsets=[my_rank * n_ranks + d, e],
-                                    value=v, op=pld.NotifyOp.AtomicAdd,
-                                )
+            # Count exchange is pull-based: publish only into my local
+            # peer-readable pub_counts row. _dispatch_pull gathers every peer's
+            # rows after the pack_done barrier. This removes cross-rank AtomicAdd
+            # count writes from the dispatch publish task.
+            for d in pl.range(n_ranks):
+                for e in pl.range(n_local_experts):
+                    v = pl.read(send_counts_bkt, [d * n_local_experts + e])
+                    pl.write(pub_counts, [my_rank * n_ranks + d, e], v)
 
         @pl.function(type=pl.FunctionType.InCore)
         def _dispatch_push(  # noqa: PLR0913
@@ -2716,6 +2709,18 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                         signal=count_done_sig, offsets=[src, 0],
                         expected=1, cmp=pld.WaitCmp.Ge,
                     )
+
+            # Pull each peer's count rows into my local pub_counts copy.
+            # Shape [1, n_local_experts_pad] is 40 INT32 = 160B, row-aligned.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    for d in pl.range(n_ranks):
+                        cnt_row = pld.tile.remote_load(
+                            pub_counts, peer=peer,
+                            offsets=[peer * n_ranks + d, 0],
+                            shape=[1, n_local_experts_pad],
+                        )
+                        pl.store(cnt_row, [peer * n_ranks + d, 0], pub_counts)
 
             self._build_local_expert_csr(
                 pub_counts, local_expert_offset, local_expert_count, my_rank,
@@ -2846,10 +2851,9 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -3812,7 +3816,7 @@ def _build_whole_decode_program(tp_size: int = TP_WORLD_SIZE):
                 local_routed_y,
             )
 
-            # 5) Combine (EP push back + weighted gather + sh_y add).
+            # 5) Combine (EP pull back + weighted gather + sh_y add).
             moe_out = self.combine_step(
                 local_routed_y,
                 recv_r_route_out, expert_weights, sh_y,
@@ -4832,10 +4836,9 @@ def _build_whole_decode_mixed_min_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -7450,10 +7453,9 @@ def _build_decode_layer_moe_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -9327,10 +9329,9 @@ def _build_mixed_2method_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -11268,10 +11269,9 @@ def _build_fused_dense_moe_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -13363,10 +13363,9 @@ def _build_mixed_moe_tail_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -15340,10 +15339,9 @@ def _build_moe_layer_real_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -17353,10 +17351,9 @@ def _build_whole_decode_all_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -21035,10 +21032,9 @@ def _build_whole_decode_faithful_program(
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[local_recv_max], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_publish(expert_indices, pub_counts, my_rank)
             local_expert_offset, local_expert_count = self._dispatch_push(
                 x, expert_indices,
@@ -24892,6 +24888,11 @@ def _build_whole_decode_faithful_real_program(
     local_recv_max = LOCAL_RECV_MAX  # matches dispatch.LOCAL_RECV_MAX (1024)
     n_routes_per_rank = BATCH * TOPK
     per_rank_buckets = PER_RANK_BUCKETS  # n_ranks * n_local_experts
+    # A2/A3 comm-domain buffers are carved sequentially without per-slot
+    # alignment. Reserve one full L2 cache line for every cross-rank control
+    # signal so AtomicAdd/TWAIT traffic cannot share a line with adjacent
+    # control or data windows. The logical tensor view remains [8, 1] INT32.
+    COMM_CONTROL_SIGNAL_BYTES = 512
 
     @pl.program
     class WholeDecodeFaithfulReal:
@@ -25440,7 +25441,7 @@ def _build_whole_decode_faithful_real_program(
             send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
             send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
             send_route: pld.DistributedTensor[
-                [n_routes_per_rank, idx_pad], pl.INT32
+                [local_recv_max, idx_pad], pl.INT32
             ],
             pub_counts: pld.DistributedTensor[
                 [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
@@ -25449,8 +25450,8 @@ def _build_whole_decode_faithful_real_program(
         ):
             # Dispatch task 1 (PULL): histogram -> pack own INT8 tokens + per-token
             # scale + route(t*TOPK+k) into own peer-readable send_* windows in
-            # (dst,loc_e) bucket order -> publish pub_counts (AtomicAdd). send_*
-            # writes are LOCAL; only pub_counts crosses ranks. The InCore task
+            # (dst,loc_e) bucket order -> publish my local pub_counts rows.
+            # send_* and pub_counts writes are LOCAL; peers pull them later.
             # boundary drains both before the pull's pack_done rendezvous.
             send_counts_bkt = pl.create_tensor(
                 [per_rank_buckets], dtype=pl.INT32,
@@ -25503,21 +25504,10 @@ def _build_whole_decode_faithful_real_program(
                     pl.write(
                         cursor_bkt, [bkt], pl.cast(slot_i32 + 1, pl.INT32),
                     )
-            for peer in pl.range(n_ranks):
-                for d in pl.range(n_ranks):
-                    for e in pl.range(n_local_experts):
-                        v = pl.read(send_counts_bkt, [d * n_local_experts + e])
-                        if peer == my_rank:
-                            pl.write(
-                                pub_counts, [my_rank * n_ranks + d, e], v,
-                            )
-                        else:
-                            if v != 0:
-                                pld.system.notify(
-                                    target=pub_counts, peer=peer,
-                                    offsets=[my_rank * n_ranks + d, e],
-                                    value=v, op=pld.NotifyOp.AtomicAdd,
-                                )
+            for d in pl.range(n_ranks):
+                for e in pl.range(n_local_experts):
+                    v = pl.read(send_counts_bkt, [d * n_local_experts + e])
+                    pl.write(pub_counts, [my_rank * n_ranks + d, e], v)
 
         @pl.function(type=pl.FunctionType.InCore)
         def _dispatch_pull(  # noqa: PLR0913
@@ -25525,8 +25515,9 @@ def _build_whole_decode_faithful_real_program(
             send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
             send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
             send_route: pld.DistributedTensor[
-                [n_routes_per_rank, idx_pad], pl.INT32
+                [local_recv_max, idx_pad], pl.INT32
             ],
+            expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
             pub_counts: pld.DistributedTensor[
                 [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
@@ -25536,6 +25527,10 @@ def _build_whole_decode_faithful_real_program(
             recv_r_route: pld.DistributedTensor[
                 [local_recv_max, idx_pad], pl.INT32
             ],
+            recv_counts: pl.Out[
+                pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32]
+            ],
+            inverse_map_out: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
             local_expert_offset: pl.Out[
                 pl.Tensor[[n_local_experts], pl.INT32]
             ],
@@ -25544,10 +25539,12 @@ def _build_whole_decode_faithful_real_program(
             ],
             my_rank: pl.Scalar[pl.INT32],
         ) -> tuple[
+            pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[n_local_experts], pl.INT32],
+            pl.Tensor[[BATCH, TOPK], pl.INT32],
         ]:
-            # Dispatch task 2 (PULL): Set/Ge rendezvous (all peers packed send_* +
+            # Dispatch task 2 (PULL): AtomicAdd/Ge rendezvous after all peers pack send_* +
             # published pub_counts) -> per-expert CSR -> gather each incoming token
             # from its source's send_* via remote_load (TGET, local-observable). The
             # gather order (loc_e outer, s ascending, row inner) reproduces the push
@@ -25566,9 +25563,93 @@ def _build_whole_decode_faithful_real_program(
                         signal=pack_done_sig, offsets=[src, 0],
                         expected=1, cmp=pld.WaitCmp.Ge,
                     )
-            self._build_local_expert_csr(
-                pub_counts, local_expert_offset, local_expert_count, my_rank,
+            counts_all = pl.create_tensor(
+                [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32,
             )
+            for src in pl.range(n_ranks):
+                if src == my_rank:
+                    for d in pl.range(n_ranks):
+                        for e in pl.range(n_local_experts):
+                            c = pl.read(
+                                pub_counts, [my_rank * n_ranks + d, e],
+                            )
+                            pl.write(
+                                counts_all, [my_rank * n_ranks + d, e],
+                                pl.cast(c, pl.INT32),
+                            )
+                            if d == my_rank:
+                                pl.write(
+                                    recv_counts, [src, e], pl.cast(c, pl.INT32),
+                                )
+                else:
+                    for d in pl.range(n_ranks):
+                        cnt_row = pld.tile.remote_load(
+                            pub_counts, peer=src,
+                            offsets=[src * n_ranks + d, 0],
+                            shape=[1, n_local_experts_pad],
+                        )
+                        for e in pl.range(n_local_experts):
+                            c = pl.read(cnt_row, [0, e])
+                            pl.write(
+                                counts_all, [src * n_ranks + d, e],
+                                pl.cast(c, pl.INT32),
+                            )
+                            if d == my_rank:
+                                pl.write(
+                                    recv_counts, [src, e], pl.cast(c, pl.INT32),
+                                )
+            for e in pl.range(n_local_experts):
+                acc = pl.cast(0, pl.INT32)
+                for src in pl.range(n_ranks):
+                    acc = acc + pl.read(recv_counts, [src, e])
+                pl.write(local_expert_count, [e], pl.cast(acc, pl.INT32))
+            pl.write(local_expert_offset, [0], pl.cast(0, pl.INT32))
+            for e in pl.range(1, n_local_experts):
+                prev_off = pl.read(local_expert_offset, [e - 1])
+                prev_cnt = pl.read(local_expert_count, [e - 1])
+                pl.write(
+                    local_expert_offset, [e],
+                    pl.cast(prev_off + prev_cnt, pl.INT32),
+                )
+
+            cursor_inv = pl.create_tensor([per_rank_buckets], dtype=pl.INT32)
+            for bkt_inv in pl.range(per_rank_buckets):
+                pl.write(cursor_inv, [bkt_inv], pl.cast(0, pl.INT32))
+            for t_inv in pl.range(BATCH):
+                for k_inv in pl.range(TOPK):
+                    eid_inv = pl.read(expert_indices, [t_inv, k_inv])
+                    dst_inv = eid_inv // n_local_experts
+                    loc_e_inv = eid_inv - dst_inv * n_local_experts
+                    bkt_inv = dst_inv * n_local_experts + loc_e_inv
+                    src_off_inv = pl.cast(0, pl.INT32)
+                    for s_inv in pl.range(n_ranks):
+                        if s_inv < my_rank:
+                            src_off_inv = src_off_inv + pl.read(
+                                counts_all,
+                                [s_inv * n_ranks + dst_inv, loc_e_inv],
+                            )
+                    loc_e_off_inv = pl.cast(0, pl.INT32)
+                    for prev_e_inv in pl.range(n_local_experts):
+                        if prev_e_inv < loc_e_inv:
+                            for s2_inv in pl.range(n_ranks):
+                                loc_e_off_inv = loc_e_off_inv + pl.read(
+                                    counts_all,
+                                    [s2_inv * n_ranks + dst_inv, prev_e_inv],
+                                )
+                    cur_inv = pl.read(cursor_inv, [bkt_inv])
+                    dst_row_inv = loc_e_off_inv + src_off_inv + cur_inv
+                    packed_inv = (
+                        dst_inv * pl.cast(local_recv_max, pl.INT32)
+                        + dst_row_inv
+                    )
+                    pl.write(
+                        inverse_map_out, [t_inv, k_inv],
+                        pl.cast(packed_inv, pl.INT32),
+                    )
+                    pl.write(
+                        cursor_inv, [bkt_inv],
+                        pl.cast(cur_inv + 1, pl.INT32),
+                    )
             # moe.py ep_all_to_all static fixed-slot pull -> recv_x PEER-MAJOR
             # (peer block at peer*n_routes_per_rank). Self block copied locally;
             # peer blocks pulled via remote_load at compound-scalar my_rank*MAX.
@@ -25601,7 +25682,7 @@ def _build_whole_decode_faithful_real_program(
                             offsets=[_self_base + r, 0], shape=[1, idx_pad],
                         )
                         pl.store(rt, [_peer_base + r, 0], recv_r_route)
-            return local_expert_offset, local_expert_count
+            return recv_counts, local_expert_offset, local_expert_count, inverse_map_out
 
         @pl.function(type=pl.FunctionType.InCore)
         def _dispatch_stage(  # noqa: PLR0913
@@ -25618,27 +25699,25 @@ def _build_whole_decode_faithful_real_program(
             ],
             local_routed_x_scale_out: pl.Out[pl.Tensor[[1, local_recv_max], pl.FP32]],
             recv_r_route_out: pl.Out[pl.Tensor[[local_recv_max], pl.INT32]],
-            pub_counts: pld.DistributedTensor[[n_ranks * n_ranks, n_local_experts_pad], pl.INT32],
+            recv_counts: pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> tuple[
             pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
             pl.Tensor[[1, local_recv_max], pl.FP32],
             pl.Tensor[[local_recv_max], pl.INT32],
         ]:
-            # Dispatch task 3: stage the pushed recv_x / recv_r_route windows out
-            # to host tensors. Separate task so the push TPUTs from _dispatch_push
-            # are DRAINED at the task boundary before these reads (the reference
-            # kernel's pipe_barrier between the TPUT loop and stage_out). recv_x
-            # is already expert-major CSR -> straight chunked copy.
+            # Dispatch task 3: compact the peer-major fixed-slot pull windows
+            # into expert-major tensors using the receiver-local count snapshot.
+            # The InCore task boundary keeps pull and compaction separate.
             running = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 for src in pl.range(n_ranks):
-                    rn = pl.cast(pl.read(pub_counts, [src * n_ranks + my_rank, e]), pl.INDEX)
+                    rn = pl.cast(pl.read(recv_counts, [src, e]), pl.INDEX)
                     src_base = pl.cast(src * n_routes_per_rank, pl.INDEX)
                     src_e_off = pl.cast(0, pl.INT32)
                     for prev_e in pl.range(n_local_experts):
                         if prev_e < e:
-                            src_e_off = src_e_off + pl.read(pub_counts, [src * n_ranks + my_rank, prev_e])
+                            src_e_off = src_e_off + pl.read(recv_counts, [src, prev_e])
                     for row in pl.range(rn):
                         src_row = src_base + pl.cast(src_e_off, pl.INDEX) + row
                         dst_row = pl.cast(running, pl.INDEX) + row
@@ -25687,26 +25766,30 @@ def _build_whole_decode_faithful_real_program(
             pl.Tensor[[1, local_recv_max], pl.FP32],
             pl.Tensor[[n_local_experts], pl.INT32],
             pl.Tensor[[n_local_experts], pl.INT32],
-            pl.Tensor[[local_recv_max], pl.INT32]
+            pl.Tensor[[local_recv_max], pl.INT32],
+            pl.Tensor[[BATCH, TOPK], pl.INT32]
         ]:
-            # DeepSeek-style push EP dispatch, SPLIT into 3 InCore tasks so each
-            # group of cross-rank ops drains at the task boundary — the DSL
-            # equivalent of the reference kernel's pipe_barrier(PIPE_ALL):
-            #   publish (notifies) | count_done + push (TPUT) | stage_out (reads).
+            # Pull EP dispatch, split into 3 InCore tasks so local pack,
+            # pack_done rendezvous + remote_load pull, and stage compact have
+            # explicit task boundaries.
             self._dispatch_pack_publish(
                 x, x_scale, expert_indices,
                 send_x, send_scale, send_route, pub_counts, my_rank,
             )
-            local_expert_offset, local_expert_count = self._dispatch_pull(
-                send_x, send_scale, send_route, pub_counts, count_done_sig,
-                recv_x, recv_scale, recv_r_route,
+            recv_counts = pl.create_tensor(
+                [n_ranks, n_local_experts_pad], dtype=pl.INT32,
+            )
+            inverse_map = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
+            recv_counts, local_expert_offset, local_expert_count, inverse_map = self._dispatch_pull(
+                send_x, send_scale, send_route, expert_indices, pub_counts, count_done_sig,
+                recv_x, recv_scale, recv_r_route, recv_counts, inverse_map,
                 local_expert_offset, local_expert_count, my_rank,
             )
             local_routed_x_out, local_routed_x_scale_out, recv_r_route_out = self._dispatch_stage(
                 recv_x, recv_scale, recv_r_route,
                 local_expert_offset, local_expert_count,
                 local_routed_x_out, local_routed_x_scale_out, recv_r_route_out,
-                pub_counts, my_rank,
+                recv_counts, my_rank,
             )
             return (
                 local_routed_x_out,
@@ -25714,6 +25797,7 @@ def _build_whole_decode_faithful_real_program(
                 local_expert_offset,
                 local_expert_count,
                 recv_r_route_out,
+                inverse_map,
             )
 
         # ---------- Stage 3a: expert_routed (local 36 experts) ----------
@@ -25744,13 +25828,16 @@ def _build_whole_decode_faithful_real_program(
                 n_rows = pl.read(local_expert_count, [e])
                 offset_i32 = pl.read(local_expert_offset, [e])
                 offset = pl.cast(offset_i32, pl.INDEX)
-                valid_rows = pl.cast(n_rows, pl.INDEX)
-
                 for tile_idx in pl.range(N_RECV_TILES):
-                    tile_row0 = tile_idx * RECV_TILE
-                    tile_offset = offset + tile_row0
-                    tile_valid = pl.min(RECV_TILE, valid_rows - tile_row0)
-                    if tile_valid > 0:
+                    tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
+                    tile_rem = n_rows - tile_row0_i32
+                    if tile_rem > 0:
+                        tile_row0 = pl.cast(tile_row0_i32, pl.INDEX)
+                        tile_offset = offset + tile_row0
+                        tile_valid = pl.cast(
+                            pl.min(pl.cast(RECV_TILE, pl.INT32), tile_rem),
+                            pl.INDEX,
+                        )
 
                         h_bf16 = pl.create_tensor(
                             [RECV_TILE, inter], dtype=pl.BF16,
@@ -25908,11 +25995,17 @@ def _build_whole_decode_faithful_real_program(
                                         [1, RECV_TILE],
                                     ),
                                 )
-                            eh_sq_row = pl.div(
+                            # Keep the native W8A8 row scale mathematically equal
+                            # to 127 / amax. pl.recip also lowers through TDIVS on
+                            # A2/A3, so this spelling is not a TDIV-avoidance fix;
+                            # leave the math unchanged during the signal-layout A/B.
+                            eh_sq_row = pl.mul(
+                                pl.recip(eh_amax),
                                 pl.full(
-                                    [1, RECV_TILE], dtype=pl.FP32, value=127.0,
+                                    [1, RECV_TILE],
+                                    dtype=pl.FP32,
+                                    value=127.0,
                                 ),
-                                eh_amax,
                             )
                             h_scale_dq = pl.reshape(
                                 pl.recip(eh_sq_row), [RECV_TILE, 1],
@@ -26411,28 +26504,23 @@ def _build_whole_decode_faithful_real_program(
                 [local_recv_max, HIDDEN], pl.BF16
             ],
             expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
-            pub_counts: pld.DistributedTensor[
-                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
-            ],
+            inverse_map: pl.Tensor[[BATCH, TOPK], pl.INT32],
             routed_y_buf: pld.DistributedTensor[
                 [n_routes_per_rank, HIDDEN], pl.BF16
             ],
             combine_done: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
-            # Combine task 2 (PULL): Set/Ge rendezvous (all holders staged
-            # routed_src_buf) -> build inverse_map HERE (InCore, so the pub_counts
-            # DistributedTensor read is valid — an Inline reader of pub_counts in
-            # Orchestration context fails codegen "tensor.read must be TensorType",
-            # same reason _dispatch_pull builds its CSR inside InCore) -> for each
-            # of MY tokens (t,k), remote_load its routed output from holder dst at
-            # CSR row dst_row into MY routed_y_buf[r_route=t*TOPK+k].
+            # Combine task 2 (PULL): AtomicAdd/Ge rendezvous after all holders
+            # stage routed_src_buf. Consume the source-local inverse_map produced
+            # by dispatch, then load each routed row from its holder. Self rows use
+            # local pl.load; peer rows use remote_load.
             for peer in pl.range(n_ranks):
                 if peer != my_rank:
                     pld.system.notify(
                         target=combine_done, peer=peer,
                         offsets=[my_rank, 0], value=1,
-                        op=pld.NotifyOp.Set,
+                        op=pld.NotifyOp.AtomicAdd,
                     )
             for src in pl.range(n_ranks):
                 if src != my_rank:
@@ -26440,10 +26528,7 @@ def _build_whole_decode_faithful_real_program(
                         signal=combine_done, offsets=[src, 0],
                         expected=1, cmp=pld.WaitCmp.Ge,
                     )
-            inverse_map = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
-            self._build_inverse_map(
-                expert_indices, pub_counts, inverse_map, my_rank,
-            )
+            # Use source-local inverse_map produced by dispatch.
             for t in pl.range(BATCH):
                 for k in pl.range(TOPK):
                     packed = pl.read(inverse_map, [t, k])
@@ -26453,15 +26538,17 @@ def _build_whole_decode_faithful_real_program(
                         pl.INDEX,
                     )
                     r_route = pl.cast(t * TOPK + k, pl.INDEX)
-                    # Always remote_load (peer=dst may == my_rank; _dispatch_pull
-                    # does the same self-read and it compiled+ran on device). A
-                    # local-vs-remote device-if would give `tile` two different
-                    # Tile types (Mem.Vec vs plain) -> SSA reassign reject.
-                    tile = pld.tile.remote_load(
-                        routed_src_buf, peer=dst,
-                        offsets=[dst_row, 0], shape=[1, HIDDEN],
-                    )
-                    pl.store(tile, [r_route, 0], routed_y_buf)
+                    if dst == my_rank:
+                        tile_local = pl.load(
+                            routed_src_buf, [dst_row, 0], [1, HIDDEN],
+                        )
+                        pl.store(tile_local, [r_route, 0], routed_y_buf)
+                    else:
+                        tile_remote = pld.tile.remote_load(
+                            routed_src_buf, peer=dst,
+                            offsets=[dst_row, 0], shape=[1, HIDDEN],
+                        )
+                        pl.store(tile_remote, [r_route, 0], routed_y_buf)
 
         @pl.function(type=pl.FunctionType.Inline)
         def combine_step(  # noqa: PLR0913
@@ -26483,24 +26570,18 @@ def _build_whole_decode_faithful_real_program(
                 [n_ranks, 1], pl.INT32
             ],
             expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
+            inverse_map: pl.Tensor[[BATCH, TOPK], pl.INT32],
             routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-            # Push design: r_route rode with each token into recv_r_route at
-            # dispatch, so combine drops the src_route_table publish + its
-            # barrier and scatters the routed output straight back.
-            # Zero routed_y_buf first: unwritten slots (not targeted by any push)
-            # else feed uninitialised garbage into _weighted_gather_and_add.
+            # Pull design: expert holders stage routed output locally; source
+            # ranks use dispatch-produced inverse_map entries to pull rows back.
             self._zero_routed_y_buf(routed_y_buf)
-            self._push_routed_y_to_sources(
-                local_routed_y,
-                pub_counts,
-                routed_y_buf,
-                combine_done_sig,
-                recv_r_route_out,
-                my_rank,
+            self._stage_routed_src(local_routed_y, routed_src_buf)
+            self._pull_routed_y(
+                routed_src_buf, expert_indices, inverse_map,
+                routed_y_buf, combine_done_sig, my_rank,
             )
-
             moe_out = self._weighted_gather_and_add(
                 routed_y_buf, expert_weights, sh_y, moe_out,
             )
@@ -26709,7 +26790,7 @@ def _build_whole_decode_faithful_real_program(
             (x_disp_i8, x_disp_scale) = self._quant_moe_input(
                 post_norm, x_disp_i8, x_disp_scale,
             )
-            # 3) Dispatch (EP push: tokens remote_store'd into peer recv_x).
+            # 3) Dispatch (EP fixed-slot pull).
             local_routed_x = pl.create_tensor(
                 [local_recv_max, HIDDEN], dtype=pl.INT8,
             )
@@ -26733,6 +26814,7 @@ def _build_whole_decode_faithful_real_program(
                 local_expert_offset,
                 local_expert_count,
                 recv_r_route_out,
+                inverse_map,
             ) = self.dispatch_step(
                 x_disp_i8, x_disp_scale, expert_indices,
                 local_routed_x, local_routed_x_scale,
@@ -26755,14 +26837,14 @@ def _build_whole_decode_faithful_real_program(
                 local_routed_y,
             )
 
-            # 5) Combine (EP push back + weighted gather + sh_y add).
+            # 5) Combine (EP pull back + weighted gather + sh_y add).
             moe_out = self.combine_step(
                 local_routed_y,
                 recv_r_route_out, expert_weights, sh_y,
                 moe_out,
                 pub_counts,
                 routed_y_buf, combine_done_sig,
-                expert_indices, routed_src_buf,
+                expert_indices, inverse_map, routed_src_buf,
                 my_rank,
             )
 
@@ -27096,7 +27178,7 @@ def _build_whole_decode_faithful_real_program(
                     for _dg in pl.range(HIDDEN // K_CHUNK):
                         _dg0 = _dg * K_CHUNK
                         dbg_out = pl.assemble(dbg_out, pl.slice(sh_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
-            # 3) Dispatch (EP push: tokens remote_store'd into peer recv_x).
+            # 3) Dispatch (EP fixed-slot pull).
             local_routed_x = pl.create_tensor(
                 [local_recv_max, HIDDEN], dtype=pl.INT8,
             )
@@ -27120,6 +27202,7 @@ def _build_whole_decode_faithful_real_program(
                 local_expert_offset,
                 local_expert_count,
                 recv_r_route_out,
+                inverse_map,
             ) = self.dispatch_step(
                 x_disp_i8, x_disp_scale, expert_indices,
                 local_routed_x, local_routed_x_scale,
@@ -27147,14 +27230,14 @@ def _build_whole_decode_faithful_real_program(
                     for _dg in pl.range(HIDDEN // K_CHUNK):
                         _dg0 = _dg * K_CHUNK
                         dbg_out = pl.assemble(dbg_out, pl.slice(local_routed_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
-            # 5) Combine (EP push back + weighted gather + sh_y add).
+            # 5) Combine (EP pull back + weighted gather + sh_y add).
             moe_out = self.combine_step(
                 local_routed_y,
                 recv_r_route_out, expert_weights, sh_y,
                 moe_out,
                 pub_counts,
                 routed_y_buf, combine_done_sig,
-                expert_indices, routed_src_buf,
+                expert_indices, inverse_map, routed_src_buf,
                 my_rank,
             )
 
@@ -27371,7 +27454,7 @@ def _build_whole_decode_faithful_real_program(
                     for _dg in pl.range(HIDDEN // K_CHUNK):
                         _dg0 = _dg * K_CHUNK
                         dbg_out = pl.assemble(dbg_out, pl.slice(sh_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
-            # 3) Dispatch (EP push: tokens remote_store'd into peer recv_x).
+            # 3) Dispatch (EP fixed-slot pull).
             local_routed_x = pl.create_tensor(
                 [local_recv_max, HIDDEN], dtype=pl.INT8,
             )
@@ -27395,6 +27478,7 @@ def _build_whole_decode_faithful_real_program(
                 local_expert_offset,
                 local_expert_count,
                 recv_r_route_out,
+                inverse_map,
             ) = self.dispatch_step(
                 x_disp_i8, x_disp_scale, expert_indices,
                 local_routed_x, local_routed_x_scale,
@@ -27422,14 +27506,14 @@ def _build_whole_decode_faithful_real_program(
                     for _dg in pl.range(HIDDEN // K_CHUNK):
                         _dg0 = _dg * K_CHUNK
                         dbg_out = pl.assemble(dbg_out, pl.slice(local_routed_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
-            # 5) Combine (EP push back + weighted gather + sh_y add).
+            # 5) Combine (EP pull back + weighted gather + sh_y add).
             moe_out = self.combine_step(
                 local_routed_y,
                 recv_r_route_out, expert_weights, sh_y,
                 moe_out,
                 pub_counts,
                 routed_y_buf, combine_done_sig,
-                expert_indices, routed_src_buf,
+                expert_indices, inverse_map, routed_src_buf,
                 my_rank,
             )
 
@@ -27507,17 +27591,17 @@ def _build_whole_decode_faithful_real_program(
             logits_shard_out: pl.Out[pl.Tensor[[tp_size, USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]],
         ):
             l0_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            l0_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            l0_attn_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
             l0_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            l0_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
+            l0_mlp_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
             l1_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            l1_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            l1_attn_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
             l1_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            l1_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
+            l1_mlp_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
             l2_attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            l2_attn_sig = pld.alloc_window_buffer(tp_size * 4)
+            l2_attn_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
             l2_mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            l2_mlp_sig = pld.alloc_window_buffer(tp_size * 4)
+            l2_mlp_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
             h_d0 = pl.create_tensor([tp_size, BATCH, HIDDEN], dtype=pl.BF16)
             h_d2 = pl.create_tensor([tp_size, BATCH, HIDDEN], dtype=pl.BF16)
             h_moe_L0 = pl.create_tensor([tp_size, BATCH, HIDDEN], dtype=pl.BF16)
@@ -27675,20 +27759,20 @@ def _build_whole_decode_faithful_real_program(
                     )
             if 0 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L0 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L0 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L0 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L0 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L0 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L0 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L0 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L0 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L0 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L0 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L0 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L0 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L0 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L0 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L0 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L0 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L0 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L0 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 3: swa-attn + MoE FUSED (pos=0); h_d2 -> dst. ----
                 if 0 == _FAITHFUL_MOE_LAYERS - 1:
@@ -27767,20 +27851,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 1 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L1 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L1 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L1 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L1 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L1 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L1 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L1 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L1 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L1 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L1 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L1 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L1 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L1 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L1 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L1 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L1 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L1 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L1 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 4: full-attn + MoE FUSED (pos=1); h_moe_L0 -> dst. ----
                 if 1 == _FAITHFUL_MOE_LAYERS - 1:
@@ -27859,20 +27943,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 2 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L2 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L2 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L2 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L2 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L2 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L2 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L2 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L2 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L2 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L2 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L2 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L2 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L2 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L2 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L2 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L2 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L2 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L2 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 5: swa-attn + MoE FUSED (pos=2); h_moe_L1 -> dst. ----
                 if 2 == _FAITHFUL_MOE_LAYERS - 1:
@@ -27951,20 +28035,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 3 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L3 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L3 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L3 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L3 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L3 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L3 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L3 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L3 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L3 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L3 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L3 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L3 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L3 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L3 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L3 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L3 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L3 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L3 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 6: swa-attn + MoE FUSED (pos=3); h_moe_L2 -> dst. ----
                 if 3 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28043,20 +28127,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 4 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L4 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L4 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L4 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L4 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L4 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L4 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L4 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L4 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L4 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L4 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L4 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L4 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L4 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L4 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L4 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L4 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L4 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L4 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 7: swa-attn + MoE FUSED (pos=4); h_moe_L3 -> dst. ----
                 if 4 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28135,20 +28219,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 5 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L5 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L5 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L5 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L5 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L5 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L5 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L5 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L5 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L5 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L5 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L5 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L5 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L5 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L5 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L5 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L5 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L5 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L5 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 8: full-attn + MoE FUSED (pos=5); h_moe_L4 -> dst. ----
                 if 5 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28227,20 +28311,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 6 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L6 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L6 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L6 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L6 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L6 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L6 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L6 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L6 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L6 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L6 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L6 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L6 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L6 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L6 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L6 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L6 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L6 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L6 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 9: swa-attn + MoE FUSED (pos=6); h_moe_L5 -> dst. ----
                 if 6 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28319,20 +28403,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 7 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L7 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L7 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L7 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L7 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L7 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L7 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L7 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L7 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L7 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L7 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L7 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L7 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L7 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L7 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L7 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L7 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L7 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L7 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 10: swa-attn + MoE FUSED (pos=7); h_moe_L6 -> dst. ----
                 if 7 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28411,20 +28495,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 8 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L8 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L8 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L8 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L8 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L8 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L8 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L8 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L8 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L8 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L8 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L8 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L8 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L8 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L8 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L8 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L8 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L8 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L8 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 11: swa-attn + MoE FUSED (pos=8); h_moe_L7 -> dst. ----
                 if 8 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28503,20 +28587,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 9 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L9 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L9 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L9 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L9 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L9 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L9 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L9 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L9 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L9 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L9 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L9 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L9 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L9 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L9 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L9 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L9 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L9 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L9 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 12: full-attn + MoE FUSED (pos=9); h_moe_L8 -> dst. ----
                 if 9 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28595,20 +28679,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 10 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L10 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L10 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L10 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L10 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L10 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L10 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L10 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L10 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L10 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L10 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L10 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L10 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L10 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L10 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L10 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L10 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L10 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L10 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 13: swa-attn + MoE FUSED (pos=10); h_moe_L9 -> dst. ----
                 if 10 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28687,20 +28771,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 11 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L11 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L11 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L11 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L11 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L11 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L11 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L11 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L11 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L11 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L11 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L11 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L11 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L11 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L11 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L11 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L11 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L11 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L11 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 14: swa-attn + MoE FUSED (pos=11); h_moe_L10 -> dst. ----
                 if 11 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28779,20 +28863,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 12 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L12 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L12 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L12 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L12 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L12 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L12 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L12 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L12 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L12 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L12 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L12 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L12 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L12 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L12 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L12 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L12 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L12 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L12 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 15: swa-attn + MoE FUSED (pos=12); h_moe_L11 -> dst. ----
                 if 12 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28871,20 +28955,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 13 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L13 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L13 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L13 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L13 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L13 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L13 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L13 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L13 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L13 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L13 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L13 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L13 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L13 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L13 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L13 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L13 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L13 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L13 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 16: full-attn + MoE FUSED (pos=13); h_moe_L12 -> dst. ----
                 if 13 == _FAITHFUL_MOE_LAYERS - 1:
@@ -28963,20 +29047,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 14 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L14 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L14 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L14 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L14 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L14 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L14 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L14 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L14 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L14 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L14 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L14 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L14 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L14 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L14 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L14 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L14 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L14 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L14 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 17: swa-attn + MoE FUSED (pos=14); h_moe_L13 -> dst. ----
                 if 14 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29055,20 +29139,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 15 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L15 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L15 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L15 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L15 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L15 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L15 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L15 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L15 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L15 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L15 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L15 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L15 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L15 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L15 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L15 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L15 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L15 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L15 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 18: swa-attn + MoE FUSED (pos=15); h_moe_L14 -> dst. ----
                 if 15 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29147,20 +29231,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 16 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L16 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L16 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L16 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L16 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L16 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L16 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L16 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L16 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L16 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L16 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L16 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L16 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L16 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L16 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L16 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L16 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L16 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L16 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 19: swa-attn + MoE FUSED (pos=16); h_moe_L15 -> dst. ----
                 if 16 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29239,20 +29323,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 17 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L17 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L17 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L17 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L17 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L17 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L17 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L17 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L17 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L17 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L17 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L17 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L17 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L17 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L17 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L17 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L17 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L17 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L17 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 20: full-attn + MoE FUSED (pos=17); h_moe_L16 -> dst. ----
                 if 17 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29331,20 +29415,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 18 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L18 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L18 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L18 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L18 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L18 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L18 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L18 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L18 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L18 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L18 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L18 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L18 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L18 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L18 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L18 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L18 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L18 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L18 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 21: swa-attn + MoE FUSED (pos=18); h_moe_L17 -> dst. ----
                 if 18 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29423,20 +29507,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 19 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L19 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L19 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L19 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L19 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L19 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L19 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L19 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L19 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L19 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L19 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L19 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L19 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L19 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L19 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L19 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L19 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L19 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L19 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 22: swa-attn + MoE FUSED (pos=19); h_moe_L18 -> dst. ----
                 if 19 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29515,20 +29599,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 20 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L20 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L20 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L20 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L20 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L20 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L20 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L20 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L20 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L20 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L20 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L20 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L20 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L20 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L20 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L20 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L20 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L20 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L20 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 23: swa-attn + MoE FUSED (pos=20); h_moe_L19 -> dst. ----
                 if 20 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29607,20 +29691,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 21 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L21 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L21 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L21 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L21 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L21 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L21 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L21 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L21 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L21 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L21 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L21 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L21 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L21 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L21 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L21 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L21 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L21 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L21 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 24: full-attn + MoE FUSED (pos=21); h_moe_L20 -> dst. ----
                 if 21 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29699,20 +29783,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 22 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L22 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L22 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L22 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L22 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L22 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L22 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L22 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L22 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L22 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L22 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L22 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L22 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L22 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L22 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L22 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L22 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L22 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L22 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 25: swa-attn + MoE FUSED (pos=22); h_moe_L21 -> dst. ----
                 if 22 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29791,20 +29875,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 23 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L23 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L23 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L23 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L23 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L23 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L23 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L23 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L23 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L23 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L23 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L23 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L23 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L23 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L23 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L23 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L23 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L23 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L23 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 26: swa-attn + MoE FUSED (pos=23); h_moe_L22 -> dst. ----
                 if 23 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29883,20 +29967,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 24 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L24 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L24 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L24 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L24 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L24 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L24 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L24 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L24 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L24 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L24 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L24 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L24 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L24 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L24 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L24 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L24 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L24 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L24 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 27: swa-attn + MoE FUSED (pos=24); h_moe_L23 -> dst. ----
                 if 24 == _FAITHFUL_MOE_LAYERS - 1:
@@ -29975,20 +30059,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 25 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L25 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L25 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L25 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L25 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L25 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L25 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L25 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L25 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L25 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L25 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L25 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L25 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L25 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L25 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L25 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L25 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L25 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L25 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 28: full-attn + MoE FUSED (pos=25); h_moe_L24 -> dst. ----
                 if 25 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30067,20 +30151,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 26 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L26 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L26 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L26 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L26 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L26 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L26 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L26 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L26 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L26 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L26 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L26 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L26 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L26 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L26 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L26 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L26 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L26 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L26 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 29: swa-attn + MoE FUSED (pos=26); h_moe_L25 -> dst. ----
                 if 26 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30159,20 +30243,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 27 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L27 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L27 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L27 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L27 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L27 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L27 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L27 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L27 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L27 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L27 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L27 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L27 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L27 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L27 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L27 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L27 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L27 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L27 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 30: swa-attn + MoE FUSED (pos=27); h_moe_L26 -> dst. ----
                 if 27 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30251,20 +30335,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 28 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L28 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L28 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L28 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L28 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L28 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L28 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L28 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L28 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L28 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L28 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L28 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L28 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L28 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L28 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L28 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L28 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L28 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L28 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 31: swa-attn + MoE FUSED (pos=28); h_moe_L27 -> dst. ----
                 if 28 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30343,20 +30427,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 29 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L29 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L29 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L29 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L29 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L29 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L29 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L29 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L29 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L29 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L29 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L29 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L29 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L29 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L29 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L29 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L29 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L29 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L29 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 32: full-attn + MoE FUSED (pos=29); h_moe_L28 -> dst. ----
                 if 29 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30435,20 +30519,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 30 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L30 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L30 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L30 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L30 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L30 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L30 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L30 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L30 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L30 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L30 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L30 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L30 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L30 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L30 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L30 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L30 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L30 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L30 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 33: swa-attn + MoE FUSED (pos=30); h_moe_L29 -> dst. ----
                 if 30 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30527,20 +30611,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 31 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L31 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L31 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L31 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L31 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L31 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L31 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L31 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L31 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L31 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L31 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L31 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L31 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L31 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L31 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L31 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L31 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L31 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L31 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 34: swa-attn + MoE FUSED (pos=31); h_moe_L30 -> dst. ----
                 if 31 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30619,20 +30703,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 32 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L32 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L32 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L32 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L32 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L32 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L32 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L32 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L32 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L32 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L32 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L32 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L32 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L32 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L32 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L32 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L32 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L32 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L32 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 35: swa-attn + MoE FUSED (pos=32); h_moe_L31 -> dst. ----
                 if 32 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30711,20 +30795,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 33 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L33 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L33 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L33 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L33 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L33 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L33 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L33 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L33 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L33 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L33 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L33 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L33 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L33 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L33 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L33 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L33 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L33 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L33 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 36: full-attn + MoE FUSED (pos=33); h_moe_L32 -> dst. ----
                 if 33 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30803,20 +30887,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 34 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L34 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L34 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L34 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L34 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L34 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L34 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L34 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L34 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L34 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L34 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L34 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L34 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L34 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L34 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L34 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L34 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L34 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L34 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 37: swa-attn + MoE FUSED (pos=34); h_moe_L33 -> dst. ----
                 if 34 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30895,20 +30979,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 35 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L35 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L35 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L35 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L35 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L35 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L35 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L35 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L35 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L35 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L35 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L35 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L35 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L35 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L35 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L35 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L35 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L35 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L35 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 38: swa-attn + MoE FUSED (pos=35); h_moe_L34 -> dst. ----
                 if 35 == _FAITHFUL_MOE_LAYERS - 1:
@@ -30987,20 +31071,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 36 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L36 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L36 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L36 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L36 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L36 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L36 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L36 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L36 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L36 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L36 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L36 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L36 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L36 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L36 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L36 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L36 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L36 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L36 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 39: swa-attn + MoE FUSED (pos=36); h_moe_L35 -> dst. ----
                 if 36 == _FAITHFUL_MOE_LAYERS - 1:
@@ -31079,20 +31163,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 37 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L37 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L37 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L37 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L37 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L37 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L37 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L37 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L37 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L37 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L37 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L37 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L37 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L37 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L37 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L37 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L37 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L37 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L37 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 40: full-attn + MoE FUSED (pos=37); h_moe_L36 -> dst. ----
                 if 37 == _FAITHFUL_MOE_LAYERS - 1:
@@ -31171,20 +31255,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 38 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L38 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L38 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L38 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L38 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L38 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L38 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L38 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L38 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L38 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L38 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L38 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L38 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L38 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L38 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L38 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L38 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L38 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L38 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 41: swa-attn + MoE FUSED (pos=38); h_moe_L37 -> dst. ----
                 if 38 == _FAITHFUL_MOE_LAYERS - 1:
@@ -31263,20 +31347,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 39 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L39 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L39 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L39 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L39 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L39 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L39 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L39 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L39 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L39 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L39 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L39 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L39 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L39 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L39 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L39 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L39 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L39 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L39 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 42: swa-attn + MoE FUSED (pos=39); h_moe_L38 -> dst. ----
                 if 39 == _FAITHFUL_MOE_LAYERS - 1:
@@ -31355,20 +31439,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 40 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L40 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L40 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L40 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L40 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L40 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L40 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L40 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L40 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L40 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L40 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L40 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L40 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L40 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L40 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L40 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L40 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L40 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L40 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 43: swa-attn + MoE FUSED (pos=40); h_moe_L39 -> dst. ----
                 if 40 == _FAITHFUL_MOE_LAYERS - 1:
@@ -31447,20 +31531,20 @@ def _build_whole_decode_faithful_real_program(
                         )
             if 41 < _FAITHFUL_MOE_LAYERS:
                 attn_tmp_buf_L41 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                attn_sig_buf_L41 = pld.alloc_window_buffer(tp_size * 4)
+                attn_sig_buf_L41 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 pub_counts_buf_L41 = pld.alloc_window_buffer(n_ranks * n_ranks * n_local_experts_pad * 4)
-                count_done_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                count_done_buf_L41 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 recv_x_buf_L41 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 recv_scale_buf_L41 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 recv_r_route_buf_L41 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
-                data_done_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                data_done_buf_L41 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 send_x_buf_L41 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 1)
                 send_scale_buf_L41 = pld.alloc_window_buffer(local_recv_max * 8 * 4)
                 send_route_buf_L41 = pld.alloc_window_buffer(local_recv_max * idx_pad * 4)
                 sh_tmp_buf_L41 = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-                sh_sig_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                sh_sig_buf_L41 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_y_window_buf_L41 = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
-                combine_done_buf_L41 = pld.alloc_window_buffer(n_ranks * 4)
+                combine_done_buf_L41 = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
                 routed_src_window_buf_L41 = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
                 # ---- layer 44: full-attn + MoE FUSED (pos=41); h_moe_L40 -> dst. ----
                 if 41 == _FAITHFUL_MOE_LAYERS - 1:
@@ -31550,11 +31634,3 @@ def _build_whole_decode_faithful_real_program(
 
 
 whole_decode_faithful_real = _build_whole_decode_faithful_real_program()
-
-
-
-
-
-
-
-

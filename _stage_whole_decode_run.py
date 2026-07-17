@@ -58,7 +58,7 @@ def main() -> int:
     # REQUIRE canonical TP=8 (--tp 8): the TP=1 unslice hits the SWA-MoE tile.full
     # dyn-shape (CLAUDE.md single-card iron rule), so tp1 is dense-only bring-up.
     if args.tp == 1:
-        from tests.step3p5._tp1_setup import apply_tp1_patch  # noqa: PLC0415
+        from tests.step3p5.common._tp1_setup import apply_tp1_patch  # noqa: PLC0415
         summary = apply_tp1_patch(reload_modules=[
             "models.step3p5.attention_full",
             "models.step3p5.attention_swa",

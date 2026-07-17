@@ -6,19 +6,4 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Compatibility entry point for the categorized canonical main IPC harness."""
-from __future__ import annotations
-
-from tests.step3p5.harnesses import _stage_whole_faithful_real_ipc as _impl
-
-
-def __getattr__(name: str):
-    return getattr(_impl, name)
-
-
-def main() -> int:
-    return _impl.main()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+"""Step3p5 end-to-end, golden, W8A8, and detailed precision tests."""

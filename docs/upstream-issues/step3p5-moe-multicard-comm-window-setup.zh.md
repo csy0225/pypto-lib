@@ -269,7 +269,7 @@ TP=8 / EP=8 的 per-rank 派生宽度:
 ```bash
 # 在 gpu-a910x-0162,环境已激活(CANN set_env + activate.sh + PTO_ISA_ROOT)
 cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-python -m tests.step3p5.test_decode_layer_moe_st \
+python -m tests.step3p5.system.test_decode_layer_moe_st \
     --variant full_silu_silu --world-size 8 -p a2a3 -d 0
 # -> 能编译,8 个 chip_process ready,然后所有 rank 507018;卡被 force-reset。
 

@@ -502,7 +502,7 @@ def active_exporter_pids(pool_dir: Path) -> list[dict[str, Any]]:
     """Find stage exporter processes that reference a specific pool directory."""
     try:
         completed = subprocess.run(
-            ["ps", "-eo", "pid=,args="],
+            ["ps", "-eo", "pid=,comm=,args="],
             capture_output=True,
             text=True,
             check=False,
@@ -512,9 +512,11 @@ def active_exporter_pids(pool_dir: Path) -> list[dict[str, Any]]:
     if completed.returncode != 0:
         return []
 
-    needles = (
-        "_stage_whole_mtp3_ipc",
-        "_stage_whole_faithful_real_ipc",
+    modules = (
+        "tests.step3p5._stage_whole_mtp3_ipc",
+        "tests.step3p5._stage_whole_faithful_real_ipc",
+        "tests.step3p5.harnesses._stage_whole_mtp3_ipc",
+        "tests.step3p5.harnesses._stage_whole_faithful_real_ipc",
     )
     pool_text = str(pool_dir.resolve())
     found: list[dict[str, Any]] = []
@@ -522,17 +524,34 @@ def active_exporter_pids(pool_dir: Path) -> list[dict[str, Any]]:
         stripped = line.strip()
         if not stripped:
             continue
-        parts = stripped.split(maxsplit=1)
-        if len(parts) != 2:
+        parts = stripped.split(maxsplit=2)
+        if len(parts) != 3:
             continue
         try:
             pid = int(parts[0])
         except ValueError:
             continue
-        command = parts[1]
-        if pid == os.getpid() or pool_text not in command:
+        comm = parts[1]
+        command = parts[2]
+        if pid == os.getpid() or not comm.startswith("python"):
             continue
-        if any(needle in command for needle in needles):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        try:
+            module_index = argv.index("-m") + 1
+            out_index = argv.index("--out") + 1
+        except (ValueError, IndexError):
+            continue
+        if module_index >= len(argv) or out_index >= len(argv):
+            continue
+        module = argv[module_index]
+        try:
+            command_pool = str(Path(argv[out_index]).resolve())
+        except OSError:
+            continue
+        if module in modules and command_pool == pool_text:
             found.append({"pid": pid, "command": command})
     return found
 

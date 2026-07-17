@@ -1,5 +1,10 @@
 # Step3p5 Test Layout
 
+The operator-facing whole-network entry point is documented in
+[`../../docs/step3p5/README.md`](../../docs/step3p5/README.md). Start there for
+the canonical main → sampler → MTP3 commands; this file describes the
+responsibility-based test layout only.
+
 The Step3p5 test tree is grouped by responsibility:
 
 ```text

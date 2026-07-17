@@ -93,7 +93,7 @@ export PTO2_RING_HEAP=4294967296
 export PTO2_RING_TASK_WINDOW=131072
 export PTO2_RING_DEP_POOL=131072
 
-cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib-mtp3
+cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
 python -m tests.step3p5.ci.run_whole_network_ci \
   --ckpt /data/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp \
   --devices 8,9,10,11,12,13,14,15 \

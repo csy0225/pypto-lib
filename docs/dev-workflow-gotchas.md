@@ -44,7 +44,7 @@ ST/UT setup helpers that overwrite module-level constants at import
 time, e.g.:
 
 ```python
-# tests/step3p5/_perrank_setup.py  (or _tp1_setup.py)
+# tests/step3p5/common/_perrank_setup.py  (or _tp1_setup.py)
 def apply_perrank_patch(reload_modules=None):
     cfg = importlib.import_module("models.step3p5.config")
     cfg.TP_WORLD_SIZE = 1

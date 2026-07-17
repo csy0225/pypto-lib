@@ -5,7 +5,7 @@
 # Compatibility entry point for the isolated cards-8..15 whole-network gate.
 #
 # The authoritative orchestration now lives in
-# tests.step3p5.run_whole_network_ci.  Keep this shell file only for workspace
+# tests.step3p5.ci.run_whole_network_ci.  Keep this shell file only for workspace
 # activation and backwards-compatible operator usage; do not add a second
 # exporter/stage/cleanup implementation here.
 set -euo pipefail
@@ -46,5 +46,5 @@ set -euo pipefail
     args+=(--keep-exporters-on-failure)
   fi
 
-  exec python -m tests.step3p5.run_whole_network_ci "${args[@]}" "$@"
+  exec python -m tests.step3p5.ci.run_whole_network_ci "${args[@]}" "$@"
 )

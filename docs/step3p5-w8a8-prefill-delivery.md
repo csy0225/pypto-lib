@@ -18,7 +18,7 @@ Required prompt lengths are covered: `1k`, `4k`, `8k`, `32k`, `64k`, `128k`.
   - runs multi-length detail comparison and final-logits comparison;
   - emits `STEP3P5_W8A8_PREFILL_REPORT.{json,md}`;
   - can package the report/artifacts into a tar file.
-- `tests/step3p5/test_step3p5_w8a8_prefill_st.py`
+- `tests/step3p5/precision/test_step3p5_w8a8_prefill_st.py`
   - pytest ST wrapper for either precomputed reports or live golden replay.
 
 The W8A8 checkpoint support used by this flow is the same loader path already
@@ -47,7 +47,7 @@ Pytest gate:
 
 ```bash
 STEP3P5_PREFILL_REPORT_ROOT=/mnt/nvme1/chensiyu/logs/step3p5_910b_w8a8_prefill_v001/pypto_prefill_precision \
-PYTHONPATH=. pytest -q tests/step3p5/test_step3p5_w8a8_prefill_st.py
+PYTHONPATH=. pytest -q tests/step3p5/precision/test_step3p5_w8a8_prefill_st.py
 # 1 passed in 0.01s
 ```
 

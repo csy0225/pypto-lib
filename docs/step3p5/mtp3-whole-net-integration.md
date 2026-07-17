@@ -206,8 +206,8 @@ scalar-read；必须先 reshape 成对齐的 `[1,B]` row tile，再从 `[0,b]`
 整网测试编排已收敛到：
 
 ```text
-tests/step3p5/run_whole_network_ci.py
-tests/step3p5/test_whole_network_ci.py
+tests/step3p5/ci/run_whole_network_ci.py
+tests/step3p5/ci/test_whole_network_ci.py
 ```
 
 runner 不复制 main/MTP kernel harness，只负责 fresh exporter 生命周期、前后 8 卡
@@ -215,5 +215,5 @@ runner 不复制 main/MTP kernel harness，只负责 fresh exporter 生命周期
 reference、超时、日志、JSON report 与 finally cleanup。详细使用和 CI job 示例见：
 
 ```text
-tests/step3p5/WHOLE_NETWORK_CI.md
+tests/step3p5/ci/WHOLE_NETWORK_CI.md
 ```

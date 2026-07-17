@@ -213,7 +213,7 @@ class _MlpService:
         self._tail_handle = None
         self._tail_worker = None
         if self._tail:
-            from tests.step3p5.test_rms_lm_head import rms_lm_head_test  # noqa: PLC0415
+            from tests.step3p5.unit.test_rms_lm_head import rms_lm_head_test  # noqa: PLC0415
             seq_lens = torch.full((USER_BATCH_DYN,), USER_BATCH_DYN, dtype=torch.int32)
             logits_out = torch.zeros(USER_BATCH_DYN, VOCAB_LOCAL, dtype=torch.float32)
             ct = rms_lm_head_test.compile(

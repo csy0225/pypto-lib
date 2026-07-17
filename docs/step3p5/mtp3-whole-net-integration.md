@@ -200,3 +200,20 @@ scalar-read；必须先 reshape 成对齐的 `[1,B]` row tile，再从 `[0,b]`
    `rc=0 / RUN done / argmax=303`；
 6. fresh exporter pool 下做 main P42 → sampler token 303 → MTP3 的整链 smoke；
 7. 最终 live vLLM `step3p5_mtp + enable_multi_layers_mtp` A/B。
+
+## 8. 统一整网 CI 入口
+
+整网测试编排已收敛到：
+
+```text
+tests/step3p5/run_whole_network_ci.py
+tests/step3p5/test_whole_network_ci.py
+```
+
+runner 不复制 main/MTP kernel harness，只负责 fresh exporter 生命周期、前后 8 卡
+环境隔离、canonical main → sampler token → MTP3 顺序、batch1/batch16、CPU
+reference、超时、日志、JSON report 与 finally cleanup。详细使用和 CI job 示例见：
+
+```text
+tests/step3p5/WHOLE_NETWORK_CI.md
+```

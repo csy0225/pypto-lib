@@ -19,8 +19,10 @@ This module is the weight analogue of the KV pool. Two roles:
       Consolidates THIS rank's PyPTO-layout weight bundle (the exact bundle
       ``weight_loader.load_step3p5_weights_for_rank`` produces — i.e. vLLM's
       resident sharded params already translated through
-      ``weight_translate.build_vllm_to_pypto_transform_plan`` incl. W8A8
-      dequant) into ONE contiguous device buffer, calls
+      ``weight_translate.build_vllm_to_pypto_transform_plan``. In the
+      released native-W8A8 path routed-MoE weights remain INT8 with FP32
+      scales (no dequant), while MTP matrices remain checkpoint-native BF16.
+      It packs those tensors into ONE contiguous device buffer, calls
       ``aclrtIpcMemGetExportKey`` ONCE, writes the 256-byte key +
       ``pypto_weight_map.rank{r}.json`` to a shared dir, and keeps the export
       handle alive for the whole serving life.
@@ -353,10 +355,12 @@ def export_from_checkpoint(
     """Convenience: load a rank bundle from a checkpoint + export it.
 
     Uses ``weight_loader.load_step3p5_weights_for_rank`` which already applies
-    every vLLM->PyPTO transform (qkv split/transpose, w8a8 dequant, head-pad,
-    fp32 promotion for gate/router_bias). The result is the exact per-rank
-    bundle ``Step3p5DecodeFwd`` consumes, so the worker can bind each key
-    straight to a kernel arg.
+    every vLLM->PyPTO layout transform (qkv split/transpose, head-pad, fp32
+    promotion for gate/router_bias). With ``int8_routed=True`` the routed MoE
+    tensors remain native INT8 plus FP32 scales; this function does not
+    dequantize them. The result is the exact per-rank bundle
+    ``Step3p5DecodeFwd`` consumes, so the worker can bind each key straight to
+    a kernel arg.
 
     For LIVE serving the bundle would instead be assembled directly from vLLM's
     resident ``nn.Parameter`` tensors using the same transform plan
@@ -378,8 +382,24 @@ def export_from_checkpoint(
     # (matching the dummy device harness), but weight_loader stores norms as bf16.
     # Zero-copy IPC cannot cast at read time, so materialize FP32 bytes here so the
     # exported pool + map dtype are FP32 (moe_gate_w/moe_router_bias already FP32).
-    _PROG_FP32 = ("input_rms_weight", "post_attn_rms_weight", "q_norm_weight",
-                  "k_norm_weight", "final_norm_weight")
+    _PROG_FP32 = (
+        "input_rms_weight",
+        "post_attn_rms_weight",
+        "q_norm_weight",
+        "k_norm_weight",
+        "final_norm_weight",
+        # MTP checkpoint tensors are native BF16, while the PyPTO norm ABI
+        # consumes FP32 gamma. Materialize only those small norm tables as
+        # FP32; MTP projection/attention/MLP/shared-head matrices stay their
+        # checkpoint-native BF16 (not a W8A8 dequant fallback).
+        "mtp_enorm_weight",
+        "mtp_hnorm_weight",
+        "mtp_input_rms_weight",
+        "mtp_post_attn_rms_weight",
+        "mtp_q_norm_weight",
+        "mtp_k_norm_weight",
+        "mtp_shared_head_norm_weight",
+    )
     for _k in _PROG_FP32:
         if _k in bundle and str(bundle[_k].dtype) != "torch.float32":
             bundle[_k] = bundle[_k].to(torch.float32)
@@ -393,6 +413,16 @@ def export_from_checkpoint(
         _kvc, _hd = int(_cfg.KV_CACHE_ROWS_DYN), int(_cfg.HEAD_DIM)
         bundle["k_cache"] = torch.zeros([_kvc, _hd], dtype=torch.bfloat16)
         bundle["v_cache"] = torch.zeros([_kvc, _hd], dtype=torch.bfloat16)
+        # MTP layers 45/46/47 own distinct KV slices. Keep them in the same
+        # one-key IPC pool but never alias them with the released main-network
+        # ctx=1 cache slots.
+        _n_mtp = int(_cfg.NUM_NEXTN_PREDICT_LAYERS)
+        bundle["mtp_k_cache"] = torch.zeros(
+            [_n_mtp * _kvc, _hd], dtype=torch.bfloat16
+        )
+        bundle["mtp_v_cache"] = torch.zeros(
+            [_n_mtp * _kvc, _hd], dtype=torch.bfloat16
+        )
     exp = WeightIpcExporter(dev)
     return exp.export(
         bundle, out_dir=out_dir, rank=rank, tp_world_size=tp_world_size,
@@ -523,16 +553,17 @@ def build_stacked_weight(weight_maps: List["WeightIpcMap"], key: str):
 #   1. iterate vLLM's sharded nn.Parameters (per the transform plan in
 #      weight_translate.build_vllm_to_pypto_transform_plan);
 #   2. for each weight, allocate its slot in the pool (DeviceTensor view) and
-#      run the transform (transpose / qkv-split / w8a8-dequant / head-pad)
+#      run the transform (transpose / qkv-split / native-W8A8 scale wiring /
+#      head-pad)
 #      DEVICE-SIDE into that slot (a tiny pypto kernel or aclrtMemcpy D2D for
-#      the pure-transpose cases + a dequant kernel for W8A8 routed experts);
+#      the pure-transpose cases + native INT8/FP32-scale mapping for routed
+#      experts);
 #   3. then aclrtIpcMemGetExportKey the whole pool ONCE.
 # This avoids both the host round-trip AND duplicating weights in a second
-# process. The transform kernels are the same ones the offline
-# weight_loader uses (see _dequant_w8a8 / _to_bf16 / _to_fp32), just emitted
-# as device ops. NOT implemented here — card-free; the lead wires device-side
-# transforms when validating live serving. The map schema + importer are
-# identical regardless of how the pool was filled.
+# process. The transform kernels follow the same layout rules as the offline
+# weight_loader; routed experts must remain INT8 + FP32 scale and MTP matrices
+# remain BF16. NOT implemented here — the map schema + importer are identical
+# regardless of how the pool was filled.
 
 
 # =============================================================================

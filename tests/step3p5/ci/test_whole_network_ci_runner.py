@@ -10,11 +10,17 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from tests.step3p5.ci._whole_network_ci_common import RunnerError, scrub_environment
+from tests.step3p5.ci._whole_network_ci_common import (
+    RunnerError,
+    active_exporter_pids,
+    scrub_environment,
+)
 from tests.step3p5.ci.run_whole_network_ci import (
     MAIN_INT8_KEYS,
     MAIN_SCALE_KEYS,
@@ -155,6 +161,51 @@ def test_log_parsers_only_accept_executed_result() -> None:
     assert _extract_main_argmax(text) == 303
     assert _extract_tokens(text) == [6178, 410, 303]
     assert _extract_main_argmax("(vLLM golden next-token argmax=303)\n") is None
+
+
+def test_active_exporter_scan_ignores_shell_command_text(
+    tmp_path: Path,
+) -> None:
+    pool = tmp_path / "ipc"
+    output = "\n".join(
+        [
+            (
+                "101 bash bash -c 'python -m "
+                "tests.step3p5.harnesses._stage_whole_mtp3_ipc "
+                f"--out {pool}'"
+            ),
+            (
+                "102 python python -m "
+                "tests.step3p5.harnesses._stage_whole_mtp3_ipc "
+                f"--export-rank 0 --out {pool}"
+            ),
+            (
+                "103 python python -m "
+                "tests.step3p5.ci.run_whole_network_ci "
+                f"--out {pool}"
+            ),
+        ]
+    )
+    completed = subprocess.CompletedProcess(
+        args=["ps"],
+        returncode=0,
+        stdout=output,
+        stderr="",
+    )
+    with patch(
+        "tests.step3p5.ci._whole_network_ci_common.subprocess.run",
+        return_value=completed,
+    ):
+        assert active_exporter_pids(pool) == [
+            {
+                "pid": 102,
+                "command": (
+                    "python -m "
+                    "tests.step3p5.harnesses._stage_whole_mtp3_ipc "
+                    f"--export-rank 0 --out {pool}"
+                ),
+            }
+        ]
 
 
 def test_pool_contract_rejects_bf16_main_routed_weight(tmp_path: Path) -> None:

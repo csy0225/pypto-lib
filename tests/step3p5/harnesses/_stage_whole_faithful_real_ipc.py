@@ -45,13 +45,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("-d", "--device", default="0,1,2,3,4,5,6,7")
     p.add_argument(
         "--layer-module",
-        default="models.step3p5.decode_layer",
+        default="models.step3p5.decode_layer_single_chip",
         help=(
-            "Module containing --layer-name. The single HOST→CHIP submission "
-            "candidate must explicitly use models.step3p5.decode_layer_single_chip."
+            "Module containing --layer-name. Default is the canonical N1 "
+            "single HOST→CHIP submission implementation."
         ),
     )
-    p.add_argument("--layer-name", default="whole_decode_faithful_real")
+    p.add_argument("--layer-name", default="whole_decode_faithful_real_single_chip")
     p.add_argument("--ckpt", default=CKPT_DEFAULT)
     p.add_argument("--out", default="/tmp/n1_weight_ipc")
     p.add_argument("--export-rank", type=int, default=-1)

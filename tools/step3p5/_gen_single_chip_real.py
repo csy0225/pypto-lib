@@ -36,6 +36,11 @@ REPO = Path(__file__).resolve().parents[2]
 BASE = REPO / "models" / "step3p5" / "decode_layer.py"
 OUTPUT = REPO / "models" / "step3p5" / "decode_layer_single_chip.py"
 
+# Keep only shared imports/constants/helpers in the generated module. The
+# generated single-submit module must not re-export the legacy 46-submit
+# whole-net builders from decode_layer.py.
+HEADER_STOP_DEF = "def _build_decode_layer_dense_program("
+
 SOURCE_DEF = "def _build_whole_decode_faithful_real_program("
 SOURCE_BIND = (
     "\nwhole_decode_faithful_real = "
@@ -845,13 +850,15 @@ def generate() -> str:
         + "    return WholeDecodeFaithfulRealSingleChip\n"
     )
 
+    header_end = text.index(HEADER_STOP_DEF)
+    header = text[:header_end].rstrip() + "\n\n"
     note = '''
-
-# Experimental single-rank chip-orchestration fusion. Keep the validated
-# ``whole_decode_faithful_real`` binding above as the release fallback until
-# this path passes compile, canonical device, accuracy, and repeated-stall gates.
+# N1 whole-net single-submit entry. This generated module intentionally keeps
+# only the final single-submit implementation and shared helpers; legacy
+# 46-submit whole-net builders remain in decode_layer.py for generator input /
+# historical baseline only and are not re-exported here.
 '''
-    return text + note + builder + GENERATED_BIND + "\n"
+    return header + note + builder + GENERATED_BIND + "\n"
 
 
 def main() -> int:

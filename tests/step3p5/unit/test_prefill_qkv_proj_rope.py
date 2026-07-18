@@ -25,8 +25,8 @@ numerical correctness for this @pl.program.
 Usage::
 
     cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-    python -m tests.step3p5.test_prefill_qkv_proj_rope --smoke
-    python -m tests.step3p5.test_prefill_qkv_proj_rope -p a2a3 -d 0
+    python -m tests.step3p5.unit.test_prefill_qkv_proj_rope --smoke
+    python -m tests.step3p5.unit.test_prefill_qkv_proj_rope -p a2a3 -d 0
 """
 
 from __future__ import annotations
@@ -290,7 +290,7 @@ def _build_golden_fn(world: dict[str, torch.Tensor], layer_idx: int):
 def main() -> int:
     args = _parse_args()
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415

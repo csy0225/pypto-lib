@@ -16,8 +16,8 @@ card UT is also the canonical buffer-budget validator.
 Usage::
 
     cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-    python -m tests.step3p5.test_rms_lm_head --smoke
-    python -m tests.step3p5.test_rms_lm_head -p a2a3 -d 0
+    python -m tests.step3p5.unit.test_rms_lm_head --smoke
+    python -m tests.step3p5.unit.test_rms_lm_head -p a2a3 -d 0
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ def _golden_fn(values: dict[str, torch.Tensor]) -> None:
 def main() -> int:
     args = _parse_args()
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415

@@ -22,8 +22,8 @@ Differences vs ST-1:
 Usage::
 
     cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-    python -m tests.step3p5.test_decode_layer_swa_dense_st --smoke
-    python -m tests.step3p5.test_decode_layer_swa_dense_st -p a2a3 -d 0
+    python -m tests.step3p5.system.test_decode_layer_swa_dense_st --smoke
+    python -m tests.step3p5.system.test_decode_layer_swa_dense_st -p a2a3 -d 0
 """
 
 from __future__ import annotations
@@ -192,10 +192,10 @@ def _torch_dense_mlp(resid1, post_rms_weight_layer, w_gate, w_up, w_down, eps):
 
 def main() -> int:
     args = _parse_args()
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
-    from tests.step3p5._tp1_setup import apply_tp1_patch  # noqa: PLC0415
+    from tests.step3p5.common._tp1_setup import apply_tp1_patch  # noqa: PLC0415
 
     summary = apply_tp1_patch(reload_modules=[
         "models.step3p5.attention_full",

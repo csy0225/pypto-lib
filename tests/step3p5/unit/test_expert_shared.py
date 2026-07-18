@@ -22,8 +22,8 @@ in a single-rank ``@pl.program`` test scaffold.
 Usage::
 
     cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-    python -m tests.step3p5.test_expert_shared --smoke
-    python -m tests.step3p5.test_expert_shared -p a2a3 -d 0
+    python -m tests.step3p5.unit.test_expert_shared --smoke
+    python -m tests.step3p5.unit.test_expert_shared -p a2a3 -d 0
 """
 
 from __future__ import annotations
@@ -210,7 +210,7 @@ def _golden_fn_for(swiglu_limit: float):
 def main() -> int:
     args = _parse_args()
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415

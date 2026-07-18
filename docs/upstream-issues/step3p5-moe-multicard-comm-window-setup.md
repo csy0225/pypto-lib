@@ -218,7 +218,7 @@ error. This is a **simpler (PTO runtime) comm-domain** layer issue, likely upstr
 ```bash
 # on gpu-a910x-0162, env activated (CANN set_env + activate.sh + PTO_ISA_ROOT)
 cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-python -m tests.step3p5.test_decode_layer_moe_st \
+python -m tests.step3p5.system.test_decode_layer_moe_st \
     --variant full_silu_silu --world-size 8 -p a2a3 -d 0
 # -> compiles, 8 chip_process ready, then 507018 on all ranks; cards force-reset.
 

@@ -68,12 +68,14 @@ Per-MTP-layer weight tables stack along the leading axis:
 
 Window contract (caller supplies):
   * For SWA attention: ``attn_tmp_window`` BF16
-    ``[BATCH, HIDDEN // TP_WORLD_SIZE]`` and ``attn_signal_window``
-    INT32 ``[TP_WORLD_SIZE, 1]``.
-  * For eh_proj's tp_all_reduce: ``eh_tmp_window`` /
-    ``eh_signal_window`` (same shapes).
-  * For dense MLP's tp_all_reduce: ``mlp_tmp_window`` /
-    ``mlp_signal_window`` (same shapes).
+    ``[BATCH, HIDDEN]`` and ``attn_signal_window`` INT32
+    ``[TP_WORLD_SIZE, 1]``.
+  * For eh_proj's tp_all_reduce: ``eh_tmp_window`` is the full
+    ``[BATCH, HIDDEN]`` barrier-allreduce staging tensor and
+    ``eh_signal_window`` is ``[TP_WORLD_SIZE, 1]``.
+  * For dense MLP's tp_all_reduce: ``mlp_tmp_window`` BF16
+    ``[BATCH, HIDDEN]`` and ``mlp_signal_window`` INT32
+    ``[TP_WORLD_SIZE, 1]``.
   Each call site allocates a fresh signal_window slot so the
   AtomicAdd ring-step counters do not collide across layers /
   collectives.
@@ -162,7 +164,7 @@ def _mtp_input_proj_body(
     eh_proj_weight: pl.Tensor[[MTP_EH_ROWS_DYN, 2 * HIDDEN], pl.BF16],
     mtp_in_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     mtp_layer_idx: pl.Scalar[pl.INT32],
-    eh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN // TP_WORLD_SIZE], pl.BF16],
+    eh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     eh_signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
@@ -269,8 +271,22 @@ def _mtp_input_proj_body(
     # ``[:, my_rank * HIDDEN_LOCAL : (my_rank + 1) * HIDDEN_LOCAL]`` —
     # the rest of the columns stay zero so the subsequent tp_all_reduce
     # produces the fully-assembled mtp_in.
-    partial = pl.full([BATCH, HIDDEN], dtype=pl.BF16, value=0.0)
+    partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     rank_col_base = my_rank * (HIDDEN // TP_WORLD_SIZE)
+
+    # This zero-fill must live inside an InCore region.  A top-level
+    # ``tensor.full`` in an inline body is otherwise lifted into the enclosing
+    # Orchestration function, which the backend rejects.  All non-local rank
+    # slots must be explicitly zero before the sum all-reduce.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_eh_zero_partial"):
+        for kb0 in pl.range(hidden_blocks):
+            zero_k0 = kb0 * K_CHUNK
+            zero_chunk = pl.full(
+                [BATCH, K_CHUNK], dtype=pl.BF16, value=0.0
+            )
+            partial = pl.assemble(
+                partial, zero_chunk, [0, zero_k0]
+            )
 
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
         for ob in pl.spmd(
@@ -278,24 +294,36 @@ def _mtp_input_proj_body(
             optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
         ):
             o0 = ob * OUT_PROJ_N_CHUNK
-            a_chunk_0 = pl.slice(concat_tile, [BATCH_TILE, K_CHUNK], [b0, 0])
-            w_chunk_0 = pl.slice(
+            mtp_eh_a_chunk_0 = pl.slice(
+                concat_tile, [BATCH_TILE, K_CHUNK], [b0, 0]
+            )
+            mtp_eh_w_chunk_0 = pl.slice(
                 eh_proj_weight,
                 [OUT_PROJ_N_CHUNK, K_CHUNK],
                 [layer_out_base + o0, 0],
             )
             eh_acc = pl.matmul(
-                a_chunk_0, w_chunk_0, out_dtype=pl.FP32, b_trans=True,
+                mtp_eh_a_chunk_0,
+                mtp_eh_w_chunk_0,
+                out_dtype=pl.FP32,
+                b_trans=True,
             )
             for kb in pl.range(1, eh_blocks):
                 k0 = kb * K_CHUNK
-                a_chunk = pl.slice(concat_tile, [BATCH_TILE, K_CHUNK], [b0, k0])
-                w_chunk = pl.slice(
+                mtp_eh_a_chunk = pl.slice(
+                    concat_tile, [BATCH_TILE, K_CHUNK], [b0, k0]
+                )
+                mtp_eh_w_chunk = pl.slice(
                     eh_proj_weight,
                     [OUT_PROJ_N_CHUNK, K_CHUNK],
                     [layer_out_base + o0, k0],
                 )
-                eh_acc = pl.matmul_acc(eh_acc, a_chunk, w_chunk, b_trans=True)
+                eh_acc = pl.matmul_acc(
+                    eh_acc,
+                    mtp_eh_a_chunk,
+                    mtp_eh_w_chunk,
+                    b_trans=True,
+                )
             partial = pl.assemble(
                 partial,
                 pl.cast(eh_acc, target_type=pl.BF16),
@@ -481,7 +509,9 @@ def mtp_layer(
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN_SWA, HIDDEN], pl.BF16],
-    w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL], pl.BF16],
+    w_g: pl.Tensor[
+        [LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16
+    ],
     gate_r: pl.Tensor[[NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16],
     # TP-sliced dense MLP bundle (per the decode_layer convention).
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
@@ -500,11 +530,11 @@ def mtp_layer(
     mtp_layer_idx: pl.Scalar[pl.INT32],
     global_layer_idx: pl.Scalar[pl.INT32],
     # TP windows (eh_proj, attention, dense MLP) — caller allocates fresh.
-    eh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN // TP_WORLD_SIZE], pl.BF16],
+    eh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     eh_signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
-    attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN // TP_WORLD_SIZE], pl.BF16],
+    attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     attn_signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
-    mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN // TP_WORLD_SIZE], pl.BF16],
+    mlp_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     mlp_signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):

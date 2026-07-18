@@ -21,6 +21,14 @@ docs/            Coding-style and workflow reference
 
 Files ending in `_draft.py` are works-in-progress and excluded from CI.
 
+## Step3p5 N=1 whole-network + MTP3
+
+The current N=1 whole-network and MTP3 execution entry points, including
+0162 reproduction commands, device isolation rules, stage boundaries, and CI
+usage, are documented in:
+
+[docs/step3p5/README.md](docs/step3p5/README.md)
+
 ## Quick start
 
 Install pypto + simpler + ptoas (see [.claude/skills/setup_env/SKILL.md](.claude/skills/setup_env/SKILL.md)

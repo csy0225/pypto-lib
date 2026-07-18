@@ -46,8 +46,8 @@ validates that all blockers except #1 are resolved.
 Usage::
 
     cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-    python -m tests.step3p5.test_decode_layer_moe_st --variant full_silu_silu --smoke
-    python -m tests.step3p5.test_decode_layer_moe_st --variant full_silu_silu -p a2a3 -d 0    # gated on Blocker 1
+    python -m tests.step3p5.system.test_decode_layer_moe_st --variant full_silu_silu --smoke
+    python -m tests.step3p5.system.test_decode_layer_moe_st --variant full_silu_silu -p a2a3 -d 0    # gated on Blocker 1
 """
 
 from __future__ import annotations
@@ -242,7 +242,7 @@ def main() -> int:  # noqa: PLR0915
     full_attn, prog_name_key, default_layer_idx = _VARIANTS[args.variant]
     layer_idx = args.layer_idx if args.layer_idx is not None else default_layer_idx
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
     # Topology selection: per-rank single-card (world_size=1) or canonical
@@ -254,7 +254,7 @@ def main() -> int:  # noqa: PLR0915
     # in our dev env (1 physical NPU).
     if args.world_size == 1:
         # Iron-rule per-rank patch: TP=1/EP=1 codegen + TP=8 widths preserved.
-        from tests.step3p5._perrank_setup import apply_perrank_patch  # noqa: PLC0415
+        from tests.step3p5.common._perrank_setup import apply_perrank_patch  # noqa: PLC0415
 
         summary = apply_perrank_patch(reload_modules=[
             "models.step3p5.attention_full",

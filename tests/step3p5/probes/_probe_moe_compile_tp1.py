@@ -1,20 +1,9 @@
 # Copyright (c) PyPTO Contributors.
 # SPDX-License-Identifier: Apache-2.0
-"""Probe: compile DecodeLayerMoE under PER-RANK patch (TP=8 widths preserved).
+"""Probe: compile DecodeLayerMoE under TP=1/EP=1 monkey-patch.
 
-Single-card per-rank compile test. Uses ``apply_perrank_patch()`` which
-flips TP_WORLD_SIZE/EP_WORLD_SIZE to 1 but KEEPS all ``*_LOCAL`` at
-canonical TP=8 slice widths (160 / 1408 / 36 / 1 / 8). Validates the
-"single-card ST/UT shape iron rule" from CLAUDE.md.
-
-Expected outcome (post-iron-rule):
-- sh_mlp / gate_matmul L1/UB overflow that previously surfaced under
-  ``apply_tp1_patch`` (unsliced full widths) → should DISAPPEAR if the
-  overflows were shape-choice artifacts.
-- gate_topk codegen error (``pto.tci ui32 {descending=false}``) →
-  expected to PERSIST (upstream PTOAS parser bug, shape-independent).
-- Any overflow that PERSISTS at per-rank widths is a real issue
-  (e.g. gate_matmul replicates N_EXPERTS=288 regardless of TP).
+Tests if the gate_topk codegen error in the TP=8 baseline path also
+surfaces in the TP=1 variant. Compile-only (a2a3sim), no device run.
 """
 from __future__ import annotations
 
@@ -37,17 +26,17 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
-    from tests.step3p5._perrank_setup import apply_perrank_patch  # noqa: PLC0415
+    from tests.step3p5.common._tp1_setup import apply_tp1_patch  # noqa: PLC0415
 
-    summary = apply_perrank_patch(reload_modules=[
+    summary = apply_tp1_patch(reload_modules=[
         "models.step3p5.attention_full",
         "models.step3p5.attention_swa",
         "models.step3p5.decode_layer",
     ])
-    print(f"[probe_moe_perrank] per-rank patch: {summary}", flush=True)
+    print(f"[probe_moe_tp1] TP=1 patch: {summary}", flush=True)
 
     from pypto import ir  # noqa: PLC0415
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415
@@ -64,7 +53,7 @@ def main() -> int:
 
     program = getattr(decode_layer, args.layer_name)
     prog_name = getattr(program, "name", None) or type(program).__name__
-    print(f"[probe_moe_perrank] resolved program={prog_name}", flush=True)
+    print(f"[probe_moe_tp1] resolved program={prog_name}", flush=True)
 
     dist_cfg = DistributedConfig(device_ids=[0], num_sub_workers=0)
     compiled = ir.compile(
@@ -74,7 +63,7 @@ def main() -> int:
         skip_ptoas=False,
         dump_passes=False,
     )
-    print(f"[probe_moe_perrank] COMPILE OK output_dir={compiled.output_dir}",
+    print(f"[probe_moe_tp1] COMPILE OK output_dir={compiled.output_dir}",
           flush=True)
     return 0
 

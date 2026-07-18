@@ -46,7 +46,7 @@ style — eliminate the `send_x` pack buffer + extra comm windows (overhead) AND
 - **Windows**: dropped `send_x` (8 MB), `src_route_table` (~144 KB), `route_pub`; added
   `recv_r_route` (~32 KB); `pub_counts` cols padded to `n_local_experts_pad=40`.
   Net **13 → 11 windows, ~17.4 MB → ~9.4 MB per rank**. Compiles clean (~0.85 s).
-- **Test fix** (`tests/step3p5/test_decode_layer_moe_st.py`): for `world_size>1`, set
+- **Test fix** (`tests/step3p5/system/test_decode_layer_moe_st.py`): for `world_size>1`, set
   `router_bias = 0` so routing spreads across all `MOE_NUM_EXPERTS` (real load-balanced
   all-to-all, `dst_rank = eid // N_LOC_E` covers ranks 0..7). The old
   `[0, N_LOC_E)` mask forced every token to rank 0 (degenerate all-to-one). `world_size==1`
@@ -129,7 +129,7 @@ Necessary **and** sufficient evidence: the hand-written C++ `ep_dispatch_combine
 - `models/step3p5/decode_layer.py`: `DecodeLayerMoE` push rewrite + 3-task dispatch split +
   AtomicAdd EP barriers + `pub_counts` pad. Dead-but-defined (uncalled): `ep_all_to_all`,
   `_pack_send_payload`, `_build_inverse_map`, `_publish_src_route_table` (remove on cleanup).
-- `tests/step3p5/test_decode_layer_moe_st.py`: multi-card balanced-routing `router_bias`.
+- `tests/step3p5/system/test_decode_layer_moe_st.py`: multi-card balanced-routing `router_bias`.
 - Single-card MoE device run also hits 507018 (same EP-runtime family; not separately triaged).
 - Mirror to `moe.py` `EpTpMoE` + `dispatch.py`/`combine.py` reference bodies + goldens: NOT done.
 - Window-overhead measurement + commit: NOT done.

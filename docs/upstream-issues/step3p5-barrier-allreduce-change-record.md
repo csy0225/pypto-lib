@@ -90,12 +90,12 @@ for k0 in pl.range(0, HIDDEN, ar_chunk):     # phase 3: mesh reduce (fp32 acc)
 |--------|---------|------------|
 | `b5bb6ee` | barrier-style tp_all_reduce + per_rank multirank inputs | ring → barrier-mesh in attention_full/swa + decode_layer; `per_rank()` broadcast of host inputs to `[N_RANKS,...]` |
 | `4f3605e` | decouple barrier all_reduce HIDDEN tiling from tp_size | `ar_chunk = HIDDEN // 8` (fixed); +codegen doc + known-pitfalls §7 |
-| `862c273` | multi-rank TP=8 numerical golden test | `tests/step3p5/test_decode_layer_full_dense_multirank_st.py` |
+| `862c273` | multi-rank TP=8 numerical golden test | `tests/step3p5/system/test_decode_layer_full_dense_multirank_st.py` |
 | `c5911d1` | merge `stepfun/develop` | — |
 | `fa60514` | barrier all_reduce + HIDDEN-width windows for `DecodeLayerMoE` | widen `attn_tmp`/`sh_tmp` to HIDDEN; shared-expert ring → barrier-mesh |
 
 **Files touched:** `models/step3p5/{attention_full,attention_swa,decode_layer,step3p5_decode}.py`,
-`tests/step3p5/test_decode_layer_full_dense_multirank_st.py`,
+`tests/step3p5/system/test_decode_layer_full_dense_multirank_st.py`,
 `docs/known-pypto-pitfalls.md`, `docs/upstream-issues/pypto-codegen-tp-all-reduce-multibuffer-ctx.md`.
 
 ## 4. Verification status

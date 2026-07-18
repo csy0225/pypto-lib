@@ -18,8 +18,8 @@ Tolerance:
 Usage::
 
     cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib
-    python -m tests.step3p5.test_gate --smoke
-    python -m tests.step3p5.test_gate -p a2a3 -d 0
+    python -m tests.step3p5.unit.test_gate --smoke
+    python -m tests.step3p5.unit.test_gate -p a2a3 -d 0
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
 
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
     import torch  # noqa: PLC0415

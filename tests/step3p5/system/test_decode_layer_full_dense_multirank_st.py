@@ -15,7 +15,7 @@ Strategy (relies on TP linearity):
     contiguous slice (rank r = block r) is sufficient and unambiguous.
 
 Run (8 cards):
-    python -m tests.step3p5.test_decode_layer_full_dense_multirank_st \
+    python -m tests.step3p5.system.test_decode_layer_full_dense_multirank_st \
         -p a2a3 -d 0,1,2,3,4,5,6,7
 """
 
@@ -39,7 +39,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repo_root))
 
     device_ids = [int(d) for d in str(args.device).split(",")]
@@ -54,7 +54,7 @@ def main() -> int:
     # Canonical TP=8 config - NO apply_tp1_patch.
     import models.step3p5.config as cfg  # noqa: PLC0415
     from models.step3p5.decode_layer import select_decode_layer  # noqa: PLC0415
-    from tests.step3p5.test_decode_layer_full_dense_st import (  # noqa: PLC0415
+    from tests.step3p5.system.test_decode_layer_full_dense_st import (  # noqa: PLC0415
         _torch_attn_no_gate,
         _torch_dense_mlp,
     )

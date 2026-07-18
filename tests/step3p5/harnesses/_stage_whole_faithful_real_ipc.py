@@ -27,6 +27,7 @@ env: source cann/set_env.sh && source WS/activate.sh && export PTO_ISA_ROOT=WS/p
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import subprocess
 import sys
@@ -42,6 +43,14 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
     p.add_argument("-d", "--device", default="0,1,2,3,4,5,6,7")
+    p.add_argument(
+        "--layer-module",
+        default="models.step3p5.decode_layer",
+        help=(
+            "Module containing --layer-name. The single HOST→CHIP submission "
+            "candidate must explicitly use models.step3p5.decode_layer_single_chip."
+        ),
+    )
     p.add_argument("--layer-name", default="whole_decode_faithful_real")
     p.add_argument("--ckpt", default=CKPT_DEFAULT)
     p.add_argument("--out", default="/tmp/n1_weight_ipc")
@@ -58,7 +67,38 @@ def _parse_args() -> argparse.Namespace:
     # decodes position-0 (self-attention over 1 token, rope identity) and its
     # argmax = the next token to compare vs vLLM's completion for prompt=[token].
     p.add_argument("--hidden-token", type=int, default=-1)
-    return p.parse_args()
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help=(
+            "Run the same prepared device program this many consecutive times. "
+            "Each run clears host-visible output/padding buffers and must produce "
+            "the canonical argmax 303."
+        ),
+    )
+    p.add_argument(
+        "--dmesg-dir",
+        default="",
+        help=(
+            "Optional directory for per-run `sudo -n dmesg -T` before/after "
+            "snapshots. Capture occurs outside the measured rt.run interval."
+        ),
+    )
+    p.add_argument(
+        "--expected-argmax",
+        type=int,
+        default=303,
+        help=(
+            "Canonical token to enforce. Use -1 only for an explicitly named "
+            "layer-boundary diagnostic with P_FAITHFUL_MOE_LAYERS < 42; "
+            "the complete P42 canonical test must keep the default 303."
+        ),
+    )
+    args = p.parse_args()
+    if args.repeat < 1:
+        p.error("--repeat must be >= 1")
+    return args
 
 
 def _do_export(args) -> int:
@@ -112,13 +152,24 @@ def _do_worker(args) -> int:
 
     from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415
     set_backend_type(BackendType.Ascend910B)
+    import pypto as _pypto_pkg  # noqa: PLC0415
+    import pypto.pypto_core as _pypto_core  # noqa: PLC0415
+    import simpler as _simpler_pkg  # noqa: PLC0415
     import models.step3p5.config as cfg  # noqa: PLC0415
-    import models.step3p5.decode_layer as dl  # noqa: PLC0415
+    dl = importlib.import_module(args.layer_module)
     from models.step3p5 import weight_loader as K  # noqa: PLC0415
     from tools.step3p5.pypto_weight_ipc import (  # noqa: PLC0415
         import_weights_all, build_stacked_weight,
     )
     assert tp == cfg.TP_WORLD_SIZE, f"need {cfg.TP_WORLD_SIZE} cards; got {tp}"
+    print(
+        "[worker] import provenance "
+        f"python={Path(sys.executable).resolve()} "
+        f"pypto={Path(_pypto_pkg.__file__).resolve()} "
+        f"pypto_core={Path(_pypto_core.__file__).resolve()} "
+        f"simpler={Path(_simpler_pkg.__file__).resolve()}",
+        flush=True,
+    )
 
     print(f"[worker] launching {tp} exporters dev_offset={dev_offset} ...", flush=True)
     procs = []
@@ -157,6 +208,11 @@ def _do_worker(args) -> int:
         from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor  # noqa: PLC0415
         os.environ["PYPTO_PROG_BUILD_DIR"] = "/data/chensiyu/hw_project/pypto/workspace/build_output"
         program = getattr(dl, args.layer_name)
+        print(
+            f"[worker] program module={dl.__name__} file={Path(dl.__file__).resolve()} "
+            f"name={program.name}",
+            flush=True,
+        )
         # Diagnostic knob: PYPTO_MEM_PLANNER=ptoas skips PyPTO MemoryReuse +
         # AllocateMemoryAddr (ptoas owns reuse) — used to test whether the
         # 42-layer gate_topk stall is a cross-chip buffer-aliasing artifact.
@@ -280,38 +336,181 @@ def _do_worker(args) -> int:
             args_list += [W_reshape(K.KEY_FINAL_NORM, (1, HIDDEN), f32), W(K.KEY_LM_HEAD)]
             args_list += [logits_shard_out]
 
-            print(f"[worker] built {len(args_list)} args (weights via IPC); VOCAB_LOCAL={VOCAB_LOCAL}; running ...", flush=True)
-            t0 = time.time()
-            rt.run(compiled, *args_list)
-            dt = time.time() - t0
-            full_logits = torch.cat([logits_shard_out[r, 0] for r in range(tp)], dim=0)
-            # Row-0 = the single valid ctx=1 token; rows 1..15 are batch padding and
-            # unused expert slots are garbage (data windows not auto-zeroed). Report
-            # BOTH the whole-buffer max (confounded by garbage) and the row-0 (valid
-            # token) magnitude so the valid-token signal is not masked by padding.
-            nh_row0 = next_hidden_out[:, 0, :].float().abs().max()
-            dbg_row0 = dbg_out[:, 0, :].float().abs().max()
-            print(f"[worker] RUN done {dt:.2f}s max|next_hidden|={next_hidden_out.float().abs().max():.4f} "
-                  f"row0|next_hidden|={nh_row0:.4f} "
-                  f"max|h_mid|={h_mid_out.float().abs().max():.4f} "
-                  f"max|dbg|={dbg_out.float().abs().max():.4f} row0|dbg|={dbg_row0:.4f} "
-                  f"max|logits|={logits_shard_out.abs().max():.4f} argmax={int(full_logits.argmax())}", flush=True)
-            _t5 = torch.topk(full_logits.float(), 5)
-            print(f"[worker] TOP5 ids={_t5.indices.tolist()} "
-                  f"vals={[round(float(v), 3) for v in _t5.values.tolist()]} "
-                  f"(vLLM golden next-token argmax=303)", flush=True)
+            print(
+                f"[worker] built {len(args_list)} args (weights via IPC); "
+                f"VOCAB_LOCAL={VOCAB_LOCAL}; repeat={args.repeat}; running ...",
+                flush=True,
+            )
+            run_times = []
+            run_fingerprints = []
+            dmesg_dir = Path(args.dmesg_dir) if args.dmesg_dir else None
+            if dmesg_dir is not None:
+                dmesg_dir.mkdir(parents=True, exist_ok=True)
+
+            def capture_dmesg(path: Path) -> None:
+                completed = subprocess.run(
+                    ["sudo", "-n", "dmesg", "-T"],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        f"dmesg capture failed rc={completed.returncode}: "
+                        f"{completed.stdout.strip()}"
+                    )
+                path.write_text(
+                    f"# captured_at_ns={time.time_ns()}\n{completed.stdout}"
+                )
+
+            for run_idx in range(1, args.repeat + 1):
+                # Never let a previous invocation's host-visible output or
+                # padding rows make a later run look successful. Communication
+                # windows remain runtime-owned and are allocated/initialized by
+                # the generated host orchestration on every rt.run.
+                h_mid_out.zero_()
+                next_hidden_out.zero_()
+                dbg_out.zero_()
+                logits_shard_out.zero_()
+                if dmesg_dir is not None:
+                    capture_dmesg(dmesg_dir / f"dmesg.run{run_idx:02d}.before.txt")
+
+                t0 = time.time()
+                try:
+                    rt.run(compiled, *args_list)
+                finally:
+                    t1 = time.time()
+                    if dmesg_dir is not None:
+                        capture_dmesg(dmesg_dir / f"dmesg.run{run_idx:02d}.after.txt")
+                dt = t1 - t0
+                run_times.append(dt)
+                full_logits = torch.cat([logits_shard_out[r, 0] for r in range(tp)], dim=0)
+                # Row-0 = the single valid ctx=1 token; rows 1..15 are batch
+                # padding. Report both whole-buffer and valid-row magnitudes,
+                # but use only row0 logits for the canonical golden.
+                nh_max = float(next_hidden_out.float().abs().max())
+                nh_row0 = float(next_hidden_out[:, 0, :].float().abs().max())
+                hmid_max = float(h_mid_out.float().abs().max())
+                dbg_max = float(dbg_out.float().abs().max())
+                dbg_row0 = float(dbg_out[:, 0, :].float().abs().max())
+                logits_max = float(logits_shard_out.abs().max())
+                argmax = int(full_logits.argmax())
+                run_fingerprints.append(
+                    (nh_max, nh_row0, hmid_max, dbg_max, dbg_row0, logits_max, argmax)
+                )
+                print(
+                    f"[worker] RUN done {dt:.2f}s run={run_idx}/{args.repeat} "
+                    f"max|next_hidden|={nh_max:.4f} row0|next_hidden|={nh_row0:.4f} "
+                    f"max|h_mid|={hmid_max:.4f} max|dbg|={dbg_max:.4f} "
+                    f"row0|dbg|={dbg_row0:.4f} max|logits|={logits_max:.4f} "
+                    f"argmax={argmax}",
+                    flush=True,
+                )
+                _t5 = torch.topk(full_logits.float(), 5)
+                print(
+                    f"[worker] TOP5 run={run_idx}/{args.repeat} ids={_t5.indices.tolist()} "
+                    f"vals={[round(float(v), 3) for v in _t5.values.tolist()]} "
+                    f"(expected argmax={args.expected_argmax})",
+                    flush=True,
+                )
+                if args.expected_argmax >= 0 and argmax != args.expected_argmax:
+                    raise RuntimeError(
+                        f"canonical accuracy failure at run {run_idx}/{args.repeat}: "
+                        f"argmax={argmax}, expected {args.expected_argmax}"
+                    )
+
+            print(
+                f"[worker] REPEAT summary pass={len(run_times)}/{args.repeat} "
+                f"min={min(run_times):.4f}s mean={sum(run_times) / len(run_times):.4f}s "
+                f"max={max(run_times):.4f}s fingerprints_unique={len(set(run_fingerprints))}",
+                flush=True,
+            )
             _pdir = os.environ.get("N1_DUMP_DIR", "")
             if _pdir:
                 os.makedirs(_pdir, exist_ok=True)
                 _P = os.environ.get("P_FAITHFUL_MOE_LAYERS", "42")
                 _S = os.environ.get("P_DBG_STAGE", "0")
-                torch.save(next_hidden_out[:, 0, :].float().cpu(),
-                           os.path.join(_pdir, f"P{_P}_nh_row0.pt"))
-                torch.save(h_mid_out[:, 0, :].float().cpu(),
-                           os.path.join(_pdir, f"P{_P}_hmid_row0.pt"))
-                torch.save(dbg_out[:, 0, :].float().cpu(),
-                           os.path.join(_pdir, f"P{_P}_S{_S}_dbg_row0.pt"))
-                print(f"[worker] DUMPED vectors P={_P} S={_S} -> {_pdir}", flush=True)
+                _logits_shards_row0 = logits_shard_out[:, 0, :].float().cpu()
+                _full_logits_row0 = torch.cat(
+                    [_logits_shards_row0[r] for r in range(tp)],
+                    dim=0,
+                )
+                # Preserve the complete physical output for layer-boundary
+                # diagnostics.  The canonical valid token is row 0, but rows
+                # 1..15 are still materialized tensors and must not be
+                # silently discarded: they are part of the padding,
+                # initialization, dynamic-quant, route, and lifetime audit.
+                _next_hidden_full = next_hidden_out.float().cpu().contiguous()
+                _h_mid_full = h_mid_out.float().cpu().contiguous()
+                _dbg_full = dbg_out.float().cpu().contiguous()
+                _logits_shards_full = logits_shard_out.float().cpu().contiguous()
+                _full_logits_all_rows = torch.cat(
+                    [_logits_shards_full[r] for r in range(tp)],
+                    dim=-1,
+                )
+                torch.save(
+                    _next_hidden_full[:, 0, :],
+                    os.path.join(_pdir, f"P{_P}_nh_row0.pt"),
+                )
+                torch.save(
+                    _h_mid_full[:, 0, :],
+                    os.path.join(_pdir, f"P{_P}_hmid_row0.pt"),
+                )
+                torch.save(
+                    _dbg_full[:, 0, :],
+                    os.path.join(_pdir, f"P{_P}_S{_S}_dbg_row0.pt"),
+                )
+                torch.save(
+                    _logits_shards_row0,
+                    os.path.join(_pdir, f"P{_P}_logits_shards_row0.pt"),
+                )
+                torch.save(
+                    _full_logits_row0,
+                    os.path.join(_pdir, f"P{_P}_full_logits_row0.pt"),
+                )
+                torch.save(
+                    _next_hidden_full,
+                    os.path.join(_pdir, f"P{_P}_nh_full.pt"),
+                )
+                torch.save(
+                    _h_mid_full,
+                    os.path.join(_pdir, f"P{_P}_hmid_full.pt"),
+                )
+                torch.save(
+                    _dbg_full,
+                    os.path.join(_pdir, f"P{_P}_S{_S}_dbg_full.pt"),
+                )
+                torch.save(
+                    _logits_shards_full,
+                    os.path.join(_pdir, f"P{_P}_logits_shards_full.pt"),
+                )
+                torch.save(
+                    _full_logits_all_rows,
+                    os.path.join(_pdir, f"P{_P}_full_logits_all_rows.pt"),
+                )
+                for _name, _tensor in (
+                    ("next_hidden", _next_hidden_full),
+                    ("h_mid", _h_mid_full),
+                    ("dbg", _dbg_full),
+                ):
+                    _finite = bool(torch.isfinite(_tensor).all())
+                    _row_max = _tensor.abs().amax(dim=-1)
+                    print(
+                        f"[worker] FULL {_name} shape={tuple(_tensor.shape)} "
+                        f"finite={_finite} "
+                        f"row_max={[_row_max[r].tolist() for r in range(tp)]}",
+                        flush=True,
+                    )
+                print(
+                    f"[worker] FULL logits shape={tuple(_full_logits_all_rows.shape)} "
+                    f"finite={bool(torch.isfinite(_full_logits_all_rows).all())}",
+                    flush=True,
+                )
+                print(
+                    f"[worker] DUMPED vectors+logits P={_P} S={_S} -> {_pdir}",
+                    flush=True,
+                )
             print("[worker] RESULT=REAL_WEIGHT_IPC_RUN_CLEAN", flush=True)
     finally:
         if args.reuse_exporters:

@@ -4,9 +4,7 @@
 Use this to launch vLLM without editing vLLM source:
 
     python tools/step3p5/make_vllm_sitecustomize.py --out-dir /tmp/pypto_patch
-    PYTHONPATH=/tmp/pypto_patch:/path/to/pypto-lib \
-      PYPTO_STEP3P5_PATCH_MODE=tail \
-      vllm serve ...
+    PYTHONPATH=/tmp/pypto_patch:/path/to/pypto-lib vllm serve ...
 
 Every Python process (including vLLM worker subprocesses) imports
 ``sitecustomize`` during startup, so the patch is installed before Step3p5 model
@@ -29,12 +27,51 @@ _REPO_ROOT = os.environ.get("PYPTO_LIB_REPO_ROOT", __REPO_ROOT_REPR__)
 if _REPO_ROOT and _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-if os.environ.get("PYPTO_STEP3P5_AUTO_PATCH", "1").lower() not in {"0", "false", "no", "off"}:
+# Skip all PyPTO installs in build/helper subprocesses that merely import torch
+# (e.g. tvm_ffi's _build_optional_torch_c_dlpack.py).  Those helpers run this
+# sitecustomize too; importing vLLM here would re-trigger the same torch/dlpack
+# build and fork-bomb.  Real model workers (multiprocessing spawn) do NOT match
+# these markers and proceed normally.
+_PYPTO_SKIP_SITE = any(
+    m in " ".join(sys.argv)
+    for m in ("_build_optional_torch_c_dlpack", "tvm_ffi/utils", "tvm_ffi\\utils")
+)
+
+# 1) model loader registration MUST run before vLLM builds the model so
+#    load_format=pypto resolves to the tail-only native-W8A8 loader.  Importing
+#    the module registers it via @register_model_loader("pypto").
+if not _PYPTO_SKIP_SITE and os.environ.get("PYPTO_STEP3P5_LOADER", "0").lower() in {"1", "true", "yes", "on"}:
+    try:
+        import tools.step3p5.pypto_model_loader  # noqa: F401
+    except ModuleNotFoundError:
+        # vLLM may be absent in non-serving helper processes; default strict so
+        # a misconfigured serving process fails loudly instead of silently
+        # loading the full decoder weights via the default loader.
+        if os.environ.get("PYPTO_STEP3P5_LOADER_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
+            raise
+    except Exception:
+        if os.environ.get("PYPTO_STEP3P5_LOADER_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
+            raise
+
+# 2) KV allocator overlay (K-major/V-major single IPC pool).
+if not _PYPTO_SKIP_SITE and os.environ.get("PYPTO_KVPOOL", "") == "1":
+    try:
+        from tools.step3p5.vllm_kvpool_backend import maybe_autoload
+        maybe_autoload()
+    except ModuleNotFoundError:
+        if os.environ.get("PYPTO_KVPOOL_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
+            raise
+    except Exception:
+        if os.environ.get("PYPTO_KVPOOL_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
+            raise
+
+# 3) Step3p5 forward patch (installs the whole-net sidecar decode path).
+if not _PYPTO_SKIP_SITE and os.environ.get("PYPTO_STEP3P5_AUTO_PATCH", "1").lower() not in {"0", "false", "no", "off"}:
     try:
         from tools.step3p5.vllm_monkey_patch import install
         install(os.environ.get("PYPTO_STEP3P5_PATCH_MODE", __MODE_REPR__))
     except ModuleNotFoundError:
-        # vLLM may not be importable in non-serving helper processes.  Keep
+        # vLLM may not be importable in non-serving helper processes. Keep
         # startup fail-open unless explicitly requested.
         if os.environ.get("PYPTO_STEP3P5_PATCH_STRICT", "0").lower() in {"1", "true", "yes"}:
             raise
@@ -48,7 +85,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[2]))
-    parser.add_argument("--mode", choices=["tail", "shadow", "full"], default="tail")
+    parser.add_argument(
+        "--mode",
+        choices=["full"],
+        default="full",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)

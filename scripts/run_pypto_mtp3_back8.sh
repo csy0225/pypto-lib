@@ -2,7 +2,7 @@
 # Copyright (c) PyPTO Contributors.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Compatibility entry point for the isolated cards-8..15 whole-network gate.
+# Operator entry point for the isolated cards-8..15 single-chip hidden-only gate.
 #
 # The authoritative orchestration now lives in
 # tests.step3p5.ci.run_whole_network_ci.  Keep this shell file only for workspace
@@ -27,8 +27,8 @@ set -euo pipefail
 
   ckpt="${CKPT:-/data/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp}"
   devices="${DEVICES:-8,9,10,11,12,13,14,15}"
-  out="${OUT:-/tmp/n1_weight_ipc_mtp3_ci}"
-  artifact_dir="${ARTIFACT_DIR:-/data/chensiyu/hw_project/pypto/workspace/logs_n1/mtp3_ci}"
+  out="${OUT:-/tmp/n1_single_chip_hidden_ci}"
+  artifact_dir="${ARTIFACT_DIR:-/data/chensiyu/hw_project/pypto/workspace/logs_n1_0162/single_chip_hidden_ci}"
 
   args=(
     --ckpt "${ckpt}"
@@ -38,12 +38,6 @@ set -euo pipefail
   )
   if [[ "${RUN_BATCH16:-1}" == "0" ]]; then
     args+=(--no-run-batch16)
-  fi
-  if [[ "${RUN_REFERENCE:-1}" == "0" ]]; then
-    args+=(--no-run-reference)
-  fi
-  if [[ "${KEEP_EXPORTERS_ON_FAILURE:-0}" == "1" ]]; then
-    args+=(--keep-exporters-on-failure)
   fi
 
   exec python -m tests.step3p5.ci.run_whole_network_ci "${args[@]}" "$@"

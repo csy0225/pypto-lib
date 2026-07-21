@@ -425,10 +425,17 @@ def attention_swa(
         [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.BF16,
     )
 
-    for b in pl.parallel(user_batch):
-        ctx_len = pl.tensor.read(seq_lens, [b])
+    # Keep the Scope-2 producer contract identical to the already validated
+    # full-attention path.  ``user_batch`` comes from ``pl.tensor.dim`` and is
+    # therefore a dynamic scalar even though the resident ABI has a fixed
+    # BATCH=16 storage shape.  A dynamic parallel bound lowers differently
+    # from the static form and can change submit/UB-lifetime behaviour.  Run
+    # the fixed storage extent and clamp metadata reads for any padding rows.
+    for b in pl.parallel(BATCH):
+        b_safe = pl.min(b, user_batch - 1)
+        ctx_len = pl.tensor.read(seq_lens, [b_safe])
         pos = ctx_len - 1
-        slot = pl.tensor.read(slot_mapping, [b])
+        slot = pl.tensor.read(slot_mapping, [b_safe])
         slot_block = slot // BLOCK_SIZE
         slot_offset = slot - slot_block * BLOCK_SIZE
         cos_row = pl.slice(rope_cos, [1, ROTARY_HALF_SWA * 2], [pos, 0])

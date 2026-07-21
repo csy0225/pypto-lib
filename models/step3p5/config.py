@@ -34,10 +34,12 @@ Step3p5 has the following distinguishing features:
 - SwigluStep with limit=7 on the routed-MoE active path of two specific layers
   and limit=16 on layer 44 share-expert; plain SiLU elsewhere
 
-See ``MIGRATION_PLAN.md`` for the multi-phase migration plan.
+The active integration contract is documented in ``docs/step3p5/README.md``.
 """
 
 from __future__ import annotations
+
+import os
 
 import pypto.language as pl
 
@@ -53,13 +55,64 @@ import pypto.language as pl
 #     ``TensorView(stride=…)`` annotation.
 #   * The codegen added a phantom trailing ``int32_t`` per dyn-dim Var to the
 #     kernel signature, which the dispatch did not pass.
-# Numeric values mirror the runtime patches that ``step3p5_decode.run_real_npu``
-# used to apply to the generated ``host_orch.py``.
+# Numeric values are the static ABI constants consumed by the single-chip
+# hidden-only Main and selected-MTP programs.
 # -----------------------------------------------------------------------------
 USER_BATCH_DYN = 16                        # = BATCH (line below)
-KV_CACHE_ROWS_DYN = 4096                   # = MAX_SEQ_DEFAULT
-BLOCK_TABLE_FLAT_DYN = 512                 # = MAX_BLOCKS_PER_SEQ * BATCH = 32 * 16
-ROPE_SEQ_DYN = 4096                        # = MAX_SEQ_DEFAULT
+_LIVE_MAX_SEQ = int(os.environ.get("PYPTO_STEP3P5_MAX_SEQ", "4096"))
+if _LIVE_MAX_SEQ <= 0 or _LIVE_MAX_SEQ % 128 != 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_MAX_SEQ must be a positive multiple of block size 128, "
+        f"got {_LIVE_MAX_SEQ}",
+    )
+_live_kv_rows_env = os.environ.get("PYPTO_STEP3P5_KV_CACHE_ROWS")
+KV_CACHE_ROWS_DYN = int(_live_kv_rows_env or "4096")
+if KV_CACHE_ROWS_DYN <= 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_KV_CACHE_ROWS must be positive, "
+        f"got {KV_CACHE_ROWS_DYN}",
+    )
+if _live_kv_rows_env is not None and KV_CACHE_ROWS_DYN % (45 * 128) != 0:
+    raise ValueError(
+        "live PYPTO_STEP3P5_KV_CACHE_ROWS must be divisible by "
+        f"45*128 rows, got {KV_CACHE_ROWS_DYN}",
+    )
+_live_mtp_kv_rows_env = os.environ.get("PYPTO_STEP3P5_MTP_KV_CACHE_ROWS")
+if _live_mtp_kv_rows_env is not None:
+    MTP_KV_CACHE_ROWS_DYN = int(_live_mtp_kv_rows_env)
+elif _live_kv_rows_env is not None:
+    # Main uses one flat K/V section containing all 45 layers, while the MTP
+    # selected-layer program's dynamic value is the capacity of ONE MTP
+    # layer.  Derive it from the same vLLM allocator only when live main rows
+    # are explicitly configured; the standalone default keeps its historical
+    # per-layer 4096-row diagnostic capacity.
+    MTP_KV_CACHE_ROWS_DYN = KV_CACHE_ROWS_DYN // 45
+else:
+    MTP_KV_CACHE_ROWS_DYN = KV_CACHE_ROWS_DYN
+if MTP_KV_CACHE_ROWS_DYN <= 0 or MTP_KV_CACHE_ROWS_DYN % 128 != 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_MTP_KV_CACHE_ROWS must be a positive multiple of "
+        f"block size 128, got {MTP_KV_CACHE_ROWS_DYN}",
+    )
+BLOCK_TABLE_FLAT_DYN = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_BLOCK_TABLE_FLAT",
+        str(((_LIVE_MAX_SEQ + 127) // 128) * USER_BATCH_DYN),
+    ),
+)
+if BLOCK_TABLE_FLAT_DYN <= 0 or BLOCK_TABLE_FLAT_DYN % USER_BATCH_DYN != 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_BLOCK_TABLE_FLAT must be positive and divisible by "
+        f"storage batch {USER_BATCH_DYN}, got {BLOCK_TABLE_FLAT_DYN}",
+    )
+ROPE_SEQ_DYN = int(
+    os.environ.get("PYPTO_STEP3P5_ROPE_SEQ", str(_LIVE_MAX_SEQ)),
+)
+if ROPE_SEQ_DYN < _LIVE_MAX_SEQ:
+    raise ValueError(
+        "PYPTO_STEP3P5_ROPE_SEQ must cover PYPTO_STEP3P5_MAX_SEQ, got "
+        f"{ROPE_SEQ_DYN} < {_LIVE_MAX_SEQ}",
+    )
 LAYER_DYN = 45                             # = NUM_HIDDEN_LAYERS
 LAYER_HIDDEN_ROWS_DYN = 49152              # = n_full_attn_layers * HIDDEN = 12 * 4096
 LAYER_INTER_ROWS_DYN = 4224                # = n_dense_mlp_layers * INTERMEDIATE_LOCAL = 3 * 1408
@@ -80,7 +133,7 @@ NUM_NEXTN_PREDICT_LAYERS = 3          # MTP layers (indices 45..47 in the ckpt)
 NUM_TOTAL_LAYERS = NUM_HIDDEN_LAYERS + NUM_NEXTN_PREDICT_LAYERS
 
 MAX_POSITION_EMBEDDINGS = 262144
-MAX_SEQ_DEFAULT = 4096                # default for kernel-level golden harness
+MAX_SEQ_DEFAULT = _LIVE_MAX_SEQ       # default for kernel-level golden harness
                                       # (the ckpt supports up to 262144)
 
 # -----------------------------------------------------------------------------
@@ -294,7 +347,7 @@ OUT_PROJ_K_CHUNK = 256
 OUT_PROJ_N_CHUNK = 64  # 910B: out_proj matmul L0-sized (avoid #1601 Vec-LHS Mat->Mat tmov)
 # MLP_OUT_CHUNK must divide BOTH the world-level INTERMEDIATE (11264, used
 # by the historical single-card drafts) AND the per-card TP-sliced
-# INTERMEDIATE_LOCAL=1408 (used by decode_layer's _dense_mlp_body_tp).
+# INTERMEDIATE_LOCAL=1408 (used by the hidden-only dense MLP body).
 # gcd(11264, 1408) = 1408 with many divisors; 128 is the largest power
 # of 2 that divides 1408 (1408 = 128 * 11) while still aligning with
 # the cube's 128B / 16-row friendly tiling.
@@ -475,6 +528,7 @@ __all__ = [
     # dynamic dims
     "USER_BATCH_DYN",
     "KV_CACHE_ROWS_DYN",
+    "MTP_KV_CACHE_ROWS_DYN",
     "BLOCK_TABLE_FLAT_DYN",
     "ROPE_SEQ_DYN",
     "LAYER_DYN",

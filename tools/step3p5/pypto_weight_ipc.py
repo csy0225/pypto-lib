@@ -140,6 +140,183 @@ def _align_up(n: int, a: int = _ALIGN) -> int:
 
 
 # =============================================================================
+# Fail-closed pool-map validation (stdlib-only, card-free).
+# =============================================================================
+class WeightMapInvalid(ValueError):
+    """Raised when an exported weight pool-map fails fail-closed validation."""
+
+
+# dtype name -> item size in bytes (mirrors _torch_dtype WITHOUT importing torch,
+# so the validator stays stdlib-only and runs card-free).
+_DTYPE_ITEMSIZE = {"float32": 4, "bfloat16": 2, "float16": 2, "int8": 1}
+
+# native-W8A8 routed-expert contract (design rule 3 / hard-constraint 4):
+# routed projection weights MUST be INT8; their per-channel scales MUST be FP32.
+# A BF16-dequantized routed weight is a forbidden fallback and must be rejected.
+_ROUTED_INT8_KEYS = ("moe_w_gate_r", "moe_w_up_r", "moe_w_down_r")
+_ROUTED_FP32_SCALE_KEYS = (
+    "moe_w_gate_r_scale",
+    "moe_w_up_r_scale",
+    "moe_w_down_r_scale",
+)
+# Router gate matrix + bias are FP32 regardless of routed quantization.
+_ROUTER_FP32_KEYS = ("moe_gate_w", "moe_router_bias")
+
+
+def _prod(shape) -> int:
+    n = 1
+    for s in shape:
+        n *= int(s)
+    return n
+
+
+def validate_weight_map(
+    pool_map: Dict[str, Any],
+    *,
+    expected: Optional[Dict[str, Tuple[Tuple[int, ...], str]]] = None,
+    native_w8a8: bool = True,
+    allow_extra_keys: bool = True,
+    align: int = _ALIGN,
+) -> None:
+    """Fail-closed validation of one rank's weight pool-map (stdlib-only).
+
+    Raises :class:`WeightMapInvalid` on any violation. Pure dict/int math — no
+    torch, no device, no pypto import — so it runs card-free and is the gate the
+    model loader gets before declaring a rank *ready* (design §4.2 analogue,
+    hard-constraints 3/4).
+
+    This is the reusable *live-serving* core. The whole-network CI has its own
+    MTP-aware superset gate in
+    ``tests/step3p5/ci/run_whole_network_ci.py::_validate_pool_map`` (adds the
+    MTP BF16/FP32 key requirements + KV non-alias); the two share the same
+    structural + native-W8A8 rules and must stay in sync.
+
+    Structural checks (always):
+      - ``version == 1``; ``pool_bytes`` is a positive int;
+      - ``map`` is a non-empty dict; each entry has offset/shape/dtype/nbytes;
+      - dtype is a known name; ``nbytes == prod(shape) * itemsize``;
+      - ``offset`` is ``align``-byte aligned; ``nbytes > 0``;
+      - ``[offset, offset + nbytes)`` lies inside ``pool_bytes``;
+      - no two entries overlap.
+
+    native-W8A8 checks (when ``native_w8a8``):
+      - any present routed weight key is INT8 (never a BF16 dequant);
+      - any present routed scale key is FP32;
+      - router gate/bias, when present, are FP32.
+
+    Expected cross-check (when ``expected`` is a ``{key: (shape, dtype)}`` map):
+      - every expected key is present with matching shape and dtype;
+      - unexpected keys are rejected unless ``allow_extra_keys``.
+    """
+    if not isinstance(pool_map, dict):
+        raise WeightMapInvalid(
+            f"pool_map must be a dict, got {type(pool_map).__name__}"
+        )
+    version = pool_map.get("version")
+    if version != 1:
+        raise WeightMapInvalid(f"unsupported map version {version!r} (want 1)")
+    pool_bytes = pool_map.get("pool_bytes")
+    if not isinstance(pool_bytes, int) or pool_bytes <= 0:
+        raise WeightMapInvalid(
+            f"pool_bytes must be a positive int, got {pool_bytes!r}"
+        )
+    entries = pool_map.get("map")
+    if not isinstance(entries, dict) or not entries:
+        raise WeightMapInvalid("map must be a non-empty dict")
+
+    spans: List[Tuple[int, int, str]] = []
+    for key, entry in entries.items():
+        if not isinstance(entry, dict):
+            raise WeightMapInvalid(f"entry {key!r} must be a dict")
+        for field in ("offset", "shape", "dtype", "nbytes"):
+            if field not in entry:
+                raise WeightMapInvalid(f"entry {key!r} missing field {field!r}")
+        offset, shape, dtype, nbytes = (
+            entry["offset"],
+            entry["shape"],
+            entry["dtype"],
+            entry["nbytes"],
+        )
+        if not isinstance(offset, int) or offset < 0:
+            raise WeightMapInvalid(
+                f"{key!r} offset must be a non-negative int, got {offset!r}"
+            )
+        if not isinstance(nbytes, int) or nbytes <= 0:
+            raise WeightMapInvalid(
+                f"{key!r} nbytes must be a positive int, got {nbytes!r}"
+            )
+        if dtype not in _DTYPE_ITEMSIZE:
+            raise WeightMapInvalid(f"{key!r} unknown dtype {dtype!r}")
+        if not isinstance(shape, (list, tuple)) or not shape:
+            raise WeightMapInvalid(
+                f"{key!r} shape must be a non-empty sequence, got {shape!r}"
+            )
+        want_nbytes = _prod(shape) * _DTYPE_ITEMSIZE[dtype]
+        if want_nbytes != nbytes:
+            raise WeightMapInvalid(
+                f"{key!r} nbytes {nbytes} != prod({list(shape)}) * "
+                f"itemsize({dtype})={want_nbytes}"
+            )
+        if offset % align != 0:
+            raise WeightMapInvalid(
+                f"{key!r} offset {offset} not {align}-byte aligned"
+            )
+        end = offset + nbytes
+        if end > pool_bytes:
+            raise WeightMapInvalid(
+                f"{key!r} span [{offset},{end}) exceeds pool_bytes {pool_bytes}"
+            )
+        spans.append((offset, end, key))
+
+    spans.sort()
+    for (o0, e0, k0), (o1, e1, k1) in zip(spans, spans[1:]):
+        if o1 < e0:
+            raise WeightMapInvalid(
+                f"entries {k0!r} [{o0},{e0}) and {k1!r} [{o1},{e1}) overlap"
+            )
+
+    if native_w8a8:
+        for k in _ROUTED_INT8_KEYS:
+            if k in entries and entries[k]["dtype"] != "int8":
+                raise WeightMapInvalid(
+                    f"native-W8A8 requires routed weight {k!r} to be int8, got "
+                    f"{entries[k]['dtype']!r} (BF16-dequant routed is forbidden)"
+                )
+        for k in _ROUTED_FP32_SCALE_KEYS:
+            if k in entries and entries[k]["dtype"] != "float32":
+                raise WeightMapInvalid(
+                    f"native-W8A8 requires routed scale {k!r} to be float32, "
+                    f"got {entries[k]['dtype']!r}"
+                )
+        for k in _ROUTER_FP32_KEYS:
+            if k in entries and entries[k]["dtype"] != "float32":
+                raise WeightMapInvalid(
+                    f"router weight {k!r} must be float32, got "
+                    f"{entries[k]['dtype']!r}"
+                )
+
+    if expected is not None:
+        missing = [k for k in expected if k not in entries]
+        if missing:
+            raise WeightMapInvalid(f"map missing expected keys: {sorted(missing)}")
+        if not allow_extra_keys:
+            extra = [k for k in entries if k not in expected]
+            if extra:
+                raise WeightMapInvalid(f"map has unexpected keys: {sorted(extra)}")
+        for k, spec in expected.items():
+            exp_shape, exp_dtype = spec
+            got_shape = tuple(int(s) for s in entries[k]["shape"])
+            if got_shape != tuple(int(s) for s in exp_shape):
+                raise WeightMapInvalid(
+                    f"{k!r} shape {list(got_shape)} != expected {list(exp_shape)}"
+                )
+            if entries[k]["dtype"] != exp_dtype:
+                raise WeightMapInvalid(
+                    f"{k!r} dtype {entries[k]['dtype']!r} != expected {exp_dtype!r}"
+                )
+
+
+# =============================================================================
 # Exporter (vLLM-side): consolidate this rank's PyPTO bundle -> ONE pool + key.
 # =============================================================================
 class WeightIpcExporter:
@@ -158,7 +335,9 @@ class WeightIpcExporter:
             ctypes.c_void_p, ctypes.c_size_t,
             ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint64,
         ]
-        self._acl.aclrtIpcMemClose.argtypes = [ctypes.c_void_p]
+        # aclrtIpcMemClose closes the opaque key, not the device pointer.
+        # Keep the exact export key alive until the owner is torn down.
+        self._acl.aclrtIpcMemClose.argtypes = [ctypes.c_char_p]
         self._acl.aclrtMalloc.argtypes = [
             ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int,
         ]
@@ -170,8 +349,9 @@ class WeightIpcExporter:
         self._pool_ptr: Optional[int] = None
         self._pool_bytes: int = 0
         self._initialized = False
+        self._ipc_owner = None
         # (dptr, nbytes) of the export handle, for teardown (mirror _KvExporter).
-        self._export_handle: Optional[Tuple[int, int]] = None
+        self._export_key: Optional[ctypes.Array[ctypes.c_char]] = None
 
     def _ensure_init(self) -> None:
         if self._initialized:
@@ -220,6 +400,19 @@ class WeightIpcExporter:
         into N pools is a TODO behind OPEN_DEVICE_QUESTION 3; for now one pool).
         """
         self._ensure_init()
+        if self._ipc_owner is None:
+            from tools.step3p5.ipc_session import maybe_start_owner  # noqa: PLC0415
+
+            self._ipc_owner = maybe_start_owner(
+                out_dir,
+                role="weight",
+                rank=rank,
+                device_id=(
+                    int(os.environ["PYPTO_IPC_DEVICE_OFFSET"]) + rank
+                    if "PYPTO_IPC_DEVICE_OFFSET" in os.environ
+                    else self._dev
+                ),
+            )
         layout = self.plan_layout(bundle)
         if not layout:
             raise RuntimeError("weight bundle is empty; nothing to export")
@@ -280,13 +473,19 @@ class WeightIpcExporter:
                 f"aclrtIpcMemGetExportKey rc={rc} pool={hex(self._pool_ptr)} "
                 f"nbytes={pool_bytes}",
             )
-        self._export_handle = (self._pool_ptr, pool_bytes)
+        self._export_key = key_buf
 
         os.makedirs(out_dir, exist_ok=True)
         key_path = os.path.join(out_dir, f"pypto_weight.key.rank{rank}")
         map_path = os.path.join(out_dir, f"pypto_weight_map.rank{rank}.json")
-        with open(key_path, "wb") as f:
+        # The key is an opaque ACL capability.  Publish it before the map, and
+        # publish the ready manifest only after both files are complete.
+        key_tmp = key_path + f".tmp.{os.getpid()}"
+        with open(key_tmp, "wb") as f:
             f.write(key_buf.raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(key_tmp, key_path)
         # Sentinel so the importer can poll-and-wait (mirror _stage_kvpool_pageattn).
         map_obj = {
             "version": 1,
@@ -304,9 +503,20 @@ class WeightIpcExporter:
                 for key, offset, shape, dtype_name, nbytes in layout
             },
         }
-        with open(map_path, "w") as f:
-            json.dump(map_obj, f, indent=2)
-        open(map_path + ".done", "w").write("1")
+        from tools.step3p5.ipc_session import (  # noqa: PLC0415
+            atomic_write_json,
+            attach_session,
+            write_ready_manifest,
+        )
+
+        map_obj = attach_session(map_obj, self._ipc_owner)
+        atomic_write_json(map_path, map_obj)
+        write_ready_manifest(
+            map_path + ".done",
+            map_path=map_path,
+            key_path=key_path,
+            owner=self._ipc_owner,
+        )
         print(
             f"[weight-ipc exporter] rank={rank} pool_GiB={pool_bytes/2**30:.2f} "
             f"keys={len(layout)} ONE_KEY pool_base={hex(self._pool_ptr)} "
@@ -320,60 +530,49 @@ class WeightIpcExporter:
             "num_keys": len(layout),
             "key_path": key_path,
             "map_path": map_path,
+            "pool_base_debug": self._pool_ptr,
         }
 
     def teardown(self) -> int:
         """Close the IPC export handle + free the pool (mirror _KvExporter.teardown)."""
         closed = 0
-        if self._export_handle is not None:
-            dptr, _ = self._export_handle
+        if self._export_key is not None:
             try:
-                if self._acl.aclrtIpcMemClose(ctypes.c_void_p(dptr)) == 0:
+                if self._acl.aclrtIpcMemClose(self._export_key) == 0:
                     closed += 1
             except Exception:  # noqa: BLE001
                 pass
-            self._export_handle = None
+            self._export_key = None
         if self._pool_ptr is not None:
             try:
                 self._acl.aclrtFree(ctypes.c_void_p(self._pool_ptr))
             except Exception:  # noqa: BLE001
                 pass
             self._pool_ptr = None
+        if self._ipc_owner is not None:
+            try:
+                self._ipc_owner.close()
+            finally:
+                self._ipc_owner = None
         return closed
 
 
-def export_from_checkpoint(
+def _prepare_checkpoint_bundle(
     ckpt_dir: str,
     *,
     rank: int,
     tp_world_size: int = 8,
-    out_dir: str,
-    dev: int = 0,
     int8_routed: bool = False,
     kv_ipc: bool = False,
+    production_hidden_only: bool = False,
 ) -> Dict[str, Any]:
-    """Convenience: load a rank bundle from a checkpoint + export it.
-
-    Uses ``weight_loader.load_step3p5_weights_for_rank`` which already applies
-    every vLLM->PyPTO layout transform (qkv split/transpose, head-pad, fp32
-    promotion for gate/router_bias). With ``int8_routed=True`` the routed MoE
-    tensors remain native INT8 plus FP32 scales; this function does not
-    dequantize them. The result is the exact per-rank bundle
-    ``Step3p5DecodeFwd`` consumes, so the worker can bind each key straight to
-    a kernel arg.
-
-    For LIVE serving the bundle would instead be assembled directly from vLLM's
-    resident ``nn.Parameter`` tensors using the same transform plan
-    (``weight_translate.build_vllm_to_pypto_transform_plan``); that path is
-    OPEN_DEVICE_QUESTION (4) below — it must not copy weights to host but
-    transform device-side into the pool. The checkpoint path here is the
-    numerically-identical reference used by the card-free validation harness.
-    """
+    """Load and normalize one rank's checkpoint bundle for the PyPTO ABI."""
     from models.step3p5.weight_loader import (  # noqa: PLC0415
         load_step3p5_weights_for_rank,
         verify_bundle_shapes,
     )
     import torch  # noqa: PLC0415
+
     bundle = load_step3p5_weights_for_rank(
         ckpt_dir, rank, tp_world_size, int8_routed=int8_routed,
     )
@@ -400,33 +599,315 @@ def export_from_checkpoint(
         "mtp_k_norm_weight",
         "mtp_shared_head_norm_weight",
     )
-    for _k in _PROG_FP32:
-        if _k in bundle and str(bundle[_k].dtype) != "torch.float32":
-            bundle[_k] = bundle[_k].to(torch.float32)
+    for key in _PROG_FP32:
+        if key in bundle and str(bundle[key].dtype) != "torch.float32":
+            bundle[key] = bundle[key].to(torch.float32)
+    if production_hidden_only:
+        # Production ownership:
+        # - vLLM owns target final norm/LM head;
+        # - vLLM owns every MTP shared-head norm/LM head;
+        # - PyPTO still owns MTP token embedding in the selected-layer body,
+        #   so KEY_EMBED must remain in this combined Main+MTP body pool.
+        from models.step3p5 import weight_loader as keys  # noqa: PLC0415
+
+        forbidden_tail = (
+            keys.KEY_FINAL_NORM,
+            keys.KEY_LM_HEAD,
+            keys.KEY_MTP_SH_NORM,
+            keys.KEY_MTP_SH_OUT,
+        )
+        for key in forbidden_tail:
+            bundle.pop(key, None)
     if kv_ipc:
-        # KV cache also via IPC (user hard constraint): carve per-rank k/v_cache
-        # slots into the same pool so the forked chip imports them zero-copy as
-        # add_inout DeviceTensors (attention reads context + writes new K/V into
-        # this shared peer memory). Values are dummy here (mechanism validation);
-        # a live exporter would map vLLM's resident KV pool instead.
-        import models.step3p5.config as _cfg  # noqa: PLC0415
-        _kvc, _hd = int(_cfg.KV_CACHE_ROWS_DYN), int(_cfg.HEAD_DIM)
-        bundle["k_cache"] = torch.zeros([_kvc, _hd], dtype=torch.bfloat16)
-        bundle["v_cache"] = torch.zeros([_kvc, _hd], dtype=torch.bfloat16)
+        # Standalone validation-only KV. Live serving exports vLLM's allocator
+        # through vllm_kvpool_backend instead and must keep this disabled.
+        import models.step3p5.config as cfg  # noqa: PLC0415
+
+        cache_rows, head_dim = int(cfg.KV_CACHE_ROWS_DYN), int(cfg.HEAD_DIM)
+        bundle["k_cache"] = torch.zeros(
+            [cache_rows, head_dim], dtype=torch.bfloat16
+        )
+        bundle["v_cache"] = torch.zeros(
+            [cache_rows, head_dim], dtype=torch.bfloat16
+        )
         # MTP layers 45/46/47 own distinct KV slices. Keep them in the same
-        # one-key IPC pool but never alias them with the released main-network
-        # ctx=1 cache slots.
-        _n_mtp = int(_cfg.NUM_NEXTN_PREDICT_LAYERS)
+        # one-key IPC pool but never alias them with the main-network cache.
+        num_mtp = int(cfg.NUM_NEXTN_PREDICT_LAYERS)
         bundle["mtp_k_cache"] = torch.zeros(
-            [_n_mtp * _kvc, _hd], dtype=torch.bfloat16
+            [num_mtp * cache_rows, head_dim], dtype=torch.bfloat16
         )
         bundle["mtp_v_cache"] = torch.zeros(
-            [_n_mtp * _kvc, _hd], dtype=torch.bfloat16
+            [num_mtp * cache_rows, head_dim], dtype=torch.bfloat16
         )
-    exp = WeightIpcExporter(dev)
-    return exp.export(
-        bundle, out_dir=out_dir, rank=rank, tp_world_size=tp_world_size,
+    return bundle
+
+
+def export_from_checkpoint_resident(
+    ckpt_dir: str,
+    *,
+    rank: int,
+    tp_world_size: int = 8,
+    out_dir: str,
+    dev: int = 0,
+    int8_routed: bool = False,
+    kv_ipc: bool = False,
+    production_hidden_only: bool = False,
+) -> Tuple[WeightIpcExporter, Dict[str, Any], Dict[str, Any]]:
+    """Export one rank and return the owner object plus the host bundle.
+
+    The caller must retain the returned ``WeightIpcExporter`` for the whole
+    serving lifetime.  This is the model-loader-owned path: the vLLM worker
+    process owns the native-W8A8 PyPTO allocation and its IPC export handle,
+    eliminating the separate checkpoint-exporter process.
+    """
+    bundle = _prepare_checkpoint_bundle(
+        ckpt_dir,
+        rank=rank,
+        tp_world_size=tp_world_size,
+        int8_routed=int8_routed,
+        kv_ipc=kv_ipc,
+        production_hidden_only=production_hidden_only,
     )
+    exporter = WeightIpcExporter(dev)
+    summary = exporter.export(
+        bundle,
+        out_dir=out_dir,
+        rank=rank,
+        tp_world_size=tp_world_size,
+    )
+    return exporter, summary, bundle
+
+
+def export_mtp_hidden_weights_from_checkpoint(
+    ckpt_dir: str,
+    *,
+    rank: int,
+    tp_world_size: int = 8,
+    out_dir: str,
+    dev: int = 0,
+) -> Tuple[WeightIpcExporter, Dict[str, Any], Dict[str, Any]]:
+    """Export only the selected MTP hidden-body bundle.
+
+    This is the standalone selected-layer bring-up path.  The production
+    Main+MTP service may use one model-owned pool, but an offline MTP device
+    run must not accidentally depend on Main KV, Main tail, or MTP shared-head
+    buffers.  The returned pool therefore contains exactly the embedding and
+    selected MTP transformer-body weights consumed by ``MtpLayerHolder``.
+
+    Only the checkpoint embedding and MTP45/46/47 tensors are read.  Main
+    decoder/MoE weights are never loaded, so this path cannot dequantize or
+    otherwise alter the native-W8A8 Main ownership domain.
+    """
+    import torch  # noqa: PLC0415
+    from models.step3p5 import weight_loader as keys  # noqa: PLC0415
+    from models.step3p5.config import (  # noqa: PLC0415
+        HEAD_DIM,
+        HIDDEN,
+        INTERMEDIATE,
+        NUM_HEADS_SWA,
+        NUM_HEADS_SWA_LOCAL_PAD,
+        NUM_HIDDEN_LAYERS,
+        NUM_KV_HEADS,
+        NUM_NEXTN_PREDICT_LAYERS,
+        VOCAB,
+    )
+    from models.step3p5.weight_loader import (  # noqa: PLC0415
+        _ShardCache,
+        _hf_mtp_keys,
+        _read_index,
+        _slice_eh_proj,
+        _slice_g_proj,
+        _slice_kv_proj,
+        _slice_mlp_col,
+        _slice_mlp_row,
+        _slice_o_proj,
+        _slice_q_proj,
+        _to_bf16,
+    )
+
+    if not 0 <= int(rank) < int(tp_world_size):
+        raise ValueError(
+            f"rank {rank} is outside tp_world_size={tp_world_size}"
+        )
+    if int(tp_world_size) != 8:
+        raise ValueError("selected Step3p5 MTP exporter requires TP=8")
+    num_heads_local = int(NUM_HEADS_SWA) // int(tp_world_size)
+    kv_heads_local = int(NUM_KV_HEADS) // int(tp_world_size)
+    intermediate_local = int(INTERMEDIATE) // int(tp_world_size)
+    hidden_local = int(HIDDEN) // int(tp_world_size)
+
+    selected: Dict[str, Any] = {}
+    weight_map = _read_index(ckpt_dir)
+    with _ShardCache(ckpt_dir, weight_map) as cache:
+        selected[keys.KEY_EMBED] = _to_bf16(
+            cache.get("model.embed_tokens.weight").contiguous()
+        )
+        rows: dict[str, list[Any]] = {
+            keys.KEY_MTP_ENORM: [],
+            keys.KEY_MTP_HNORM: [],
+            keys.KEY_MTP_EH_PROJ: [],
+            keys.KEY_MTP_INPUT_RMS: [],
+            keys.KEY_MTP_POST_ATTN_RMS: [],
+            keys.KEY_MTP_Q_NORM: [],
+            keys.KEY_MTP_K_NORM: [],
+            keys.KEY_MTP_WQ: [],
+            keys.KEY_MTP_WK: [],
+            keys.KEY_MTP_WV: [],
+            keys.KEY_MTP_WO: [],
+            keys.KEY_MTP_WG: [],
+            keys.KEY_MTP_DENSE_GATE: [],
+            keys.KEY_MTP_DENSE_UP: [],
+            keys.KEY_MTP_DENSE_DOWN: [],
+        }
+        for local_idx in range(int(NUM_NEXTN_PREDICT_LAYERS)):
+            mtp = _hf_mtp_keys(int(NUM_HIDDEN_LAYERS) + local_idx)
+            rows[keys.KEY_MTP_ENORM].append(
+                cache.get(mtp["enorm"]).to(torch.float32)
+            )
+            rows[keys.KEY_MTP_HNORM].append(
+                cache.get(mtp["hnorm"]).to(torch.float32)
+            )
+            rows[keys.KEY_MTP_EH_PROJ].append(
+                _slice_eh_proj(
+                    cache.get(mtp["eh_proj"]),
+                    int(rank),
+                    hidden_local,
+                )
+            )
+            rows[keys.KEY_MTP_INPUT_RMS].append(
+                cache.get(mtp["input_rms"]).to(torch.float32)
+            )
+            rows[keys.KEY_MTP_POST_ATTN_RMS].append(
+                cache.get(mtp["post_attn_rms"]).to(torch.float32)
+            )
+            rows[keys.KEY_MTP_Q_NORM].append(
+                cache.get(mtp["q_norm"]).to(torch.float32)
+            )
+            rows[keys.KEY_MTP_K_NORM].append(
+                cache.get(mtp["k_norm"]).to(torch.float32)
+            )
+            rows[keys.KEY_MTP_WQ].append(
+                _slice_q_proj(
+                    cache.get(mtp["q_proj"]),
+                    int(rank),
+                    num_heads_local,
+                )
+            )
+            rows[keys.KEY_MTP_WK].append(
+                _slice_kv_proj(
+                    cache.get(mtp["k_proj"]),
+                    int(rank),
+                    kv_heads_local,
+                )
+            )
+            rows[keys.KEY_MTP_WV].append(
+                _slice_kv_proj(
+                    cache.get(mtp["v_proj"]),
+                    int(rank),
+                    kv_heads_local,
+                )
+            )
+            rows[keys.KEY_MTP_WO].append(
+                _slice_o_proj(
+                    cache.get(mtp["o_proj"]),
+                    int(rank),
+                    num_heads_local,
+                )
+            )
+            rows[keys.KEY_MTP_WG].append(
+                _slice_g_proj(
+                    cache.get(mtp["g_proj"]),
+                    int(rank),
+                    num_heads_local,
+                    pad_to=int(NUM_HEADS_SWA_LOCAL_PAD),
+                )
+            )
+            rows[keys.KEY_MTP_DENSE_GATE].append(
+                _slice_mlp_col(
+                    cache.get(mtp["gate_proj"]),
+                    int(rank),
+                    intermediate_local,
+                )
+            )
+            rows[keys.KEY_MTP_DENSE_UP].append(
+                _slice_mlp_col(
+                    cache.get(mtp["up_proj"]),
+                    int(rank),
+                    intermediate_local,
+                )
+            )
+            rows[keys.KEY_MTP_DENSE_DOWN].append(
+                _slice_mlp_row(
+                    cache.get(mtp["down_proj"]),
+                    int(rank),
+                    intermediate_local,
+                )
+            )
+        for key, values in rows.items():
+            selected[key] = torch.stack(values, dim=0).contiguous()
+
+    if tuple(selected[keys.KEY_EMBED].shape) != (int(VOCAB), int(HIDDEN)):
+        raise RuntimeError("selected MTP embedding shape is invalid")
+    forbidden_tail = {
+        keys.KEY_FINAL_NORM,
+        keys.KEY_LM_HEAD,
+        keys.KEY_MTP_SH_NORM,
+        keys.KEY_MTP_SH_OUT,
+    }
+    if forbidden_tail & set(selected):
+        raise RuntimeError("selected MTP weight pool contains a vLLM-owned tail")
+    exporter = WeightIpcExporter(dev)
+    summary = exporter.export(
+        selected,
+        out_dir=out_dir,
+        rank=rank,
+        tp_world_size=tp_world_size,
+    )
+    return exporter, summary, selected
+
+
+def export_from_checkpoint(
+    ckpt_dir: str,
+    *,
+    rank: int,
+    tp_world_size: int = 8,
+    out_dir: str,
+    dev: int = 0,
+    int8_routed: bool = False,
+    kv_ipc: bool = False,
+    production_hidden_only: bool = False,
+) -> Dict[str, Any]:
+    """Convenience: load a rank bundle from a checkpoint + export it.
+
+    Uses ``weight_loader.load_step3p5_weights_for_rank`` which already applies
+    every vLLM->PyPTO layout transform (qkv split/transpose, head-pad, fp32
+    promotion for gate/router_bias). With ``int8_routed=True`` the routed MoE
+    tensors remain native INT8 plus FP32 scales; this function does not
+    dequantize them. The result is the exact per-rank bundle
+    ``Step3p5DecodeFwd`` consumes, so the worker can bind each key straight to
+    a kernel arg.
+
+    For LIVE serving the bundle would instead be assembled directly from vLLM's
+    resident ``nn.Parameter`` tensors using the same transform plan
+    (``weight_translate.build_vllm_to_pypto_transform_plan``); that path is
+    OPEN_DEVICE_QUESTION (4) below — it must not copy weights to host but
+    transform device-side into the pool. The checkpoint path here is the
+    numerically-identical reference used by the card-free validation harness.
+    """
+    exporter, summary, _bundle = export_from_checkpoint_resident(
+        ckpt_dir,
+        rank=rank,
+        tp_world_size=tp_world_size,
+        out_dir=out_dir,
+        dev=dev,
+        int8_routed=int8_routed,
+        kv_ipc=kv_ipc,
+        production_hidden_only=production_hidden_only,
+    )
+    # Historical standalone callers intentionally keep the raw allocation
+    # alive until process exit.  No __del__ tears it down.
+    del exporter, _bundle
+    return summary
 
 
 # =============================================================================
@@ -515,11 +996,30 @@ def import_weights_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> Lis
     """
     device_key_map: Dict[int, bytes] = {}
     maps_json: List[Dict[str, Any]] = []
+    from tools.step3p5.ipc_session import (  # noqa: PLC0415
+        validate_key_file,
+        validate_live_session,
+    )
+
     for r in range(tp):
-        with open(os.path.join(out_dir, f"pypto_weight.key.rank{r}"), "rb") as f:
-            device_key_map[dev_offset + r] = f.read()
-        with open(os.path.join(out_dir, f"pypto_weight_map.rank{r}.json")) as f:
-            maps_json.append(json.load(f))
+        key_path = os.path.join(out_dir, f"pypto_weight.key.rank{r}")
+        map_path = os.path.join(out_dir, f"pypto_weight_map.rank{r}.json")
+        ready_path = map_path + ".done"
+        key = validate_key_file(key_path)
+        with open(map_path) as f:
+            pool_map = json.load(f)
+        validate_live_session(
+            pool_map,
+            expected_rank=r,
+            expected_tp=tp,
+            expected_device_id=dev_offset + r,
+            expected_role="weight",
+            ready_path=ready_path,
+            map_path=map_path,
+            key_path=key_path,
+        )
+        device_key_map[dev_offset + r] = key
+        maps_json.append(pool_map)
     vas = rt.import_ipc_all(device_key_map)  # {device_id: peer VA}
     print(
         "[weight-ipc importer] import_ipc_all peer_bases="

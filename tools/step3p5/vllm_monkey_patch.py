@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
-"""Step3p5 vLLM monkey-patch entry points for PyPTO backend bring-up.
+"""Step3p5 vLLM patch for the canonical PyPTO whole-net hidden-only backend.
 
-This module intentionally separates *patch mechanics* from the eventual PyPTO
-NPU full-runner implementation.  It provides:
-
-- install/uninstall helpers that patch vLLM's Step3p5 classes in-place;
-- a validated ``tail`` mode replacing the final norm + logits path with a
-  PyPTO-compatible tail call (same numerical contract as current precision
-  reports);
-- a ``shadow`` mode wrapping the full model forward for instrumentation while
-  delegating computation to vLLM;
-- a fail-closed ``full`` mode that raises a clear error until the real
-  ``Step3p5DecodeFwd`` online runner is wired.
-
-The production full-network replacement should plug into
-``_pypto_full_forward`` without changing the vLLM patch surface.
+The only installable mode is ``full``: Main decoder math runs in the resident
+single-chip PyPTO program, while vLLM retains final norm, LM head, sampling,
+MTP shared heads and speculative acceptance/rejection.
 """
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import os
 import sys
@@ -36,11 +24,44 @@ class PatchState:
     original_model_forward: Callable[..., Any]
     original_causal_forward: Callable[..., Any]
     original_compute_logits: Callable[..., Any]
-    original_decoder_layer_forward: Callable[..., Any] | None = None
 
 
 class PyPTOBackendUnavailable(RuntimeError):
     """Raised when the requested PyPTO full-network runner is not wired yet."""
+
+
+# --- Fail-closed decode-gate decision (pure; unit-tested card-free) ----------
+# Broadcast as an INT32 code from rank 0 so all TP ranks take the same branch.
+GATE_FAIL_CLOSED = 0   # real request PyPTO cannot serve
+GATE_PROCEED = 1       # run the PyPTO whole-net sidecar
+GATE_PROFILE_NOOP = 2  # profile/dummy/warmup: original no-op forward is safe
+
+
+def classify_decode_gate(
+    *,
+    is_real_request: bool,
+    sidecar_available: bool,
+    eligible: bool,
+) -> int:
+    """Decide how a Step3p5 decode forward proceeds (fail-closed).
+
+    Only identifiable profile/dummy/warmup calls may take the metadata-only
+    no-op path. Every real request that is not served by the canonical
+    single-chip sidecar fails closed; there is no vanilla or per-layer fallback.
+
+    Args:
+      is_real_request: a live per-layer ``attn_metadata`` exists (real decode).
+        ``False`` marks profile/dummy/warmup, where the no-op fallback is safe.
+      sidecar_available: the resident whole-net sidecar socket is present.
+      eligible: pure one-token-per-request decode ABI holds (1..16 rows, no
+        prefill, no spec, PP==1, hidden ``[T,4096]`` BF16, no token padding).
+    Returns one of the ``GATE_*`` codes.
+    """
+    if not is_real_request:
+        return GATE_PROFILE_NOOP
+    if sidecar_available and eligible:
+        return GATE_PROCEED
+    return GATE_FAIL_CLOSED
 
 
 def _repo_root() -> Path:
@@ -65,199 +86,381 @@ def _set_patch_state(step3p5, state: PatchState | None) -> None:
         setattr(step3p5, _PATCH_ATTR, state)
 
 
-def _maybe_dump_param_meta(model) -> None:
-    """Dump vLLM Step3p5 parameter metadata once for translator bring-up."""
-    out_path = os.environ.get("PYPTO_STEP3P5_DUMP_PARAM_META")
-    if not out_path or getattr(model, "_pypto_param_meta_dumped", False):
-        return
-    import json
-    from pathlib import Path
-
-    meta = {}
-    for name, param in model.named_parameters():
-        meta[name] = {
-            "shape": list(param.shape),
-            "dtype": str(param.dtype).removeprefix("torch."),
-            "device": str(param.device),
-            "requires_grad": bool(getattr(param, "requires_grad", False)),
-        }
-    path = Path(out_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"num_parameters": len(meta), "parameters": meta}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    setattr(model, "_pypto_param_meta_dumped", True)
-
-
-def _pypto_layer_ref_forward(self, positions, hidden_states):
-    """PyPTO-style decoder-layer orchestration using live vLLM kernels.
-
-    This replaces ``Step3p5DecoderLayer.forward`` for all 45 main layers while
-    reusing vLLM's attention/MoE/MLP submodules for the heavy math and KV-cache
-    side effects.  It is the online layer-replacement bridge before the true
-    PyPTO @pl NPU programs are wired into ``Step3p5DecodeFwd``.
-    """
-    residual = hidden_states
-    hidden_states = self.input_layernorm(hidden_states)
-    self.self_attn.layer_idx = self.layer_idx
-    attn_delta = self.self_attn(positions=positions, hidden_states=hidden_states)
-    if int(getattr(self, "_pypto_layer_ref_calls", 0)) == 0:
-        _maybe_dump_forward_context(self)
-    hidden_states = attn_delta + residual
-
-    residual = hidden_states
-    hidden_states = self.post_attention_layernorm(hidden_states)
-    if self.use_moe:
-        ffn_output = self.moe(hidden_states)
-    else:
-        ffn_output = self.mlp(hidden_states)
-    hidden_states = ffn_output + residual
-
-    # Lightweight observability for online E2E reports.
-    try:
-        self._pypto_layer_ref_calls = int(getattr(self, "_pypto_layer_ref_calls", 0)) + 1
-        self._pypto_layer_ref_last_shape = tuple(hidden_states.shape)
-    except Exception:
-        pass
-    return hidden_states
-
-
-def _tensor_brief(x) -> dict[str, Any]:
-    try:
-        return {"shape": list(x.shape), "dtype": str(x.dtype).removeprefix("torch."), "device": str(x.device)}
-    except Exception:
-        return {"repr": repr(x)[:200]}
-
-
-def _maybe_dump_forward_context(model) -> None:
-    """Dump vLLM forward context metadata needed by a future PyPTO runner."""
-    out_path = os.environ.get("PYPTO_STEP3P5_FORWARD_CONTEXT_REPORT")
-    if not out_path:
-        return
-    import json
-    from pathlib import Path
-
-    report: dict[str, Any] = {"ok": False}
-    try:
-        from vllm.forward_context import get_forward_context
-        ctx = get_forward_context()
-        attn_metadata = ctx.attn_metadata
-        slot_mapping = ctx.slot_mapping
-        no_compile_layers = ctx.no_compile_layers
-        report["attn_metadata_type"] = type(attn_metadata).__name__
-        report["slot_mapping_type"] = type(slot_mapping).__name__
-        report["no_compile_layers_count"] = len(no_compile_layers) if hasattr(no_compile_layers, "__len__") else None
-        if isinstance(slot_mapping, dict):
-            report["slot_mapping"] = {str(k): _tensor_brief(v) for k, v in list(slot_mapping.items())[:8]}
-            report["slot_mapping_count"] = len(slot_mapping)
-        if isinstance(attn_metadata, dict):
-            sample = {}
-            for k, v in list(attn_metadata.items())[:3]:
-                attrs = {}
-                for attr in ("num_prefills", "num_decode_tokens", "num_prefill_tokens", "seq_lens", "block_table", "block_table_tensor", "slot_mapping"):
-                    if hasattr(v, attr):
-                        val = getattr(v, attr)
-                        attrs[attr] = _tensor_brief(val) if hasattr(val, "shape") else repr(val)[:200]
-                sample[str(k)] = {"type": type(v).__name__, "attrs": attrs}
-            report["attn_metadata_count"] = len(attn_metadata)
-            report["attn_metadata_sample"] = sample
-        # KV cache objects live on no_compile attention layers.
-        kv_sample = {}
-        for k, layer in list(no_compile_layers.items())[:3]:
-            kv = getattr(layer, "kv_cache", None)
-            kv_sample[str(k)] = _tensor_brief(kv) if kv is not None else None
-        report["kv_cache_sample"] = kv_sample
-        report["ok"] = True
-    except Exception as exc:  # noqa: BLE001
-        # Forward context may already be cleared by compute_logits; do not
-        # overwrite a successful layer-time report with a tail-time miss.
-        path = Path(out_path)
-        if path.exists():
-            return
-        report["error"] = repr(exc)
-    path = Path(out_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _maybe_dump_layer_ref_report(model) -> None:
-    """Dump per-layer replacement invocation counts after an online request."""
-    out_path = os.environ.get("PYPTO_STEP3P5_LAYER_REF_REPORT")
-    if not out_path:
-        return
-    import json
-    from pathlib import Path
-
-    layers = getattr(getattr(model, "model", None), "layers", [])
-    layer_reports = []
-    for idx, layer in enumerate(layers):
-        if layer.__class__.__name__ == "PPMissingLayer":
-            continue
-        layer_reports.append({
-            "layer": int(getattr(layer, "layer_idx", idx)),
-            "calls": int(getattr(layer, "_pypto_layer_ref_calls", 0)),
-            "last_shape": list(getattr(layer, "_pypto_layer_ref_last_shape", []) or []),
-            "replaced": bool(getattr(layer, "_pypto_layer_ref_calls", 0)),
-        })
-    payload = {
-        "mode": os.environ.get("PYPTO_STEP3P5_PATCH_MODE"),
-        "num_layers_observed": len(layer_reports),
-        "num_layers_replaced": sum(1 for item in layer_reports if item["replaced"]),
-        "all_observed_layers_replaced": bool(layer_reports) and all(item["replaced"] for item in layer_reports),
-        "layers": layer_reports,
-    }
-    path = Path(out_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
 def _pypto_tail_compute_logits(self, hidden_states):
-    """PyPTO-compatible final RMSNorm + LM-head tail.
-
-    The actual math intentionally mirrors the already precision-closed
-    ``tools/step3p5/final_logits_from_vllm.py`` contract: consume final hidden,
-    apply Step3p5 final norm, then vocab projection/logits processing.  It uses
-    vLLM's live modules for now so quantized LM-head sharding remains identical
-    to vLLM-Ascend while the PyPTO runner ABI is being wired.
-    """
-    _maybe_dump_param_meta(self)
+    """vLLM-owned final RMSNorm and LM-head tail."""
     normed_hidden_states = self.model.norm(hidden_states)
     logits = self.logits_processor(self.lm_head, normed_hidden_states)
-    _maybe_dump_layer_ref_report(self)
-    _maybe_dump_forward_context(self)
-    setattr(self, "_pypto_tail_last_shape", tuple(logits.shape))
     return logits
 
 
-def _pypto_full_forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
-    """Placeholder for the future full PyPTO Step3p5 runner.
+def _wd_sock_path() -> str:
+    return os.environ.get("PYPTO_WHOLE_DECODE_SOCK", "/logs/pypto_whole_decode.sock")
 
-    The online full runner must replace this body with a call that prepares
-    hidden/KV/block-table inputs, invokes ``Step3p5DecodeFwd``/prefill runner,
-    and returns hidden states compatible with vLLM's compute_logits path.
+
+# Lazily-created, process-global whole-decode sidecar client.  Rank 0 is the
+# only socket peer.  TP coordination around the call is CPU/Gloo-only: using a
+# vLLM device-group broadcast while PyPTO owns the same eight NPUs can form a
+# cross-runtime collective cycle.
+_WD_CLIENT = None
+
+
+def _wd_client():
+    global _WD_CLIENT
+    if _WD_CLIENT is None:
+        from tools.step3p5.whole_decode_sidecar import WholeDecodeClient  # noqa: PLC0415
+        _WD_CLIENT = WholeDecodeClient(_wd_sock_path()).connect()
+    return _WD_CLIENT
+
+
+def _sidecar_result_payload(
+    run_sidecar,
+    *,
+    output_key: str = "next_hidden",
+) -> dict[str, Any]:
+    """Execute one rank-0 sidecar transaction and turn success/failure into data.
+
+    All ranks consume the returned object through ``tp.broadcast_object``.
+    ``run_sidecar`` may issue multiple ordered whole-net rounds for one vLLM
+    speculative target forward. A failure in any round is deliberately
+    represented as a terminal error, not a fallback request: PyPTO may already
+    have mutated paged KV in this or an earlier round.
     """
-    raise PyPTOBackendUnavailable(
-        "PYPTO_STEP3P5_PATCH_MODE=full requested, but the online "
-        "Step3p5DecodeFwd/prefill runner is not wired yet. Use mode=tail "
-        "or mode=shadow for bring-up instrumentation."
+    try:
+        out_meta, output = run_sidecar()
+        return {
+            "ok": True,
+            "out_meta": dict(out_meta),
+            output_key: output,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error": repr(exc),
+        }
+
+
+def _run_decode_plan(client, hidden_cpu, decode_plan):
+    """Execute ordered N=1 whole-net rounds and restore flattened token order.
+
+    vLLM flattens speculative target verification request-major, while PyPTO's
+    production program accepts one position per request.  ``decode_plan``
+    partitions every flattened token index into ordered speculative-position
+    rounds.  Earlier rounds complete (including KV writes) before later rounds
+    enter the same resident sidecar/runtime.
+
+    The returned hidden uses vLLM's original flattened token order so the
+    unchanged final RMSNorm, LM head, target sampler and rejection sampler
+    consume exactly the rows they expect.
+    """
+    import torch  # noqa: PLC0415
+
+    if (
+        hidden_cpu.dtype != torch.bfloat16
+        or hidden_cpu.ndim != 2
+        or int(hidden_cpu.shape[0]) != int(decode_plan.valid_tokens)
+    ):
+        raise PyPTOBackendUnavailable(
+            "decode-plan hidden ABI mismatch: "
+            f"dtype={hidden_cpu.dtype}, shape={tuple(hidden_cpu.shape)}, "
+            f"valid_tokens={decode_plan.valid_tokens}"
+        )
+
+    next_hidden_cpu = torch.empty_like(hidden_cpu)
+    seen = torch.zeros(decode_plan.valid_tokens, dtype=torch.bool)
+    round_metas: list[dict[str, Any]] = []
+    for round_idx, decode_meta in enumerate(decode_plan.steps):
+        token_indices = tuple(int(index) for index in decode_meta.token_indices)
+        if len(token_indices) != decode_meta.valid_tokens:
+            raise PyPTOBackendUnavailable(
+                f"decode round {round_idx}: token-index count "
+                f"{len(token_indices)} != valid_tokens "
+                f"{decode_meta.valid_tokens}"
+            )
+        if len(set(token_indices)) != len(token_indices):
+            raise PyPTOBackendUnavailable(
+                f"decode round {round_idx}: duplicate token indices "
+                f"{token_indices}"
+            )
+        if any(
+            index < 0 or index >= decode_plan.valid_tokens
+            for index in token_indices
+        ):
+            raise PyPTOBackendUnavailable(
+                f"decode round {round_idx}: token index out of range "
+                f"{token_indices}"
+            )
+
+        index = torch.tensor(token_indices, dtype=torch.long)
+        if torch.any(seen.index_select(0, index)):
+            raise PyPTOBackendUnavailable(
+                f"decode round {round_idx}: token indices were already "
+                f"produced {token_indices}"
+            )
+        step_hidden = hidden_cpu.index_select(0, index).contiguous()
+        tensors = {"hidden": step_hidden}
+        tensors.update(decode_meta.protocol_tensors())
+        out_meta, out = client.decode(
+            tensors,
+            decode_meta.protocol_meta(),
+        )
+        step_next_hidden = out.get("next_hidden")
+        if (
+            not isinstance(step_next_hidden, torch.Tensor)
+            or step_next_hidden.dtype != torch.bfloat16
+            or tuple(step_next_hidden.shape) != tuple(step_hidden.shape)
+        ):
+            raise PyPTOBackendUnavailable(
+                f"decode round {round_idx}: sidecar next_hidden ABI "
+                f"mismatch; got "
+                f"{getattr(step_next_hidden, 'dtype', None)}/"
+                f"{getattr(step_next_hidden, 'shape', None)}, expected "
+                f"{step_hidden.dtype}/{tuple(step_hidden.shape)}"
+            )
+        if not torch.isfinite(step_next_hidden.float()).all():
+            raise PyPTOBackendUnavailable(
+                f"decode round {round_idx}: sidecar returned NaN/Inf "
+                "next_hidden"
+            )
+        next_hidden_cpu.index_copy_(
+            0,
+            index,
+            step_next_hidden.contiguous(),
+        )
+        seen.index_fill_(0, index, True)
+        round_metas.append(
+            {
+                "round_idx": round_idx,
+                "token_indices": list(token_indices),
+                "out_meta": dict(out_meta),
+            }
+        )
+
+    if not torch.all(seen):
+        missing = torch.nonzero(~seen, as_tuple=False).flatten().tolist()
+        raise PyPTOBackendUnavailable(
+            f"decode plan did not produce hidden rows {missing}"
+        )
+    return (
+        {
+            "op": "decode_plan",
+            "round_count": len(round_metas),
+            "query_lengths": list(decode_plan.query_lengths),
+            "rounds": round_metas,
+        },
+        next_hidden_cpu,
     )
 
 
-def install(mode: str | None = None) -> dict[str, Any]:
-    """Install the Step3p5 monkey patch.
+def _pypto_full_forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+    """Full PyPTO Step3p5 runner via the resident whole-net sidecar.
 
-    Modes:
-      - ``tail``: replace ``Step3p5ForCausalLM.compute_logits`` only.
-      - ``shadow``: wrap ``Step3p5Model.forward`` and delegate to original.
-      - ``layer_ref``: replace all 45 ``Step3p5DecoderLayer.forward`` bodies
-        with PyPTO-style Python orchestration while reusing vLLM kernels.
-      - ``full``: replace ``Step3p5Model.forward`` with fail-closed full-runner
-        placeholder (until real PyPTO online runner lands).
+    Data flow (live single-handoff, N=1 whole-net; see phases/20 §G):
+      1. vLLM embeds locally (embed_tokens) -> hidden [num_tokens, HIDDEN],
+         replicated across the 8 TP ranks.
+      2. every rank copies its embedding hidden to CPU, completing rank-local
+         NPU work before PyPTO takes the shared device partition.
+      3. rank-0 extracts the already-built vLLM-Ascend attention metadata.
+         A normal decode is one whole-net round. Speculative target
+         verification is decomposed into ordered one-position-per-request
+         rounds so each earlier round publishes KV before the next consumes it.
+         The decision is broadcast on the TP CPU/Gloo group before any rank
+         branches.
+      4. all ranks rendezvous on the CPU group. Rank-0 drives the sidecar while
+         ranks 1..7 wait only on the CPU control plane.
+      5. rank-0 broadcasts a CPU result object containing status and replicated
+         hidden. Each rank independently copies the hidden back to its NPU.
+      6. return next_hidden; vLLM's (patched) compute_logits applies the
+         validated final norm + lm_head tail.
+
+    Final live token-exact validation is gated on the held whole-net hang fix +
+    a running co-resident vLLM 8001 (SIMPLER_COMM_NO_HCCL sidecar).
     """
-    mode = (mode or os.environ.get("PYPTO_STEP3P5_PATCH_MODE") or "tail").lower()
-    if mode not in {"tail", "shadow", "layer_ref", "full"}:
-        raise ValueError(f"unsupported Step3p5 PyPTO patch mode: {mode}")
+    import torch  # noqa: PLC0415
+    step3p5 = _load_step3p5_module()
+    state = _patch_state(step3p5)
+    original_forward = state.original_model_forward if state is not None else None
+
+    # embed locally (mirror vLLM Step3p5Model.forward preamble)
+    if inputs_embeds is None:
+        hidden = self.embed_tokens(input_ids)
+    else:
+        hidden = inputs_embeds
+
+    from vllm.distributed import (  # noqa: PLC0415
+        get_pp_group,
+        get_tensor_model_parallel_rank,
+        get_tp_group,
+    )
+    rank = get_tensor_model_parallel_rank()
+    tp = get_tp_group()
+
+    # This copy is required on *every* rank, even though rank 0 alone sends the
+    # payload to the sidecar.  Besides producing the socket input, it completes
+    # rank-local embedding work before non-rank0 workers enter a CPU-only wait.
+    # No vLLM NPU collective is allowed between here and sidecar completion.
+    hidden_cpu = hidden.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+
+    decode_plan = None
+    local_error = None
+    decision = GATE_FAIL_CLOSED
+    if rank == 0:
+        # metadata-only no-op is allowed ONLY for profile/dummy/warmup, which
+        # have no live per-layer attention metadata.  A real decode request that
+        # PyPTO cannot serve must fail closed, never silently pass embeddings to
+        # the final norm/LM head (design §5.1).
+        sidecar_available = os.path.exists(_wd_sock_path())
+        is_real_request = False
+        eligible = False
+        try:
+            from vllm.forward_context import get_forward_context  # noqa: PLC0415
+            ctx = get_forward_context()
+            attn_md = getattr(ctx, "attn_metadata", None)
+            if attn_md is not None:
+                is_real_request = (
+                    len(attn_md) > 0 if hasattr(attn_md, "__len__") else True
+                )
+        except Exception:  # noqa: BLE001
+            # No live forward context => profile/dummy/warmup.
+            is_real_request = False
+        if is_real_request:
+            try:
+                if not sidecar_available:
+                    raise PyPTOBackendUnavailable("sidecar socket is absent")
+                pp = get_pp_group()
+                if int(getattr(pp, "world_size", 1)) != 1:
+                    raise PyPTOBackendUnavailable(
+                        "pipeline parallel live path is unsupported"
+                    )
+                if hidden.ndim != 2 or hidden.shape[1] != 4096:
+                    raise PyPTOBackendUnavailable(
+                        f"hidden must be [T,4096], got {tuple(hidden.shape)}"
+                    )
+                if hidden.dtype != torch.bfloat16:
+                    raise PyPTOBackendUnavailable(
+                        f"hidden must be BF16, got {hidden.dtype}"
+                    )
+                from vllm.forward_context import (  # noqa: PLC0415
+                    get_forward_context,
+                )
+                from tools.step3p5.vllm_decode_metadata import (  # noqa: PLC0415
+                    extract_pypto_decode_plan,
+                )
+
+                decode_plan = extract_pypto_decode_plan(
+                    get_forward_context(),
+                    vllm_config=self.vllm_config,
+                    positions=positions,
+                )
+                if int(hidden.shape[0]) != decode_plan.valid_tokens:
+                    raise PyPTOBackendUnavailable(
+                        "graph/token padding is not supported by the first live "
+                        f"ABI: hidden rows={hidden.shape[0]}, "
+                        f"valid={decode_plan.valid_tokens}"
+                    )
+                eligible = True
+            except Exception as exc:  # noqa: BLE001
+                local_error = exc
+                eligible = False
+        decision = classify_decode_gate(
+            is_real_request=is_real_request,
+            sidecar_available=sidecar_available,
+            eligible=eligible,
+        )
+
+    # GroupCoordinator.broadcast_object uses its CPU group (or its host
+    # message-queue broadcaster).  Do not replace this with ``tp.broadcast``:
+    # the latter uses the NPU device group and can deadlock against PyPTO's
+    # all-rank collectives on the same physical cards.
+    decision = int(tp.broadcast_object(decision if rank == 0 else None, src=0))
+
+    if decision == GATE_PROFILE_NOOP:
+        if original_forward is None:
+            raise PyPTOBackendUnavailable(
+                f"PyPTO path unavailable and no fallback exists: {local_error!r}"
+            )
+        setattr(
+            self,
+            "_pypto_profile_noops",
+            int(getattr(self, "_pypto_profile_noops", 0)) + 1,
+        )
+        return original_forward(self, input_ids, positions, intermediate_tensors, inputs_embeds)
+
+    if decision == GATE_FAIL_CLOSED:
+        if rank == 0:
+            reason = (
+                repr(local_error)
+                if local_error is not None
+                else (
+                    "real decode request is not PyPTO-eligible and no correct "
+                    "fallback exists (tail-only instance)"
+                )
+            )
+            setattr(self, "_pypto_full_last_error", reason)
+        setattr(
+            self,
+            "_pypto_full_fail_closed",
+            int(getattr(self, "_pypto_full_fail_closed", 0)) + 1,
+        )
+        raise PyPTOBackendUnavailable(
+            "PyPTO real decode request failed closed"
+            + (f": {local_error!r}" if rank == 0 and local_error is not None else "")
+        )
+
+    # decision == GATE_PROCEED.  This CPU-group rendezvous guarantees every
+    # vLLM rank has completed the embedding->CPU copy and no rank is still
+    # submitting vLLM NPU work when rank 0 enters the resident PyPTO runtime.
+    tp.barrier()
+
+    payload = None
+    if rank == 0:
+        assert decode_plan is not None
+
+        def _run_sidecar():
+            cli = _wd_client()
+            return _run_decode_plan(cli, hidden_cpu, decode_plan)
+
+        payload = _sidecar_result_payload(_run_sidecar)
+
+    # Status and output use one CPU control-plane broadcast.  Non-rank0 workers
+    # block here without occupying their NPU/HCCL stream while PyPTO runs.
+    payload = tp.broadcast_object(payload, src=0)
+    if not bool(payload.get("ok")):
+        if rank == 0:
+            setattr(self, "_pypto_full_last_error", payload.get("error"))
+        raise PyPTOBackendUnavailable(
+            "PyPTO sidecar decode failed on rank0: "
+            f"{payload.get('error_type')}: {payload.get('error')}"
+            if rank == 0
+            else "PyPTO sidecar decode failed on rank0"
+        )
+
+    next_hidden_cpu = payload["next_hidden"]
+    if (
+        next_hidden_cpu.dtype != torch.bfloat16
+        or tuple(next_hidden_cpu.shape) != tuple(hidden_cpu.shape)
+    ):
+        raise PyPTOBackendUnavailable(
+            "CPU control-plane next_hidden ABI mismatch after broadcast"
+        )
+    next_hidden = next_hidden_cpu.to(
+        device=hidden.device,
+        dtype=hidden.dtype,
+    )
+    if rank == 0:
+        setattr(self, "_pypto_full_last_meta", dict(payload["out_meta"]))
+    setattr(self, "_pypto_full_calls", int(getattr(self, "_pypto_full_calls", 0)) + 1)
+    return next_hidden
+
+
+def install(mode: str | None = None) -> dict[str, Any]:
+    """Install the only production mode: full hidden-only whole-net."""
+    mode = (mode or os.environ.get("PYPTO_STEP3P5_PATCH_MODE") or "full").lower()
+    if mode != "full":
+        raise ValueError(
+            "only PYPTO_STEP3P5_PATCH_MODE=full is supported; "
+            f"got {mode!r}"
+        )
 
     step3p5 = _load_step3p5_module()
     if _patch_state(step3p5) is not None:
@@ -268,28 +471,10 @@ def install(mode: str | None = None) -> dict[str, Any]:
         original_model_forward=step3p5.Step3p5Model.forward,
         original_causal_forward=step3p5.Step3p5ForCausalLM.forward,
         original_compute_logits=step3p5.Step3p5ForCausalLM.compute_logits,
-        original_decoder_layer_forward=step3p5.Step3p5DecoderLayer.forward,
     )
 
-    if mode == "tail":
-        step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
-    elif mode == "layer_ref":
-        step3p5.Step3p5DecoderLayer.forward = _pypto_layer_ref_forward
-        step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
-    elif mode == "shadow":
-        original = state.original_model_forward
-
-        @functools.wraps(original)
-        def shadow_forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
-            setattr(self, "_pypto_shadow_last_input_shape", tuple(input_ids.shape) if input_ids is not None else None)
-            setattr(self, "_pypto_shadow_last_positions_shape", tuple(positions.shape))
-            return original(self, input_ids, positions, intermediate_tensors, inputs_embeds)
-
-        step3p5.Step3p5Model.forward = shadow_forward
-        step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
-    else:
-        step3p5.Step3p5Model.forward = _pypto_full_forward
-        step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
+    step3p5.Step3p5Model.forward = _pypto_full_forward
+    step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
 
     _set_patch_state(step3p5, state)
     return {"ok": True, "installed": True, "mode": mode}
@@ -301,8 +486,6 @@ def uninstall() -> dict[str, Any]:
     if state is None:
         return {"ok": True, "installed": False}
     step3p5.Step3p5Model.forward = state.original_model_forward
-    if state.original_decoder_layer_forward is not None:
-        step3p5.Step3p5DecoderLayer.forward = state.original_decoder_layer_forward
     step3p5.Step3p5ForCausalLM.forward = state.original_causal_forward
     step3p5.Step3p5ForCausalLM.compute_logits = state.original_compute_logits
     _set_patch_state(step3p5, None)
@@ -322,7 +505,7 @@ def status() -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["install", "uninstall", "status"])
-    parser.add_argument("--mode", choices=["tail", "shadow", "layer_ref", "full"], default=None)
+    parser.add_argument("--mode", choices=["full"], default=None)
     args = parser.parse_args()
 
     sys.path.insert(0, str(_repo_root()))

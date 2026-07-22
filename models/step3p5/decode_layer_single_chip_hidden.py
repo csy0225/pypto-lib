@@ -505,6 +505,45 @@ def _dense_mlp_body_tp_fused(
     return next_hidden
 
 
+# -----------------------------------------------------------------------------
+# Whole-decode MoE activation lookup.
+#
+# The whole program is source-unrolled, so physical-layer activation choices
+# are resolved while the Python graph is built. L43/L44 call dedicated static
+# specializations; no runtime layer branch enters an expert kernel.
+# -----------------------------------------------------------------------------
+MOE_ACTIVATION_BY_LAYER: dict[int, tuple[float, float]] = {
+    layer_idx: (
+        float(SWIGLU_LIMITS[layer_idx]),
+        float(SWIGLU_LIMITS_SHARED[layer_idx]),
+    )
+    for layer_idx in range(3, 45)
+}
+MOE_ORCH_METHOD_BY_CONFIG: dict[tuple[str, float, float], str] = {
+    ("swa", 0.0, 0.0): "swa_moe_chip_orch",
+    ("full", 0.0, 0.0): "full_moe_chip_orch",
+    ("swa", 7.0, 0.0): "swa_moe_chip_orch_swiglu7_silu",
+    ("full", 7.0, 16.0): "full_moe_chip_orch_swiglu7_swiglu16",
+}
+
+
+def _whole_decode_moe_orch_method(layer_idx: int) -> str:
+    attention_kind = "full" if is_full_attention(layer_idx) else "swa"
+    activation = MOE_ACTIVATION_BY_LAYER[layer_idx]
+    return MOE_ORCH_METHOD_BY_CONFIG[(attention_kind, *activation)]
+
+
+assert all(
+    MOE_ACTIVATION_BY_LAYER[layer_idx] == (0.0, 0.0)
+    for layer_idx in range(3, 43)
+)
+assert _whole_decode_moe_orch_method(43) == "swa_moe_chip_orch_swiglu7_silu"
+assert (
+    _whole_decode_moe_orch_method(44)
+    == "full_moe_chip_orch_swiglu7_swiglu16"
+)
+
+
 # =============================================================================
 # Per-layer @pl.program builders.
 #
@@ -566,6 +605,13 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
 
     _routed_swiglu_limit = routed_lim
     _shared_swiglu_limit = shared_lim
+    # Dedicated physical-layer specializations. These closure constants are
+    # compile-time values, so their expert kernels contain no runtime layer
+    # selection.
+    _routed_swiglu7_step = True
+    _routed_swiglu7_limit = 7.0
+    _shared_swiglu16_step = True
+    _shared_swiglu16_limit = 16.0
     tp_chunk = HIDDEN // tp_size
     _FAITHFUL_MOE_LAYERS = int(__import__('os').environ.get('P_FAITHFUL_MOE_LAYERS', '42'))  # bisect: N MoE layers emitted (default 42 = full)
 
@@ -3495,6 +3541,1273 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                     )
             return next_hidden_out
         # ---- host_orch: real per-layer weights, full+swa routing. ----
+        @pl.function(type=pl.FunctionType.Inline)
+        def _expert_routed_swiglu7(  # noqa: PLR0913, PLR0915
+            self,
+            local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
+            local_routed_x_scale: pl.Tensor[[1, local_recv_max], pl.FP32],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            w_gate: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.INT8
+            ],
+            w_gate_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_up: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.INT8
+            ],
+            w_up_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_down: pl.Tensor[
+                [n_local_experts, inter, HIDDEN], pl.INT8
+            ],
+            w_down_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+        ):
+            for e in pl.parallel(n_local_experts):
+                n_rows = pl.read(local_expert_count, [e])
+                offset_i32 = pl.read(local_expert_offset, [e])
+                offset = pl.cast(offset_i32, pl.INDEX)
+                for tile_idx in pl.range(N_RECV_TILES):
+                    tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
+                    tile_rem = n_rows - tile_row0_i32
+                    if tile_rem > 0:
+                        tile_row0 = pl.cast(tile_row0_i32, pl.INDEX)
+                        tile_offset = offset + tile_row0
+                        tile_valid = pl.cast(
+                            pl.min(pl.cast(RECV_TILE, pl.INT32), tile_rem),
+                            pl.INDEX,
+                        )
+
+                        h_bf16 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.BF16,
+                        )
+
+                        for nb in pl.spmd(
+                            inter // ROUTED_GATE_N_CHUNK,
+                            name_hint="expert_gate_up",
+                        ):
+                            n0 = nb * ROUTED_GATE_N_CHUNK
+                            x0 = pl.slice(
+                                local_routed_x,
+                                [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                [tile_offset, 0],
+                            )
+                            wg0_2d = pl.reshape(
+                                pl.slice(
+                                    w_gate,
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
+                                ),
+                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            )
+                            wu0_2d = pl.reshape(
+                                pl.slice(
+                                    w_up,
+                                    [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                    [e, 0, n0],
+                                ),
+                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            )
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.INT32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.INT32)
+                            for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
+                                k0 = kb * ROUTED_GATE_K_CHUNK
+                                xk = pl.slice(
+                                    local_routed_x,
+                                    [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                    [tile_offset, k0],
+                                )
+                                wgk = pl.reshape(
+                                    pl.slice(
+                                        w_gate,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                wuk = pl.reshape(
+                                    pl.slice(
+                                        w_up,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                                up_acc = pl.matmul_acc(up_acc, xk, wuk)
+
+                            # Per-token act scale: contiguous [1,RECV_TILE] row-
+                            # slice of the UNPADDED local_routed_x_scale + reshape [RECV_TILE,1]
+                            # (ccec ND2ND-safe; a [RECV_TILE,1] col-slice of a
+                            # padded tensor is a strided ColMajor TLOAD ccec rejects).
+                            x_scale_col = pl.reshape(
+                                pl.slice(
+                                    local_routed_x_scale, [1, RECV_TILE], [0, tile_offset],
+                                ),
+                                [RECV_TILE, 1],
+                            )
+                            wg_scale_row = pl.slice(
+                                w_gate_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
+                            )
+                            wu_scale_row = pl.slice(
+                                w_up_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
+                            )
+                            gate_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        gate_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_col,
+                                ),
+                                wg_scale_row,
+                            )
+                            up_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        up_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    x_scale_col,
+                                ),
+                                wu_scale_row,
+                            )
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
+                            )
+                            silu = pl.mul(gate_2d, sigmoid)
+                            if _routed_swiglu7_step:
+                                silu_c = pl.minimum(silu, _routed_swiglu7_limit)
+                                up_c = pl.maximum(
+                                    pl.minimum(up_2d, _routed_swiglu7_limit),
+                                    -_routed_swiglu7_limit,
+                                )
+                                gated = pl.mul(silu_c, up_c)
+                            else:
+                                gated = pl.mul(silu, up_2d)
+
+                            gated_v = pl.set_validshape(
+                                gated, tile_valid, ROUTED_GATE_N_CHUNK,
+                            )
+                            gated_m = pl.fillpad(
+                                gated_v, pad_value=pl.PadValue.zero,
+                            )
+                            h_bf16[
+                                :, n0 : n0 + ROUTED_GATE_N_CHUNK
+                            ] = pl.cast(gated_m, target_type=pl.BF16)
+
+                        # Per-token INT8 requant of the swiglu intermediate for
+                        # the INT8 down-proj (moe.py h_i8: BARE slice amax, no
+                        # set_validshape/fillpad — h_bf16 padding rows are already
+                        # zero from the gated fillpad above).
+                        h_i8 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.INT8,
+                        )
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP, name_hint="routed_h_quant",
+                        ):
+                            eh_amax = pl.full(
+                                [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                            )
+                            for hqa in pl.range(inter // ROUTED_GATE_N_CHUNK):
+                                hqa0 = hqa * ROUTED_GATE_N_CHUNK
+                                eh_a = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqa0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                eh_amax = pl.maximum(
+                                    eh_amax,
+                                    pl.reshape(
+                                        pl.row_max(
+                                            pl.maximum(eh_a, pl.neg(eh_a)),
+                                        ),
+                                        [1, RECV_TILE],
+                                    ),
+                                )
+                            # Keep the native W8A8 row scale mathematically equal
+                            # to 127 / amax. pl.recip also lowers through TDIVS on
+                            # A2/A3, so this spelling is not a TDIV-avoidance fix;
+                            # leave the math unchanged during the signal-layout A/B.
+                            eh_sq_row = pl.mul(
+                                pl.recip(eh_amax),
+                                pl.full(
+                                    [1, RECV_TILE],
+                                    dtype=pl.FP32,
+                                    value=127.0,
+                                ),
+                            )
+                            h_scale_dq = pl.reshape(
+                                pl.recip(eh_sq_row), [RECV_TILE, 1],
+                            )
+                            eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                            for hqn in pl.range(inter // ROUTED_GATE_N_CHUNK):
+                                hqn0 = hqn * ROUTED_GATE_N_CHUNK
+                                eh_q = pl.cast(
+                                    pl.slice(
+                                        h_bf16,
+                                        [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                        [0, hqn0],
+                                    ),
+                                    target_type=pl.FP32,
+                                )
+                                eh_scaled = pl.row_expand_mul(eh_q, eh_sq_col)
+                                eh_i32 = pl.cast(
+                                    eh_scaled, target_type=pl.INT32, mode="rint",
+                                )
+                                eh_half = pl.cast(
+                                    eh_i32, target_type=pl.FP16, mode="round",
+                                )
+                                h_i8[
+                                    :, hqn0 : hqn0 + ROUTED_GATE_N_CHUNK
+                                ] = pl.cast(
+                                    eh_half, target_type=pl.INT8, mode="trunc",
+                                )
+
+                        for db in pl.spmd(
+                            HIDDEN // ROUTED_DOWN_N_CHUNK,
+                            name_hint="expert_down",
+                        ):
+                            d0 = db * ROUTED_DOWN_N_CHUNK
+                            h0 = pl.slice(
+                                h_i8,
+                                [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                [0, 0],
+                            )
+                            wd0 = pl.reshape(
+                                pl.slice(
+                                    w_down,
+                                    [
+                                        1,
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                    [e, 0, d0],
+                                ),
+                                [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
+                            )
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.INT32)
+                            for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
+                                k0 = kb2 * ROUTED_DOWN_K_CHUNK
+                                hk = pl.slice(
+                                    h_i8,
+                                    [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                    [0, k0],
+                                )
+                                wdk = pl.reshape(
+                                    pl.slice(
+                                        w_down,
+                                        [
+                                            1,
+                                            ROUTED_DOWN_K_CHUNK,
+                                            ROUTED_DOWN_N_CHUNK,
+                                        ],
+                                        [e, k0, d0],
+                                    ),
+                                    [
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                )
+                                y_acc = pl.matmul_acc(y_acc, hk, wdk)
+
+                            wd_scale_row = pl.slice(
+                                w_down_scale, [1, ROUTED_DOWN_N_CHUNK], [e, d0],
+                            )
+                            y_2d = pl.col_expand_mul(
+                                pl.row_expand_mul(
+                                    pl.cast(
+                                        y_acc, target_type=pl.FP32, mode="none",
+                                    ),
+                                    h_scale_dq,
+                                ),
+                                wd_scale_row,
+                            )
+                            y_v = pl.set_validshape(
+                                y_2d, tile_valid, ROUTED_DOWN_N_CHUNK,
+                            )
+                            y_m = pl.fillpad(
+                                y_v, pad_value=pl.PadValue.zero,
+                            )
+                            local_routed_y = pl.assemble(
+                                local_routed_y,
+                                pl.cast(y_m, target_type=pl.BF16),
+                                [tile_offset, d0],
+                            )
+
+            return local_routed_y
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def expert_routed_step_swiglu7(
+            self,
+            local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
+            local_routed_x_scale: pl.Tensor[[1, local_recv_max], pl.FP32],
+            local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+            local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+            w_gate_r: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.INT8
+            ],
+            w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_up_r: pl.Tensor[
+                [n_local_experts, HIDDEN, inter], pl.INT8
+            ],
+            w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_down_r: pl.Tensor[
+                [n_local_experts, inter, HIDDEN], pl.INT8
+            ],
+            w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
+            local_routed_y: pl.Out[
+                pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
+            ],
+        ) -> pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]:
+            local_routed_y = self._expert_routed_swiglu7(
+                local_routed_x,
+                local_routed_x_scale,
+                local_expert_offset, local_expert_count,
+                w_gate_r, w_gate_r_scale,
+                w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
+                local_routed_y,
+            )
+            return local_routed_y
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def _expert_shared_local_swiglu16(
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            w_gate: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        ):
+            # Keep gate/up activation and down projection in one InCore kernel,
+            # but never assemble a full [BATCH,160] Vec tile.  The wide tile is
+            # miscompiled on A2/A3; five [BATCH,32] tiles match moe.py's
+            # device-validated implementation.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_mlp"):
+                x0_0 = pl.slice(
+                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
+                )
+                wg0_0 = pl.slice(
+                    w_gate,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 0],
+                )
+                wu0_0 = pl.slice(
+                    w_up,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 0],
+                )
+                gate_acc_0 = pl.matmul(x0_0, wg0_0, out_dtype=pl.FP32)
+                up_acc_0 = pl.matmul(x0_0, wu0_0, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_0 = pl.slice(
+                        x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
+                    )
+                    wgk_0 = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 0],
+                    )
+                    wuk_0 = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 0],
+                    )
+                    gate_acc_0 = pl.matmul_acc(gate_acc_0, xk_0, wgk_0)
+                    up_acc_0 = pl.matmul_acc(up_acc_0, xk_0, wuk_0)
+                sigmoid_0 = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc_0)), 1.0),
+                )
+                silu_0 = pl.mul(gate_acc_0, sigmoid_0)
+                if _shared_swiglu16_step:
+                    silu_c_0 = pl.minimum(
+                        silu_0, _shared_swiglu16_limit,
+                    )
+                    up_c_0 = pl.maximum(
+                        pl.minimum(up_acc_0, _shared_swiglu16_limit),
+                        -_shared_swiglu16_limit,
+                    )
+                    gated_0 = pl.mul(silu_c_0, up_c_0)
+                else:
+                    gated_0 = pl.mul(silu_0, up_acc_0)
+                h_c0 = pl.cast(gated_0, target_type=pl.BF16)
+
+                x0_1 = pl.slice(
+                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
+                )
+                wg0_1 = pl.slice(
+                    w_gate,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 32],
+                )
+                wu0_1 = pl.slice(
+                    w_up,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 32],
+                )
+                gate_acc_1 = pl.matmul(x0_1, wg0_1, out_dtype=pl.FP32)
+                up_acc_1 = pl.matmul(x0_1, wu0_1, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_1 = pl.slice(
+                        x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
+                    )
+                    wgk_1 = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 32],
+                    )
+                    wuk_1 = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 32],
+                    )
+                    gate_acc_1 = pl.matmul_acc(gate_acc_1, xk_1, wgk_1)
+                    up_acc_1 = pl.matmul_acc(up_acc_1, xk_1, wuk_1)
+                sigmoid_1 = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc_1)), 1.0),
+                )
+                silu_1 = pl.mul(gate_acc_1, sigmoid_1)
+                if _shared_swiglu16_step:
+                    silu_c_1 = pl.minimum(
+                        silu_1, _shared_swiglu16_limit,
+                    )
+                    up_c_1 = pl.maximum(
+                        pl.minimum(up_acc_1, _shared_swiglu16_limit),
+                        -_shared_swiglu16_limit,
+                    )
+                    gated_1 = pl.mul(silu_c_1, up_c_1)
+                else:
+                    gated_1 = pl.mul(silu_1, up_acc_1)
+                h_c1 = pl.cast(gated_1, target_type=pl.BF16)
+
+                x0_2 = pl.slice(
+                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
+                )
+                wg0_2 = pl.slice(
+                    w_gate,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 64],
+                )
+                wu0_2 = pl.slice(
+                    w_up,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 64],
+                )
+                gate_acc_2 = pl.matmul(x0_2, wg0_2, out_dtype=pl.FP32)
+                up_acc_2 = pl.matmul(x0_2, wu0_2, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_2 = pl.slice(
+                        x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
+                    )
+                    wgk_2 = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 64],
+                    )
+                    wuk_2 = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 64],
+                    )
+                    gate_acc_2 = pl.matmul_acc(gate_acc_2, xk_2, wgk_2)
+                    up_acc_2 = pl.matmul_acc(up_acc_2, xk_2, wuk_2)
+                sigmoid_2 = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc_2)), 1.0),
+                )
+                silu_2 = pl.mul(gate_acc_2, sigmoid_2)
+                if _shared_swiglu16_step:
+                    silu_c_2 = pl.minimum(
+                        silu_2, _shared_swiglu16_limit,
+                    )
+                    up_c_2 = pl.maximum(
+                        pl.minimum(up_acc_2, _shared_swiglu16_limit),
+                        -_shared_swiglu16_limit,
+                    )
+                    gated_2 = pl.mul(silu_c_2, up_c_2)
+                else:
+                    gated_2 = pl.mul(silu_2, up_acc_2)
+                h_c2 = pl.cast(gated_2, target_type=pl.BF16)
+
+                x0_3 = pl.slice(
+                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
+                )
+                wg0_3 = pl.slice(
+                    w_gate,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 96],
+                )
+                wu0_3 = pl.slice(
+                    w_up,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 96],
+                )
+                gate_acc_3 = pl.matmul(x0_3, wg0_3, out_dtype=pl.FP32)
+                up_acc_3 = pl.matmul(x0_3, wu0_3, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_3 = pl.slice(
+                        x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
+                    )
+                    wgk_3 = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 96],
+                    )
+                    wuk_3 = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 96],
+                    )
+                    gate_acc_3 = pl.matmul_acc(gate_acc_3, xk_3, wgk_3)
+                    up_acc_3 = pl.matmul_acc(up_acc_3, xk_3, wuk_3)
+                sigmoid_3 = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc_3)), 1.0),
+                )
+                silu_3 = pl.mul(gate_acc_3, sigmoid_3)
+                if _shared_swiglu16_step:
+                    silu_c_3 = pl.minimum(
+                        silu_3, _shared_swiglu16_limit,
+                    )
+                    up_c_3 = pl.maximum(
+                        pl.minimum(up_acc_3, _shared_swiglu16_limit),
+                        -_shared_swiglu16_limit,
+                    )
+                    gated_3 = pl.mul(silu_c_3, up_c_3)
+                else:
+                    gated_3 = pl.mul(silu_3, up_acc_3)
+                h_c3 = pl.cast(gated_3, target_type=pl.BF16)
+
+                x0_4 = pl.slice(
+                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
+                )
+                wg0_4 = pl.slice(
+                    w_gate,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 128],
+                )
+                wu0_4 = pl.slice(
+                    w_up,
+                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                    [0, 128],
+                )
+                gate_acc_4 = pl.matmul(x0_4, wg0_4, out_dtype=pl.FP32)
+                up_acc_4 = pl.matmul(x0_4, wu0_4, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk_4 = pl.slice(
+                        x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
+                    )
+                    wgk_4 = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 128],
+                    )
+                    wuk_4 = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, 128],
+                    )
+                    gate_acc_4 = pl.matmul_acc(gate_acc_4, xk_4, wgk_4)
+                    up_acc_4 = pl.matmul_acc(up_acc_4, xk_4, wuk_4)
+                sigmoid_4 = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc_4)), 1.0),
+                )
+                silu_4 = pl.mul(gate_acc_4, sigmoid_4)
+                if _shared_swiglu16_step:
+                    silu_c_4 = pl.minimum(
+                        silu_4, _shared_swiglu16_limit,
+                    )
+                    up_c_4 = pl.maximum(
+                        pl.minimum(up_acc_4, _shared_swiglu16_limit),
+                        -_shared_swiglu16_limit,
+                    )
+                    gated_4 = pl.mul(silu_c_4, up_c_4)
+                else:
+                    gated_4 = pl.mul(silu_4, up_acc_4)
+                h_c4 = pl.cast(gated_4, target_type=pl.BF16)
+
+                # Down projection consumes the five narrow activation tiles
+                # directly; recombining them would restore the compiler bug.
+                for db in pl.range(HIDDEN // SHARED_DOWN_N_CHUNK):
+                    d0 = db * SHARED_DOWN_N_CHUNK
+                    wd_c0 = pl.slice(
+                        w_down,
+                        [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                        [0, d0],
+                    )
+                    y_acc = pl.matmul(h_c0, wd_c0, out_dtype=pl.FP32)
+                    wd_c1 = pl.slice(
+                        w_down,
+                        [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                        [32, d0],
+                    )
+                    y_acc = pl.matmul_acc(y_acc, h_c1, wd_c1)
+                    wd_c2 = pl.slice(
+                        w_down,
+                        [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                        [64, d0],
+                    )
+                    y_acc = pl.matmul_acc(y_acc, h_c2, wd_c2)
+                    wd_c3 = pl.slice(
+                        w_down,
+                        [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                        [96, d0],
+                    )
+                    y_acc = pl.matmul_acc(y_acc, h_c3, wd_c3)
+                    wd_c4 = pl.slice(
+                        w_down,
+                        [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                        [128, d0],
+                    )
+                    y_acc = pl.matmul_acc(y_acc, h_c4, wd_c4)
+                    sh_y_shard = pl.assemble(
+                        sh_y_shard,
+                        pl.cast(y_acc, target_type=pl.BF16),
+                        [0, d0],
+                    )
+
+            return sh_y_shard
+
+        @pl.function(type=pl.FunctionType.Inline)
+        def expert_shared_step_swiglu16(  # noqa: PLR0913
+            self,
+            x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            sh_y: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            sh_tmp_window: pld.DistributedTensor[
+                [BATCH, HIDDEN], pl.BF16
+            ],
+            sh_signal_window: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            sh_y = self._expert_shared_local_swiglu16(
+                x, w_gate_s, w_up_s, w_down_s, sh_y,
+            )
+            # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
+            if TP_WORLD_SIZE > 1:
+                self.tp_all_reduce(
+                    sh_y, sh_tmp_window, sh_signal_window, my_rank,
+                )
+            return sh_y
+
+        @pl.function(
+            type=pl.FunctionType.Orchestration,
+            attrs={"inline_orchestration": True},
+        )
+        def full_moe_chip_orch_swiglu7_swiglu16(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[HIDDEN, hidden_q_full], pl.BF16],
+            wk: pl.Tensor[[HIDDEN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[HIDDEN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_full], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_full], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[hidden_q_full, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[HIDDEN, nh_full_pad], pl.BF16],
+            gate_r: pl.Tensor[[nh_full_pad, hidden_q_full], pl.BF16],
+            post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
+            w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
+            w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            dbg_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            recv_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_r_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],
+            send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            send_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],
+            sh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            sh_signal_window: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            routed_y_buf: pld.DistributedTensor[[n_routes_per_rank, HIDDEN], pl.BF16],
+            combine_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1 = attention_full_inline(
+                current_hidden, input_rms_weight, wq, wk, wv,
+                q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin, k_cache, v_cache,
+                wo, w_g, gate_r, resid1,
+                norm_layer_idx, attn_layer_idx,
+                attn_tmp_window, attn_signal_window, my_rank,
+            )
+            # Save the attention residual into a DEDICATED per-layer external
+            # buffer resid_hold (write-once here, read-once by section D). The
+            # local resid1 create_tensor is reused by gate/shared/routed InCore
+            # scratch inside this big fused orch, so section D cannot read resid1
+            # directly. Earlier code stashed into next_hidden_out, but that made
+            # next_hidden_out have TWO writers (stash + residual_add) => a WAW that
+            # RAW-only-v1 (single-value producer_index) cannot serialise across
+            # submissions => nondeterministic output. resid_hold has ONE writer
+            # (here) and ONE reader (section D); next_hidden_out has ONE writer
+            # (section D). Both are clean single-producer RAW.
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="stash_resid_hold",
+            ):
+                for _rs in pl.range(HIDDEN // K_CHUNK):
+                    _r0 = _rs * K_CHUNK
+                    resid_hold = pl.assemble(
+                        resid_hold,
+                        pl.slice(resid1, [BATCH, K_CHUNK], [0, _r0]),
+                        [0, _r0],
+                    )
+            if _DBG_STAGE == 5:
+                # Diagnostic: dump resid_hold (the attention residual = MoE-block
+                # attention output) to isolate whether the valid-token race is in
+                # attention (this) vs the MoE body (stages 1-4).
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_5"):
+                    for _d5 in pl.range(HIDDEN // K_CHUNK):
+                        _d50 = _d5 * K_CHUNK
+                        dbg_out = pl.assemble(
+                            dbg_out,
+                            pl.slice(resid_hold, [BATCH, K_CHUNK], [0, _d50]),
+                            [0, _d50],
+                        )
+            # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+            hidden_blocks = HIDDEN // K_CHUNK
+            post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
+            ):
+                for kb in pl.range(hidden_blocks):
+                    k0 = kb * K_CHUNK
+                    rchunk = pl.cast(
+                        pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
+
+                sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+                for kb2 in pl.range(hidden_blocks):
+                    k0 = kb2 * K_CHUNK
+                    ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
+                    sq_sum = pl.add(
+                        sq_sum,
+                        pl.reshape(
+                            pl.row_sum(pl.mul(ck, ck)),
+                            [1, BATCH],
+                        ),
+                    )
+                inv_rms_moe = pl.recip(
+                    pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+                )
+                inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
+                for kb3 in pl.range(hidden_blocks):
+                    k0 = kb3 * K_CHUNK
+                    norm_chunk = pl.slice(
+                        resid1_fp32, [BATCH, K_CHUNK], [0, k0],
+                    )
+                    gamma = pl.slice(
+                        post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
+                    )
+                    scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
+                    normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
+                    post_norm = pl.assemble(
+                        post_norm,
+                        pl.cast(normed, target_type=pl.BF16),
+                        [0, k0],
+                    )
+
+            if _DBG_STAGE == 1:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_1"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(post_norm, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
+            # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
+            # inlined per-stage methods (``self.gate_step`` /
+            # ``self.dispatch_step`` / ``self.expert_routed_step`` /
+            # ``self.expert_shared_step`` / ``self.combine_step``) directly
+            # rather than instantiating a separate ``@pl.program``.
+            moe_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+
+            # 1) Gate (local, replicated).
+            expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
+            expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
+            expert_indices, expert_weights = self.gate_step(
+                post_norm, gate_w, router_bias,
+                expert_indices, expert_weights,
+            )
+
+            # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+            sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            sh_y = self.expert_shared_step_swiglu16(
+                post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
+                sh_tmp_window, sh_signal_window, my_rank,
+            )
+
+
+            # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
+            # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
+            x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+            x_disp_scale = pl.create_tensor([BATCH, 8], dtype=pl.FP32)
+            (x_disp_i8, x_disp_scale) = self._quant_moe_input(
+                post_norm, x_disp_i8, x_disp_scale,
+            )
+            if _DBG_STAGE == 2:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_2"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(sh_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # 3) Dispatch (EP fixed-slot pull).
+            local_routed_x = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.INT8,
+            )
+            local_routed_x_scale = pl.create_tensor(
+                [1, local_recv_max], dtype=pl.FP32,
+            )
+            local_expert_offset = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            local_expert_count = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            # Per-recv-row r_route (= source t*TOPK+k), staged from recv_r_route;
+            # combine uses it to scatter the routed output back to the source.
+            recv_r_route_out = pl.create_tensor(
+                [local_recv_max], dtype=pl.INT32,
+            )
+            (
+                local_routed_x,
+                local_routed_x_scale,
+                local_expert_offset,
+                local_expert_count,
+                recv_r_route_out,
+                inverse_map,
+            ) = self.dispatch_step(
+                x_disp_i8, x_disp_scale, expert_indices,
+                local_routed_x, local_routed_x_scale,
+                local_expert_offset, local_expert_count, recv_r_route_out,
+                pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,
+                send_x, send_scale, send_route,
+                my_rank,
+            )
+
+            if _DBG_STAGE == 32:
+                # Diagnostic-only: dump local_routed_x_scale[0, :1024] into
+                # dbg_out row 0. Other rows/cols remain host-initialized zero.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_32_local_routed_x_scale"):
+                    _scale_dbg = pl.cast(
+                        pl.slice(local_routed_x_scale, [1, local_recv_max], [0, 0]),
+                        target_type=pl.BF16,
+                    )
+                    dbg_out = pl.assemble(dbg_out, _scale_dbg, [0, 0])
+            if _DBG_STAGE == 33:
+                # Diagnostic-only: dump recv_r_route_out[:1024] into dbg_out row 0
+                # as BF16 values. It is route metadata, not model data.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_33_recv_route"):
+                    _route_dbg = pl.reshape(
+                        pl.cast(
+                            pl.cast(
+                                pl.slice(recv_r_route_out, [local_recv_max], [0]),
+                                target_type=pl.FP32,
+                            ),
+                            target_type=pl.BF16,
+                        ),
+                        [1, local_recv_max],
+                    )
+                    dbg_out = pl.assemble(dbg_out, _route_dbg, [0, 0])
+
+            # 4) Routed experts (local 36).
+            local_routed_y = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.BF16,
+            )
+            local_routed_y = self.expert_routed_step_swiglu7(
+                local_routed_x,
+                local_routed_x_scale,
+                local_expert_offset, local_expert_count,
+                w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
+                local_routed_y,
+            )
+
+            if _DBG_STAGE == 3:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_3"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(local_routed_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # 5) Combine (EP pull back + weighted gather + sh_y add).
+            moe_out = self.combine_step(
+                local_routed_y,
+                recv_r_route_out, expert_weights, sh_y,
+                moe_out,
+                pub_counts,
+                routed_y_buf, combine_done_sig,
+                expert_indices, inverse_map, routed_src_buf,
+                my_rank,
+            )
+
+            if _DBG_STAGE == 4:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_4"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(moe_out, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # ── D: residual add: next_hidden_out = resid1 + moe_out. ───
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_residual_add",
+            ):
+                for kb4 in pl.range(hidden_blocks):
+                    k0 = kb4 * K_CHUNK
+                    m = pl.cast(
+                        pl.slice(moe_out, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    r = pl.cast(pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]), target_type=pl.FP32)
+                    next_hidden_out = pl.assemble(
+                        next_hidden_out,
+                        pl.cast(pl.add(r, m), target_type=pl.BF16),
+                        [0, k0],
+                    )
+            return next_hidden_out
+
+        @pl.function(
+            type=pl.FunctionType.Orchestration,
+            attrs={"inline_orchestration": True},
+        )
+        def swa_moe_chip_orch_swiglu7_silu(  # noqa: PLR0913, PLR0915
+            self,
+            current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            wq: pl.Tensor[[HIDDEN, hidden_q_swa], pl.BF16],
+            wk: pl.Tensor[[HIDDEN, KV_HIDDEN_LOCAL], pl.BF16],
+            wv: pl.Tensor[[HIDDEN, KV_HIDDEN_LOCAL], pl.BF16],
+            q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+            rope_cos: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_swa], pl.FP32],
+            rope_sin: pl.Tensor[[ROPE_SEQ_DYN, rotary_dim_swa], pl.FP32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+            wo: pl.Tensor[[hidden_q_swa, HIDDEN], pl.BF16],
+            w_g: pl.Tensor[[HIDDEN, nh_swa_pad], pl.BF16],
+            gate_r: pl.Tensor[[nh_swa_pad, hidden_q_swa], pl.BF16],
+            post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+            gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+            router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+            w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_up_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
+            w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
+            w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
+            w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
+            w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+            w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+            next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            dbg_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            attn_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            count_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            recv_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            recv_r_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],
+            send_x: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.INT8],
+            send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
+            send_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],
+            sh_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            sh_signal_window: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            routed_y_buf: pld.DistributedTensor[[n_routes_per_rank, HIDDEN], pl.BF16],
+            combine_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1 = attention_swa_inline(
+                current_hidden, input_rms_weight, wq, wk, wv,
+                q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping,
+                rope_cos, rope_sin, k_cache, v_cache,
+                wo, w_g, gate_r, resid1,
+                norm_layer_idx, attn_layer_idx,
+                attn_tmp_window, attn_signal_window, my_rank,
+            )
+            # Save the attention residual into a DEDICATED per-layer external
+            # buffer resid_hold (write-once here, read-once by section D). The
+            # local resid1 create_tensor is reused by gate/shared/routed InCore
+            # scratch inside this big fused orch, so section D cannot read resid1
+            # directly. Earlier code stashed into next_hidden_out, but that made
+            # next_hidden_out have TWO writers (stash + residual_add) => a WAW that
+            # RAW-only-v1 (single-value producer_index) cannot serialise across
+            # submissions => nondeterministic output. resid_hold has ONE writer
+            # (here) and ONE reader (section D); next_hidden_out has ONE writer
+            # (section D). Both are clean single-producer RAW.
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="stash_resid_hold",
+            ):
+                for _rs in pl.range(HIDDEN // K_CHUNK):
+                    _r0 = _rs * K_CHUNK
+                    resid_hold = pl.assemble(
+                        resid_hold,
+                        pl.slice(resid1, [BATCH, K_CHUNK], [0, _r0]),
+                        [0, _r0],
+                    )
+            if _DBG_STAGE == 5:
+                # Diagnostic: dump resid_hold (the attention residual = MoE-block
+                # attention output) to isolate whether the valid-token race is in
+                # attention (this) vs the MoE body (stages 1-4).
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_5"):
+                    for _d5 in pl.range(HIDDEN // K_CHUNK):
+                        _d50 = _d5 * K_CHUNK
+                        dbg_out = pl.assemble(
+                            dbg_out,
+                            pl.slice(resid_hold, [BATCH, K_CHUNK], [0, _d50]),
+                            [0, _d50],
+                        )
+            # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+            hidden_blocks = HIDDEN // K_CHUNK
+            post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
+            ):
+                for kb in pl.range(hidden_blocks):
+                    k0 = kb * K_CHUNK
+                    rchunk = pl.cast(
+                        pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
+
+                sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+                for kb2 in pl.range(hidden_blocks):
+                    k0 = kb2 * K_CHUNK
+                    ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
+                    sq_sum = pl.add(
+                        sq_sum,
+                        pl.reshape(
+                            pl.row_sum(pl.mul(ck, ck)),
+                            [1, BATCH],
+                        ),
+                    )
+                inv_rms_moe = pl.recip(
+                    pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+                )
+                inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
+                for kb3 in pl.range(hidden_blocks):
+                    k0 = kb3 * K_CHUNK
+                    norm_chunk = pl.slice(
+                        resid1_fp32, [BATCH, K_CHUNK], [0, k0],
+                    )
+                    gamma = pl.slice(
+                        post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
+                    )
+                    scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
+                    normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
+                    post_norm = pl.assemble(
+                        post_norm,
+                        pl.cast(normed, target_type=pl.BF16),
+                        [0, k0],
+                    )
+
+            if _DBG_STAGE == 1:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_1"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(post_norm, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
+            # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
+            # inlined per-stage methods (``self.gate_step`` /
+            # ``self.dispatch_step`` / ``self.expert_routed_step`` /
+            # ``self.expert_shared_step`` / ``self.combine_step``) directly
+            # rather than instantiating a separate ``@pl.program``.
+            moe_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+
+            # 1) Gate (local, replicated).
+            expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
+            expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
+            expert_indices, expert_weights = self.gate_step(
+                post_norm, gate_w, router_bias,
+                expert_indices, expert_weights,
+            )
+
+            # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
+            sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            sh_y = self.expert_shared_step(
+                post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
+                sh_tmp_window, sh_signal_window, my_rank,
+            )
+
+
+            # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
+            # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
+            x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+            x_disp_scale = pl.create_tensor([BATCH, 8], dtype=pl.FP32)
+            (x_disp_i8, x_disp_scale) = self._quant_moe_input(
+                post_norm, x_disp_i8, x_disp_scale,
+            )
+            if _DBG_STAGE == 2:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_2"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(sh_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # 3) Dispatch (EP fixed-slot pull).
+            local_routed_x = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.INT8,
+            )
+            local_routed_x_scale = pl.create_tensor(
+                [1, local_recv_max], dtype=pl.FP32,
+            )
+            local_expert_offset = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            local_expert_count = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
+            # Per-recv-row r_route (= source t*TOPK+k), staged from recv_r_route;
+            # combine uses it to scatter the routed output back to the source.
+            recv_r_route_out = pl.create_tensor(
+                [local_recv_max], dtype=pl.INT32,
+            )
+            (
+                local_routed_x,
+                local_routed_x_scale,
+                local_expert_offset,
+                local_expert_count,
+                recv_r_route_out,
+                inverse_map,
+            ) = self.dispatch_step(
+                x_disp_i8, x_disp_scale, expert_indices,
+                local_routed_x, local_routed_x_scale,
+                local_expert_offset, local_expert_count, recv_r_route_out,
+                pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,
+                send_x, send_scale, send_route,
+                my_rank,
+            )
+
+            if _DBG_STAGE == 32:
+                # Diagnostic-only: dump local_routed_x_scale[0, :1024] into
+                # dbg_out row 0. Other rows/cols remain host-initialized zero.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_32_local_routed_x_scale"):
+                    _scale_dbg = pl.cast(
+                        pl.slice(local_routed_x_scale, [1, local_recv_max], [0, 0]),
+                        target_type=pl.BF16,
+                    )
+                    dbg_out = pl.assemble(dbg_out, _scale_dbg, [0, 0])
+            if _DBG_STAGE == 33:
+                # Diagnostic-only: dump recv_r_route_out[:1024] into dbg_out row 0
+                # as BF16 values. It is route metadata, not model data.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_33_recv_route"):
+                    _route_dbg = pl.reshape(
+                        pl.cast(
+                            pl.cast(
+                                pl.slice(recv_r_route_out, [local_recv_max], [0]),
+                                target_type=pl.FP32,
+                            ),
+                            target_type=pl.BF16,
+                        ),
+                        [1, local_recv_max],
+                    )
+                    dbg_out = pl.assemble(dbg_out, _route_dbg, [0, 0])
+
+            # 4) Routed experts (local 36).
+            local_routed_y = pl.create_tensor(
+                [local_recv_max, HIDDEN], dtype=pl.BF16,
+            )
+            local_routed_y = self.expert_routed_step_swiglu7(
+                local_routed_x,
+                local_routed_x_scale,
+                local_expert_offset, local_expert_count,
+                w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
+                w_down_r, w_down_r_scale,
+                local_routed_y,
+            )
+
+            if _DBG_STAGE == 3:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_3"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(local_routed_y, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # 5) Combine (EP pull back + weighted gather + sh_y add).
+            moe_out = self.combine_step(
+                local_routed_y,
+                recv_r_route_out, expert_weights, sh_y,
+                moe_out,
+                pub_counts,
+                routed_y_buf, combine_done_sig,
+                expert_indices, inverse_map, routed_src_buf,
+                my_rank,
+            )
+
+            if _DBG_STAGE == 4:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dbg_dump_4"):
+                    for _dg in pl.range(HIDDEN // K_CHUNK):
+                        _dg0 = _dg * K_CHUNK
+                        dbg_out = pl.assemble(dbg_out, pl.slice(moe_out, [BATCH, K_CHUNK], [0, _dg0]), [0, _dg0])
+            # ── D: residual add: next_hidden_out = resid1 + moe_out. ───
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="moe_residual_add",
+            ):
+                for kb4 in pl.range(hidden_blocks):
+                    k0 = kb4 * K_CHUNK
+                    m = pl.cast(
+                        pl.slice(moe_out, [BATCH, K_CHUNK], [0, k0]),
+                        target_type=pl.FP32,
+                    )
+                    r = pl.cast(pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]), target_type=pl.FP32)
+                    next_hidden_out = pl.assemble(
+                        next_hidden_out,
+                        pl.cast(pl.add(r, m), target_type=pl.BF16),
+                        [0, k0],
+                    )
+            return next_hidden_out
+
         @pl.function(type=pl.FunctionType.Orchestration)
         def whole_chip_orch(  # noqa: PLR0913, PLR0915
             self,
@@ -6197,7 +7510,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             resid_hold_layer_43 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
-            h_layer_43 = self.swa_moe_chip_orch(
+            h_layer_43 = self.swa_moe_chip_orch_swiglu7_silu(
                 h_layer_42,
                 input_rms,
                 pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [32 * (HIDDEN), 0]),
@@ -6253,7 +7566,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             resid_hold_layer_44 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
-            next_hidden_out = self.full_moe_chip_orch(
+            next_hidden_out = self.full_moe_chip_orch_swiglu7_swiglu16(
                 h_layer_43,
                 input_rms,
                 pl.slice(full_wq, [HIDDEN, hidden_q_full], [11 * (HIDDEN), 0]),

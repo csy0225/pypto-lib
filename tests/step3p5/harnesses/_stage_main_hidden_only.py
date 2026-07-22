@@ -45,6 +45,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True)
     parser.add_argument("--num-blocks", type=int, default=32)
     parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument("--teacher-forced", action="store_true", help="feed oracle token each step; log all steps, never raise (per-position top-1 accuracy vs a live/greedy oracle)")
+    parser.add_argument("--seed-token", type=int, default=6127, help="first decode input token (default 6127)")
     parser.add_argument("--oracle-token", action="append", type=int)
     parser.add_argument("--export-rank", type=int, default=-1)
     parser.add_argument("--dev", type=int, default=8)
@@ -495,8 +497,8 @@ def _step_metadata(
 
 def _run_worker(args: argparse.Namespace) -> int:
     devices = _devices(args.device)
-    if not 1 <= args.steps <= 128:
-        raise ValueError("--steps must be in [1,128] for the direct gate")
+    if not 1 <= args.steps <= args.num_blocks * BLOCK_SIZE:
+        raise ValueError("--steps must be in [1, num_blocks*128]")
     if args.repeat_identical and args.steps != 2:
         raise ValueError("--repeat-identical requires --steps 2")
     if args.steps > args.num_blocks * BLOCK_SIZE:
@@ -531,8 +533,9 @@ def _run_worker(args: argparse.Namespace) -> int:
         raise ValueError(
             f"oracle has {len(expected_tokens)} tokens but steps={args.steps}"
         )
-    if not args.repeat_identical and expected_tokens[0] != 303:
-        raise ValueError("canonical Main oracle must start with token 303")
+    if (not args.repeat_identical and not args.oracle_token and args.seed_token == 6127
+            and expected_tokens[0] != 303):
+        raise ValueError("built-in canonical Main oracle must start with token 303")
 
     holder = WholeDecodeHolder(
         device_ids=devices,
@@ -545,7 +548,7 @@ def _run_worker(args: argparse.Namespace) -> int:
     repeat_hidden: torch.Tensor | None = None
     try:
         with holder:
-            token = 6127
+            token = args.seed_token
             for step in range(args.steps):
                 metadata_step = 0 if args.repeat_identical else step
                 embedding = _load_embedding_row(args.ckpt, token)
@@ -653,7 +656,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                         )
                 reports.append(report)
                 print(json.dumps(report, sort_keys=True), flush=True)
-                if sampled != expected:
+                if sampled != expected and not getattr(args, "teacher_forced", False):
                     raise AssertionError(report)
                 if (
                     args.repeat_identical
@@ -662,7 +665,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                 ):
                     raise AssertionError(report)
                 if not args.repeat_identical:
-                    token = sampled
+                    token = expected if getattr(args, "teacher_forced", False) else sampled
     finally:
         if not args.reuse_exporters:
             _stop_exporters(out, procs)
@@ -693,7 +696,10 @@ def _run_worker(args: argparse.Namespace) -> int:
         + (
             "MAIN_HIDDEN_ONLY_IDENTICAL_REPEAT_EXACT"
             if args.repeat_identical
-            else "MAIN_HIDDEN_ONLY_8STEP_TOKEN_EXACT"
+            else ("MAIN_HIDDEN_ONLY_TEACHER_FORCED_MATCH_%d_of_%d" % (
+                sum(1 for r in reports if r.get("token_exact")), len(reports))
+                if getattr(args, "teacher_forced", False)
+                else "MAIN_HIDDEN_ONLY_8STEP_TOKEN_EXACT")
         ),
         flush=True,
     )

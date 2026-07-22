@@ -1,0 +1,50 @@
+# Live token-alignment A/B（主网整网精度准出）
+
+pypto 整网 decode 与 **live vanilla vLLM W8A8 oracle** 在同一 prompt 上逐 token 对齐，
+统计 top-1 一致率。这是主网 hidden-only decode 的**在线精度准出口径**（Phase 21 L3：
+top-1 ≥ 95%）。
+
+## 为什么不再用硬编码 oracle
+
+旧 harness 用写死的 `DEFAULT_ORACLE_TOKENS = [303,1207,19384,...]`。其中 position 2 的
+`19384(题目)` 是**错的**：它来自"一次性生成完整文本再 `tokenizer.encode(text)`"——该
+re-tokenization 在 merge 边界会串位。对相同 no-BOS 显式 id 上下文 `[6127,303,1207]`，
+**vanilla vLLM 自己**和 pypto **都**输出 `6127(北京)`，`19384` 只是 vanilla 的第 2 名。
+硬编码常量导致 harness 在 step2 误报 FAIL。**正确做法 = step-by-step 显式 id、每步单
+token encode、无 BOS**（`gen_vanilla_oracle.py`）。
+
+## 两阶段（0162）
+
+pypto `.venv311` 没有 transformers，vanilla oracle 在独立容器里；oracle 端口 8000
+host-networked（host 可直连）。
+
+- Stage 1（oracle 环境，有 transformers + 能连 8000）：`gen_vanilla_oracle.py` 从 seed
+  逐步贪心生成 → `ORACLE_IDS_JSON`。
+- Stage 2（pypto host，cards 8-15）：`_stage_main_hidden_only --teacher-forced
+  --seed-token <seed> --oracle-token <id>...`，每步喂 oracle 正确 token（解耦 token
+  链，避免一次翻转污染后续），比 pypto argmax == oracle 下一 token。
+
+## 跑法
+
+先确保 vanilla oracle 起在 cards 0-7 / 8000（`/logs/start_8000_oracle.sh`，容器内）。
+然后：
+
+```bash
+ORACLE_EXEC="sudo -n nsenter -t <sleep-infinity-pid> -m -p -- /usr/local/python3.11.14/bin/python3" \
+N=128 SEED=6127 \
+bash tests/step3p5/ci/run_live_precision_ab.sh
+```
+
+准出：`LIVE_AB_ALIGNED >= 95%`。
+
+## 已验证结果（2026-07-23, 0162, stepfun/develop a632c42e）
+
+- seed=6127(北京)，N=128，**ALIGNED = 124/128 = 96.9%**（≥95% PASS）。
+- 生成文本连贯（"，但北京是直辖市，不是省。所以..."）。
+- 4 个 miss（step 43/70/98/104）全是 vanilla **自己**的 near/dead-tie（gap 0.0–0.25
+  logprob；43/98 gap=0.0000），且 pypto 的选择 = vanilla **fresh 查询的 #1**（rank 0）
+  → 属 vanilla 自身 tie-break 非确定性，非 pypto 精度缺陷。
+- 结论：主网 multi-decode 精度**正常**，pypto ≈ vanilla 逐 token 对齐。
+
+> 边界：本 gate 覆盖主网 45 层 hidden→vLLM tail 的 decode 对齐。MTP45/46/47 端到端对齐
+> 是独立 gate（另见 MTP CI）。

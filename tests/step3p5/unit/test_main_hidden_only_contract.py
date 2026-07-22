@@ -39,6 +39,48 @@ def test_hidden_only_program_is_the_only_main_production_entry():
     assert "whole_decode_faithful_real_single_chip =" not in source
 
 
+def test_hidden_only_program_selects_swiglu_by_physical_layer():
+    source = _HIDDEN_PROGRAM.read_text()
+    assert "MOE_ACTIVATION_BY_LAYER" in source
+    assert '("swa", 7.0, 0.0): "swa_moe_chip_orch_swiglu7_silu"' in source
+    assert (
+        '("full", 7.0, 16.0): '
+        '"full_moe_chip_orch_swiglu7_swiglu16"'
+    ) in source
+
+    factory_class = _class_source(
+        _HIDDEN_PROGRAM,
+        "WholeDecodeFaithfulRealSingleChipHiddenOnly",
+    )
+    tree = ast.parse(factory_class)
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    for name in (
+        "_expert_routed_swiglu7",
+        "expert_routed_step_swiglu7",
+        "_expert_shared_local_swiglu16",
+        "expert_shared_step_swiglu16",
+        "swa_moe_chip_orch_swiglu7_silu",
+        "full_moe_chip_orch_swiglu7_swiglu16",
+    ):
+        assert name in functions
+
+    for name in (
+        "_expert_routed",
+        "_expert_routed_swiglu7",
+        "_expert_shared_local",
+        "_expert_shared_local_swiglu16",
+    ):
+        function_source = ast.get_source_segment(factory_class, functions[name])
+        assert function_source is not None
+        assert "layer_idx" not in function_source
+
+    assert "self.swa_moe_chip_orch_swiglu7_silu(" in factory_class
+    assert "self.full_moe_chip_orch_swiglu7_swiglu16(" in factory_class
+
 def test_hidden_only_program_has_no_vllm_owned_tail():
     source = _class_source(
         _HIDDEN_PROGRAM,

@@ -100,7 +100,7 @@ def main() -> int:
         SHARE_EXPERT_DIM_LOCAL, TP_WORLD_SIZE,
     )
     from models.step3p5 import weight_loader as wl  # noqa: PLC0415
-    from models.step3p5.decode_layer import select_moe_block  # noqa: PLC0415
+    from models.step3p5.moe import select_moe_block  # noqa: PLC0415
     from golden import TensorSpec, ratio_allclose, run  # noqa: PLC0415
 
     bf16 = torch.bfloat16

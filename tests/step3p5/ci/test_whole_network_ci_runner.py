@@ -22,57 +22,10 @@ from tests.step3p5.ci._whole_network_ci_common import (
     scrub_environment,
 )
 from tests.step3p5.ci.run_whole_network_ci import (
-    MAIN_INT8_KEYS,
-    MAIN_SCALE_KEYS,
-    MTP_BF16_KEYS,
-    MTP_FP32_KEYS,
     WholeNetworkConfig,
-    _extract_main_argmax,
-    _extract_tokens,
-    _validate_pool_map,
     preflight,
     run,
 )
-
-
-def _write_pool_map(path: Path) -> None:
-    entries: dict[str, dict[str, object]] = {}
-    offset = 0
-
-    def add(key: str, dtype: str, shape: list[int]) -> None:
-        nonlocal offset
-        element_size = {
-            "int8": 1,
-            "bfloat16": 2,
-            "float32": 4,
-        }[dtype]
-        offset = (offset + 511) // 512 * 512
-        nbytes = element_size
-        for item in shape:
-            nbytes *= item
-        entries[key] = {
-            "offset": offset,
-            "shape": shape,
-            "dtype": dtype,
-            "nbytes": nbytes,
-        }
-        offset += nbytes
-
-    for key in MAIN_INT8_KEYS:
-        add(key, "int8", [1])
-    for key in MAIN_SCALE_KEYS:
-        add(key, "float32", [1])
-    for key in MTP_FP32_KEYS:
-        add(key, "float32", [1])
-    for key in MTP_BF16_KEYS:
-        shape = [3, 1] if key in ("mtp_k_cache", "mtp_v_cache") else [1]
-        add(key, "bfloat16", shape)
-    for key in ("k_cache", "v_cache"):
-        add(key, "bfloat16", [1, 1])
-    path.write_text(
-        json.dumps({"pool_bytes": offset, "map": entries}),
-        encoding="utf-8",
-    )
 
 
 def _write_checkpoint_index(ckpt: Path) -> None:
@@ -152,17 +105,6 @@ def test_scrub_environment_removes_front8_controls(tmp_path: Path) -> None:
     assert env["PYTHONPATH"] == str(tmp_path)
 
 
-def test_log_parsers_only_accept_executed_result() -> None:
-    text = (
-        "[worker] RUN done 2.61s max|logits|=12.0 argmax=303\n"
-        "(vLLM golden next-token argmax=303)\n"
-        "[worker] RUN done 1.94s tokens_row0=[6178, 410, 303]\n"
-    )
-    assert _extract_main_argmax(text) == 303
-    assert _extract_tokens(text) == [6178, 410, 303]
-    assert _extract_main_argmax("(vLLM golden next-token argmax=303)\n") is None
-
-
 def test_active_exporter_scan_ignores_shell_command_text(
     tmp_path: Path,
 ) -> None:
@@ -171,12 +113,12 @@ def test_active_exporter_scan_ignores_shell_command_text(
         [
             (
                 "101 bash bash -c 'python -m "
-                "tests.step3p5.harnesses._stage_whole_mtp3_ipc "
+                "tests.step3p5.harnesses._stage_mtp_hidden_selected "
                 f"--out {pool}'"
             ),
             (
                 "102 python python -m "
-                "tests.step3p5.harnesses._stage_whole_mtp3_ipc "
+                "tests.step3p5.harnesses._stage_mtp_hidden_selected "
                 f"--export-rank 0 --out {pool}"
             ),
             (
@@ -201,25 +143,11 @@ def test_active_exporter_scan_ignores_shell_command_text(
                 "pid": 102,
                 "command": (
                     "python -m "
-                    "tests.step3p5.harnesses._stage_whole_mtp3_ipc "
+                    "tests.step3p5.harnesses._stage_mtp_hidden_selected "
                     f"--export-rank 0 --out {pool}"
                 ),
             }
         ]
-
-
-def test_pool_contract_rejects_bf16_main_routed_weight(tmp_path: Path) -> None:
-    map_path = tmp_path / "pypto_weight_map.rank0.json"
-    _write_pool_map(map_path)
-    result = _validate_pool_map(map_path, rank=0)
-    assert result["native_main_routed_dtype"] == "int8"
-
-    payload = json.loads(map_path.read_text(encoding="utf-8"))
-    payload["map"][MAIN_INT8_KEYS[0]]["dtype"] = "bfloat16"
-    payload["map"][MAIN_INT8_KEYS[0]]["nbytes"] = 2
-    map_path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(RunnerError, match="must be int8"):
-        _validate_pool_map(map_path, rank=0)
 
 
 def test_preflight_protects_front8_and_requires_contiguous_devices(

@@ -1,31 +1,28 @@
-# Step3p5 Test Layout
+# Step3p5 canonical test layout
 
-The operator-facing whole-network entry point is documented in
-[`../../docs/step3p5/README.md`](../../docs/step3p5/README.md). Start there for
-the canonical main → sampler → MTP3 commands; this file describes the
-responsibility-based test layout only.
-
-The Step3p5 test tree is grouped by responsibility:
+当前测试树只服务于 single-chip hidden-only Main/MTP：
 
 ```text
-common/      shared topology/configuration patches used by tests
-probes/      focused compiler, lowering, and runtime diagnostics
-harnesses/   device, real-weight, IPC, and canonical execution programs
-unit/        card-free and focused unit/contract tests
-system/      layer-level simulator and multi-device system tests
-precision/   golden, W8A8, detailed, and end-to-end precision tests
-ci/          whole-network CI runner, pytest gate, tests, and documentation
+harnesses/
+  _stage_main_hidden_only.py
+  _stage_mtp_hidden_selected.py
+unit/
+  ABI、metadata、KV reserve、IPC、loader、control-plane contracts
+ci/
+  run_whole_network_ci.py
+  test_whole_network_ci_runner.py
+  WHOLE_NETWORK_CI.md
 ```
 
-The top-level package intentionally contains only this index plus compatibility
-entry points for commands that are part of the 0162 canonical workflow:
+推荐入口：
 
-```text
-tests.step3p5.harnesses._stage_whole_faithful_real_ipc
-tests.step3p5.harnesses._stage_whole_mtp3_ipc
-tests.step3p5.ci.run_whole_network_ci
+```bash
+python -m tests.step3p5.ci.run_whole_network_ci \
+  --ckpt /data/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp \
+  --devices 8,9,10,11,12,13,14,15 \
+  --out /tmp/n1_single_chip_hidden_ci \
+  --artifact-dir /data/chensiyu/hw_project/pypto/workspace/logs_n1_0162/single_chip_hidden_ci
 ```
 
-New code should import and invoke the categorized modules directly. The
-compatibility modules exist so pinned commands and external automation can be
-migrated without changing the validated execution behavior in one step.
+旧 per-layer decode、旧 whole-net IPC wrapper、旧 whole-MTP3 和旧
+generator 不允许重新添加兼容入口。

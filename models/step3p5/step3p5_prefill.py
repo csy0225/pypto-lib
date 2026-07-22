@@ -18,9 +18,8 @@ NotImplementedError)。
 
 Step3p5 top-level prefill entry — 8-card TP/EP prefill.
 
-Sibling of ``step3p5_decode.py``; same per-rank weight bundle, same
-CLI shape, but the residual stream walks a sequence-major prefill
-tile ``[T, HIDDEN]`` instead of decode's row-per-user tile.
+The residual stream walks a sequence-major prefill tile ``[T, HIDDEN]``.
+This diagnostic entry is independent of the retired per-layer decode tree.
 
 Phase 6 status note:
   As of this commit only ``prefill_qkv_proj_rope.py`` and
@@ -58,18 +57,13 @@ if TYPE_CHECKING:  # pragma: no cover — type-only
     import torch
 
 from .config import (
+    LAYER_TYPE_FULL,
+    LAYER_TYPES,
     MAX_SEQ_DEFAULT,
     NUM_HIDDEN_LAYERS,
     NUM_NEXTN_PREDICT_LAYERS,
     TP_WORLD_SIZE,
     is_moe_layer,
-)
-from .step3p5_decode import (
-    PLATFORM_CHOICES,
-    SMOKE_PASS_THRESHOLD,
-    _project_logits,
-    _torch_dense_mlp,
-    _zero_centered_rmsnorm,
 )
 from .weight_loader import (
     DEFAULT_CKPT_DIR,
@@ -90,30 +84,70 @@ from .weight_loader import (
 
 
 log = logging.getLogger(__name__)
+PLATFORM_CHOICES = ("a2a3", "a2a3sim", "a5", "a5sim")
+SMOKE_PASS_THRESHOLD = 0.95
 
 
 # =============================================================================
-# Prefill-side dispatcher smoke. Reuses ``select_decode_layer`` (the same
-# eight per-layer programs handle prefill once the @pl.program signature
-# is wired in Phase 6 — the dispatcher table itself is shared because
-# layer flavour selection is identical).
+# Prefill-side layer-kind classification.  It deliberately uses only config,
+# so the retired per-layer decode implementation cannot re-enter the tree.
 # =============================================================================
 def run_dispatcher_smoke() -> dict[str, int]:
-    """Walk all 45 main layers + 3 MTP layers through the per-layer dispatch.
-
-    Records the dispatched ``kind`` for each layer and emits a histogram.
-    Imports ``decode_layer`` lazily so a missing pypto runtime does not
-    block the weight-only smoke path. The prefill kernels (when they
-    land in Phase 6) use the same kind-table for layer routing.
-    """
-    from .decode_layer import select_decode_layer  # noqa: PLC0415
-
+    """Classify all 45 main layers plus three MTP layers from config."""
     kinds: dict[str, int] = {}
-    for li in range(NUM_HIDDEN_LAYERS):
-        _, kind = select_decode_layer(li)
+    for li, layer_type in enumerate(LAYER_TYPES[:NUM_HIDDEN_LAYERS]):
+        if is_moe_layer(li):
+            kind = (
+                "full_moe"
+                if layer_type == LAYER_TYPE_FULL
+                else "swa_moe"
+            )
+        else:
+            kind = (
+                "full_dense"
+                if layer_type == LAYER_TYPE_FULL
+                else "swa_dense"
+            )
         kinds[kind] = kinds.get(kind, 0) + 1
     kinds["mtp_swa_dense"] = NUM_NEXTN_PREDICT_LAYERS
     return kinds
+
+
+def _zero_centered_rmsnorm(
+    x: "torch.Tensor",
+    gamma: "torch.Tensor",
+    eps: float = 1e-5,
+) -> "torch.Tensor":
+    import torch  # noqa: PLC0415
+
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    return (
+        x.float()
+        * torch.rsqrt(variance + eps)
+        * (gamma.float() + 1.0)
+    )
+
+
+def _torch_dense_mlp(
+    x: "torch.Tensor",
+    w_gate: "torch.Tensor",
+    w_up: "torch.Tensor",
+    w_down: "torch.Tensor",
+) -> "torch.Tensor":
+    import torch  # noqa: PLC0415
+
+    x32 = x.bfloat16().float()
+    gate = x32 @ w_gate.float()
+    up = x32 @ w_up.float()
+    gated = (gate * torch.sigmoid(gate) * up).bfloat16()
+    return (gated.float() @ w_down.float()).bfloat16()
+
+
+def _project_logits(
+    hidden: "torch.Tensor",
+    lm_head_weight: "torch.Tensor",
+) -> "torch.Tensor":
+    return hidden.bfloat16().float() @ lm_head_weight.float().T
 
 
 # =============================================================================
@@ -205,9 +239,8 @@ def run_smoke(
 ) -> dict[str, object]:
     """Run the end-to-end prefill smoke for one rank.
 
-    Mirrors the decode smoke's three-step structure:
-      1. Dispatcher correctness — every layer reaches a valid per-layer
-         ``@pl.program`` via ``select_decode_layer``.
+    Three-step diagnostic:
+      1. Layer-kind classification from the model config.
       2. Weight-loader correctness — via the real ckpt or synthetic.
       3. Per-rank residual-stream wiring — torch reference walks all 45
          main layers on a sequence-major ``[T, HIDDEN]`` tile.
@@ -216,12 +249,8 @@ def run_smoke(
 
     torch.manual_seed(seed)
 
-    # ── 1. Dispatcher smoke. ─────────────────────────────────────────
-    try:
-        layer_kinds = run_dispatcher_smoke()
-    except Exception as exc:  # noqa: BLE001 — pypto may not be importable
-        log.warning("dispatcher smoke skipped: %s", exc)
-        layer_kinds = {"dispatcher_unavailable": -1}
+    # ── 1. Layer-kind classification. ────────────────────────────────
+    layer_kinds = run_dispatcher_smoke()
 
     # ── 2. Load per-rank weight bundle. ──────────────────────────────
     if use_synthetic or ckpt_dir is None or not os.path.isdir(ckpt_dir):

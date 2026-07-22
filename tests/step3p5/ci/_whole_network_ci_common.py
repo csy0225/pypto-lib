@@ -513,10 +513,8 @@ def active_exporter_pids(pool_dir: Path) -> list[dict[str, Any]]:
         return []
 
     modules = (
-        "tests.step3p5._stage_whole_mtp3_ipc",
-        "tests.step3p5._stage_whole_faithful_real_ipc",
-        "tests.step3p5.harnesses._stage_whole_mtp3_ipc",
-        "tests.step3p5.harnesses._stage_whole_faithful_real_ipc",
+        "tests.step3p5.harnesses._stage_main_hidden_only",
+        "tests.step3p5.harnesses._stage_mtp_hidden_selected",
     )
     pool_text = str(pool_dir.resolve())
     found: list[dict[str, Any]] = []

@@ -11,8 +11,8 @@
 (各种 attention 与 dense MLP 权重)/ EP-sliced(每卡 36 个 routed expert)
 + MTP 专属。这里是纯 host Python,不进 NPU,不带任何 pypto 装饰器。
 [关键装饰器] 无(纯 host Python 函数)。
-[SPMD 角色] host 侧 per-rank 切片;真正的 SPMD 由 step3p5_decode.py /
-step3p5_prefill.py 拉起每卡进程后开始。
+[SPMD 角色] host 侧 per-rank 切片；真正的 SPMD 由 single-chip
+hidden-only Main/MTP program 的 host orchestration 拉起。
 [详见] 中文架构指南 §1, §9
 
 ────── 以下为英文原 docstring ──────
@@ -23,8 +23,8 @@ This module maps the HuggingFace-format safetensors checkpoint shipped at
 ``/mnt/chensiyu-jfs/multi-hardware/models/step3p5_flash_release_hf_mtp3_bf16/``
 into the per-card weight bundles consumed by the Wave-3 TP/EP kernels.
 
-Per-rank bundle layout (consolidated from the kernel signatures in
-``decode_fwd.py`` / ``decode_layer.py`` / ``mtp.py`` / ``rms_lm_head.py``):
+Per-rank bundle layout is consolidated from the current hidden-only Main/MTP
+program signatures. The final RMSNorm and vocabulary head remain vLLM-owned.
 
 REPLICATED tensors — identical bytes on every rank:
   * ``embed_tokens``                shape ``[VOCAB, HIDDEN]``      BF16
@@ -49,8 +49,9 @@ TP-SLICED tensors — each rank holds 1/TP_WORLD_SIZE:
   * ``lm_head_weight``              ``[VOCAB_LOCAL, HIDDEN]`` BF16
 
 EP-SLICED tensors — each rank hosts MOE_NUM_EXPERTS_LOCAL of MOE_NUM_EXPERTS experts:
-  * ``moe_w_gate_r`` / ``moe_w_up_r`` ``[NUM_MOE_LAYERS, MOE_NUM_EXPERTS_LOCAL, HIDDEN, MOE_INTERMEDIATE]`` BF16
-  * ``moe_w_down_r`` ``[NUM_MOE_LAYERS, MOE_NUM_EXPERTS_LOCAL, MOE_INTERMEDIATE, HIDDEN]`` BF16
+  * ``moe_w_gate_r`` / ``moe_w_up_r`` ``[NUM_MOE_LAYERS, MOE_NUM_EXPERTS_LOCAL, HIDDEN, MOE_INTERMEDIATE]`` INT8
+  * ``moe_w_down_r`` ``[NUM_MOE_LAYERS, MOE_NUM_EXPERTS_LOCAL, MOE_INTERMEDIATE, HIDDEN]`` INT8
+  * routed gate/up/down scales are FP32 and remain paired with those INT8 slabs
 
 MTP tensors (3 next-N-predict layers; LAYER_TYPES[45..47] all SWA):
   * ``mtp_enorm_weight`` / ``mtp_hnorm_weight``  ``[NUM_MTP, HIDDEN]`` BF16 (replicated)
@@ -674,7 +675,7 @@ def load_step3p5_weights_for_rank(
 
     Returns a flat dict of named ``torch.Tensor``s. Caller stacks them
     along a leading rank axis when constructing a full 8-rank decode
-    invocation (see ``step3p5_decode.py``).
+    invocation (see the hidden-only Main/MTP holders).
     """
     if not 0 <= rank < tp_world_size:
         raise ValueError(
@@ -1096,9 +1097,9 @@ COMPACT_DEFAULTS: dict[str, int] = {
     #
     # NOTE: layer counts (num_hidden_layers, num_full_layers,
     # num_swa_layers, num_dense_layers, num_moe_layers, num_mtp) are kept
-    # at the production values — the dispatcher in ``decode_layer.py``
+    # at the production values — the hidden-only programs
     # walks the compile-time ``LAYER_TYPES`` table from ``config.py``,
-    # so the torch reference in ``step3p5_decode.py`` needs one bundle
+    # so the torch reference needs one bundle
     # row per real layer for ``is_full_attention`` / ``is_moe_layer`` to
     # line up with the indexed weight slabs.
     "hidden": 256,

@@ -68,6 +68,19 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument(
+        "--itl-context-lens",
+        default="",
+        help=(
+            "perf-only: comma list of decode context lengths (e.g. "
+            "1024,8192,32768,65536). When set, skip the token loop; for each L "
+            "pin metadata to seq_len=L and time holder.run() over --itl-iters "
+            "(attention compute is invariant to KV content, so no prefill is "
+            "needed). Emits per-context ITL stats to itl_report.json."
+        ),
+    )
+    parser.add_argument("--itl-iters", type=int, default=20, help="measured decode iters per context")
+    parser.add_argument("--itl-warmup", type=int, default=3, help="warmup decode iters per context (not recorded)")
     return parser.parse_args()
 
 
@@ -495,6 +508,72 @@ def _step_metadata(
     return seq, pos, table, slot
 
 
+def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
+    """perf-only: measure decode inter-token latency (ITL) vs context length.
+
+    For each target context length L, pin the active-row metadata to seq_len=L
+    and time ``holder.run()`` over ``--itl-iters`` (after ``--itl-warmup``).
+    Attention compute is invariant to KV *content*, so we do not prefill — the
+    per-step wall time at seq_len=L is the steady-state ITL at that context.
+    Writes itl_report.json.
+    """
+    import statistics
+
+    ctx_lens = [int(x) for x in str(args.itl_context_lens).split(",") if x.strip()]
+    cap = args.num_blocks * BLOCK_SIZE
+    for length in ctx_lens:
+        if not 1 <= length <= cap:
+            raise ValueError(
+                f"itl context {length} out of range [1, {cap}] "
+                f"(raise --num-blocks; need >= {(length + BLOCK_SIZE - 1) // BLOCK_SIZE})"
+            )
+
+    # Fixed dummy embedding — content is irrelevant to decode-step timing.
+    embedding = _load_embedding_row(args.ckpt, args.seed_token).unsqueeze(0)
+    results: list[dict[str, object]] = []
+    for length in ctx_lens:
+        seq, pos, table, slot = _step_metadata(
+            step=length - 1, scheduler_num_blocks=args.num_blocks
+        )
+        set_kwargs = dict(
+            seq_lens=seq, positions=pos, block_table=table, slot_mapping=slot
+        )
+        for _ in range(max(0, args.itl_warmup)):
+            holder.set_live_step(embedding, **set_kwargs)
+            holder.run()
+        samples: list[float] = []
+        for _ in range(max(1, args.itl_iters)):
+            holder.set_live_step(embedding, **set_kwargs)
+            started = time.time()
+            holder.run()
+            samples.append(time.time() - started)
+        ms = sorted(s * 1000.0 for s in samples)
+        n = len(ms)
+        res = {
+            "context_len": length,
+            "iters": n,
+            "itl_ms_min": round(ms[0], 3),
+            "itl_ms_mean": round(statistics.fmean(ms), 3),
+            "itl_ms_p50": round(ms[n // 2], 3),
+            "itl_ms_p99": round(ms[min(n - 1, int(n * 0.99))], 3),
+            "itl_ms_max": round(ms[-1], 3),
+        }
+        results.append(res)
+        print(json.dumps(res, sort_keys=True), flush=True)
+
+    report = {
+        "kind": "decode_itl",
+        "num_blocks": args.num_blocks,
+        "block_size": BLOCK_SIZE,
+        "batch": BATCH,
+        "warmup": args.itl_warmup,
+        "results": results,
+    }
+    (out / "itl_report.json").write_text(json.dumps(report, indent=2))
+    print(f"ITL_REPORT={out / 'itl_report.json'}", flush=True)
+    return 0
+
+
 def _run_worker(args: argparse.Namespace) -> int:
     devices = _devices(args.device)
     if not 1 <= args.steps <= args.num_blocks * BLOCK_SIZE:
@@ -548,6 +627,8 @@ def _run_worker(args: argparse.Namespace) -> int:
     repeat_hidden: torch.Tensor | None = None
     try:
         with holder:
+            if args.itl_context_lens:
+                return _run_itl(holder, args, out)
             token = args.seed_token
             for step in range(args.steps):
                 metadata_step = 0 if args.repeat_identical else step

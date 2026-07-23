@@ -177,7 +177,7 @@ export PTO2_RING_HEAP=4294967296
 export PTO2_RING_TASK_WINDOW=131072
 export PTO2_RING_DEP_POOL=131072
 
-cd /data/chensiyu/hw_project/pypto/workspace/pypto-lib-live
+cd /data/chensiyu/hw_project/pypto/workspace/vllm-pypto
 export CKPT=/data/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp
 ```
 

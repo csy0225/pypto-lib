@@ -21,7 +21,7 @@
 #   CKPT_PYPTO  : ckpt path visible to the pypto host (e.g. /data/chensiyu/...)
 set -uo pipefail
 WS=${WS:-/data/chensiyu/hw_project/pypto/workspace}
-LIB=${LIB:-$WS/pypto-lib-live}
+LIB=${LIB:-$WS/vllm-pypto}
 SEED=${SEED:-6127}
 N=${N:-128}
 DEVICES=${DEVICES:-8,9,10,11,12,13,14,15}

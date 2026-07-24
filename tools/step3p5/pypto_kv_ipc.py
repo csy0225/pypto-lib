@@ -434,14 +434,10 @@ def import_kv_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List[KvI
             raise KvIpcMapError(
                 "TP ranks expose different Main padding reserves"
             )
-    vas = rt.import_ipc_all(
-        device_key_map,
-        # Register each rank's KV pool so the dispatch guard accepts the interior
-        # DeviceTensor(peer_base + offset) K/V pointers carved from the pool.
-        region_bytes={
-            dev_offset + rank: int(maps_json[rank]["pool_bytes"]) for rank in range(tp)
-        },
-    )
+    # simpler 36957c6b import_ipc_all(self, device_key_map) — no region_bytes.
+    # No dispatch provenance guard in this runtime, so interior
+    # DeviceTensor(peer_base + offset) K/V pointers are accepted directly.
+    vas = rt.import_ipc_all(device_key_map)
     print(
         "[kv-ipc importer] import_ipc_all peer_bases="
         + str([hex(vas[dev_offset + rank]) for rank in range(tp)]),

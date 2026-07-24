@@ -193,6 +193,7 @@ def swa_chip_orch(
 class WholeDecodeOpt:
     @pl.function(
         type=pl.FunctionType.Orchestration,
+        auto_scope=False,
         attrs={"inline_orchestration": True},
     )
     def whole_chip_orch(  # noqa: PLR0913, PLR0915

@@ -3999,6 +3999,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
+        return next_hidden_out
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def whole_chip_orch(  # noqa: PLR0913, PLR0915

@@ -5089,8 +5089,8 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 4,
                 0,
-                2,  # moe_epoch (C1)
                 my_rank,
+                2,  # moe_epoch (C1)
             )
             h_layer_5 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5151,9 +5151,9 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_combine_done_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 5,
-                3,  # moe_epoch (C1)
                 0,
                 my_rank,
+                3,  # moe_epoch (C1)
             )
             h_layer_6 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5213,10 +5213,10 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [3 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_combine_done_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                4,  # moe_epoch (C1)
                 6,
                 0,
                 my_rank,
+                4,  # moe_epoch (C1)
             )
             h_layer_7 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5275,11 +5275,11 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32, 0]),
                 pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [4 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_combine_done_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                5,  # moe_epoch (C1)
                 pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 7,
                 0,
                 my_rank,
+                5,  # moe_epoch (C1)
             )
             h_layer_8 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5337,12 +5337,12 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [5 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32, 0]),
                 pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [5 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                6,  # moe_epoch (C1)
                 pl.slice(moe_combine_done_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 8,
                 0,
                 my_rank,
+                6,  # moe_epoch (C1)
             )
             h_layer_9 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5399,13 +5399,13 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [6 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32, 0]),
-                7,  # moe_epoch (C1)
                 pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [6 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_combine_done_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 9,
                 0,
                 my_rank,
+                7,  # moe_epoch (C1)
             )
             h_layer_10 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5461,7 +5461,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [7 * BATCH, 0]),
-                8,  # moe_epoch (C1)
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32, 0]),
                 pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [7 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_combine_done_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
@@ -5469,6 +5468,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 10,
                 0,
                 my_rank,
+                8,  # moe_epoch (C1)
             )
             h_layer_11 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5523,7 +5523,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                9,  # moe_epoch (C1)
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [8 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32, 0]),
                 pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [8 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
@@ -5532,6 +5531,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 11,
                 0,
                 my_rank,
+                9,  # moe_epoch (C1)
             )
             h_layer_12 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5585,7 +5585,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                10,  # moe_epoch (C1)
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [9 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32, 0]),
@@ -5595,6 +5594,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 12,
                 0,
                 my_rank,
+                10,  # moe_epoch (C1)
             )
             h_layer_13 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5647,7 +5647,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_data_done_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                11,  # moe_epoch (C1)
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [10 * BATCH, 0]),
@@ -5658,6 +5657,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 13,
                 0,
                 my_rank,
+                11,  # moe_epoch (C1)
             )
             h_layer_14 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5709,7 +5709,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_data_done_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                12,  # moe_epoch (C1)
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
@@ -5721,6 +5720,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 14,
                 0,
                 my_rank,
+                12,  # moe_epoch (C1)
             )
             h_layer_15 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5771,7 +5771,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_data_done_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                13,  # moe_epoch (C1)
                 pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
@@ -5784,6 +5783,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 15,
                 0,
                 my_rank,
+                13,  # moe_epoch (C1)
             )
             h_layer_16 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5833,7 +5833,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_count_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                14,  # moe_epoch (C1)
                 pl.slice(moe_data_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
@@ -5847,6 +5846,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 16,
                 0,
                 my_rank,
+                14,  # moe_epoch (C1)
             )
             h_layer_17 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5895,7 +5895,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [14 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_count_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                15,  # moe_epoch (C1)
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_data_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
@@ -5910,6 +5909,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 17,
                 0,
                 my_rank,
+                15,  # moe_epoch (C1)
             )
             h_layer_18 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5957,7 +5957,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [15 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [15 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_count_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                16,  # moe_epoch (C1)
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_data_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
@@ -5973,6 +5972,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 18,
                 0,
                 my_rank,
+                16,  # moe_epoch (C1)
             )
             h_layer_19 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6019,7 +6019,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [16 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [16 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [16 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                17,  # moe_epoch (C1)
                 pl.slice(moe_count_done_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
@@ -6036,6 +6035,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 19,
                 0,
                 my_rank,
+                17,  # moe_epoch (C1)
             )
             h_layer_20 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6081,7 +6081,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 resid_hold_layer_20,
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [17 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [17 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                18,  # moe_epoch (C1)
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [17 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_count_done_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
@@ -6099,6 +6098,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 20,
                 0,
                 my_rank,
+                18,  # moe_epoch (C1)
             )
             h_layer_21 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6143,7 +6143,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 dbg_layer_21,
                 resid_hold_layer_21,
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [18 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                19,  # moe_epoch (C1)
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [18 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [18 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_count_done_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
@@ -6162,6 +6161,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 21,
                 0,
                 my_rank,
+                19,  # moe_epoch (C1)
             )
             h_layer_22 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6205,7 +6205,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_22,
                 dbg_layer_22,
                 resid_hold_layer_22,
-                20,  # moe_epoch (C1)
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [19 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [19 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [19 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
@@ -6225,6 +6224,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 22,
                 0,
                 my_rank,
+                20,  # moe_epoch (C1)
             )
             h_layer_23 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6267,7 +6267,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [20 * (sh_inter_local), 0]),
                 h_layer_23,
                 dbg_layer_23,
-                21,  # moe_epoch (C1)
                 resid_hold_layer_23,
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [20 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [20 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
@@ -6288,6 +6287,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 23,
                 0,
                 my_rank,
+                21,  # moe_epoch (C1)
             )
             h_layer_24 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6329,7 +6329,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [21 * (HIDDEN), 0]),
                 pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [21 * (sh_inter_local), 0]),
                 h_layer_24,
-                22,  # moe_epoch (C1)
                 dbg_layer_24,
                 resid_hold_layer_24,
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [21 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
@@ -6351,6 +6350,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 24,
                 0,
                 my_rank,
+                22,  # moe_epoch (C1)
             )
             h_layer_25 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6391,7 +6391,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [22 * (HIDDEN), 0]),
                 pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [22 * (HIDDEN), 0]),
                 pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [22 * (sh_inter_local), 0]),
-                23,  # moe_epoch (C1)
                 h_layer_25,
                 dbg_layer_25,
                 resid_hold_layer_25,
@@ -6414,6 +6413,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 25,
                 0,
                 my_rank,
+                23,  # moe_epoch (C1)
             )
             h_layer_26 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6453,7 +6453,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [23 * (n_local_experts), 0]),
                 pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [23 * (HIDDEN), 0]),
                 pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [23 * (HIDDEN), 0]),
-                24,  # moe_epoch (C1)
                 pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [23 * (sh_inter_local), 0]),
                 h_layer_26,
                 dbg_layer_26,
@@ -6477,6 +6476,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 26,
                 0,
                 my_rank,
+                24,  # moe_epoch (C1)
             )
             h_layer_27 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6515,7 +6515,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.reshape(pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [24 * (n_local_experts * inter), 0]), [n_local_experts, inter, HIDDEN]),
                 pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [24 * (n_local_experts), 0]),
                 pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [24 * (HIDDEN), 0]),
-                25,  # moe_epoch (C1)
                 pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [24 * (HIDDEN), 0]),
                 pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [24 * (sh_inter_local), 0]),
                 h_layer_27,
@@ -6540,6 +6539,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 27,
                 0,
                 my_rank,
+                25,  # moe_epoch (C1)
             )
             h_layer_28 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6577,7 +6577,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [25 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [25 * (n_local_experts * inter), 0]), [n_local_experts, inter, HIDDEN]),
                 pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [25 * (n_local_experts), 0]),
-                26,  # moe_epoch (C1)
                 pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [25 * (HIDDEN), 0]),
                 pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [25 * (HIDDEN), 0]),
                 pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [25 * (sh_inter_local), 0]),
@@ -6603,6 +6602,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 28,
                 0,
                 my_rank,
+                26,  # moe_epoch (C1)
             )
             h_layer_29 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6639,7 +6639,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.reshape(pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [26 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [26 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [26 * (n_local_experts * inter), 0]), [n_local_experts, inter, HIDDEN]),
-                27,  # moe_epoch (C1)
                 pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [26 * (n_local_experts), 0]),
                 pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [26 * (HIDDEN), 0]),
                 pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [26 * (HIDDEN), 0]),
@@ -6666,6 +6665,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 29,
                 0,
                 my_rank,
+                27,  # moe_epoch (C1)
             )
             h_layer_30 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6701,7 +6701,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [27 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [27 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [27 * (n_local_experts), 0]),
-                28,  # moe_epoch (C1)
                 pl.reshape(pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [27 * (n_local_experts * inter), 0]), [n_local_experts, inter, HIDDEN]),
                 pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [27 * (n_local_experts), 0]),
                 pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [27 * (HIDDEN), 0]),
@@ -6729,6 +6728,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 30,
                 0,
                 my_rank,
+                28,  # moe_epoch (C1)
             )
             h_layer_31 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6763,7 +6763,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.reshape(pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [28 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [28 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [28 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
-                29,  # moe_epoch (C1)
                 pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [28 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [28 * (n_local_experts * inter), 0]), [n_local_experts, inter, HIDDEN]),
                 pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [28 * (n_local_experts), 0]),
@@ -6792,6 +6791,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 31,
                 0,
                 my_rank,
+                29,  # moe_epoch (C1)
             )
             h_layer_32 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6825,7 +6825,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_router_bias, [N_EXPERTS], [29 * (N_EXPERTS)]),
                 pl.reshape(pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [29 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [29 * (n_local_experts), 0]),
-                30,  # moe_epoch (C1)
                 pl.reshape(pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [29 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [29 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [29 * (n_local_experts * inter), 0]), [n_local_experts, inter, HIDDEN]),
@@ -6855,6 +6854,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 32,
                 0,
                 my_rank,
+                30,  # moe_epoch (C1)
             )
             h_layer_33 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6887,7 +6887,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [30 * (HIDDEN), 0]),
                 pl.slice(moe_router_bias, [N_EXPERTS], [30 * (N_EXPERTS)]),
                 pl.reshape(pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [30 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
-                31,  # moe_epoch (C1)
                 pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [30 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [30 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [30 * (n_local_experts), 0]),
@@ -6918,6 +6917,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 33,
                 0,
                 my_rank,
+                31,  # moe_epoch (C1)
             )
             h_layer_34 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6949,7 +6949,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 post_rms,
                 pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [31 * (HIDDEN), 0]),
                 pl.slice(moe_router_bias, [N_EXPERTS], [31 * (N_EXPERTS)]),
-                32,  # moe_epoch (C1)
                 pl.reshape(pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [31 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [31 * (n_local_experts), 0]),
                 pl.reshape(pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [31 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
@@ -6981,6 +6980,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 34,
                 0,
                 my_rank,
+                32,  # moe_epoch (C1)
             )
             h_layer_35 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7011,7 +7011,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [26 * (nh_swa_pad), 0]),
                 post_rms,
                 pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [32 * (HIDDEN), 0]),
-                33,  # moe_epoch (C1)
                 pl.slice(moe_router_bias, [N_EXPERTS], [32 * (N_EXPERTS)]),
                 pl.reshape(pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [32 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
                 pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [32 * (n_local_experts), 0]),
@@ -7044,6 +7043,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 35,
                 0,
                 my_rank,
+                33,  # moe_epoch (C1)
             )
             h_layer_36 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7073,7 +7073,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(full_w_g, [HIDDEN, nh_full_pad], [9 * (HIDDEN), 0]),
                 pl.slice(full_gate_r, [nh_full_pad, hidden_q_full], [9 * (nh_full_pad), 0]),
                 post_rms,
-                34,  # moe_epoch (C1)
                 pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [33 * (HIDDEN), 0]),
                 pl.slice(moe_router_bias, [N_EXPERTS], [33 * (N_EXPERTS)]),
                 pl.reshape(pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [33 * (n_local_experts * HIDDEN), 0]), [n_local_experts, HIDDEN, inter]),
@@ -7107,6 +7106,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 36,
                 0,
                 my_rank,
+                34,  # moe_epoch (C1)
             )
             h_layer_37 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7135,7 +7135,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [27 * (hidden_q_swa), 0]),
                 pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [27 * (HIDDEN), 0]),
                 pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [27 * (nh_swa_pad), 0]),
-                35,  # moe_epoch (C1)
                 post_rms,
                 pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [34 * (HIDDEN), 0]),
                 pl.slice(moe_router_bias, [N_EXPERTS], [34 * (N_EXPERTS)]),
@@ -7170,6 +7169,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 37,
                 0,
                 my_rank,
+                35,  # moe_epoch (C1)
             )
             h_layer_38 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7197,7 +7197,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 v_cache,
                 pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [28 * (hidden_q_swa), 0]),
                 pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [28 * (HIDDEN), 0]),
-                36,  # moe_epoch (C1)
                 pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [28 * (nh_swa_pad), 0]),
                 post_rms,
                 pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [35 * (HIDDEN), 0]),
@@ -7233,6 +7232,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 38,
                 0,
                 my_rank,
+                36,  # moe_epoch (C1)
             )
             h_layer_39 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7259,7 +7259,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 k_cache,
                 v_cache,
                 pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [29 * (hidden_q_swa), 0]),
-                37,  # moe_epoch (C1)
                 pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [29 * (HIDDEN), 0]),
                 pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [29 * (nh_swa_pad), 0]),
                 post_rms,
@@ -7296,6 +7295,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 39,
                 0,
                 my_rank,
+                37,  # moe_epoch (C1)
             )
             h_layer_40 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7321,7 +7321,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 rope_sin_full,
                 k_cache,
                 v_cache,
-                38,  # moe_epoch (C1)
                 pl.slice(full_wo, [hidden_q_full, HIDDEN], [10 * (hidden_q_full), 0]),
                 pl.slice(full_w_g, [HIDDEN, nh_full_pad], [10 * (HIDDEN), 0]),
                 pl.slice(full_gate_r, [nh_full_pad, hidden_q_full], [10 * (nh_full_pad), 0]),
@@ -7359,6 +7358,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 40,
                 0,
                 my_rank,
+                38,  # moe_epoch (C1)
             )
             h_layer_41 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7383,7 +7383,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 rope_cos_swa,
                 rope_sin_swa,
                 k_cache,
-                39,  # moe_epoch (C1)
                 v_cache,
                 pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [30 * (hidden_q_swa), 0]),
                 pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [30 * (HIDDEN), 0]),
@@ -7422,6 +7421,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 41,
                 0,
                 my_rank,
+                39,  # moe_epoch (C1)
             )
             h_layer_42 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7445,7 +7445,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 slot_mapping,
                 rope_cos_swa,
                 rope_sin_swa,
-                40,  # moe_epoch (C1)
                 k_cache,
                 v_cache,
                 pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [31 * (hidden_q_swa), 0]),
@@ -7485,6 +7484,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 42,
                 0,
                 my_rank,
+                40,  # moe_epoch (C1)
             )
             h_layer_43 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7507,7 +7507,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 block_table,
                 slot_mapping,
                 rope_cos_swa,
-                41,  # moe_epoch (C1)
                 rope_sin_swa,
                 k_cache,
                 v_cache,
@@ -7548,6 +7547,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 43,
                 0,
                 my_rank,
+                41,  # moe_epoch (C1)
             )
             resid_hold_layer_44 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7563,7 +7563,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 seq_lens,
                 block_table,
                 slot_mapping,
-                42,  # moe_epoch (C1)
                 rope_cos_full,
                 rope_sin_full,
                 k_cache,
@@ -7605,6 +7604,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 44,
                 0,
                 my_rank,
+                42,  # moe_epoch (C1)
             )
             return next_hidden_out
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)

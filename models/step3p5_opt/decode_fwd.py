@@ -246,7 +246,7 @@ class WholeDecodeOpt:
         attn_layer_idx: pl.Scalar[pl.INT32],
         mlp_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ):
+    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1 = attention_full_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
@@ -300,7 +300,7 @@ class WholeDecodeOpt:
         attn_layer_idx: pl.Scalar[pl.INT32],
         mlp_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ):
+    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1 = attention_swa_inline(
             current_hidden, input_rms_weight, wq, wk, wv,

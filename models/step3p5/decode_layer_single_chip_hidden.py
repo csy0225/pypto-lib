@@ -656,15 +656,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
     COMM_SIGNAL_STRIDE_I32 = COMM_CONTROL_SIGNAL_BYTES // 4
     WHOLE_CHIP_DENSE_LAYERS = 3
     WHOLE_CHIP_MOE_LAYERS = 42
-    # C1: MoE comm windows reused across all 42 layers via a monotonic
-    # moe_epoch counter (notify value=1 AtomicAdd per layer; wait expected
-    # = moe_epoch, Ge). Replaces per-layer physical isolation (42x stacked
-    # windows, ~730MB) with a single-set reuse (~17MB). B2 degradation
-    # path: flip to False to restore per-layer stacked windows + expected=1
-    # (the previously shipped isolated-signal design).
-    MOE_WINDOW_REUSE = True
-    MOE_WINDOW_LAYERS = 1 if MOE_WINDOW_REUSE else WHOLE_CHIP_MOE_LAYERS
-    _MOE_REUSE_OFF_MUL = 0 if MOE_WINDOW_REUSE else 1  # const-fold: reuse=1 -> *0, reuse=0 -> *1
 
     @pl.program
     class WholeDecodeFaithfulRealSingleChipHiddenOnly:
@@ -1306,7 +1297,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pl.Tensor[[n_local_experts], pl.INT32]
             ],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> tuple[
             pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
             pl.Tensor[[n_local_experts], pl.INT32],
@@ -1318,15 +1308,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             # from its source's send_* via remote_load (TGET, local-observable). The
             # gather order (loc_e outer, s ascending, row inner) reproduces the push
             # dst_row exactly. Barrier BEFORE the read (ep_all_to_all pattern); no
-            # trailing barrier (dst owns recv_x).
-            #
-            # C1: single-set window reuse -> signal accumulates 1/layer across all
-            # 42 MoE layers. wait expected=moe_epoch (Ge) so layer N only resolves
-            # after N peers have packed for layer N. Anchor read (pl.read scalar,
-            # legal in InCore) establishes RAW dep on the signal slot before wait,
-            # preventing early resolve. (pl.at allow_early_resolve is not legal in
-            # InCore per coding-style sec.1; deferred to follow-up.)
-            _pack_anchor = pl.read(pack_done_sig, [my_rank, 0])
+            # trailing barrier (dst owns recv_x; send_* are per-layer distinct).
             for peer in pl.range(n_ranks):
                 if peer != my_rank:
                     pld.system.notify(
@@ -1336,16 +1318,10 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                     )
             for src in pl.range(n_ranks):
                 if src != my_rank:
-                    if MOE_WINDOW_REUSE:
-                        pld.system.wait(
-                            signal=pack_done_sig, offsets=[src, 0],
-                            expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                        )
-                    else:
-                        pld.system.wait(
-                            signal=pack_done_sig, offsets=[src, 0],
-                            expected=1, cmp=pld.WaitCmp.Ge,
-                        )
+                    pld.system.wait(
+                        signal=pack_done_sig, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             counts_all = pl.create_tensor(
                 [n_ranks * n_ranks, n_local_experts_pad], dtype=pl.INT32,
             )
@@ -1544,7 +1520,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             send_scale: pld.DistributedTensor[[local_recv_max, 8], pl.FP32],
             send_route: pld.DistributedTensor[[local_recv_max, idx_pad], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> tuple[
             pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
             pl.Tensor[[1, local_recv_max], pl.FP32],
@@ -1567,7 +1542,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             recv_counts, local_expert_offset, local_expert_count, inverse_map = self._dispatch_pull(
                 send_x, send_scale, send_route, expert_indices, pub_counts, count_done_sig,
                 recv_x, recv_scale, recv_r_route, recv_counts, inverse_map,
-                local_expert_offset, local_expert_count, my_rank, moe_epoch,
+                local_expert_offset, local_expert_count, my_rank,
             )
             local_routed_x_out, local_routed_x_scale_out, recv_r_route_out = self._dispatch_stage(
                 recv_x, recv_scale, recv_r_route,
@@ -2303,6 +2278,113 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                         )
                     pl.write(cursor, [bkt], pl.cast(idx + 1, pl.INT32))
 
+        @pl.function(type=pl.FunctionType.InCore)
+        def _push_routed_y_to_sources(  # noqa: PLR0913
+            self,
+            local_routed_y: pl.Tensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
+            pub_counts: pld.DistributedTensor[
+                [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+            ],
+            routed_y_buf: pld.DistributedTensor[
+                [n_routes_per_rank, HIDDEN], pl.BF16
+            ],
+            combine_done: pld.DistributedTensor[
+                [n_ranks, 1], pl.INT32
+            ],
+            recv_r_route_out: pl.Tensor[[local_recv_max], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            # zero-done barrier (wave 1): every rank must finish _zero_routed_y_buf
+            # (called immediately before this push in the combine caller) before any
+            # peer pld.tensor.put lands, else a fast peer's push into a not-yet-zeroed
+            # routed_y_buf is clobbered by the local zero -> racy moe_out. Mirrors
+            # moe.py combine_step's pub_route_barrier (dropped with src_route_table).
+            # Same combine_done window, two-wave: wave 1 =1 here, post-push barrier =2.
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+            e_cursor = pl.cast(0, pl.INT32)
+            for e in pl.range(n_local_experts):
+                src_off = pl.cast(0, pl.INT32)
+                for src in pl.range(n_ranks):
+                    n = pl.cast(
+                        pl.read(
+                            pub_counts, [src * n_ranks + my_rank, e],
+                        ),
+                        pl.INDEX,
+                    )
+                    for row in pl.range(n):
+                        local_row = (
+                            pl.cast(e_cursor, pl.INDEX)
+                            + pl.cast(src_off, pl.INDEX) + row
+                        )
+                        # r_route rode with the token at dispatch (recv_r_route);
+                        # local_row is the same expert-major CSR row order.
+                        r_route = pl.read(recv_r_route_out, [local_row])
+                        if src == my_rank:
+                            tile = pl.load(
+                                local_routed_y,
+                                [local_row, 0], [1, HIDDEN],
+                            )
+                            pl.store(tile, [r_route, 0], routed_y_buf)
+                        else:
+                            # moe.py-aligned combine push: pld.tensor.put
+                            # establishes a RAW dep into the gather so the
+                            # consumer waits for the push DMA to land. Fire-and-
+                            # forget remote_store let the gather read partially-
+                            # landed routed_y_buf -> racy moe_out (device: moe_out
+                            # row0 5.6/5.0/26 across identical runs). Mirrors the
+                            # dispatch recv_x push, which already uses tensor.put.
+                            pld.tensor.put(
+                                dst=routed_y_buf,
+                                peer=src,
+                                src=local_routed_y,
+                                dst_offsets=[r_route, 0],
+                                src_offsets=[local_row, 0],
+                                shape=[1, HIDDEN],
+                            )
+                    src_off = src_off + pl.cast(n, pl.INT32)
+                total_e = pl.cast(0, pl.INT32)
+                for src2 in pl.range(n_ranks):
+                    total_e = total_e + pl.read(
+                        pub_counts, [src2 * n_ranks + my_rank, e],
+                    )
+                e_cursor = e_cursor + total_e
+
+            pld.system.notify(
+                target=combine_done, peer=my_rank,
+                offsets=[my_rank, 0], value=0, op=pld.NotifyOp.AtomicAdd,
+            )
+            for peer in pl.range(n_ranks):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_done,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(n_ranks):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_done,
+                        offsets=[src, 0],
+                        expected=2,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
         @pl.function(type=pl.FunctionType.Inline)
         def _weighted_gather_and_add(
             self,
@@ -2385,16 +2467,11 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             ],
             combine_done: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ):
             # Combine task 2 (PULL): AtomicAdd/Ge rendezvous after all holders
             # stage routed_src_buf. Consume the source-local inverse_map produced
             # by dispatch, then load each routed row from its holder. Self rows use
             # local pl.load; peer rows use remote_load.
-            #
-            # C1: single-set window reuse -> signal accumulates 1/layer. wait
-            # expected=moe_epoch (Ge). Anchor read before wait for RAW dep.
-            _combine_anchor = pl.read(combine_done, [my_rank, 0])
             for peer in pl.range(n_ranks):
                 if peer != my_rank:
                     pld.system.notify(
@@ -2404,16 +2481,10 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                     )
             for src in pl.range(n_ranks):
                 if src != my_rank:
-                    if MOE_WINDOW_REUSE:
-                        pld.system.wait(
-                            signal=combine_done, offsets=[src, 0],
-                            expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                        )
-                    else:
-                        pld.system.wait(
-                            signal=combine_done, offsets=[src, 0],
-                            expected=1, cmp=pld.WaitCmp.Ge,
-                        )
+                    pld.system.wait(
+                        signal=combine_done, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
             # Use source-local inverse_map produced by dispatch.
             for t in pl.range(BATCH):
                 for k in pl.range(TOPK):
@@ -2459,7 +2530,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             inverse_map: pl.Tensor[[BATCH, TOPK], pl.INT32],
             routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             # Pull design: expert holders stage routed output locally; source
             # ranks use dispatch-produced inverse_map entries to pull rows back.
@@ -2467,7 +2537,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             self._stage_routed_src(local_routed_y, routed_src_buf)
             self._pull_routed_y(
                 routed_src_buf, expert_indices, inverse_map,
-                routed_y_buf, combine_done_sig, my_rank, moe_epoch,
+                routed_y_buf, combine_done_sig, my_rank,
             )
             moe_out = self._weighted_gather_and_add(
                 routed_y_buf, expert_weights, sh_y, moe_out,
@@ -2589,7 +2659,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
             norm_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             # ── A': input IS h_mid (attn+dense_mlp already done in attn_dense_orch). ───
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -2710,7 +2779,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,
                 send_x, send_scale, send_route,
                 my_rank,
-                moe_epoch,
             )
 
             # 4) Routed experts (local 36).
@@ -2735,7 +2803,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 routed_y_buf, combine_done_sig,
                 expert_indices, inverse_map, routed_src_buf,
                 my_rank,
-                moe_epoch,
             )
 
             # ── D: residual add: next_hidden_out = resid1 + moe_out. ───
@@ -2929,7 +2996,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             norm_layer_idx: pl.Scalar[pl.INT32],
             attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             resid1 = attention_full_inline(
@@ -3092,7 +3158,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,
                 send_x, send_scale, send_route,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 32:
@@ -3147,7 +3212,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 routed_y_buf, combine_done_sig,
                 expert_indices, inverse_map, routed_src_buf,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 4:
@@ -3236,7 +3300,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             norm_layer_idx: pl.Scalar[pl.INT32],
             attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             resid1 = attention_swa_inline(
@@ -3399,7 +3462,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,
                 send_x, send_scale, send_route,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 32:
@@ -3454,7 +3516,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 routed_y_buf, combine_done_sig,
                 expert_indices, inverse_map, routed_src_buf,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 4:
@@ -4206,7 +4267,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             norm_layer_idx: pl.Scalar[pl.INT32],
             attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             resid1 = attention_full_inline(
@@ -4369,7 +4429,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,
                 send_x, send_scale, send_route,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 32:
@@ -4424,7 +4483,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 routed_y_buf, combine_done_sig,
                 expert_indices, inverse_map, routed_src_buf,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 4:
@@ -4509,7 +4567,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             norm_layer_idx: pl.Scalar[pl.INT32],
             attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             resid1 = attention_swa_inline(
@@ -4672,7 +4729,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 pub_counts, count_done_sig, recv_x, recv_scale, recv_r_route, data_done_sig,
                 send_x, send_scale, send_route,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 32:
@@ -4727,7 +4783,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 routed_y_buf, combine_done_sig,
                 expert_indices, inverse_map, routed_src_buf,
                 my_rank,
-                moe_epoch,
             )
 
             if _DBG_STAGE == 4:
@@ -4812,52 +4867,52 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 [WHOLE_CHIP_DENSE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
             ],
             moe_attn_tmp_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * BATCH, HIDDEN], pl.BF16
+                [WHOLE_CHIP_MOE_LAYERS * BATCH, HIDDEN], pl.BF16
             ],
             moe_attn_signal_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
             ],
             moe_pub_counts_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * n_ranks * n_ranks, n_local_experts_pad], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * n_ranks * n_ranks, n_local_experts_pad], pl.INT32
             ],
             moe_count_done_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
             ],
             moe_recv_x_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * local_recv_max, HIDDEN], pl.INT8
+                [WHOLE_CHIP_MOE_LAYERS * local_recv_max, HIDDEN], pl.INT8
             ],
             moe_recv_scale_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * local_recv_max, 8], pl.FP32
+                [WHOLE_CHIP_MOE_LAYERS * local_recv_max, 8], pl.FP32
             ],
             moe_recv_route_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * local_recv_max, idx_pad], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * local_recv_max, idx_pad], pl.INT32
             ],
             moe_data_done_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
             ],
             moe_send_x_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * local_recv_max, HIDDEN], pl.INT8
+                [WHOLE_CHIP_MOE_LAYERS * local_recv_max, HIDDEN], pl.INT8
             ],
             moe_send_scale_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * local_recv_max, 8], pl.FP32
+                [WHOLE_CHIP_MOE_LAYERS * local_recv_max, 8], pl.FP32
             ],
             moe_send_route_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * local_recv_max, idx_pad], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * local_recv_max, idx_pad], pl.INT32
             ],
             moe_shared_tmp_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * BATCH, HIDDEN], pl.BF16
+                [WHOLE_CHIP_MOE_LAYERS * BATCH, HIDDEN], pl.BF16
             ],
             moe_shared_signal_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
             ],
             moe_routed_y_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * n_routes_per_rank, HIDDEN], pl.BF16
+                [WHOLE_CHIP_MOE_LAYERS * n_routes_per_rank, HIDDEN], pl.BF16
             ],
             moe_combine_done_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
+                [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
             ],
             moe_routed_src_stack: pld.DistributedTensor[
-                [MOE_WINDOW_LAYERS * local_recv_max, HIDDEN], pl.BF16
+                [WHOLE_CHIP_MOE_LAYERS * local_recv_max, HIDDEN], pl.BF16
             ],
             my_rank: pl.Scalar[pl.INT32],
         ):
@@ -5008,26 +5063,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_3,
                 dbg_layer_3,
                 resid_hold_layer_3,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [0 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [0 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [0 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [0 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [0 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [0 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [0 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [0 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [0 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [0 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [0 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [0 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [0 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [0 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [0 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [0 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [0 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [0 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [0 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [0 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [0 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [0 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [0 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [0 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [0 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [0 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [0 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [0 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [0 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [0 * local_recv_max, 0]),
                 3,
                 0,
                 my_rank,
-                1,  # moe_epoch (C1)
             )
             h_layer_4 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5071,26 +5125,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_4,
                 dbg_layer_4,
                 resid_hold_layer_4,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [1 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [1 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [1 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [1 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [1 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [1 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [1 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [1 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [1 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [1 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [1 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [1 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [1 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [1 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [1 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [1 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [1 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [1 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [1 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [1 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [1 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [1 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [1 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [1 * local_recv_max, 0]),
                 4,
                 0,
                 my_rank,
-                2,  # moe_epoch (C1)
             )
             h_layer_5 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5134,26 +5187,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_5,
                 dbg_layer_5,
                 resid_hold_layer_5,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [2 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [2 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [2 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [2 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [2 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [2 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [2 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [2 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [2 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [2 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [2 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [2 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [2 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [2 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [2 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [2 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [2 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [2 * local_recv_max, 0]),
                 5,
                 0,
                 my_rank,
-                3,  # moe_epoch (C1)
             )
             h_layer_6 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5197,26 +5249,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_6,
                 dbg_layer_6,
                 resid_hold_layer_6,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [3 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [3 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [3 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [3 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [3 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [3 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [3 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [3 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [3 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [3 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [3 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [3 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [3 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [3 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [3 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [3 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [3 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [3 * local_recv_max, 0]),
                 6,
                 0,
                 my_rank,
-                4,  # moe_epoch (C1)
             )
             h_layer_7 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5260,26 +5311,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_7,
                 dbg_layer_7,
                 resid_hold_layer_7,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [4 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [4 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [4 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [4 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [4 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [4 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [4 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [4 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [4 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [4 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [4 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [4 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [4 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [4 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [4 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [4 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [4 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [4 * local_recv_max, 0]),
                 7,
                 0,
                 my_rank,
-                5,  # moe_epoch (C1)
             )
             h_layer_8 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5323,26 +5373,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_8,
                 dbg_layer_8,
                 resid_hold_layer_8,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [5 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [5 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [5 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [5 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [5 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [5 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [5 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [5 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [5 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [5 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [5 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [5 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [5 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [5 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [5 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [5 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [5 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [5 * local_recv_max, 0]),
                 8,
                 0,
                 my_rank,
-                6,  # moe_epoch (C1)
             )
             h_layer_9 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5386,26 +5435,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_9,
                 dbg_layer_9,
                 resid_hold_layer_9,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [6 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [6 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [6 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [6 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [6 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [6 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [6 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [6 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [6 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [6 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [6 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [6 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [6 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [6 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [6 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [6 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [6 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [6 * local_recv_max, 0]),
                 9,
                 0,
                 my_rank,
-                7,  # moe_epoch (C1)
             )
             h_layer_10 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5449,26 +5497,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_10,
                 dbg_layer_10,
                 resid_hold_layer_10,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [7 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [7 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [7 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [7 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [7 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [7 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [7 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [7 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [7 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [7 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [7 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [7 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [7 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [7 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [7 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [7 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [7 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [7 * local_recv_max, 0]),
                 10,
                 0,
                 my_rank,
-                8,  # moe_epoch (C1)
             )
             h_layer_11 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5512,26 +5559,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_11,
                 dbg_layer_11,
                 resid_hold_layer_11,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [8 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [8 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [8 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [8 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [8 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [8 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [8 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [8 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [8 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [8 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [8 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [8 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [8 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [8 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [8 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [8 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [8 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [8 * local_recv_max, 0]),
                 11,
                 0,
                 my_rank,
-                9,  # moe_epoch (C1)
             )
             h_layer_12 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5575,26 +5621,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_12,
                 dbg_layer_12,
                 resid_hold_layer_12,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [9 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [9 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [9 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [9 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [9 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [9 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [9 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [9 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [9 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [9 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [9 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [9 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [9 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [9 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [9 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [9 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [9 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [9 * local_recv_max, 0]),
                 12,
                 0,
                 my_rank,
-                10,  # moe_epoch (C1)
             )
             h_layer_13 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5638,26 +5683,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_13,
                 dbg_layer_13,
                 resid_hold_layer_13,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [10 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [10 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [10 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [10 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [10 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [10 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [10 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [10 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [10 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [10 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [10 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [10 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [10 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [10 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [10 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [10 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [10 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [10 * local_recv_max, 0]),
                 13,
                 0,
                 my_rank,
-                11,  # moe_epoch (C1)
             )
             h_layer_14 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5701,26 +5745,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_14,
                 dbg_layer_14,
                 resid_hold_layer_14,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [11 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [11 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [11 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [11 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [11 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [11 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [11 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [11 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [11 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [11 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [11 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [11 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [11 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [11 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [11 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [11 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [11 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [11 * local_recv_max, 0]),
                 14,
                 0,
                 my_rank,
-                12,  # moe_epoch (C1)
             )
             h_layer_15 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5764,26 +5807,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_15,
                 dbg_layer_15,
                 resid_hold_layer_15,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [12 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [12 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [12 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [12 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [12 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [12 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [12 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [12 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [12 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [12 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [12 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [12 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [12 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [12 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [12 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [12 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [12 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [12 * local_recv_max, 0]),
                 15,
                 0,
                 my_rank,
-                13,  # moe_epoch (C1)
             )
             h_layer_16 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5827,26 +5869,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_16,
                 dbg_layer_16,
                 resid_hold_layer_16,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [13 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [13 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [13 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [13 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [13 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [13 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [13 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [13 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [13 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [13 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [13 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [13 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [13 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [13 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [13 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [13 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [13 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [13 * local_recv_max, 0]),
                 16,
                 0,
                 my_rank,
-                14,  # moe_epoch (C1)
             )
             h_layer_17 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5890,26 +5931,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_17,
                 dbg_layer_17,
                 resid_hold_layer_17,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [14 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [14 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [14 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [14 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [14 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [14 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [14 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [14 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [14 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [14 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [14 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [14 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [14 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [14 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [14 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [14 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [14 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [14 * local_recv_max, 0]),
                 17,
                 0,
                 my_rank,
-                15,  # moe_epoch (C1)
             )
             h_layer_18 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -5953,26 +5993,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_18,
                 dbg_layer_18,
                 resid_hold_layer_18,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [15 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [15 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [15 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [15 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [15 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [15 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [15 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [15 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [15 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [15 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [15 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [15 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [15 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [15 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [15 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [15 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [15 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [15 * local_recv_max, 0]),
                 18,
                 0,
                 my_rank,
-                16,  # moe_epoch (C1)
             )
             h_layer_19 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6016,26 +6055,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_19,
                 dbg_layer_19,
                 resid_hold_layer_19,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [16 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [16 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [16 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [16 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [16 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [16 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [16 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [16 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [16 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [16 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [16 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [16 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [16 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [16 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [16 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [16 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [16 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [16 * local_recv_max, 0]),
                 19,
                 0,
                 my_rank,
-                17,  # moe_epoch (C1)
             )
             h_layer_20 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6079,26 +6117,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_20,
                 dbg_layer_20,
                 resid_hold_layer_20,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [17 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [17 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [17 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [17 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [17 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [17 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [17 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [17 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [17 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [17 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [17 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [17 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [17 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [17 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [17 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [17 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [17 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [17 * local_recv_max, 0]),
                 20,
                 0,
                 my_rank,
-                18,  # moe_epoch (C1)
             )
             h_layer_21 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6142,26 +6179,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_21,
                 dbg_layer_21,
                 resid_hold_layer_21,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [18 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [18 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [18 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [18 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [18 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [18 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [18 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [18 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [18 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [18 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [18 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [18 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [18 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [18 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [18 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [18 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [18 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [18 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [18 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [18 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [18 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [18 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [18 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [18 * local_recv_max, 0]),
                 21,
                 0,
                 my_rank,
-                19,  # moe_epoch (C1)
             )
             h_layer_22 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6205,26 +6241,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_22,
                 dbg_layer_22,
                 resid_hold_layer_22,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [19 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [19 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [19 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [19 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [19 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [19 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [19 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [19 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [19 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [19 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [19 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [19 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [19 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [19 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [19 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [19 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [19 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [19 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [19 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [19 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [19 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [19 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [19 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [19 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [19 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [19 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [19 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [19 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [19 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [19 * local_recv_max, 0]),
                 22,
                 0,
                 my_rank,
-                20,  # moe_epoch (C1)
             )
             h_layer_23 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6268,26 +6303,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_23,
                 dbg_layer_23,
                 resid_hold_layer_23,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [20 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [20 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [20 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [20 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [20 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [20 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [20 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [20 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [20 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [20 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [20 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [20 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [20 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [20 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [20 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [20 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [20 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [20 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [20 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [20 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [20 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [20 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [20 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [20 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [20 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [20 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [20 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [20 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [20 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [20 * local_recv_max, 0]),
                 23,
                 0,
                 my_rank,
-                21,  # moe_epoch (C1)
             )
             h_layer_24 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6331,26 +6365,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_24,
                 dbg_layer_24,
                 resid_hold_layer_24,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [21 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [21 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [21 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [21 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [21 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [21 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [21 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [21 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [21 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [21 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [21 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [21 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [21 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [21 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [21 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [21 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [21 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [21 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [21 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [21 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [21 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [21 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [21 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [21 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [21 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [21 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [21 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [21 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [21 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [21 * local_recv_max, 0]),
                 24,
                 0,
                 my_rank,
-                22,  # moe_epoch (C1)
             )
             h_layer_25 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6394,26 +6427,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_25,
                 dbg_layer_25,
                 resid_hold_layer_25,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [22 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [22 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [22 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [22 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [22 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [22 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [22 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [22 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [22 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [22 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [22 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [22 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [22 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [22 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [22 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [22 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [22 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [22 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [22 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [22 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [22 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [22 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [22 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [22 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [22 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [22 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [22 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [22 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [22 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [22 * local_recv_max, 0]),
                 25,
                 0,
                 my_rank,
-                23,  # moe_epoch (C1)
             )
             h_layer_26 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6457,26 +6489,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_26,
                 dbg_layer_26,
                 resid_hold_layer_26,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [23 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [23 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [23 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [23 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [23 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [23 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [23 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [23 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [23 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [23 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [23 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [23 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [23 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [23 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [23 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [23 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [23 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [23 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [23 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [23 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [23 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [23 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [23 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [23 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [23 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [23 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [23 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [23 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [23 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [23 * local_recv_max, 0]),
                 26,
                 0,
                 my_rank,
-                24,  # moe_epoch (C1)
             )
             h_layer_27 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6520,26 +6551,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_27,
                 dbg_layer_27,
                 resid_hold_layer_27,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [24 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [24 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [24 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [24 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [24 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [24 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [24 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [24 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [24 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [24 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [24 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [24 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [24 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [24 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [24 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [24 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [24 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [24 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [24 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [24 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [24 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [24 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [24 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [24 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [24 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [24 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [24 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [24 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [24 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [24 * local_recv_max, 0]),
                 27,
                 0,
                 my_rank,
-                25,  # moe_epoch (C1)
             )
             h_layer_28 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6583,26 +6613,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_28,
                 dbg_layer_28,
                 resid_hold_layer_28,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [25 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [25 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [25 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [25 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [25 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [25 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [25 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [25 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [25 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [25 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [25 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [25 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [25 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [25 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [25 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [25 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [25 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [25 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [25 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [25 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [25 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [25 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [25 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [25 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [25 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [25 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [25 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [25 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [25 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [25 * local_recv_max, 0]),
                 28,
                 0,
                 my_rank,
-                26,  # moe_epoch (C1)
             )
             h_layer_29 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6646,26 +6675,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_29,
                 dbg_layer_29,
                 resid_hold_layer_29,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [26 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [26 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [26 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [26 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [26 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [26 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [26 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [26 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [26 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [26 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [26 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [26 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [26 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [26 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [26 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [26 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [26 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [26 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [26 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [26 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [26 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [26 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [26 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [26 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [26 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [26 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [26 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [26 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [26 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [26 * local_recv_max, 0]),
                 29,
                 0,
                 my_rank,
-                27,  # moe_epoch (C1)
             )
             h_layer_30 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6709,26 +6737,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_30,
                 dbg_layer_30,
                 resid_hold_layer_30,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [27 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [27 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [27 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [27 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [27 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [27 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [27 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [27 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [27 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [27 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [27 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [27 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [27 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [27 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [27 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [27 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [27 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [27 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [27 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [27 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [27 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [27 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [27 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [27 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [27 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [27 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [27 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [27 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [27 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [27 * local_recv_max, 0]),
                 30,
                 0,
                 my_rank,
-                28,  # moe_epoch (C1)
             )
             h_layer_31 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6772,26 +6799,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_31,
                 dbg_layer_31,
                 resid_hold_layer_31,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [28 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [28 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [28 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [28 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [28 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [28 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [28 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [28 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [28 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [28 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [28 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [28 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [28 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [28 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [28 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [28 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [28 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [28 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [28 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [28 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [28 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [28 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [28 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [28 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [28 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [28 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [28 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [28 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [28 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [28 * local_recv_max, 0]),
                 31,
                 0,
                 my_rank,
-                29,  # moe_epoch (C1)
             )
             h_layer_32 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6835,26 +6861,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_32,
                 dbg_layer_32,
                 resid_hold_layer_32,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [29 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [29 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [29 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [29 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [29 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [29 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [29 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [29 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [29 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [29 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [29 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [29 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [29 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [29 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [29 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [29 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [29 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [29 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [29 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [29 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [29 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [29 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [29 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [29 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [29 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [29 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [29 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [29 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [29 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [29 * local_recv_max, 0]),
                 32,
                 0,
                 my_rank,
-                30,  # moe_epoch (C1)
             )
             h_layer_33 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6898,26 +6923,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_33,
                 dbg_layer_33,
                 resid_hold_layer_33,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [30 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [30 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [30 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [30 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [30 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [30 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [30 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [30 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [30 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [30 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [30 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [30 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [30 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [30 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [30 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [30 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [30 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [30 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [30 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [30 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [30 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [30 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [30 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [30 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [30 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [30 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [30 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [30 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [30 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [30 * local_recv_max, 0]),
                 33,
                 0,
                 my_rank,
-                31,  # moe_epoch (C1)
             )
             h_layer_34 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -6961,26 +6985,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_34,
                 dbg_layer_34,
                 resid_hold_layer_34,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [31 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [31 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [31 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [31 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [31 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [31 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [31 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [31 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [31 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [31 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [31 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [31 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [31 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [31 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [31 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [31 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [31 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [31 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [31 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [31 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [31 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [31 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [31 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [31 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [31 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [31 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [31 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [31 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [31 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [31 * local_recv_max, 0]),
                 34,
                 0,
                 my_rank,
-                32,  # moe_epoch (C1)
             )
             h_layer_35 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7024,26 +7047,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_35,
                 dbg_layer_35,
                 resid_hold_layer_35,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [32 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [32 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [32 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [32 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [32 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [32 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [32 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [32 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [32 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [32 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [32 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [32 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [32 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [32 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [32 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [32 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [32 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [32 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [32 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [32 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [32 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [32 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [32 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [32 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [32 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [32 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [32 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [32 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [32 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [32 * local_recv_max, 0]),
                 35,
                 0,
                 my_rank,
-                33,  # moe_epoch (C1)
             )
             h_layer_36 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7087,26 +7109,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_36,
                 dbg_layer_36,
                 resid_hold_layer_36,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [33 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [33 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [33 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [33 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [33 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [33 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [33 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [33 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [33 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [33 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [33 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [33 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [33 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [33 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [33 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [33 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [33 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [33 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [33 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [33 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [33 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [33 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [33 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [33 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [33 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [33 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [33 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [33 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [33 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [33 * local_recv_max, 0]),
                 36,
                 0,
                 my_rank,
-                34,  # moe_epoch (C1)
             )
             h_layer_37 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7150,26 +7171,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_37,
                 dbg_layer_37,
                 resid_hold_layer_37,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [34 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [34 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [34 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [34 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [34 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [34 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [34 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [34 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [34 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [34 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [34 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [34 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [34 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [34 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [34 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [34 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [34 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [34 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [34 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [34 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [34 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [34 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [34 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [34 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [34 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [34 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [34 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [34 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [34 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [34 * local_recv_max, 0]),
                 37,
                 0,
                 my_rank,
-                35,  # moe_epoch (C1)
             )
             h_layer_38 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7213,26 +7233,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_38,
                 dbg_layer_38,
                 resid_hold_layer_38,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [35 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [35 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [35 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [35 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [35 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [35 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [35 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [35 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [35 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [35 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [35 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [35 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [35 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [35 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [35 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [35 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [35 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [35 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [35 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [35 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [35 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [35 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [35 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [35 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [35 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [35 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [35 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [35 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [35 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [35 * local_recv_max, 0]),
                 38,
                 0,
                 my_rank,
-                36,  # moe_epoch (C1)
             )
             h_layer_39 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7276,26 +7295,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_39,
                 dbg_layer_39,
                 resid_hold_layer_39,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [36 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [36 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [36 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [36 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [36 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [36 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [36 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [36 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [36 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [36 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [36 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [36 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [36 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [36 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [36 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [36 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [36 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [36 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [36 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [36 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [36 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [36 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [36 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [36 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [36 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [36 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [36 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [36 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [36 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [36 * local_recv_max, 0]),
                 39,
                 0,
                 my_rank,
-                37,  # moe_epoch (C1)
             )
             h_layer_40 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7339,26 +7357,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_40,
                 dbg_layer_40,
                 resid_hold_layer_40,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [37 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [37 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [37 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [37 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [37 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [37 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [37 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [37 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [37 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [37 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [37 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [37 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [37 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [37 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [37 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [37 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [37 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [37 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [37 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [37 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [37 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [37 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [37 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [37 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [37 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [37 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [37 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [37 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [37 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [37 * local_recv_max, 0]),
                 40,
                 0,
                 my_rank,
-                38,  # moe_epoch (C1)
             )
             h_layer_41 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7402,26 +7419,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_41,
                 dbg_layer_41,
                 resid_hold_layer_41,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [38 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [38 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [38 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [38 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [38 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [38 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [38 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [38 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [38 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [38 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [38 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [38 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [38 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [38 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [38 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [38 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [38 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [38 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [38 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [38 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [38 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [38 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [38 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [38 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [38 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [38 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [38 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [38 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [38 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [38 * local_recv_max, 0]),
                 41,
                 0,
                 my_rank,
-                39,  # moe_epoch (C1)
             )
             h_layer_42 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7465,26 +7481,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_42,
                 dbg_layer_42,
                 resid_hold_layer_42,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [39 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [39 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [39 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [39 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [39 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [39 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [39 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [39 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [39 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [39 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [39 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [39 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [39 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [39 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [39 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [39 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [39 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [39 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [39 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [39 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [39 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [39 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [39 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [39 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [39 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [39 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [39 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [39 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [39 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [39 * local_recv_max, 0]),
                 42,
                 0,
                 my_rank,
-                40,  # moe_epoch (C1)
             )
             h_layer_43 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7528,26 +7543,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 h_layer_43,
                 dbg_layer_43,
                 resid_hold_layer_43,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [40 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [40 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [40 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [40 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [40 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [40 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [40 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [40 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [40 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [40 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [40 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [40 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [40 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [40 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [40 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [40 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [40 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [40 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [40 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [40 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [40 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [40 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [40 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [40 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [40 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [40 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [40 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [40 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [40 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [40 * local_recv_max, 0]),
                 43,
                 0,
                 my_rank,
-                41,  # moe_epoch (C1)
             )
             resid_hold_layer_44 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
@@ -7585,26 +7599,25 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 next_hidden_out,
                 dbg_out,
                 resid_hold_layer_44,
-                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [41 * BATCH * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_attn_signal_stack, [tp_size, 1], [41 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [41 * n_ranks * n_ranks * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_count_done_stack, [n_ranks, 1], [41 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [41 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [41 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_data_done_stack, [n_ranks, 1], [41 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [41 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [41 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [41 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [41 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [41 * BATCH, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [41 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [41 * n_ranks * n_ranks, 0]),
+                pl.slice(moe_count_done_stack, [n_ranks, 1], [41 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [41 * local_recv_max, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [41 * local_recv_max, 0]),
+                pl.slice(moe_data_done_stack, [n_ranks, 1], [41 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_recv_route_stack, [local_recv_max, idx_pad], [41 * local_recv_max, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [41 * local_recv_max, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [41 * local_recv_max, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [41 * local_recv_max, 0]),
                 pl.slice(moe_shared_tmp_stack, [BATCH, HIDDEN], [41 * BATCH, 0]),
                 pl.slice(moe_shared_signal_stack, [n_ranks, 1], [41 * COMM_SIGNAL_STRIDE_I32, 0]),
-                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [41 * n_routes_per_rank * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_combine_done_stack, [n_ranks, 1], [41 * COMM_SIGNAL_STRIDE_I32 * _MOE_REUSE_OFF_MUL, 0]),
-                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [41 * local_recv_max * _MOE_REUSE_OFF_MUL, 0]),
+                pl.slice(moe_routed_y_stack, [n_routes_per_rank, HIDDEN], [41 * n_routes_per_rank, 0]),
+                pl.slice(moe_combine_done_stack, [n_ranks, 1], [41 * COMM_SIGNAL_STRIDE_I32, 0]),
+                pl.slice(moe_routed_src_stack, [local_recv_max, HIDDEN], [41 * local_recv_max, 0]),
                 44,
                 0,
                 my_rank,
-                42,  # moe_epoch (C1)
             )
             return next_hidden_out
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
@@ -7662,22 +7675,22 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             dense_attn_signal_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
             dense_mlp_tmp_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_DENSE_LAYERS * BATCH * HIDDEN * 2)
             dense_mlp_signal_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
-            moe_attn_tmp_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * BATCH * HIDDEN * 2)
-            moe_attn_signal_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
-            moe_pub_counts_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * n_ranks * n_ranks * n_local_experts_pad * 4)
-            moe_count_done_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
-            moe_recv_x_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * local_recv_max * HIDDEN)
-            moe_recv_scale_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * local_recv_max * 8 * 4)
-            moe_recv_route_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * local_recv_max * idx_pad * 4)
-            moe_data_done_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
-            moe_send_x_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * local_recv_max * HIDDEN)
-            moe_send_scale_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * local_recv_max * 8 * 4)
-            moe_send_route_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * local_recv_max * idx_pad * 4)
+            moe_attn_tmp_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * BATCH * HIDDEN * 2)
+            moe_attn_signal_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
+            moe_pub_counts_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * n_ranks * n_ranks * n_local_experts_pad * 4)
+            moe_count_done_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
+            moe_recv_x_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * local_recv_max * HIDDEN)
+            moe_recv_scale_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * local_recv_max * 8 * 4)
+            moe_recv_route_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * local_recv_max * idx_pad * 4)
+            moe_data_done_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
+            moe_send_x_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * local_recv_max * HIDDEN)
+            moe_send_scale_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * local_recv_max * 8 * 4)
+            moe_send_route_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * local_recv_max * idx_pad * 4)
             moe_shared_tmp_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * BATCH * HIDDEN * 2)
             moe_shared_signal_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
-            moe_routed_y_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * n_routes_per_rank * HIDDEN * 2)
-            moe_combine_done_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
-            moe_routed_src_stack_buf = pld.alloc_window_buffer(MOE_WINDOW_LAYERS * local_recv_max * HIDDEN * 2)
+            moe_routed_y_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * n_routes_per_rank * HIDDEN * 2)
+            moe_combine_done_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
+            moe_routed_src_stack_buf = pld.alloc_window_buffer(WHOLE_CHIP_MOE_LAYERS * local_recv_max * HIDDEN * 2)
             for r in pl.range(pld.world_size()):
                 self.whole_chip_orch(
                     current_hidden[r],
@@ -7731,37 +7744,37 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                                dtype=pl.BF16),
                     pld.window(dense_mlp_signal_stack_buf, [WHOLE_CHIP_DENSE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
                                dtype=pl.INT32),
-                    pld.window(moe_attn_tmp_stack_buf, [MOE_WINDOW_LAYERS * BATCH, HIDDEN],
+                    pld.window(moe_attn_tmp_stack_buf, [WHOLE_CHIP_MOE_LAYERS * BATCH, HIDDEN],
                                dtype=pl.BF16),
-                    pld.window(moe_attn_signal_stack_buf, [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
+                    pld.window(moe_attn_signal_stack_buf, [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
                                dtype=pl.INT32),
-                    pld.window(moe_pub_counts_stack_buf, [MOE_WINDOW_LAYERS * n_ranks * n_ranks, n_local_experts_pad],
+                    pld.window(moe_pub_counts_stack_buf, [WHOLE_CHIP_MOE_LAYERS * n_ranks * n_ranks, n_local_experts_pad],
                                dtype=pl.INT32),
-                    pld.window(moe_count_done_stack_buf, [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
+                    pld.window(moe_count_done_stack_buf, [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
                                dtype=pl.INT32),
-                    pld.window(moe_recv_x_stack_buf, [MOE_WINDOW_LAYERS * local_recv_max, HIDDEN],
+                    pld.window(moe_recv_x_stack_buf, [WHOLE_CHIP_MOE_LAYERS * local_recv_max, HIDDEN],
                                dtype=pl.INT8),
-                    pld.window(moe_recv_scale_stack_buf, [MOE_WINDOW_LAYERS * local_recv_max, 8],
+                    pld.window(moe_recv_scale_stack_buf, [WHOLE_CHIP_MOE_LAYERS * local_recv_max, 8],
                                dtype=pl.FP32),
-                    pld.window(moe_recv_route_stack_buf, [MOE_WINDOW_LAYERS * local_recv_max, idx_pad],
+                    pld.window(moe_recv_route_stack_buf, [WHOLE_CHIP_MOE_LAYERS * local_recv_max, idx_pad],
                                dtype=pl.INT32),
-                    pld.window(moe_data_done_stack_buf, [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
+                    pld.window(moe_data_done_stack_buf, [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
                                dtype=pl.INT32),
-                    pld.window(moe_send_x_stack_buf, [MOE_WINDOW_LAYERS * local_recv_max, HIDDEN],
+                    pld.window(moe_send_x_stack_buf, [WHOLE_CHIP_MOE_LAYERS * local_recv_max, HIDDEN],
                                dtype=pl.INT8),
-                    pld.window(moe_send_scale_stack_buf, [MOE_WINDOW_LAYERS * local_recv_max, 8],
+                    pld.window(moe_send_scale_stack_buf, [WHOLE_CHIP_MOE_LAYERS * local_recv_max, 8],
                                dtype=pl.FP32),
-                    pld.window(moe_send_route_stack_buf, [MOE_WINDOW_LAYERS * local_recv_max, idx_pad],
+                    pld.window(moe_send_route_stack_buf, [WHOLE_CHIP_MOE_LAYERS * local_recv_max, idx_pad],
                                dtype=pl.INT32),
                     pld.window(moe_shared_tmp_stack_buf, [WHOLE_CHIP_MOE_LAYERS * BATCH, HIDDEN],
                                dtype=pl.BF16),
                     pld.window(moe_shared_signal_stack_buf, [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
                                dtype=pl.INT32),
-                    pld.window(moe_routed_y_stack_buf, [MOE_WINDOW_LAYERS * n_routes_per_rank, HIDDEN],
+                    pld.window(moe_routed_y_stack_buf, [WHOLE_CHIP_MOE_LAYERS * n_routes_per_rank, HIDDEN],
                                dtype=pl.BF16),
-                    pld.window(moe_combine_done_stack_buf, [MOE_WINDOW_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
+                    pld.window(moe_combine_done_stack_buf, [WHOLE_CHIP_MOE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
                                dtype=pl.INT32),
-                    pld.window(moe_routed_src_stack_buf, [MOE_WINDOW_LAYERS * local_recv_max, HIDDEN],
+                    pld.window(moe_routed_src_stack_buf, [WHOLE_CHIP_MOE_LAYERS * local_recv_max, HIDDEN],
                                dtype=pl.BF16),
                     r,
                     device=r,

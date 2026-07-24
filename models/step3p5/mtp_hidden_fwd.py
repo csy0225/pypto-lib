@@ -52,7 +52,7 @@ from .attention_swa import (
     LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_SWA,
     attention_swa,
 )
-from .decode_fwd import _dense_mlp_body_tp
+from .decode_layer_single_chip_hidden import _dense_mlp_body_tp
 
 
 NUM_MTP = NUM_NEXTN_PREDICT_LAYERS

@@ -336,7 +336,7 @@ def preflight(config: WholeNetworkConfig) -> dict[str, Any]:
     if not config.repo_root.is_dir():
         raise RunnerError(f"repository root does not exist: {config.repo_root}")
     required_sources = (
-        "models/step3p5/decode_fwd.py",
+        "models/step3p5/decode_layer_single_chip_hidden.py",
         "models/step3p5/mtp_hidden_fwd.py",
         "tests/step3p5/harnesses/_stage_main_hidden_only.py",
         "tests/step3p5/harnesses/_stage_mtp_hidden_selected.py",

@@ -9,7 +9,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[3]
 _HIDDEN_PROGRAM = (
-    _ROOT / "models" / "step3p5" / "decode_fwd.py"
+    _ROOT / "models" / "step3p5" / "decode_layer_single_chip_hidden.py"
 )
 _HOLDER = _ROOT / "tools" / "step3p5" / "whole_decode_holder.py"
 _SIDECAR = _ROOT / "tools" / "step3p5" / "whole_decode_sidecar.py"

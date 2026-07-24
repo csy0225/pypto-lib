@@ -1,11 +1,11 @@
 """Step3p5 decode whole-net, DeepSeek-aligned loop form (阶段 1 dense-only).
 
 Architectural pivot (task #27): the baseline
-``models/step3p5/decode_fwd.py`` unrolls all 45 layers inline as a single
-``@pl.program`` body, with per-layer ``*_chip_orch`` helpers marked
-``inline_orchestration=True``. That 45x unroll is the brittleness root:
-return-0-Var-like walls, view-escape-scope walls, 45x SSA + a single 766 MB
-comm domain with no inter-layer drain.
+``models/step3p5/decode_layer_single_chip_hidden.py`` unrolls all 45 layers
+inline as a single ``@pl.program`` body, with per-layer ``*_chip_orch``
+helpers marked ``inline_orchestration=True``. That 45x unroll is the
+brittleness root: return-0-Var-like walls, view-escape-scope walls, 45x SSA
++ a single 766 MB comm domain with no inter-layer drain.
 
 This module rebuilds the whole-net in the DeepSeek ``decode_fwd`` form:
 
@@ -35,7 +35,7 @@ import pypto.language.distributed as pld
 
 from models.step3p5.attention_full import attention_full
 from models.step3p5.attention_swa import attention_swa
-from models.step3p5.decode_fwd import _dense_mlp_body_tp
+from models.step3p5.decode_layer_single_chip_hidden import _dense_mlp_body_tp
 from models.step3p5.config import (
     BATCH,
     BLOCK_TABLE_FLAT_DYN,

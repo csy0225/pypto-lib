@@ -133,6 +133,82 @@ dense_mlp_inline = pl.inline(_dense_mlp_body_tp._func)
 
 @pl.program
 class WholeDecodeOpt:
+    # ── TP all-reduce collective ────────────────────────────────────────
+    # attention_full / attention_swa / _dense_mlp_body_tp 的 inlined body 里
+    # 都调 ``self.tp_all_reduce(...)`` 汇集 o_proj / down_proj 的 partial sum。
+    # pl.inline 把这些 body 拷进本 program 后，``self.tp_all_reduce`` 解析到本
+    # program 的 method，所以必须在这里定义。定义按 baseline
+    # decode_layer_single_chip_hidden.py 的 InCore 形态原样搬入（two-wave
+    # completion barrier，expected=1/2 Ge），不改语义。
+    @pl.function(type=pl.FunctionType.InCore)
+    def tp_all_reduce(
+        self,
+        local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+        signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+        my_rank: pl.Scalar[pl.INT32],
+    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+        group_size = tp_size
+
+        # Phase 1: stage-in — copy local into my tmp_window slot (full HIDDEN).
+        # All-reduce HIDDEN tiling width: fixed, INDEPENDENT of tp_size.
+        ar_chunk = HIDDEN // 8
+        for k0 in pl.range(0, HIDDEN, ar_chunk):
+            stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
+            pl.store(stage_tile, [0, k0], tmp_window)
+
+        # Phase 2: barrier — notify all peers (one round), then wait on all
+        # peers (one round). expected=1 fixed (cells start zero, accumulate to
+        # N-1 after all notifies land; we only require >=1 from each peer slot).
+        for peer in pl.range(group_size):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=signal_window, peer=peer,
+                    offsets=[my_rank, 0], value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(group_size):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=signal_window, offsets=[src, 0],
+                    expected=1, cmp=pld.WaitCmp.Ge,
+                )
+
+        # Phase 3: load own tmp slot, then for each peer remote_load + tadd
+        # (FP32 — PTOAS bf16 tadd unsupported, cast through f32). Result lands
+        # back in `local` (in-place reduction target).
+        for k0 in pl.range(0, HIDDEN, ar_chunk):
+            own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
+            acc = pl.cast(own_tile, target_type=pl.FP32)
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    recv = pld.tile.remote_load(
+                        tmp_window, peer=peer,
+                        offsets=[0, k0], shape=[BATCH, ar_chunk],
+                    )
+                    acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
+            pl.store(
+                pl.cast(acc, target_type=pl.BF16),
+                [0, k0], local,
+            )
+        # Phase 4: completion barrier (framework two-wave protocol). Ensures
+        # every rank finished Phase 3 reads before returning, so the next
+        # layer's collective cannot race this one's reads. threshold 1 -> 2.
+        for peer in pl.range(group_size):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=signal_window, peer=peer,
+                    offsets=[my_rank, 0], value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(group_size):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=signal_window, offsets=[src, 0],
+                    expected=2, cmp=pld.WaitCmp.Ge,
+                )
+        return local
+
     @pl.function(
         type=pl.FunctionType.Orchestration,
         auto_scope=False,

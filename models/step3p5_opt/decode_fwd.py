@@ -179,6 +179,7 @@ idx_pad = 8
 inter = MOE_INTERMEDIATE
 sh_inter_local = INTER_S_LOCAL
 local_recv_max = LOCAL_RECV_MAX  # 1024
+stage_rows = 8  # baseline builder-local closure constant (L644), hoisted
 n_routes_per_rank = BATCH * TOPK
 per_rank_buckets = PER_RANK_BUCKETS
 sh_tp_chunk = HIDDEN // tp_size

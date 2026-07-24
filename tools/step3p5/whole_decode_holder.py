@@ -36,6 +36,14 @@ _F32 = torch.float32
 _I32 = torch.int32
 MAIN_PROGRAM = "whole_decode_faithful_real_single_chip_hidden_only"
 
+# opt-mode slot maps (Diff B): canonical KEY_WQ_FULL[12] / KEY_WQ_SWA[33] split
+# into opt's 4 attn buckets. full_wq/swa_wq copy canonical 原样（dead slot 无害，
+# L44@full_wq[11] / L43@swa_wq[32] 的 slot 索引依赖 [12]/[33] 尺寸）；moe_full_wq
+# 取 canonical FULL slot 1-10（L4,8,…,40）；moe_swa_wq 取 canonical SWA slot 2-31
+# （30 个 MoE-swa 层，跳过 dense L1(slot0)/L2(slot1)/L43(slot32)）。
+_MOE_FULL_SLOTS = tuple(range(1, 11))            # 10 full-MoE attn layers
+_MOE_SWA_SLOTS = tuple(range(2, 32))             # 30 swa-MoE attn layers
+
 
 def _zsh(*shape, dtype=_BF16):
     """DistributedWorker 契约：host tensor 必须 share_memory 且 prepare() 前分配。"""
@@ -67,6 +75,8 @@ class WholeDecodeHolder:
         *,
         platform="a2a3",
         kv_ipc=True,
+        program=None,
+        layer_module=None,
     ):
         self.device_ids = list(device_ids)
         self.tp = len(self.device_ids)
@@ -76,6 +86,18 @@ class WholeDecodeHolder:
         self.layer_name = MAIN_PROGRAM
         self.platform = platform
         self.kv_ipc = kv_ipc
+        # opt-mode: 指向 step3p5_opt 的 whole_decode_opt（循环式 4-bucket split）。
+        # default None = canonical baseline（hidden-only faithful_real_single_chip）。
+        # layer_module 形如 "models.step3p5_opt.decode_fwd"；program 形如
+        # "whole_decode_opt"。两者必须同时给或同时不给。
+        self.opt_mode = program is not None or layer_module is not None
+        if self.opt_mode:
+            if program is None or layer_module is None:
+                raise ValueError(
+                    "opt 模式必须同时给 program= 和 layer_module="
+                )
+        self._opt_program_name = program
+        self._opt_layer_module = layer_module
 
         # populated by build()
         self.compiled = None
@@ -141,6 +163,10 @@ class WholeDecodeHolder:
 
     # ---- build (compile; no device prepare yet) ----------------------------
 
+    def _opt_const(self, name: str) -> int:
+        """读 step3p5_opt.decode_fwd 的模块级常量（opt 模式专用）。"""
+        return int(getattr(self._dl, name))
+
     def build(self):
         """编译 program + 解析常量/VOCAB。无 device prepare（那在 __enter__）。"""
         from pypto.backend import BackendType, set_backend_type  # noqa: PLC0415
@@ -148,13 +174,18 @@ class WholeDecodeHolder:
         if self.kv_ipc:
             self._infer_rows_from_map()
         import models.step3p5.config as cfg  # noqa: PLC0415
-        # 0162 release 只允许这一份 single-submit hidden-only program。
-        import models.step3p5.decode_layer_single_chip_hidden as dl  # noqa: PLC0415
         from models.step3p5 import weight_loader as K  # noqa: PLC0415
         self._cfg = cfg
-        self._dl = dl
         self._K = K
         assert self.tp == cfg.TP_WORLD_SIZE, f"need {cfg.TP_WORLD_SIZE} cards; got {self.tp}"
+        if self.opt_mode:
+            import importlib  # noqa: PLC0415
+            dl = importlib.import_module(self._opt_layer_module)
+            self.layer_name = self._opt_program_name
+        else:
+            # 0162 release 只允许这一份 single-submit hidden-only program。
+            import models.step3p5.decode_layer_single_chip_hidden as dl  # noqa: PLC0415
+        self._dl = dl
 
         from pypto import ir  # noqa: PLC0415
         from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
@@ -162,7 +193,7 @@ class WholeDecodeHolder:
             "PYPTO_PROG_BUILD_DIR",
             "/data/chensiyu/hw_project/pypto/workspace/build_output",
         )
-        program = dl.whole_decode_faithful_real_single_chip_hidden_only
+        program = getattr(dl, self.layer_name)
         _mplan = None
         if os.environ.get("PYPTO_MEM_PLANNER", "").lower() == "ptoas":
             from pypto.pypto_core import passes as _passes  # noqa: PLC0415
@@ -217,6 +248,17 @@ class WholeDecodeHolder:
         self.current_hidden = _zsh(tp, BATCH, HIDDEN)
         self.gate_r_full = _zsh(tp, N_FULL, NHF_PAD, HQ_FULL)
         self.gate_r_swa = _zsh(tp, N_SWA, NHS_PAD, HQ_SWA)
+        if self.opt_mode:
+            # opt-mode 循环式 4-bucket split：full/swa 各对应 dense+post-loop 全量，
+            # moe_full/moe_swa 是 MoE loop 专用桶，需要各自的 block-diag R 常量。
+            n_moe_full = self._opt_const("NUM_FULL_MOE_LAYERS")
+            n_moe_swa = self._opt_const("NUM_SWA_MOE_LAYERS")
+            self.gate_r_moe_full = _zsh(tp, n_moe_full, NHF_PAD, HQ_FULL)
+            self.gate_r_moe_swa = _zsh(tp, n_moe_swa, NHS_PAD, HQ_SWA)
+            for _h in range(HQ_FULL // HEAD_DIM):
+                self.gate_r_moe_full[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
+            for _h in range(HQ_SWA // HEAD_DIM):
+                self.gate_r_moe_swa[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
         # block-diag R constant (layer-independent): R[h, h*HEAD_DIM+d]=1 for real
         # local heads (count = HQ//HEAD_DIM), padded rows stay zero.
         for _h in range(HQ_FULL // HEAD_DIM):
@@ -243,9 +285,6 @@ class WholeDecodeHolder:
         self._prepare_cm = self.compiled.prepare()
         self.rt = self._prepare_cm.__enter__()
         self._wmaps = import_weights_all(self.rt, self.out_dir, tp=tp, dev_offset=self.dev_offset)
-
-        def W(key):
-            return build_stacked_weight(self._wmaps, key)
 
         if self.kv_ipc:
             from tools.step3p5.pypto_kv_ipc import (  # noqa: PLC0415
@@ -283,31 +322,102 @@ class WholeDecodeHolder:
         self._initialize_rope_tables()
 
         # arg order MUST match the compiled program signature (see harness _do_worker)
+        def W(key):
+            return build_stacked_weight(self._wmaps, key)
+
+        def Wsub(key, slots):
+            """opt-mode 4-bucket split：从 canonical 整桶 [N,...] 里按 leading-dim
+            slots 取零拷贝连续子视图（每 rank 独立切片，再叠成 StackedDeviceTensor）。
+
+            canonical KEY_WQ_FULL=[12] 全 12 个 FULL 层紧凑叠放；opt moe_full_wq[10]
+            取 slot 1-10（L4,8,…,40；slot0=L0 dense、slot11=L44 post-loop 留在
+            full_wq 桶里）。KEY_WQ_SWA=[33] 同理，moe_swa_wq[30] 取 slot 2-31。
+            DeviceTensor.__getitem__ 只允许 outermost partial slice（连续），满足。
+            """
+            from pypto.runtime.device_tensor import StackedDeviceTensor  # noqa: PLC0415
+            start, stop = slots[0], slots[-1] + 1
+            shards = [self._wmaps[r].device_tensor(key)[start:stop] for r in range(tp)]
+            full = (tp, *tuple(shards[0].shape))
+            return StackedDeviceTensor(shards, full, list(range(tp)))
+
+        if self.opt_mode:
+            args = self._build_opt_args(W, Wsub)
+        else:
+            args = [self.current_hidden]
+            args += [W(K.KEY_INPUT_RMS), W(K.KEY_POST_ATTN_RMS), W(K.KEY_Q_NORM), W(K.KEY_K_NORM)]
+            args += [W(K.KEY_WQ_FULL), W(K.KEY_WK_FULL), W(K.KEY_WV_FULL), W(K.KEY_WO_FULL), W(K.KEY_WG_FULL),
+                     self.gate_r_full]
+            args += [W(K.KEY_WQ_SWA), W(K.KEY_WK_SWA), W(K.KEY_WV_SWA), W(K.KEY_WO_SWA), W(K.KEY_WG_SWA),
+                     self.gate_r_swa]
+            args += [W(K.KEY_DENSE_GATE), W(K.KEY_DENSE_UP), W(K.KEY_DENSE_DOWN)]
+            args += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS),
+                     W(K.KEY_MOE_W_GATE_R), W(K.KEY_MOE_W_GATE_R_SCALE),
+                     W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_UP_R_SCALE),
+                     W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_DOWN_R_SCALE),
+                     W(K.KEY_MOE_W_GATE_S),
+                     W(K.KEY_MOE_W_UP_S), W(K.KEY_MOE_W_DOWN_S)]
+            args += [self.seq_lens, self.block_table, self.slot_mapping,
+                     self.rope_cf, self.rope_sf, self.rope_cs, self.rope_ss,
+                     self.k_cache, self.v_cache]
+            args += [self._h_mid_out, self._next_hidden_out]
+            args += [self._dbg_out]
+        self._args_list = args
+        print(
+            f"[holder] resident: built {len(args)} args; "
+            f"program={self.layer_name}",
+            flush=True,
+        )
+        return self
+
+    def _build_opt_args(self, W, Wsub):
+        """opt-mode 53-arg host_orch arg-list（严格按 decode_fwd.py L4561-4616 签名）。
+
+        Diff A: 只 1 个 Out（next_hidden_out），跳过 canonical 的 h_mid_out + dbg_out。
+        Diff B: attn 4-bucket split（full/swa/moe_full/moe_swa），moe 桶从 canonical
+        KEY_WQ_FULL/SWA 按 _MOE_FULL_SLOTS/_MOE_SWA_SLOTS 取连续子视图。
+        常量名读 dl_opt.*（N_FULL_ATTN_LAYERS 等）。
+        """
+        K = self._K
         args = [self.current_hidden]
+        # 5 activations / RMS (L4564-4567)
         args += [W(K.KEY_INPUT_RMS), W(K.KEY_POST_ATTN_RMS), W(K.KEY_Q_NORM), W(K.KEY_K_NORM)]
+        # 6 dense-full-attn (L4568-4573): full_wq/wk/wv/wo/w_g + full_gate_r
         args += [W(K.KEY_WQ_FULL), W(K.KEY_WK_FULL), W(K.KEY_WV_FULL), W(K.KEY_WO_FULL), W(K.KEY_WG_FULL),
                  self.gate_r_full]
+        # 6 dense-swa-attn (L4574-4579): swa_wq/wk/wv/wo/w_g + swa_gate_r
         args += [W(K.KEY_WQ_SWA), W(K.KEY_WK_SWA), W(K.KEY_WV_SWA), W(K.KEY_WO_SWA), W(K.KEY_WG_SWA),
                  self.gate_r_swa]
+        # 3 dense-MLP (L4580-4582)
         args += [W(K.KEY_DENSE_GATE), W(K.KEY_DENSE_UP), W(K.KEY_DENSE_DOWN)]
+        # 6 MoE-full-attn (L4584-4589): moe_full_wq/wk/wv/wo/w_g + moe_full_gate_r
+        args += [Wsub(K.KEY_WQ_FULL, _MOE_FULL_SLOTS),
+                 Wsub(K.KEY_WK_FULL, _MOE_FULL_SLOTS),
+                 Wsub(K.KEY_WV_FULL, _MOE_FULL_SLOTS),
+                 Wsub(K.KEY_WO_FULL, _MOE_FULL_SLOTS),
+                 Wsub(K.KEY_WG_FULL, _MOE_FULL_SLOTS),
+                 self.gate_r_moe_full]
+        # 6 MoE-swa-attn (L4590-4595): moe_swa_wq/wk/wv/wo/w_g + moe_swa_gate_r
+        args += [Wsub(K.KEY_WQ_SWA, _MOE_SWA_SLOTS),
+                 Wsub(K.KEY_WK_SWA, _MOE_SWA_SLOTS),
+                 Wsub(K.KEY_WV_SWA, _MOE_SWA_SLOTS),
+                 Wsub(K.KEY_WO_SWA, _MOE_SWA_SLOTS),
+                 Wsub(K.KEY_WG_SWA, _MOE_SWA_SLOTS),
+                 self.gate_r_moe_swa]
+        # 11 MoE expert/router (L4596-4606)
         args += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS),
                  W(K.KEY_MOE_W_GATE_R), W(K.KEY_MOE_W_GATE_R_SCALE),
                  W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_UP_R_SCALE),
                  W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_DOWN_R_SCALE),
                  W(K.KEY_MOE_W_GATE_S),
                  W(K.KEY_MOE_W_UP_S), W(K.KEY_MOE_W_DOWN_S)]
+        # 7 KV/rope meta (L4607-4613)
         args += [self.seq_lens, self.block_table, self.slot_mapping,
-                 self.rope_cf, self.rope_sf, self.rope_cs, self.rope_ss,
-                 self.k_cache, self.v_cache]
-        args += [self._h_mid_out, self._next_hidden_out]
-        args += [self._dbg_out]
-        self._args_list = args
-        print(
-            f"[holder] resident: built {len(args)} args; "
-            f"program={MAIN_PROGRAM}",
-            flush=True,
-        )
-        return self
+                 self.rope_cf, self.rope_sf, self.rope_cs, self.rope_ss]
+        # 2 InOut cache (L4614-4615)
+        args += [self.k_cache, self.v_cache]
+        # 1 Out (L4616): only next_hidden_out (Diff A: skip h_mid_out + dbg_out)
+        args += [self._next_hidden_out]
+        return args
 
     def __exit__(self, exc_type, exc, tb):
         if self._prepare_cm is not None:

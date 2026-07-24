@@ -149,7 +149,7 @@ class WholeDecodeHolder:
             self._infer_rows_from_map()
         import models.step3p5.config as cfg  # noqa: PLC0415
         # 0162 release 只允许这一份 single-submit hidden-only program。
-        import models.step3p5.decode_layer_single_chip_hidden as dl  # noqa: PLC0415
+        import models.step3p5.decode_fwd as dl  # noqa: PLC0415
         from models.step3p5 import weight_loader as K  # noqa: PLC0415
         self._cfg = cfg
         self._dl = dl

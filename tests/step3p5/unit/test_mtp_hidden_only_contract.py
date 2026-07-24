@@ -65,7 +65,7 @@ def test_production_program_has_no_legacy_main_or_mtp_imports():
     }
     assert "decode_layer" not in imports
     assert "mtp" not in imports
-    assert "decode_layer_single_chip_hidden" in imports
+    assert "decode_fwd" in imports
 
 
 def test_each_call_owns_fresh_collective_windows():

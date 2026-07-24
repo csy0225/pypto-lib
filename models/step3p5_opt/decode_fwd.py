@@ -2734,6 +2734,7 @@ class WholeDecodeOpt:
                     [0, k0],
                 )
         return next_hidden_out
+    @pl.function(type=pl.FunctionType.Inline)
     def _expert_routed_swiglu7(  # noqa: PLR0913, PLR0915
         self,
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],

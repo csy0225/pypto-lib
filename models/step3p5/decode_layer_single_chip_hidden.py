@@ -2589,6 +2589,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
             norm_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
+            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             # ── A': input IS h_mid (attn+dense_mlp already done in attn_dense_orch). ───
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)

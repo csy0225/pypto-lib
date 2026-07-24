@@ -262,6 +262,7 @@ class WholeDecodeOpt:
             h0_out, norm_layer_idx, mlp_layer_idx,
             mlp_tmp_window, mlp_signal_window, my_rank,
         )
+        return h0_out
 
     @pl.function(
         type=pl.FunctionType.Orchestration,
@@ -315,6 +316,7 @@ class WholeDecodeOpt:
             hidden_out, norm_layer_idx, mlp_layer_idx,
             mlp_tmp_window, mlp_signal_window, my_rank,
         )
+        return hidden_out
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def whole_chip_orch(  # noqa: PLR0913, PLR0915
@@ -365,7 +367,7 @@ class WholeDecodeOpt:
     ):
         # ── L0: full-attn dense layer (distinct shape, emitted pre-loop). ──
         h_layer_0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        self.full_chip_orch(
+        h_layer_0 = self.full_chip_orch(
             current_hidden,
             input_rms,
             pl.slice(full_wq, [HIDDEN, hidden_q_full], [0, 0]),
@@ -412,7 +414,7 @@ class WholeDecodeOpt:
             sig_off = (layer_idx + 1) * COMM_SIGNAL_STRIDE_I32
             norm_idx = layer_idx + 1
             h_next = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-            self.swa_chip_orch(
+            h_next = self.swa_chip_orch(
                 prev_hidden,
                 input_rms,
                 pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
@@ -447,6 +449,7 @@ class WholeDecodeOpt:
             prev_hidden = h_next
 
         next_hidden_out = prev_hidden
+        return next_hidden_out
 
     @pl.function(
         level=pl.Level.HOST,

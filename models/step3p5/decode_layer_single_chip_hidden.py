@@ -2242,7 +2242,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 [n_ranks, 1], pl.INT32
             ],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             sh_y = self._expert_shared_local(
                 x, w_gate_s, w_up_s, w_down_s, sh_y,
@@ -2506,7 +2505,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             mlp_signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             resid1 = attention_inline(
@@ -2591,7 +2589,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             routed_src_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
             norm_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             # ── A': input IS h_mid (attn+dense_mlp already done in attn_dense_orch). ───
             resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -4138,7 +4135,6 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 [n_ranks, 1], pl.INT32
             ],
             my_rank: pl.Scalar[pl.INT32],
-            moe_epoch: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             sh_y = self._expert_shared_local_swiglu16(
                 x, w_gate_s, w_up_s, w_down_s, sh_y,

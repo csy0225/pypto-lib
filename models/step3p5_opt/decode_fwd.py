@@ -59,7 +59,6 @@ from models.step3p5.config import (
     BLOCK_SIZE,
     BLOCK_TABLE_FLAT_DYN,
     EPS,
-    FINAL_RMS_K_CHUNK,
     HEAD_DIM,
     HEAD_DIM_INV,
     HIDDEN,
@@ -76,7 +75,6 @@ from models.step3p5.config import (
     LAYER_DYN,
     LAYER_HIDDEN_ROWS_DYN,
     LAYER_INTER_ROWS_DYN,
-    LM_HEAD_K_CHUNK,
     MAX_SEQ_DEFAULT,
     MLP_OUT_CHUNK,
     MOE_INTERMEDIATE,
@@ -99,8 +97,6 @@ from models.step3p5.config import (
     SLIDING_WINDOW,
     TP_WORLD_SIZE,
     USER_BATCH_DYN,
-    VOCAB_CHUNK,
-    VOCAB_LOCAL,
 )
 from models.step3p5.attention_full import (
     LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_FULL,
@@ -109,7 +105,6 @@ from models.step3p5.attention_swa import (
     LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_SWA,
 )
 from models.step3p5.dispatch import LOCAL_RECV_MAX, N_RANKS_PAD, PER_RANK_BUCKETS
-from models.step3p5.rms_lm_head import rms_lm_head as _rms_lm_head_kernel
 
 # Per-rank slice widths (TP=8). Single-card ST/UT iron rule: keep per-rank
 # widths, never unslice to full.
@@ -223,11 +218,6 @@ _SHARED_SWIGLU16_LIMIT = 16.0
 attention_full_inline = pl.inline(attention_full._func)
 attention_swa_inline = pl.inline(attention_swa._func)
 dense_mlp_inline = pl.inline(_dense_mlp_body_tp._func)
-# Final RMSNorm + vocab-sliced LM-head matmul (body verbatim from
-# rms_lm_head.py; single-scope fused form, no materialised final_normed
-# scratch — see rms_lm_head.py NOTE 2026-07-04). RMSNorm replicated, matmul
-# rank-local → no tp_all_reduce dependency, safe to inline standalone.
-rms_lm_head_inline = pl.inline(_rms_lm_head_kernel._func)
 
 
 @pl.program
@@ -4072,12 +4062,6 @@ class WholeDecodeOpt:
         k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
-        # Final RMSNorm (replicated) + vocab-sliced LM-head weight + logits shard.
-        final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
-        lm_head_weight: pl.Tensor[[VOCAB_LOCAL, HIDDEN], pl.BF16],
-        logits_shard_out: pl.Out[
-            pl.Tensor[[USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
-        ],
         dense_attn_tmp_stack: pld.DistributedTensor[
             [NUM_DENSE_LAYERS * BATCH, HIDDEN], pl.BF16
         ],
@@ -4568,21 +4552,6 @@ class WholeDecodeOpt:
             0,
             my_rank,
         )
-
-        # ── Final RMSNorm + vocab-sliced LM-head matmul (per-rank shard) ──
-        # Input = L44 output (next_hidden_out, written by L44's Out param).
-        # RMSNorm replicated (last layer's tp_all_reduce homogenised hidden),
-        # lm_head weight vocab-sliced per rank → no collective here. Body
-        # verbatim from rms_lm_head.py (single-scope fused, inv_rms once then
-        # inline-normalise each k-chunk in the vocab matmul loop). Out param
-        # loop-carry closed by the inline body's `return out`.
-        logits_shard_out = rms_lm_head_inline(
-            next_hidden_out,
-            final_norm_weight,
-            lm_head_weight,
-            seq_lens,
-            logits_shard_out,
-        )
         return next_hidden_out
 
     @pl.function(
@@ -4645,11 +4614,6 @@ class WholeDecodeOpt:
         k_cache: pl.InOut[pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         v_cache: pl.InOut[pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         next_hidden_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
-        final_norm_weight: pl.Tensor[[tp_size, 1, HIDDEN], pl.FP32],
-        lm_head_weight: pl.Tensor[[tp_size, VOCAB_LOCAL, HIDDEN], pl.BF16],
-        logits_shard_out: pl.Out[
-            pl.Tensor[[tp_size, USER_BATCH_DYN, VOCAB_LOCAL], pl.FP32]
-        ],
     ):
         dense_attn_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
         dense_attn_signal_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
@@ -4729,9 +4693,6 @@ class WholeDecodeOpt:
                 k_cache[r],
                 v_cache[r],
                 next_hidden_out[r],
-                final_norm_weight[r],
-                lm_head_weight[r],
-                logits_shard_out[r],
                 pld.window(dense_attn_tmp_stack_buf, [NUM_DENSE_LAYERS * BATCH, HIDDEN],
                            dtype=pl.BF16),
                 pld.window(dense_attn_signal_stack_buf, [NUM_DENSE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],

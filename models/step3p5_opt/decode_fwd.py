@@ -19,8 +19,9 @@ inside a ``@pl.function`` method); helpers stay as class methods with
 * a single ``@pl.program class`` with a ``whole_chip_orch`` method whose
   body is a ``for layer_idx in pl.range(N)`` runtime loop (``ForStmt``,
   not ``ForKind::Unroll``);
-* per-layer ``chip_orch`` helpers as ``@pl.function(auto_scope=False)``
-  class methods with ``pl.Out`` return-params (Var, never a view);
+* per-layer ``chip_orch`` helpers as ``@pl.function(type=Orchestration,
+  attrs={'inline_orchestration': True})`` class methods (decorator + 签名
+  逐字对齐 baseline) with ``pl.Out`` return-params (Var, never a view);
 * per-layer weight slices via dynamic ``layer_idx * STRIDE`` scalar offsets
   into stacked leading-dim weight tensors (B1 resident="stacked");
 * per-layer intermediates created fresh each iteration (carry pattern).
@@ -211,7 +212,6 @@ class WholeDecodeOpt:
 
     @pl.function(
         type=pl.FunctionType.Orchestration,
-        auto_scope=False,
         attrs={"inline_orchestration": True},
     )
     def full_chip_orch(  # noqa: PLR0913, PLR0915
@@ -265,7 +265,6 @@ class WholeDecodeOpt:
 
     @pl.function(
         type=pl.FunctionType.Orchestration,
-        auto_scope=False,
         attrs={"inline_orchestration": True},
     )
     def swa_chip_orch(  # noqa: PLR0913, PLR0915
@@ -317,11 +316,7 @@ class WholeDecodeOpt:
             mlp_tmp_window, mlp_signal_window, my_rank,
         )
 
-    @pl.function(
-        type=pl.FunctionType.Orchestration,
-        auto_scope=False,
-        attrs={"inline_orchestration": True},
-    )
+    @pl.function(type=pl.FunctionType.Orchestration)
     def whole_chip_orch(  # noqa: PLR0913, PLR0915
         self,
         current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
@@ -370,39 +365,38 @@ class WholeDecodeOpt:
     ):
         # ── L0: full-attn dense layer (distinct shape, emitted pre-loop). ──
         h_layer_0 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        with pl.scope():
-            self.full_chip_orch(
-                current_hidden,
-                input_rms,
-                pl.slice(full_wq, [HIDDEN, hidden_q_full], [0, 0]),
-                pl.slice(full_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [0, 0]),
-                pl.slice(full_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [0, 0]),
-                q_norm,
-                k_norm,
-                seq_lens,
-                block_table,
-                slot_mapping,
-                rope_cos_full,
-                rope_sin_full,
-                k_cache,
-                v_cache,
-                pl.slice(full_wo, [hidden_q_full, HIDDEN], [0, 0]),
-                pl.slice(full_w_g, [HIDDEN, nh_full_pad], [0, 0]),
-                pl.slice(full_gate_r, [nh_full_pad, hidden_q_full], [0, 0]),
-                post_rms,
-                pl.slice(dense_w_gate, [HIDDEN, INTER_LOCAL], [0, 0]),
-                pl.slice(dense_w_up, [HIDDEN, INTER_LOCAL], [0, 0]),
-                pl.slice(dense_w_down, [INTER_LOCAL, HIDDEN], [0, 0]),
-                h_layer_0,
-                pl.slice(dense_attn_tmp_stack, [BATCH, HIDDEN], [0, 0]),
-                pl.slice(dense_attn_signal_stack, [tp_size, 1], [0, 0]),
-                pl.slice(dense_mlp_tmp_stack, [BATCH, HIDDEN], [0, 0]),
-                pl.slice(dense_mlp_signal_stack, [tp_size, 1], [0, 0]),
-                0,
-                0,
-                0,
-                my_rank,
-            )
+        self.full_chip_orch(
+            current_hidden,
+            input_rms,
+            pl.slice(full_wq, [HIDDEN, hidden_q_full], [0, 0]),
+            pl.slice(full_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [0, 0]),
+            pl.slice(full_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [0, 0]),
+            q_norm,
+            k_norm,
+            seq_lens,
+            block_table,
+            slot_mapping,
+            rope_cos_full,
+            rope_sin_full,
+            k_cache,
+            v_cache,
+            pl.slice(full_wo, [hidden_q_full, HIDDEN], [0, 0]),
+            pl.slice(full_w_g, [HIDDEN, nh_full_pad], [0, 0]),
+            pl.slice(full_gate_r, [nh_full_pad, hidden_q_full], [0, 0]),
+            post_rms,
+            pl.slice(dense_w_gate, [HIDDEN, INTER_LOCAL], [0, 0]),
+            pl.slice(dense_w_up, [HIDDEN, INTER_LOCAL], [0, 0]),
+            pl.slice(dense_w_down, [INTER_LOCAL, HIDDEN], [0, 0]),
+            h_layer_0,
+            pl.slice(dense_attn_tmp_stack, [BATCH, HIDDEN], [0, 0]),
+            pl.slice(dense_attn_signal_stack, [tp_size, 1], [0, 0]),
+            pl.slice(dense_mlp_tmp_stack, [BATCH, HIDDEN], [0, 0]),
+            pl.slice(dense_mlp_signal_stack, [tp_size, 1], [0, 0]),
+            0,
+            0,
+            0,
+            my_rank,
+        )
 
         # ── L1/L2: swa-attn dense layers inside a runtime pl.range loop. ──
         # layer_idx ∈ {0, 1} maps to physical layers {1, 2}: swa weight offset
@@ -418,39 +412,38 @@ class WholeDecodeOpt:
             sig_off = (layer_idx + 1) * COMM_SIGNAL_STRIDE_I32
             norm_idx = layer_idx + 1
             h_next = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-            with pl.scope():
-                self.swa_chip_orch(
-                    prev_hidden,
-                    input_rms,
-                    pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
-                    pl.slice(swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
-                    pl.slice(swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
-                    q_norm,
-                    k_norm,
-                    seq_lens,
-                    block_table,
-                    slot_mapping,
-                    rope_cos_swa,
-                    rope_sin_swa,
-                    k_cache,
-                    v_cache,
-                    pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off, 0]),
-                    pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off, 0]),
-                    pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off, 0]),
-                    post_rms,
-                    pl.slice(dense_w_gate, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
-                    pl.slice(dense_w_up, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
-                    pl.slice(dense_w_down, [INTER_LOCAL, HIDDEN], [dense_down_off, 0]),
-                    h_next,
-                    pl.slice(dense_attn_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
-                    pl.slice(dense_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
-                    pl.slice(dense_mlp_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
-                    pl.slice(dense_mlp_signal_stack, [tp_size, 1], [sig_off, 0]),
-                    norm_idx,
-                    0,
-                    0,
-                    my_rank,
-                )
+            self.swa_chip_orch(
+                prev_hidden,
+                input_rms,
+                pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
+                pl.slice(swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
+                pl.slice(swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
+                q_norm,
+                k_norm,
+                seq_lens,
+                block_table,
+                slot_mapping,
+                rope_cos_swa,
+                rope_sin_swa,
+                k_cache,
+                v_cache,
+                pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off, 0]),
+                pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off, 0]),
+                pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off, 0]),
+                post_rms,
+                pl.slice(dense_w_gate, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
+                pl.slice(dense_w_up, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
+                pl.slice(dense_w_down, [INTER_LOCAL, HIDDEN], [dense_down_off, 0]),
+                h_next,
+                pl.slice(dense_attn_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
+                pl.slice(dense_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
+                pl.slice(dense_mlp_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
+                pl.slice(dense_mlp_signal_stack, [tp_size, 1], [sig_off, 0]),
+                norm_idx,
+                0,
+                0,
+                my_rank,
+            )
             prev_hidden = h_next
 
         next_hidden_out = prev_hidden
@@ -458,7 +451,6 @@ class WholeDecodeOpt:
     @pl.function(
         level=pl.Level.HOST,
         role=pl.Role.Orchestrator,
-        type=pl.FunctionType.Orchestration,
     )
     def host_orch(  # noqa: PLR0913, PLR0915
         self,

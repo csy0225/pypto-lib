@@ -81,6 +81,17 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--itl-iters", type=int, default=20, help="measured decode iters per context")
     parser.add_argument("--itl-warmup", type=int, default=3, help="warmup decode iters per context (not recorded)")
+    parser.add_argument(
+        "--dfx",
+        default="",
+        help=(
+            "PERF-A1 DFX capture tokens passed to holder via N1_DFX "
+            "(e.g. 'swim' for l2_swimlane, 'pmu' for AICore PMU, 'scope'/'dep'). "
+            "Artifacts land under {compiled.output_dir}/dfx_outputs/. Run swim and "
+            "pmu in SEPARATE invocations (each perturbs timing)."
+        ),
+    )
+    parser.add_argument("--pmu", type=int, default=1, help="AICore PMU event type when --dfx contains 'pmu' (1=CYCLE..4=MEMORY)")
     return parser.parse_args()
 
 
@@ -600,6 +611,10 @@ def _run_worker(args: argparse.Namespace) -> int:
     )
     os.environ["PYPTO_STEP3P5_ROPE_SEQ"] = str(int(args.num_blocks) * BLOCK_SIZE)
     os.environ.setdefault("PYPTO_PROG_BUILD_DIR", str(out / "build_output"))
+    if args.dfx:
+        # PERF-A1: forward DFX tokens to WholeDecodeHolder.run() via env.
+        os.environ["N1_DFX"] = args.dfx
+        os.environ["N1_PMU"] = str(args.pmu)
 
     from tools.step3p5.whole_decode_holder import WholeDecodeHolder
 

@@ -488,12 +488,22 @@ class WholeDecodeHolder:
         """复用常驻 rt 跑一次 whole-net forward，只返回 raw hidden。"""
         assert self.rt is not None, "enter holder (with h:) before run()"
         t0 = time.time()
+        # DFX capture (PERF-A1 baseline). N1_DFX = tokens; N1_PMU = int event type.
+        #   "swim"/"l2" -> enable_l2_swimlane (dfx_outputs/l2_swimlane_records.json
+        #                  + merged_swimlane_*.json = per-task/per-layer timing)
+        #   "pmu"       -> enable_pmu = int(N1_PMU or 1)  (dfx_outputs/pmu.csv)
+        #   "dep"       -> enable_dep_gen ; "scope" -> enable_scope_stats
+        # Artifacts under {self.compiled.output_dir}/dfx_outputs/. Swimlane and PMU
+        # perturb timing -> collect in SEPARATE run() calls from clean wallclock.
         _dfx = os.environ.get("N1_DFX", "")
         if _dfx:
             from pypto.runtime.runner import RunConfig  # noqa: PLC0415
+            _pmu = int(os.environ.get("N1_PMU", "1")) if "pmu" in _dfx else 0
             _rc = RunConfig(platform=self.platform,
                             enable_dep_gen=("dep" in _dfx),
-                            enable_scope_stats=("scope" in _dfx))
+                            enable_scope_stats=("scope" in _dfx),
+                            enable_l2_swimlane=("swim" in _dfx or "l2" in _dfx),
+                            enable_pmu=_pmu)
             self.rt.run(self.compiled, *self._args_list, config=_rc)
         else:
             self.rt.run(self.compiled, *self._args_list)

@@ -44,24 +44,60 @@ import pypto.language.distributed as pld
 from models.step3p5.attention_full import attention_full
 from models.step3p5.attention_swa import attention_swa
 from models.step3p5.decode_layer_single_chip_hidden import _dense_mlp_body_tp
+
+# 注意：attention_full / attention_swa / _dense_mlp_body_tp 的 kernel body 经
+# ``pl.inline`` 拷进本模块后，body 内引用的 config 常量按 **本模块** 的 module
+# global 解析（非 source 模块）。所以 dense 路径三个 kernel 用到的 config 常量必须
+# 在这里一次性全导入，否则 codegen 报 UndefinedVariableError（已在
+# ``INPUT_PROJ_K_CHUNK`` 上撞过）。LAYER_QHIDDEN_ROWS_DYN 在 full / swa 两个 source
+# 模块里值不同（full=12288，swa=33*1536=50688），按 baseline 别名 _FULL/_SWA 区分。
 from models.step3p5.config import (
+    ATTN_SCALE,
     BATCH,
+    BATCH_TILE,
+    BLOCK_SIZE,
     BLOCK_TABLE_FLAT_DYN,
+    EPS,
     HEAD_DIM,
+    HEAD_DIM_INV,
     HIDDEN,
+    HIDDEN_INV,
     HIDDEN_Q_FULL_LOCAL,
     HIDDEN_Q_SWA_LOCAL,
+    INPUT_PROJ_K_CHUNK,
     INTERMEDIATE_LOCAL,
+    K_CHUNK,
     KV_CACHE_ROWS_DYN,
+    KV_HEADS_LOCAL,
     KV_HIDDEN_LOCAL,
+    KV_PROJ_K_CHUNK_LOCAL,
     LAYER_DYN,
+    LAYER_HIDDEN_ROWS_DYN,
+    LAYER_INTER_ROWS_DYN,
+    MAX_SEQ_DEFAULT,
+    MLP_OUT_CHUNK,
     NUM_HEADS_FULL_LOCAL_PAD,
     NUM_HEADS_SWA_LOCAL_PAD,
+    OUT_PROJ_K_CHUNK,
+    OUT_PROJ_N_CHUNK,
+    Q_HEAD_BATCH_FULL,
+    Q_HEAD_BATCH_SWA,
+    Q_HEAD_PAD_FULL,
+    Q_OUT_CHUNK,
+    Q_PER_KV_FULL,
+    Q_PER_KV_SWA,
     ROPE_SEQ_DYN,
     ROTARY_HALF_FULL,
     ROTARY_HALF_SWA,
+    SLIDING_WINDOW,
     TP_WORLD_SIZE,
     USER_BATCH_DYN,
+)
+from models.step3p5.attention_full import (
+    LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_FULL,
+)
+from models.step3p5.attention_swa import (
+    LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_SWA,
 )
 
 # Per-rank slice widths (TP=8). Single-card ST/UT iron rule: keep per-rank

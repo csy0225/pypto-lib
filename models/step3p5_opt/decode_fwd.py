@@ -191,6 +191,15 @@ NUM_FULL_MOE_LAYERS = 10
 NUM_SWA_MOE_LAYERS = 30
 NUM_MOE_LAYERS = NUM_FULL_MOE_LAYERS + NUM_SWA_MOE_LAYERS  # 40
 
+# silu_silu activation closure constants (Phase 3 = silu_silu only, both limits
+# 0.0 → swiglu-clip branches dead). Mirrors baseline builder L588-607; lifted to
+# module level because step3p5_opt is a flat @pl.program class, not a builder.
+# Phase 4 will add swiglu7_silu / swiglu7_swiglu16 as separate explicit layers.
+_ROUTED_SWIGLU_STEP = False
+_ROUTED_SWIGLU_LIMIT = 0.0
+_SHARED_SWIGLU_STEP = False
+_SHARED_SWIGLU_LIMIT = 0.0
+
 # Inlined kernel functions (DeepSeek form: pl.inline of the _func).
 attention_full_inline = pl.inline(attention_full._func)
 attention_swa_inline = pl.inline(attention_swa._func)
@@ -1266,11 +1275,11 @@ class WholeDecodeOpt:
                             pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
                         )
                         silu = pl.mul(gate_2d, sigmoid)
-                        if _routed_swiglu_step:
-                            silu_c = pl.minimum(silu, _routed_swiglu_limit)
+                        if _ROUTED_SWIGLU_STEP:
+                            silu_c = pl.minimum(silu, _ROUTED_SWIGLU_LIMIT)
                             up_c = pl.maximum(
-                                pl.minimum(up_2d, _routed_swiglu_limit),
-                                -_routed_swiglu_limit,
+                                pl.minimum(up_2d, _ROUTED_SWIGLU_LIMIT),
+                                -_ROUTED_SWIGLU_LIMIT,
                             )
                             gated = pl.mul(silu_c, up_c)
                         else:
@@ -1515,13 +1524,13 @@ class WholeDecodeOpt:
                 pl.add(pl.exp(pl.neg(gate_acc_0)), 1.0),
             )
             silu_0 = pl.mul(gate_acc_0, sigmoid_0)
-            if _shared_swiglu_step:
+            if _SHARED_SWIGLU_STEP:
                 silu_c_0 = pl.minimum(
-                    silu_0, _shared_swiglu_limit,
+                    silu_0, _SHARED_SWIGLU_LIMIT,
                 )
                 up_c_0 = pl.maximum(
-                    pl.minimum(up_acc_0, _shared_swiglu_limit),
-                    -_shared_swiglu_limit,
+                    pl.minimum(up_acc_0, _SHARED_SWIGLU_LIMIT),
+                    -_SHARED_SWIGLU_LIMIT,
                 )
                 gated_0 = pl.mul(silu_c_0, up_c_0)
             else:
@@ -1564,13 +1573,13 @@ class WholeDecodeOpt:
                 pl.add(pl.exp(pl.neg(gate_acc_1)), 1.0),
             )
             silu_1 = pl.mul(gate_acc_1, sigmoid_1)
-            if _shared_swiglu_step:
+            if _SHARED_SWIGLU_STEP:
                 silu_c_1 = pl.minimum(
-                    silu_1, _shared_swiglu_limit,
+                    silu_1, _SHARED_SWIGLU_LIMIT,
                 )
                 up_c_1 = pl.maximum(
-                    pl.minimum(up_acc_1, _shared_swiglu_limit),
-                    -_shared_swiglu_limit,
+                    pl.minimum(up_acc_1, _SHARED_SWIGLU_LIMIT),
+                    -_SHARED_SWIGLU_LIMIT,
                 )
                 gated_1 = pl.mul(silu_c_1, up_c_1)
             else:
@@ -1613,13 +1622,13 @@ class WholeDecodeOpt:
                 pl.add(pl.exp(pl.neg(gate_acc_2)), 1.0),
             )
             silu_2 = pl.mul(gate_acc_2, sigmoid_2)
-            if _shared_swiglu_step:
+            if _SHARED_SWIGLU_STEP:
                 silu_c_2 = pl.minimum(
-                    silu_2, _shared_swiglu_limit,
+                    silu_2, _SHARED_SWIGLU_LIMIT,
                 )
                 up_c_2 = pl.maximum(
-                    pl.minimum(up_acc_2, _shared_swiglu_limit),
-                    -_shared_swiglu_limit,
+                    pl.minimum(up_acc_2, _SHARED_SWIGLU_LIMIT),
+                    -_SHARED_SWIGLU_LIMIT,
                 )
                 gated_2 = pl.mul(silu_c_2, up_c_2)
             else:
@@ -1662,13 +1671,13 @@ class WholeDecodeOpt:
                 pl.add(pl.exp(pl.neg(gate_acc_3)), 1.0),
             )
             silu_3 = pl.mul(gate_acc_3, sigmoid_3)
-            if _shared_swiglu_step:
+            if _SHARED_SWIGLU_STEP:
                 silu_c_3 = pl.minimum(
-                    silu_3, _shared_swiglu_limit,
+                    silu_3, _SHARED_SWIGLU_LIMIT,
                 )
                 up_c_3 = pl.maximum(
-                    pl.minimum(up_acc_3, _shared_swiglu_limit),
-                    -_shared_swiglu_limit,
+                    pl.minimum(up_acc_3, _SHARED_SWIGLU_LIMIT),
+                    -_SHARED_SWIGLU_LIMIT,
                 )
                 gated_3 = pl.mul(silu_c_3, up_c_3)
             else:
@@ -1711,13 +1720,13 @@ class WholeDecodeOpt:
                 pl.add(pl.exp(pl.neg(gate_acc_4)), 1.0),
             )
             silu_4 = pl.mul(gate_acc_4, sigmoid_4)
-            if _shared_swiglu_step:
+            if _SHARED_SWIGLU_STEP:
                 silu_c_4 = pl.minimum(
-                    silu_4, _shared_swiglu_limit,
+                    silu_4, _SHARED_SWIGLU_LIMIT,
                 )
                 up_c_4 = pl.maximum(
-                    pl.minimum(up_acc_4, _shared_swiglu_limit),
-                    -_shared_swiglu_limit,
+                    pl.minimum(up_acc_4, _SHARED_SWIGLU_LIMIT),
+                    -_SHARED_SWIGLU_LIMIT,
                 )
                 gated_4 = pl.mul(silu_c_4, up_c_4)
             else:

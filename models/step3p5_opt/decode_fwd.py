@@ -209,6 +209,11 @@ NUM_MOE_LAYERS = NUM_FULL_MOE_LAYERS + NUM_SWA_MOE_LAYERS  # 40 (loop body L3..L
 # at offsets 40/41 → stacks sized to 42 (loop keeps iterating 40).
 NUM_MOE_LAYERS_TOTAL = NUM_MOE_LAYERS + 2  # 42
 
+# Per-layer hidden dump: 3 dense (L0/L1/L2) + 40 MoE loop (L3..L42) + L43 + L44 = 45.
+# Used by the per_layer_hidden Out to locate the first diverging layer vs the
+# baseline explicit-layer-table program (accuracy bisect).
+NUM_DECODE_LAYERS_TOTAL = NUM_DENSE_LAYERS + NUM_MOE_LAYERS + 2  # 45
+
 # OPT_STOP_AFTER bisect: MoE loop 迭代层数 (module-level plain if/elif/else —
 # pypto DSL parser 不支持 body 内的三元表达式 IfExp，必须在 module level 算好
 # 常量喂进 whole_chip_orch body). 0=NUM_MOE_LAYERS(40, 零回归); 3=OPT_MOE_LAYERS;
@@ -4086,6 +4091,9 @@ class WholeDecodeOpt:
         k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+        per_layer_hidden: pl.Out[
+            pl.Tensor[[NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
+        ],
         dense_attn_tmp_stack: pld.DistributedTensor[
             [NUM_DENSE_LAYERS * BATCH, HIDDEN], pl.BF16
         ],
@@ -4186,6 +4194,14 @@ class WholeDecodeOpt:
             my_rank,
         )
 
+        # Per-layer dump L0 (phys 0).
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_l0"):
+            per_layer_hidden = pl.assemble(
+                per_layer_hidden,
+                pl.slice(h_layer_0, [BATCH, HIDDEN], [0, 0]),
+                [0, 0, 0],
+            )
+
         # ── L1/L2: swa-attn dense layers inside a runtime pl.range loop. ──
         # layer_idx ∈ {0, 1} maps to physical layers {1, 2}: swa weight offset
         # = layer_idx, dense MLP offset = layer_idx + 1, norm/mlp idx = +1.
@@ -4234,6 +4250,13 @@ class WholeDecodeOpt:
                     0,
                     my_rank,
                 )
+                # Per-layer dump L1/L2 (phys = layer_idx + 1).
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dense"):
+                    per_layer_hidden = pl.assemble(
+                        per_layer_hidden,
+                        pl.slice(h_next, [BATCH, HIDDEN], [0, 0]),
+                        [layer_idx + 1, 0, 0],
+                    )
                 prev_hidden = h_next
 
         # ── L3-L42: MoE silu_silu 40 layers inside a runtime pl.range loop. ──
@@ -4324,18 +4347,18 @@ class WholeDecodeOpt:
                         pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
                         pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off, 0]),
                         pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off, 0]),
-                        pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
                         pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
-                        pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
                         pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
                         pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
                         pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
                         pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
-                        pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off, 0]),
-                        pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
                         norm_layer_idx,
                         0,
@@ -4396,22 +4419,29 @@ class WholeDecodeOpt:
                         pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
                         pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off, 0]),
                         pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off, 0]),
-                        pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
                         pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
-                        pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
                         pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
                         pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
                         pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
                         pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
-                        pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off, 0]),
-                        pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_sig_off, 0]),
                         pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
                         norm_layer_idx,
                         0,
                         my_rank,
+                    )
+                # Per-layer dump MoE L3..L42 (phys = layer_idx + 3).
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_moe"):
+                    per_layer_hidden = pl.assemble(
+                        per_layer_hidden,
+                        pl.slice(h_moe, [BATCH, HIDDEN], [0, 0]),
+                        [phys_layer, 0, 0],
                     )
                 prev_hidden = h_moe
 
@@ -4487,23 +4517,30 @@ class WholeDecodeOpt:
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off_43, 0]),
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off_43, 0]),
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off_43, 0]),
-                pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_sig_off_43, 0]),
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off_43, 0]),
-                pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_sig_off_43, 0]),
                 pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off_43, 0]),
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off_43, 0]),
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off_43, 0]),
                 pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_43, 0]),
-                pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_sig_off_43, 0]),
                 pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off_43, 0]),
-                pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_sig_off_43, 0]),
                 pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
                 norm_layer_idx_43,
                 0,
                 my_rank,
             )
+            # Per-layer dump L43 (phys 43).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_l43"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_43, [BATCH, HIDDEN], [0, 0]),
+                    [43, 0, 0],
+                )
             prev_hidden = h_layer_43
     
             resid_hold_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -4568,18 +4605,18 @@ class WholeDecodeOpt:
                 pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off_44, 0]),
                 pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off_44, 0]),
                 pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off_44, 0]),
-                pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_sig_off_44, 0]),
                 pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
                 pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off_44, 0]),
-                pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_sig_off_44, 0]),
                 pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off_44, 0]),
                 pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
                 pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off_44, 0]),
                 pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off_44, 0]),
                 pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_44, 0]),
-                pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_sig_off_44, 0]),
                 pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off_44, 0]),
-                pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_sig_off_44, 0]),
                 pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
                 norm_layer_idx_44,
                 0,
@@ -4601,6 +4638,13 @@ class WholeDecodeOpt:
                         pl.slice(prev_hidden, [BATCH, K_CHUNK], [0, k0]),
                         [0, k0],
                     )
+        # Per-layer dump L44 (phys 44) from final next_hidden_out.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_l44"):
+            per_layer_hidden = pl.assemble(
+                per_layer_hidden,
+                pl.slice(next_hidden_out, [BATCH, HIDDEN], [0, 0]),
+                [44, 0, 0],
+            )
         return next_hidden_out
 
     @pl.function(
@@ -4663,6 +4707,9 @@ class WholeDecodeOpt:
         k_cache: pl.InOut[pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         v_cache: pl.InOut[pl.Tensor[[tp_size, KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         next_hidden_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
+        per_layer_hidden: pl.Out[
+            pl.Tensor[[tp_size, NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
+        ],
     ):
         dense_attn_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
         dense_attn_signal_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
@@ -4674,18 +4721,18 @@ class WholeDecodeOpt:
         moe_pub_counts_stack_buf = pld.alloc_window_buffer(
             NUM_MOE_LAYERS_TOTAL * n_ranks * n_ranks * n_local_experts_pad * 4
         )
-        moe_count_done_sig_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * n_ranks * COMM_CONTROL_SIGNAL_BYTES)
+        moe_count_done_sig_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
         moe_recv_x_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * local_recv_max * HIDDEN)
         moe_recv_scale_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * local_recv_max * 8 * 4)
-        moe_data_done_sig_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * n_ranks * COMM_CONTROL_SIGNAL_BYTES)
+        moe_data_done_sig_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
         moe_recv_r_route_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * local_recv_max * idx_pad * 4)
         moe_send_x_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * local_recv_max * HIDDEN)
         moe_send_scale_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * local_recv_max * 8 * 4)
         moe_send_route_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * local_recv_max * idx_pad * 4)
         moe_sh_tmp_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * BATCH * HIDDEN * 2)
-        moe_sh_signal_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * n_ranks * COMM_CONTROL_SIGNAL_BYTES)
+        moe_sh_signal_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
         moe_routed_y_buf_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * n_routes_per_rank * HIDDEN * 2)
-        moe_combine_done_sig_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * n_ranks * COMM_CONTROL_SIGNAL_BYTES)
+        moe_combine_done_sig_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
         moe_routed_src_buf_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * local_recv_max * HIDDEN * 2)
         for r in pl.range(pld.world_size()):
             self.whole_chip_orch(
@@ -4742,6 +4789,7 @@ class WholeDecodeOpt:
                 k_cache[r],
                 v_cache[r],
                 next_hidden_out[r],
+                per_layer_hidden[r],
                 pld.window(dense_attn_tmp_stack_buf, [NUM_DENSE_LAYERS * BATCH, HIDDEN],
                            dtype=pl.BF16),
                 pld.window(dense_attn_signal_stack_buf, [NUM_DENSE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],
@@ -4757,13 +4805,13 @@ class WholeDecodeOpt:
                 pld.window(moe_pub_counts_stack_buf,
                            [NUM_MOE_LAYERS_TOTAL * n_ranks * n_ranks, n_local_experts_pad],
                            dtype=pl.INT32),
-                pld.window(moe_count_done_sig_stack_buf, [NUM_MOE_LAYERS_TOTAL * n_ranks, 1],
+                pld.window(moe_count_done_sig_stack_buf, [NUM_MOE_LAYERS_TOTAL * COMM_SIGNAL_STRIDE_I32, 1],
                            dtype=pl.INT32),
                 pld.window(moe_recv_x_stack_buf, [NUM_MOE_LAYERS_TOTAL * local_recv_max, HIDDEN],
                            dtype=pl.INT8),
                 pld.window(moe_recv_scale_stack_buf, [NUM_MOE_LAYERS_TOTAL * local_recv_max, 8],
                            dtype=pl.FP32),
-                pld.window(moe_data_done_sig_stack_buf, [NUM_MOE_LAYERS_TOTAL * n_ranks, 1],
+                pld.window(moe_data_done_sig_stack_buf, [NUM_MOE_LAYERS_TOTAL * COMM_SIGNAL_STRIDE_I32, 1],
                            dtype=pl.INT32),
                 pld.window(moe_recv_r_route_stack_buf, [NUM_MOE_LAYERS_TOTAL * local_recv_max, idx_pad],
                            dtype=pl.INT32),
@@ -4775,11 +4823,11 @@ class WholeDecodeOpt:
                            dtype=pl.INT32),
                 pld.window(moe_sh_tmp_stack_buf, [NUM_MOE_LAYERS_TOTAL * BATCH, HIDDEN],
                            dtype=pl.BF16),
-                pld.window(moe_sh_signal_stack_buf, [NUM_MOE_LAYERS_TOTAL * n_ranks, 1],
+                pld.window(moe_sh_signal_stack_buf, [NUM_MOE_LAYERS_TOTAL * COMM_SIGNAL_STRIDE_I32, 1],
                            dtype=pl.INT32),
                 pld.window(moe_routed_y_buf_stack_buf, [NUM_MOE_LAYERS_TOTAL * n_routes_per_rank, HIDDEN],
                            dtype=pl.BF16),
-                pld.window(moe_combine_done_sig_stack_buf, [NUM_MOE_LAYERS_TOTAL * n_ranks, 1],
+                pld.window(moe_combine_done_sig_stack_buf, [NUM_MOE_LAYERS_TOTAL * COMM_SIGNAL_STRIDE_I32, 1],
                            dtype=pl.INT32),
                 pld.window(moe_routed_src_buf_stack_buf, [NUM_MOE_LAYERS_TOTAL * local_recv_max, HIDDEN],
                            dtype=pl.BF16),

@@ -656,6 +656,10 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
     COMM_SIGNAL_STRIDE_I32 = COMM_CONTROL_SIGNAL_BYTES // 4
     WHOLE_CHIP_DENSE_LAYERS = 3
     WHOLE_CHIP_MOE_LAYERS = 42
+    # Per-layer hidden dump: 3 dense (L0/L1/L2) + 42 MoE (L3..L44) = 45.
+    # Used by the per_layer_hidden Out to locate the first diverging layer vs
+    # the opt loop-form program (accuracy bisect).
+    NUM_DECODE_LAYERS_TOTAL = WHOLE_CHIP_DENSE_LAYERS + WHOLE_CHIP_MOE_LAYERS  # 45
 
     @pl.program
     class WholeDecodeFaithfulRealSingleChipHiddenOnly:
@@ -4854,6 +4858,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             h_mid_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
             dbg_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+            per_layer_hidden: pl.Out[pl.Tensor[[NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]],
             dense_attn_tmp_stack: pld.DistributedTensor[
                 [WHOLE_CHIP_DENSE_LAYERS * BATCH, HIDDEN], pl.BF16
             ],
@@ -4954,6 +4959,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 0).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p00"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_0, [BATCH, HIDDEN], [0, 0]),
+                    [0, 0, 0],
+                )
             h_mid_out = self.swa_chip_orch(
                 h_layer_0,
                 input_rms,
@@ -4986,6 +4999,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 1).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p01"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_mid_out, [BATCH, HIDDEN], [0, 0]),
+                    [1, 0, 0],
+                )
             h_layer_2 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5021,6 +5042,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 2).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p02"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_2, [BATCH, HIDDEN], [0, 0]),
+                    [2, 0, 0],
+                )
             h_layer_3 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5083,6 +5112,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 3).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p03"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_3, [BATCH, HIDDEN], [0, 0]),
+                    [3, 0, 0],
+                )
             h_layer_4 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5145,6 +5182,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 4).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p04"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_4, [BATCH, HIDDEN], [0, 0]),
+                    [4, 0, 0],
+                )
             h_layer_5 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5207,6 +5252,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 5).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p05"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_5, [BATCH, HIDDEN], [0, 0]),
+                    [5, 0, 0],
+                )
             h_layer_6 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5269,6 +5322,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 6).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p06"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_6, [BATCH, HIDDEN], [0, 0]),
+                    [6, 0, 0],
+                )
             h_layer_7 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5331,6 +5392,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 7).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p07"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_7, [BATCH, HIDDEN], [0, 0]),
+                    [7, 0, 0],
+                )
             h_layer_8 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5393,6 +5462,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 8).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p08"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_8, [BATCH, HIDDEN], [0, 0]),
+                    [8, 0, 0],
+                )
             h_layer_9 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5455,6 +5532,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 9).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p09"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_9, [BATCH, HIDDEN], [0, 0]),
+                    [9, 0, 0],
+                )
             h_layer_10 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5517,6 +5602,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 10).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p10"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_10, [BATCH, HIDDEN], [0, 0]),
+                    [10, 0, 0],
+                )
             h_layer_11 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5579,6 +5672,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 11).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p11"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_11, [BATCH, HIDDEN], [0, 0]),
+                    [11, 0, 0],
+                )
             h_layer_12 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5641,6 +5742,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 12).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p12"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_12, [BATCH, HIDDEN], [0, 0]),
+                    [12, 0, 0],
+                )
             h_layer_13 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5703,6 +5812,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 13).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p13"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_13, [BATCH, HIDDEN], [0, 0]),
+                    [13, 0, 0],
+                )
             h_layer_14 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5765,6 +5882,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 14).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p14"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_14, [BATCH, HIDDEN], [0, 0]),
+                    [14, 0, 0],
+                )
             h_layer_15 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5827,6 +5952,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 15).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p15"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_15, [BATCH, HIDDEN], [0, 0]),
+                    [15, 0, 0],
+                )
             h_layer_16 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5889,6 +6022,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 16).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p16"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_16, [BATCH, HIDDEN], [0, 0]),
+                    [16, 0, 0],
+                )
             h_layer_17 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -5951,6 +6092,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 17).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p17"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_17, [BATCH, HIDDEN], [0, 0]),
+                    [17, 0, 0],
+                )
             h_layer_18 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6013,6 +6162,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 18).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p18"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_18, [BATCH, HIDDEN], [0, 0]),
+                    [18, 0, 0],
+                )
             h_layer_19 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6075,6 +6232,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 19).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p19"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_19, [BATCH, HIDDEN], [0, 0]),
+                    [19, 0, 0],
+                )
             h_layer_20 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6137,6 +6302,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 20).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p20"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_20, [BATCH, HIDDEN], [0, 0]),
+                    [20, 0, 0],
+                )
             h_layer_21 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6199,6 +6372,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 21).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p21"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_21, [BATCH, HIDDEN], [0, 0]),
+                    [21, 0, 0],
+                )
             h_layer_22 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6261,6 +6442,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 22).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p22"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_22, [BATCH, HIDDEN], [0, 0]),
+                    [22, 0, 0],
+                )
             h_layer_23 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6323,6 +6512,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 23).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p23"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_23, [BATCH, HIDDEN], [0, 0]),
+                    [23, 0, 0],
+                )
             h_layer_24 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6385,6 +6582,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 24).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p24"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_24, [BATCH, HIDDEN], [0, 0]),
+                    [24, 0, 0],
+                )
             h_layer_25 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6447,6 +6652,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 25).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p25"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_25, [BATCH, HIDDEN], [0, 0]),
+                    [25, 0, 0],
+                )
             h_layer_26 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6509,6 +6722,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 26).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p26"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_26, [BATCH, HIDDEN], [0, 0]),
+                    [26, 0, 0],
+                )
             h_layer_27 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6571,6 +6792,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 27).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p27"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_27, [BATCH, HIDDEN], [0, 0]),
+                    [27, 0, 0],
+                )
             h_layer_28 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6633,6 +6862,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 28).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p28"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_28, [BATCH, HIDDEN], [0, 0]),
+                    [28, 0, 0],
+                )
             h_layer_29 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6695,6 +6932,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 29).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p29"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_29, [BATCH, HIDDEN], [0, 0]),
+                    [29, 0, 0],
+                )
             h_layer_30 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6757,6 +7002,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 30).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p30"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_30, [BATCH, HIDDEN], [0, 0]),
+                    [30, 0, 0],
+                )
             h_layer_31 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6819,6 +7072,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 31).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p31"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_31, [BATCH, HIDDEN], [0, 0]),
+                    [31, 0, 0],
+                )
             h_layer_32 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6881,6 +7142,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 32).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p32"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_32, [BATCH, HIDDEN], [0, 0]),
+                    [32, 0, 0],
+                )
             h_layer_33 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -6943,6 +7212,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 33).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p33"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_33, [BATCH, HIDDEN], [0, 0]),
+                    [33, 0, 0],
+                )
             h_layer_34 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7005,6 +7282,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 34).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p34"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_34, [BATCH, HIDDEN], [0, 0]),
+                    [34, 0, 0],
+                )
             h_layer_35 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7067,6 +7352,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 35).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p35"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_35, [BATCH, HIDDEN], [0, 0]),
+                    [35, 0, 0],
+                )
             h_layer_36 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7129,6 +7422,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 36).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p36"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_36, [BATCH, HIDDEN], [0, 0]),
+                    [36, 0, 0],
+                )
             h_layer_37 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7191,6 +7492,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 37).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p37"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_37, [BATCH, HIDDEN], [0, 0]),
+                    [37, 0, 0],
+                )
             h_layer_38 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7253,6 +7562,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 38).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p38"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_38, [BATCH, HIDDEN], [0, 0]),
+                    [38, 0, 0],
+                )
             h_layer_39 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7315,6 +7632,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 39).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p39"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_39, [BATCH, HIDDEN], [0, 0]),
+                    [39, 0, 0],
+                )
             h_layer_40 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7377,6 +7702,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 40).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p40"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_40, [BATCH, HIDDEN], [0, 0]),
+                    [40, 0, 0],
+                )
             h_layer_41 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7439,6 +7772,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 41).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p41"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_41, [BATCH, HIDDEN], [0, 0]),
+                    [41, 0, 0],
+                )
             h_layer_42 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7501,6 +7842,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 42).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p42"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_42, [BATCH, HIDDEN], [0, 0]),
+                    [42, 0, 0],
+                )
             h_layer_43 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7563,6 +7912,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 43).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p43"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(h_layer_43, [BATCH, HIDDEN], [0, 0]),
+                    [43, 0, 0],
+                )
             resid_hold_layer_44 = pl.create_tensor(
                 [BATCH, HIDDEN], dtype=pl.BF16
             )
@@ -7619,6 +7976,14 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                 0,
                 my_rank,
             )
+
+            # Per-layer dump (phys 44).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_p44"):
+                per_layer_hidden = pl.assemble(
+                    per_layer_hidden,
+                    pl.slice(next_hidden_out, [BATCH, HIDDEN], [0, 0]),
+                    [44, 0, 0],
+                )
             return next_hidden_out
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(  # noqa: PLR0913, PLR0915
@@ -7666,6 +8031,9 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
             h_mid_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
             next_hidden_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
             dbg_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
+            per_layer_hidden: pl.Out[
+                pl.Tensor[[tp_size, NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
+            ],
         ):
             # Buffers are stacked by semantic category, not reused by
             # layer. Every per-layer slice therefore has a distinct
@@ -7736,6 +8104,7 @@ def _build_whole_decode_faithful_real_single_chip_hidden_only_program(
                     h_mid_out[r],
                     next_hidden_out[r],
                     dbg_out[r],
+                    per_layer_hidden[r],
                     pld.window(dense_attn_tmp_stack_buf, [WHOLE_CHIP_DENSE_LAYERS * BATCH, HIDDEN],
                                dtype=pl.BF16),
                     pld.window(dense_attn_signal_stack_buf, [WHOLE_CHIP_DENSE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],

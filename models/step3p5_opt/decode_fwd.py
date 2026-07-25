@@ -209,6 +209,17 @@ NUM_MOE_LAYERS = NUM_FULL_MOE_LAYERS + NUM_SWA_MOE_LAYERS  # 40 (loop body L3..L
 # at offsets 40/41 → stacks sized to 42 (loop keeps iterating 40).
 NUM_MOE_LAYERS_TOTAL = NUM_MOE_LAYERS + 2  # 42
 
+# OPT_STOP_AFTER bisect: MoE loop 迭代层数 (module-level plain if/elif/else —
+# pypto DSL parser 不支持 body 内的三元表达式 IfExp，必须在 module level 算好
+# 常量喂进 whole_chip_orch body). 0=NUM_MOE_LAYERS(40, 零回归); 3=OPT_MOE_LAYERS;
+# 1/2=0 (skip MoE loop).
+if OPT_STOP_AFTER == 0:
+    _OPT_MOE_N = NUM_MOE_LAYERS
+elif OPT_STOP_AFTER == 3:
+    _OPT_MOE_N = OPT_MOE_LAYERS
+else:
+    _OPT_MOE_N = 0
+
 # silu_silu activation closure constants (Phase 3 = silu_silu only, both limits
 # 0.0 → swiglu-clip branches dead). Mirrors baseline builder L588-607; lifted to
 # module level because step3p5_opt is a flat @pl.program class, not a builder.
@@ -4238,12 +4249,10 @@ class WholeDecodeOpt:
         # across layers). Pristine fixed-threshold expected=1 kept verbatim;
         # no moe_epoch. See memory moe-protocol-c1-handoff-loop-form.
         # OPT_STOP_AFTER bisect: 0=NUM_MOE_LAYERS(40, 零回归); 3=OPT_MOE_LAYERS;
-        # 1/2=skip (carry = prev_hidden 不变).
-        _opt_moe_n = NUM_MOE_LAYERS if OPT_STOP_AFTER == 0 else (
-            OPT_MOE_LAYERS if OPT_STOP_AFTER == 3 else 0
-        )
-        if _opt_moe_n > 0:
-            for layer_idx in pl.range(_opt_moe_n):
+        # 1/2=skip (carry = prev_hidden 不变). _OPT_MOE_N 在 module level 用
+        # if/elif/else 算好（body 内三元 IfExp pypto parser 不支持）。
+        if _OPT_MOE_N > 0:
+            for layer_idx in pl.range(_OPT_MOE_N):
                 phys_layer = layer_idx + 3
                 norm_layer_idx = pl.cast(phys_layer, pl.INT32)
                 # MoE weight/window offset = layer_idx * slot (0-indexed into the

@@ -2219,7 +2219,10 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+    ) -> tuple[
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    ]:
         resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1 = attention_full_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
@@ -2458,7 +2461,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out
+        return next_hidden_out, dbg_out
 
     # ---- MoE-layer swa-attn FUSED with MoE-block: attention -> resid1
     # (local, intra-orch) -> post_norm -> EP/TP MoE -> residual. Mirrors the
@@ -2523,7 +2526,10 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+    ) -> tuple[
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    ]:
         resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1 = attention_swa_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
@@ -2762,7 +2768,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out
+        return next_hidden_out, dbg_out
     @pl.function(type=pl.FunctionType.Inline)
     def _expert_routed_swiglu7(  # noqa: PLR0913, PLR0915
         self,
@@ -3489,7 +3495,10 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+    ) -> tuple[
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    ]:
         resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1 = attention_full_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
@@ -3728,7 +3737,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out
+        return next_hidden_out, dbg_out
 
     @pl.function(
         type=pl.FunctionType.Orchestration,
@@ -3789,7 +3798,10 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+    ) -> tuple[
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    ]:
         resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1 = attention_swa_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
@@ -4028,7 +4040,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out
+        return next_hidden_out, dbg_out
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def whole_chip_orch(  # noqa: PLR0913, PLR0915
@@ -4315,7 +4327,7 @@ class WholeDecodeOpt:
                     fa_w_off = full_idx * HIDDEN
                     fa_wo_off = full_idx * hidden_q_full
                     fa_gate_r_off = full_idx * nh_full_pad
-                    h_moe = self.full_moe_chip_orch(
+                    h_moe, dbg_moe = self.full_moe_chip_orch(
                         prev_hidden,
                         input_rms,
                         pl.slice(moe_full_wq, [HIDDEN, hidden_q_full], [fa_w_off, 0]),
@@ -4387,7 +4399,7 @@ class WholeDecodeOpt:
                     swa_w_off = swa_idx * HIDDEN
                     swa_wo_off = swa_idx * hidden_q_swa
                     swa_gate_r_off = swa_idx * nh_swa_pad
-                    h_moe = self.swa_moe_chip_orch(
+                    h_moe, dbg_moe = self.swa_moe_chip_orch(
                         prev_hidden,
                         input_rms,
                         pl.slice(moe_swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
@@ -4496,7 +4508,7 @@ class WholeDecodeOpt:
             moe_recv_off_43 = 40 * local_recv_max
             moe_route_off_43 = 40 * n_routes_per_rank
             norm_layer_idx_43 = pl.cast(43, pl.INT32)
-            h_layer_43 = self.swa_moe_chip_orch_swiglu7_silu(
+            h_layer_43, dbg_layer_43 = self.swa_moe_chip_orch_swiglu7_silu(
                 prev_hidden,
                 input_rms,
                 pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off_43, 0]),
@@ -4590,7 +4602,7 @@ class WholeDecodeOpt:
             moe_recv_off_44 = 41 * local_recv_max
             moe_route_off_44 = 41 * n_routes_per_rank
             norm_layer_idx_44 = pl.cast(44, pl.INT32)
-            next_hidden_out = self.full_moe_chip_orch_swiglu7_swiglu16(
+            next_hidden_out, dbg_layer_44 = self.full_moe_chip_orch_swiglu7_swiglu16(
                 prev_hidden,
                 input_rms,
                 pl.slice(full_wq, [HIDDEN, hidden_q_full], [full_w_off_44, 0]),

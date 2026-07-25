@@ -4217,6 +4217,7 @@ class WholeDecodeOpt:
                 win_off = (layer_idx + 1) * BATCH
                 sig_off = (layer_idx + 1) * COMM_SIGNAL_STRIDE_I32
                 norm_idx = layer_idx + 1
+                dump_phys = layer_idx + 1
                 h_next = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
                 h_next = self.swa_chip_orch(
                     prev_hidden,
@@ -4250,12 +4251,15 @@ class WholeDecodeOpt:
                     0,
                     my_rank,
                 )
-                # Per-layer dump L1/L2 (phys = layer_idx + 1).
+                # Per-layer dump L1/L2 (phys = dump_phys, pre-computed to
+                # mirror the working MoE-loop dump site which uses a
+                # pre-computed phys_layer offset; inline `[layer_idx+1,0,0]`
+                # arithmetic produced all-0 dumps under the runtime pl.range).
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dense"):
                     per_layer_hidden = pl.assemble(
                         per_layer_hidden,
                         pl.slice(h_next, [BATCH, HIDDEN], [0, 0]),
-                        [layer_idx + 1, 0, 0],
+                        [dump_phys, 0, 0],
                     )
                 prev_hidden = h_next
 

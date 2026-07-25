@@ -4094,6 +4094,15 @@ class WholeDecodeOpt:
         per_layer_hidden: pl.Out[
             pl.Tensor[[NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
         ],
+        # Per-layer dbg_out dump for L3 stage-bisect (P_DBG_STAGE probe).
+        # chip_orch writes its dbg_out Out (stage 1/2/3/4/5 probes) into the
+        # loop-level dbg_moe / dbg_layer_43 / dbg_layer_44 buffers; this top-
+        # level Out surfaces them per physical layer to host. Mirrors
+        # per_layer_hidden readback. Non-probe runs: chip_orch doesn't write
+        # dbg_out → buffers stay zero-init → this Out stays zero (no compute).
+        dbg_out: pl.Out[
+            pl.Tensor[[NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
+        ],
         dense_attn_tmp_stack: pld.DistributedTensor[
             [NUM_DENSE_LAYERS * BATCH, HIDDEN], pl.BF16
         ],
@@ -4447,6 +4456,17 @@ class WholeDecodeOpt:
                         pl.slice(h_moe, [BATCH, HIDDEN], [0, 0]),
                         [phys_layer, 0, 0],
                     )
+                # Surface chip_orch's dbg_out (stage probe output) to host.
+                # chip_orch writes dbg_moe only when a _DBG_STAGE probe fires;
+                # otherwise dbg_moe stays zero-init. Always-on assemble so any
+                # P_DBG_STAGE value flows through (stage 5=resid_hold,
+                # 1=post_norm, 2=sh_y, 3=local_routed_y, 4=moe_out).
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dbg_moe"):
+                    dbg_out = pl.assemble(
+                        dbg_out,
+                        pl.slice(dbg_moe, [BATCH, HIDDEN], [0, 0]),
+                        [phys_layer, 0, 0],
+                    )
                 prev_hidden = h_moe
 
         # ── Phase 4: L43/L44 post-loop explicit specialization layers ──
@@ -4545,6 +4565,12 @@ class WholeDecodeOpt:
                     pl.slice(h_layer_43, [BATCH, HIDDEN], [0, 0]),
                     [43, 0, 0],
                 )
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dbg_l43"):
+                dbg_out = pl.assemble(
+                    dbg_out,
+                    pl.slice(dbg_layer_43, [BATCH, HIDDEN], [0, 0]),
+                    [43, 0, 0],
+                )
             prev_hidden = h_layer_43
     
             resid_hold_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -4626,6 +4652,12 @@ class WholeDecodeOpt:
                 0,
                 my_rank,
             )
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dbg_l44"):
+                dbg_out = pl.assemble(
+                    dbg_out,
+                    pl.slice(dbg_layer_44, [BATCH, HIDDEN], [0, 0]),
+                    [44, 0, 0],
+                )
         else:
             # Carry-thread write-back: L44 被 skip，把最后真正执行的 block 的
             # hidden (prev_hidden) 写进 next_hidden_out。P1=swa-dense loop 末轮
@@ -4714,6 +4746,9 @@ class WholeDecodeOpt:
         per_layer_hidden: pl.Out[
             pl.Tensor[[tp_size, NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
         ],
+        dbg_out: pl.Out[
+            pl.Tensor[[tp_size, NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
+        ],
     ):
         dense_attn_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
         dense_attn_signal_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
@@ -4794,6 +4829,7 @@ class WholeDecodeOpt:
                 v_cache[r],
                 next_hidden_out[r],
                 per_layer_hidden[r],
+                dbg_out[r],
                 pld.window(dense_attn_tmp_stack_buf, [NUM_DENSE_LAYERS * BATCH, HIDDEN],
                            dtype=pl.BF16),
                 pld.window(dense_attn_signal_stack_buf, [NUM_DENSE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],

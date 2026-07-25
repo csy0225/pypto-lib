@@ -279,6 +279,12 @@ class WholeDecodeHolder:
         # Per-layer hidden dump buffer for accuracy bisect (opt + baseline both).
         # Decode program runs 45 layers (L0..L44); shape [tp, 45, BATCH, HIDDEN].
         self._per_layer_hidden = _zsh(tp, 45, BATCH, HIDDEN)
+        # Per-layer dbg_out dump buffer for L3 stage-bisect (P_DBG_STAGE
+        # probe). Mirrors per_layer_hidden layout. opt host_orch surfaces
+        # chip_orch's per-iter dbg_out (stage 1/2/3/4/5 probe output) into
+        # this buffer. baseline's host_orch has no such Out → buffer stays
+        # zero for baseline (harness reads zeros, no side effect).
+        self._dbg_out_dump = _zsh(tp, 45, BATCH, HIDDEN)
         from tools.step3p5.pypto_weight_ipc import (  # noqa: PLC0415
             import_weights_all, build_stacked_weight,
         )
@@ -424,6 +430,12 @@ class WholeDecodeHolder:
         args += [self._next_hidden_out]
         # per_layer_hidden Out (per-layer dump for accuracy bisect).
         args += [self._per_layer_hidden]
+        # dbg_out Out (per-layer stage-probe dump for L3 stage-bisect).
+        # Always passed — the Out is in the opt signature; chip_orch only
+        # writes dbg_moe when a _DBG_STAGE probe fires, otherwise dbg_moe
+        # stays zero-init so non-probe runs pay only a zero-buffer write-back
+        # (no compute).
+        args += [self._dbg_out_dump]
         return args
 
     def __exit__(self, exc_type, exc, tb):
@@ -626,4 +638,5 @@ class WholeDecodeHolder:
             self.rt.run(self.compiled, *self._args_list)
         self._last_run_sec = time.time() - t0
         return {"next_hidden": self._next_hidden_out,
-                "per_layer_hidden": self._per_layer_hidden}
+                "per_layer_hidden": self._per_layer_hidden,
+                "dbg_out_dump": self._dbg_out_dump}

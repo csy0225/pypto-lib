@@ -276,6 +276,9 @@ class WholeDecodeHolder:
             _zsh(tp, BATCH, HIDDEN),
         )
         self._dbg_out = _zsh(tp, BATCH, HIDDEN)
+        # Per-layer hidden dump buffer for accuracy bisect (opt + baseline both).
+        # Decode program runs 45 layers (L0..L44); shape [tp, 45, BATCH, HIDDEN].
+        self._per_layer_hidden = _zsh(tp, 45, BATCH, HIDDEN)
         from tools.step3p5.pypto_weight_ipc import (  # noqa: PLC0415
             import_weights_all, build_stacked_weight,
         )
@@ -361,6 +364,8 @@ class WholeDecodeHolder:
                      self.k_cache, self.v_cache]
             args += [self._h_mid_out, self._next_hidden_out]
             args += [self._dbg_out]
+            # per_layer_hidden Out (per-layer dump for accuracy bisect).
+            args += [self._per_layer_hidden]
         self._args_list = args
         print(
             f"[holder] resident: built {len(args)} args; "
@@ -417,6 +422,8 @@ class WholeDecodeHolder:
         args += [self.k_cache, self.v_cache]
         # 1 Out (L4616): only next_hidden_out (Diff A: skip h_mid_out + dbg_out)
         args += [self._next_hidden_out]
+        # per_layer_hidden Out (per-layer dump for accuracy bisect).
+        args += [self._per_layer_hidden]
         return args
 
     def __exit__(self, exc_type, exc, tb):
@@ -618,4 +625,5 @@ class WholeDecodeHolder:
         else:
             self.rt.run(self.compiled, *self._args_list)
         self._last_run_sec = time.time() - t0
-        return {"next_hidden": self._next_hidden_out}
+        return {"next_hidden": self._next_hidden_out,
+                "per_layer_hidden": self._per_layer_hidden}

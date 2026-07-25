@@ -69,6 +69,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
     parser.add_argument(
+        "--layer-module",
+        default=None,
+        help="opt-mode: import this module for the program (e.g. models.step3p5_opt.decode_fwd); default None = canonical baseline",
+    )
+    parser.add_argument(
+        "--layer-name",
+        default=None,
+        help="opt-mode: program attr name in --layer-module (e.g. whole_decode_opt); must be given together with --layer-module",
+    )
+    parser.add_argument(
         "--itl-context-lens",
         default="",
         help=(
@@ -637,6 +647,8 @@ def _run_worker(args: argparse.Namespace) -> int:
         ckpt=args.ckpt,
         platform=args.platform,
         kv_ipc=True,
+        program=args.layer_name,
+        layer_module=args.layer_module,
     ).build()
     reports: list[dict[str, object]] = []
     repeat_hidden: torch.Tensor | None = None
@@ -674,6 +686,18 @@ def _run_worker(args: argparse.Namespace) -> int:
                     hidden_snapshot[0, 0],
                     out / f"main_step{step:02d}_hidden.pt",
                 )
+                # Per-layer hidden dump for accuracy bisect. Shape [tp, 45, BATCH, HIDDEN];
+                # save rank-0 row0 per layer (matches main_step hidden convention).
+                if "per_layer_hidden" in result:
+                    pl_hidden = result["per_layer_hidden"]
+                    pl_dir = out / f"per_layer_step{step:02d}"
+                    pl_dir.mkdir(parents=True, exist_ok=True)
+                    n_layers = pl_hidden.shape[1] if pl_hidden.dim() >= 3 else 0
+                    for li in range(n_layers):
+                        torch.save(
+                            pl_hidden[0, li, 0].to(torch.bfloat16).clone(),
+                            pl_dir / f"layer{li:02d}.pt",
+                        )
                 tp_spread = float(
                     (hidden[:, 0].float() - hidden[0:1, 0].float())
                     .abs()

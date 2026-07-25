@@ -698,24 +698,6 @@ def _run_worker(args: argparse.Namespace) -> int:
                             pl_hidden[0, li, 0].to(torch.bfloat16).clone(),
                             pl_dir / f"layer{li:02d}.pt",
                         )
-                # Per-layer dbg_out dump (L3 stage-bisect probe). Same layout
-                # as per_layer_hidden; for MoE layers (L3..L44) holds the
-                # chip_orch stage-probe output selected by P_DBG_STAGE:
-                #   5=resid_hold (attention residual), 1=post_norm, 2=sh_y,
-                #   3=local_routed_y, 4=moe_out. Stays zero-init when the
-                # probe is off (P_DBG_STAGE=0) or for non-MoE layers (dense
-                # L0-L2 have no chip_orch dbg_out writer). opt-only — baseline
-                # host_orch has no dbg_out Out, so buffer stays zero there.
-                if "dbg_out_dump" in result:
-                    dbd = result["dbg_out_dump"]
-                    dbd_dir = out / f"dbg_out_dump_step{step:02d}"
-                    dbd_dir.mkdir(parents=True, exist_ok=True)
-                    n_layers = dbd.shape[1] if dbd.dim() >= 3 else 0
-                    for li in range(n_layers):
-                        torch.save(
-                            dbd[0, li, 0].to(torch.bfloat16).clone(),
-                            dbd_dir / f"layer{li:02d}.pt",
-                        )
                 tp_spread = float(
                     (hidden[:, 0].float() - hidden[0:1, 0].float())
                     .abs()

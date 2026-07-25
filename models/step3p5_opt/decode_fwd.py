@@ -192,9 +192,10 @@ _DBG_STAGE = int(__import__("os").environ.get("P_DBG_STAGE", "0"))
 # 1 = 只 L0 (skip swa-dense loop + MoE loop + L43/L44).
 # 2 = L0 + L1/L2 swa-dense loop (skip MoE loop + L43/L44) ← P1.
 # 3 = L0 + L1/L2 + MoE loop(OPT_MOE_LAYERS 层) (skip L43/L44).
-# L43/L44 在 OPT_STOP_AFTER < 3 时 skip；截断时 final next_hidden_out 从最后
-# 真正执行的 block 写回 (carry threading). host_orch 42 层 alloc / 53-arg 签名
-# 不动 —— 截断只是 loop range=0 不生成 task，unused allocs 无害。
+# L43/L44 只在 OPT_STOP_AFTER == 0（full graph）时执行；OPT_STOP_AFTER=1/2/3
+# 是截断模式，会跳过 L43/L44。截断时 final next_hidden_out 从最后真正执行的
+# block 写回 (carry threading). host_orch 42 层 alloc / 53-arg 签名不动 ——
+# 截断只是 loop range=0 不生成 task，unused allocs 无害。
 import os as _os
 OPT_STOP_AFTER = int(_os.environ.get("OPT_STOP_AFTER", "0"))
 OPT_MOE_LAYERS = int(_os.environ.get("OPT_MOE_LAYERS", "40"))
@@ -2219,40 +2220,20 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> tuple[
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    ]:
-        resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1 = attention_full_inline(
+    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+        # Write attention directly into the dedicated residual Out.  Avoid a
+        # create_tensor -> reassign -> assemble handoff here: inside the
+        # runtime MoE pl.range that pattern could read the pre-call zero SSA
+        # version when stashing the residual, dropping the attention branch.
+        resid_hold = attention_full_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
             q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping,
             rope_cos, rope_sin, k_cache, v_cache,
-            wo, w_g, gate_r, resid1,
+            wo, w_g, gate_r, resid_hold,
             norm_layer_idx, attn_layer_idx,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # Save the attention residual into a DEDICATED per-layer external
-        # buffer resid_hold (write-once here, read-once by section D). The
-        # local resid1 create_tensor is reused by gate/shared/routed InCore
-        # scratch inside this big fused orch, so section D cannot read resid1
-        # directly. Earlier code stashed into next_hidden_out, but that made
-        # next_hidden_out have TWO writers (stash + residual_add) => a WAW that
-        # RAW-only-v1 (single-value producer_index) cannot serialise across
-        # submissions => nondeterministic output. resid_hold has ONE writer
-        # (here) and ONE reader (section D); next_hidden_out has ONE writer
-        # (section D). Both are clean single-producer RAW.
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="stash_resid_hold",
-        ):
-            for _rs in pl.range(HIDDEN // K_CHUNK):
-                _r0 = _rs * K_CHUNK
-                resid_hold = pl.assemble(
-                    resid_hold,
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, _r0]),
-                    [0, _r0],
-                )
         if _DBG_STAGE == 5:
             # Diagnostic: dump resid_hold (the attention residual = MoE-block
             # attention output) to isolate whether the valid-token race is in
@@ -2265,7 +2246,7 @@ class WholeDecodeOpt:
                         pl.slice(resid_hold, [BATCH, K_CHUNK], [0, _d50]),
                         [0, _d50],
                     )
-        # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
@@ -2275,7 +2256,7 @@ class WholeDecodeOpt:
             for kb in pl.range(hidden_blocks):
                 k0 = kb * K_CHUNK
                 rchunk = pl.cast(
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
                     target_type=pl.FP32,
                 )
                 resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
@@ -2461,7 +2442,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out, dbg_out
+        return next_hidden_out
 
     # ---- MoE-layer swa-attn FUSED with MoE-block: attention -> resid1
     # (local, intra-orch) -> post_norm -> EP/TP MoE -> residual. Mirrors the
@@ -2526,40 +2507,19 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> tuple[
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    ]:
-        resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1 = attention_swa_inline(
+    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+        # See full_moe_chip_orch: write the post-attention hidden directly
+        # into the dedicated residual Out so the loop body reads the post-call
+        # SSA value rather than a zero-initialized local tensor version.
+        resid_hold = attention_swa_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
             q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping,
             rope_cos, rope_sin, k_cache, v_cache,
-            wo, w_g, gate_r, resid1,
+            wo, w_g, gate_r, resid_hold,
             norm_layer_idx, attn_layer_idx,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # Save the attention residual into a DEDICATED per-layer external
-        # buffer resid_hold (write-once here, read-once by section D). The
-        # local resid1 create_tensor is reused by gate/shared/routed InCore
-        # scratch inside this big fused orch, so section D cannot read resid1
-        # directly. Earlier code stashed into next_hidden_out, but that made
-        # next_hidden_out have TWO writers (stash + residual_add) => a WAW that
-        # RAW-only-v1 (single-value producer_index) cannot serialise across
-        # submissions => nondeterministic output. resid_hold has ONE writer
-        # (here) and ONE reader (section D); next_hidden_out has ONE writer
-        # (section D). Both are clean single-producer RAW.
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="stash_resid_hold",
-        ):
-            for _rs in pl.range(HIDDEN // K_CHUNK):
-                _r0 = _rs * K_CHUNK
-                resid_hold = pl.assemble(
-                    resid_hold,
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, _r0]),
-                    [0, _r0],
-                )
         if _DBG_STAGE == 5:
             # Diagnostic: dump resid_hold (the attention residual = MoE-block
             # attention output) to isolate whether the valid-token race is in
@@ -2572,7 +2532,7 @@ class WholeDecodeOpt:
                         pl.slice(resid_hold, [BATCH, K_CHUNK], [0, _d50]),
                         [0, _d50],
                     )
-        # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
@@ -2582,7 +2542,7 @@ class WholeDecodeOpt:
             for kb in pl.range(hidden_blocks):
                 k0 = kb * K_CHUNK
                 rchunk = pl.cast(
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
                     target_type=pl.FP32,
                 )
                 resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
@@ -2768,7 +2728,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out, dbg_out
+        return next_hidden_out
     @pl.function(type=pl.FunctionType.Inline)
     def _expert_routed_swiglu7(  # noqa: PLR0913, PLR0915
         self,
@@ -3495,40 +3455,18 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> tuple[
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    ]:
-        resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1 = attention_full_inline(
+    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+        # Keep the specialized L44 path on the same direct-Out residual
+        # discipline as the loop-form MoE layers.
+        resid_hold = attention_full_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
             q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping,
             rope_cos, rope_sin, k_cache, v_cache,
-            wo, w_g, gate_r, resid1,
+            wo, w_g, gate_r, resid_hold,
             norm_layer_idx, attn_layer_idx,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # Save the attention residual into a DEDICATED per-layer external
-        # buffer resid_hold (write-once here, read-once by section D). The
-        # local resid1 create_tensor is reused by gate/shared/routed InCore
-        # scratch inside this big fused orch, so section D cannot read resid1
-        # directly. Earlier code stashed into next_hidden_out, but that made
-        # next_hidden_out have TWO writers (stash + residual_add) => a WAW that
-        # RAW-only-v1 (single-value producer_index) cannot serialise across
-        # submissions => nondeterministic output. resid_hold has ONE writer
-        # (here) and ONE reader (section D); next_hidden_out has ONE writer
-        # (section D). Both are clean single-producer RAW.
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="stash_resid_hold",
-        ):
-            for _rs in pl.range(HIDDEN // K_CHUNK):
-                _r0 = _rs * K_CHUNK
-                resid_hold = pl.assemble(
-                    resid_hold,
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, _r0]),
-                    [0, _r0],
-                )
         if _DBG_STAGE == 5:
             # Diagnostic: dump resid_hold (the attention residual = MoE-block
             # attention output) to isolate whether the valid-token race is in
@@ -3541,7 +3479,7 @@ class WholeDecodeOpt:
                         pl.slice(resid_hold, [BATCH, K_CHUNK], [0, _d50]),
                         [0, _d50],
                     )
-        # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
@@ -3551,7 +3489,7 @@ class WholeDecodeOpt:
             for kb in pl.range(hidden_blocks):
                 k0 = kb * K_CHUNK
                 rchunk = pl.cast(
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
                     target_type=pl.FP32,
                 )
                 resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
@@ -3737,7 +3675,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out, dbg_out
+        return next_hidden_out
 
     @pl.function(
         type=pl.FunctionType.Orchestration,
@@ -3798,40 +3736,18 @@ class WholeDecodeOpt:
         norm_layer_idx: pl.Scalar[pl.INT32],
         attn_layer_idx: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
-    ) -> tuple[
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    ]:
-        resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1 = attention_swa_inline(
+    ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+        # Keep the specialized L43 path on the same direct-Out residual
+        # discipline as the loop-form MoE layers.
+        resid_hold = attention_swa_inline(
             current_hidden, input_rms_weight, wq, wk, wv,
             q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping,
             rope_cos, rope_sin, k_cache, v_cache,
-            wo, w_g, gate_r, resid1,
+            wo, w_g, gate_r, resid_hold,
             norm_layer_idx, attn_layer_idx,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # Save the attention residual into a DEDICATED per-layer external
-        # buffer resid_hold (write-once here, read-once by section D). The
-        # local resid1 create_tensor is reused by gate/shared/routed InCore
-        # scratch inside this big fused orch, so section D cannot read resid1
-        # directly. Earlier code stashed into next_hidden_out, but that made
-        # next_hidden_out have TWO writers (stash + residual_add) => a WAW that
-        # RAW-only-v1 (single-value producer_index) cannot serialise across
-        # submissions => nondeterministic output. resid_hold has ONE writer
-        # (here) and ONE reader (section D); next_hidden_out has ONE writer
-        # (section D). Both are clean single-producer RAW.
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="stash_resid_hold",
-        ):
-            for _rs in pl.range(HIDDEN // K_CHUNK):
-                _r0 = _rs * K_CHUNK
-                resid_hold = pl.assemble(
-                    resid_hold,
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, _r0]),
-                    [0, _r0],
-                )
         if _DBG_STAGE == 5:
             # Diagnostic: dump resid_hold (the attention residual = MoE-block
             # attention output) to isolate whether the valid-token race is in
@@ -3844,7 +3760,7 @@ class WholeDecodeOpt:
                         pl.slice(resid_hold, [BATCH, K_CHUNK], [0, _d50]),
                         [0, _d50],
                     )
-        # ── B: post-attention zero-centred RMSNorm of resid1. ──────
+        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
@@ -3854,7 +3770,7 @@ class WholeDecodeOpt:
             for kb in pl.range(hidden_blocks):
                 k0 = kb * K_CHUNK
                 rchunk = pl.cast(
-                    pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
                     target_type=pl.FP32,
                 )
                 resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
@@ -4040,7 +3956,7 @@ class WholeDecodeOpt:
                     pl.cast(pl.add(r, m), target_type=pl.BF16),
                     [0, k0],
                 )
-        return next_hidden_out, dbg_out
+        return next_hidden_out
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def whole_chip_orch(  # noqa: PLR0913, PLR0915
@@ -4104,15 +4020,6 @@ class WholeDecodeOpt:
         v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         per_layer_hidden: pl.Out[
-            pl.Tensor[[NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
-        ],
-        # Per-layer dbg_out dump for L3 stage-bisect (P_DBG_STAGE probe).
-        # chip_orch writes its dbg_out Out (stage 1/2/3/4/5 probes) into the
-        # loop-level dbg_moe / dbg_layer_43 / dbg_layer_44 buffers; this top-
-        # level Out surfaces them per physical layer to host. Mirrors
-        # per_layer_hidden readback. Non-probe runs: chip_orch doesn't write
-        # dbg_out → buffers stay zero-init → this Out stays zero (no compute).
-        dbg_out: pl.Out[
             pl.Tensor[[NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
         ],
         dense_attn_tmp_stack: pld.DistributedTensor[
@@ -4226,9 +4133,10 @@ class WholeDecodeOpt:
         # ── L1/L2: swa-attn dense layers inside a runtime pl.range loop. ──
         # layer_idx ∈ {0, 1} maps to physical layers {1, 2}: swa weight offset
         # = layer_idx, dense MLP offset = layer_idx + 1, norm/mlp idx = +1.
-        # OPT_STOP_AFTER bisect: <2 时 skip swa-dense loop (carry = h_layer_0).
+        # OPT_STOP_AFTER bisect: 0=full graph (including L1/L2), 1=skip
+        # swa-dense and MoE, 2=stop after L2, 3=enter the MoE loop.
         prev_hidden = h_layer_0
-        if OPT_STOP_AFTER >= 2:
+        if OPT_STOP_AFTER == 0 or OPT_STOP_AFTER >= 2:
             for layer_idx in pl.range(NUM_SWA_DENSE_LAYERS):
                 swa_w_off = layer_idx * HIDDEN
                 swa_wo_off = layer_idx * hidden_q_swa
@@ -4327,7 +4235,7 @@ class WholeDecodeOpt:
                     fa_w_off = full_idx * HIDDEN
                     fa_wo_off = full_idx * hidden_q_full
                     fa_gate_r_off = full_idx * nh_full_pad
-                    h_moe, dbg_moe = self.full_moe_chip_orch(
+                    h_moe = self.full_moe_chip_orch(
                         prev_hidden,
                         input_rms,
                         pl.slice(moe_full_wq, [HIDDEN, hidden_q_full], [fa_w_off, 0]),
@@ -4399,7 +4307,7 @@ class WholeDecodeOpt:
                     swa_w_off = swa_idx * HIDDEN
                     swa_wo_off = swa_idx * hidden_q_swa
                     swa_gate_r_off = swa_idx * nh_swa_pad
-                    h_moe, dbg_moe = self.swa_moe_chip_orch(
+                    h_moe = self.swa_moe_chip_orch(
                         prev_hidden,
                         input_rms,
                         pl.slice(moe_swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
@@ -4468,17 +4376,6 @@ class WholeDecodeOpt:
                         pl.slice(h_moe, [BATCH, HIDDEN], [0, 0]),
                         [phys_layer, 0, 0],
                     )
-                # Surface chip_orch's dbg_out (stage probe output) to host.
-                # chip_orch writes dbg_moe only when a _DBG_STAGE probe fires;
-                # otherwise dbg_moe stays zero-init. Always-on assemble so any
-                # P_DBG_STAGE value flows through (stage 5=resid_hold,
-                # 1=post_norm, 2=sh_y, 3=local_routed_y, 4=moe_out).
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dbg_moe"):
-                    dbg_out = pl.assemble(
-                        dbg_out,
-                        pl.slice(dbg_moe, [BATCH, HIDDEN], [0, 0]),
-                        [phys_layer, 0, 0],
-                    )
                 prev_hidden = h_moe
 
         # ── Phase 4: L43/L44 post-loop explicit specialization layers ──
@@ -4508,7 +4405,7 @@ class WholeDecodeOpt:
             moe_recv_off_43 = 40 * local_recv_max
             moe_route_off_43 = 40 * n_routes_per_rank
             norm_layer_idx_43 = pl.cast(43, pl.INT32)
-            h_layer_43, dbg_layer_43 = self.swa_moe_chip_orch_swiglu7_silu(
+            h_layer_43 = self.swa_moe_chip_orch_swiglu7_silu(
                 prev_hidden,
                 input_rms,
                 pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off_43, 0]),
@@ -4577,12 +4474,6 @@ class WholeDecodeOpt:
                     pl.slice(h_layer_43, [BATCH, HIDDEN], [0, 0]),
                     [43, 0, 0],
                 )
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dbg_l43"):
-                dbg_out = pl.assemble(
-                    dbg_out,
-                    pl.slice(dbg_layer_43, [BATCH, HIDDEN], [0, 0]),
-                    [43, 0, 0],
-                )
             prev_hidden = h_layer_43
     
             resid_hold_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
@@ -4602,7 +4493,7 @@ class WholeDecodeOpt:
             moe_recv_off_44 = 41 * local_recv_max
             moe_route_off_44 = 41 * n_routes_per_rank
             norm_layer_idx_44 = pl.cast(44, pl.INT32)
-            next_hidden_out, dbg_layer_44 = self.full_moe_chip_orch_swiglu7_swiglu16(
+            next_hidden_out = self.full_moe_chip_orch_swiglu7_swiglu16(
                 prev_hidden,
                 input_rms,
                 pl.slice(full_wq, [HIDDEN, hidden_q_full], [full_w_off_44, 0]),
@@ -4664,12 +4555,6 @@ class WholeDecodeOpt:
                 0,
                 my_rank,
             )
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="dump_dbg_l44"):
-                dbg_out = pl.assemble(
-                    dbg_out,
-                    pl.slice(dbg_layer_44, [BATCH, HIDDEN], [0, 0]),
-                    [44, 0, 0],
-                )
         else:
             # Carry-thread write-back: L44 被 skip，把最后真正执行的 block 的
             # hidden (prev_hidden) 写进 next_hidden_out。P1=swa-dense loop 末轮
@@ -4758,9 +4643,6 @@ class WholeDecodeOpt:
         per_layer_hidden: pl.Out[
             pl.Tensor[[tp_size, NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
         ],
-        dbg_out: pl.Out[
-            pl.Tensor[[tp_size, NUM_DECODE_LAYERS_TOTAL, BATCH, HIDDEN], pl.BF16]
-        ],
     ):
         dense_attn_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
         dense_attn_signal_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
@@ -4841,7 +4723,6 @@ class WholeDecodeOpt:
                 v_cache[r],
                 next_hidden_out[r],
                 per_layer_hidden[r],
-                dbg_out[r],
                 pld.window(dense_attn_tmp_stack_buf, [NUM_DENSE_LAYERS * BATCH, HIDDEN],
                            dtype=pl.BF16),
                 pld.window(dense_attn_signal_stack_buf, [NUM_DENSE_LAYERS * COMM_SIGNAL_STRIDE_I32, 1],

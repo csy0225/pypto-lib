@@ -186,6 +186,19 @@ sh_tp_chunk = HIDDEN // tp_size
 # Diagnostic bisect knob (build-time constant): MoE chip_orch op-level dump.
 _DBG_STAGE = int(__import__("os").environ.get("P_DBG_STAGE", "0"))
 
+# Diagnostic bisect knob (build-time constant): 507018 dispatch-cut bisect.
+# 0 (default) = L0 + L1/L2 swa-dense loop + L3-L42 MoE loop(40) + L43 + L44 全跑
+#   (零回归，行为等价 frozen program).
+# 1 = 只 L0 (skip swa-dense loop + MoE loop + L43/L44).
+# 2 = L0 + L1/L2 swa-dense loop (skip MoE loop + L43/L44) ← P1.
+# 3 = L0 + L1/L2 + MoE loop(OPT_MOE_LAYERS 层) (skip L43/L44).
+# L43/L44 在 OPT_STOP_AFTER < 3 时 skip；截断时 final next_hidden_out 从最后
+# 真正执行的 block 写回 (carry threading). host_orch 42 层 alloc / 53-arg 签名
+# 不动 —— 截断只是 loop range=0 不生成 task，unused allocs 无害。
+import os as _os
+OPT_STOP_AFTER = int(_os.environ.get("OPT_STOP_AFTER", "0"))
+OPT_MOE_LAYERS = int(_os.environ.get("OPT_MOE_LAYERS", "40"))
+
 # MoE-layer counts for the loop form. L3..L42 = 40 MoE silu_silu layers split
 # by attention type: 10 full-attn (L3..L12) + 30 swa-attn (L13..L42).
 NUM_FULL_MOE_LAYERS = 10
@@ -4165,50 +4178,52 @@ class WholeDecodeOpt:
         # ── L1/L2: swa-attn dense layers inside a runtime pl.range loop. ──
         # layer_idx ∈ {0, 1} maps to physical layers {1, 2}: swa weight offset
         # = layer_idx, dense MLP offset = layer_idx + 1, norm/mlp idx = +1.
+        # OPT_STOP_AFTER bisect: <2 时 skip swa-dense loop (carry = h_layer_0).
         prev_hidden = h_layer_0
-        for layer_idx in pl.range(NUM_SWA_DENSE_LAYERS):
-            swa_w_off = layer_idx * HIDDEN
-            swa_wo_off = layer_idx * hidden_q_swa
-            swa_gate_r_off = layer_idx * nh_swa_pad
-            dense_w_off = (layer_idx + 1) * HIDDEN
-            dense_down_off = (layer_idx + 1) * INTER_LOCAL
-            win_off = (layer_idx + 1) * BATCH
-            sig_off = (layer_idx + 1) * COMM_SIGNAL_STRIDE_I32
-            norm_idx = layer_idx + 1
-            h_next = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-            h_next = self.swa_chip_orch(
-                prev_hidden,
-                input_rms,
-                pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
-                pl.slice(swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
-                pl.slice(swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
-                q_norm,
-                k_norm,
-                seq_lens,
-                block_table,
-                slot_mapping,
-                rope_cos_swa,
-                rope_sin_swa,
-                k_cache,
-                v_cache,
-                pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off, 0]),
-                pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off, 0]),
-                pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off, 0]),
-                post_rms,
-                pl.slice(dense_w_gate, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
-                pl.slice(dense_w_up, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
-                pl.slice(dense_w_down, [INTER_LOCAL, HIDDEN], [dense_down_off, 0]),
-                h_next,
-                pl.slice(dense_attn_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
-                pl.slice(dense_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
-                pl.slice(dense_mlp_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
-                pl.slice(dense_mlp_signal_stack, [tp_size, 1], [sig_off, 0]),
-                norm_idx,
-                0,
-                0,
-                my_rank,
-            )
-            prev_hidden = h_next
+        if OPT_STOP_AFTER >= 2:
+            for layer_idx in pl.range(NUM_SWA_DENSE_LAYERS):
+                swa_w_off = layer_idx * HIDDEN
+                swa_wo_off = layer_idx * hidden_q_swa
+                swa_gate_r_off = layer_idx * nh_swa_pad
+                dense_w_off = (layer_idx + 1) * HIDDEN
+                dense_down_off = (layer_idx + 1) * INTER_LOCAL
+                win_off = (layer_idx + 1) * BATCH
+                sig_off = (layer_idx + 1) * COMM_SIGNAL_STRIDE_I32
+                norm_idx = layer_idx + 1
+                h_next = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                h_next = self.swa_chip_orch(
+                    prev_hidden,
+                    input_rms,
+                    pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
+                    pl.slice(swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
+                    pl.slice(swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
+                    q_norm,
+                    k_norm,
+                    seq_lens,
+                    block_table,
+                    slot_mapping,
+                    rope_cos_swa,
+                    rope_sin_swa,
+                    k_cache,
+                    v_cache,
+                    pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off, 0]),
+                    pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off, 0]),
+                    pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off, 0]),
+                    post_rms,
+                    pl.slice(dense_w_gate, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
+                    pl.slice(dense_w_up, [HIDDEN, INTER_LOCAL], [dense_w_off, 0]),
+                    pl.slice(dense_w_down, [INTER_LOCAL, HIDDEN], [dense_down_off, 0]),
+                    h_next,
+                    pl.slice(dense_attn_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
+                    pl.slice(dense_attn_signal_stack, [tp_size, 1], [sig_off, 0]),
+                    pl.slice(dense_mlp_tmp_stack, [BATCH, HIDDEN], [win_off, 0]),
+                    pl.slice(dense_mlp_signal_stack, [tp_size, 1], [sig_off, 0]),
+                    norm_idx,
+                    0,
+                    0,
+                    my_rank,
+                )
+                prev_hidden = h_next
 
         # ── L3-L42: MoE silu_silu 40 layers inside a runtime pl.range loop. ──
         # layer_idx ∈ 0..39 maps to physical layer 3 + layer_idx. The real
@@ -4222,168 +4237,174 @@ class WholeDecodeOpt:
         # kind (NOT single-window reuse — that would race the Ge(1) rendezvous
         # across layers). Pristine fixed-threshold expected=1 kept verbatim;
         # no moe_epoch. See memory moe-protocol-c1-handoff-loop-form.
-        for layer_idx in pl.range(NUM_MOE_LAYERS):
-            phys_layer = layer_idx + 3
-            norm_layer_idx = pl.cast(phys_layer, pl.INT32)
-            # MoE weight/window offset = layer_idx * slot (0-indexed into the
-            # 40-layer stacks).
-            moe_w_off = layer_idx * HIDDEN
-            moe_bias_off = layer_idx * N_EXPERTS
-            moe_r_off = layer_idx * (n_local_experts * HIDDEN)
-            moe_r_down_off = layer_idx * (n_local_experts * inter)
-            moe_r_scale_off = layer_idx * n_local_experts
-            moe_sh_down_off = layer_idx * sh_inter_local
-            moe_win_off = layer_idx * BATCH
-            moe_sig_off = layer_idx * COMM_SIGNAL_STRIDE_I32
-            moe_pub_off = layer_idx * (n_ranks * n_ranks)
-            moe_recv_off = layer_idx * local_recv_max
-            moe_route_off = layer_idx * n_routes_per_rank
-            h_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-            dbg_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-            resid_hold_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-            # full_moe at layer_idx % 4 == 1 (physical 4,8,12,...). full_idx =
-            # (layer_idx - 1) // 4 maps {1,5,9,...} -> {0,1,2,...,9}.
-            # swa_idx = layer_idx - full_count_so_far; computed inside branch.
-            if layer_idx % 4 == 1:
-                full_idx = (layer_idx - 1) // 4
-                fa_w_off = full_idx * HIDDEN
-                fa_wo_off = full_idx * hidden_q_full
-                fa_gate_r_off = full_idx * nh_full_pad
-                h_moe = self.full_moe_chip_orch(
-                    prev_hidden,
-                    input_rms,
-                    pl.slice(moe_full_wq, [HIDDEN, hidden_q_full], [fa_w_off, 0]),
-                    pl.slice(moe_full_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [fa_w_off, 0]),
-                    pl.slice(moe_full_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [fa_w_off, 0]),
-                    q_norm,
-                    k_norm,
-                    seq_lens,
-                    block_table,
-                    slot_mapping,
-                    rope_cos_full,
-                    rope_sin_full,
-                    k_cache,
-                    v_cache,
-                    pl.slice(moe_full_wo, [hidden_q_full, HIDDEN], [fa_wo_off, 0]),
-                    pl.slice(moe_full_w_g, [HIDDEN, nh_full_pad], [fa_w_off, 0]),
-                    pl.slice(moe_full_gate_r, [nh_full_pad, hidden_q_full], [fa_gate_r_off, 0]),
-                    post_rms,
-                    pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off, 0]),
-                    pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off]),
-                    pl.reshape(
-                        pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
-                        [n_local_experts, HIDDEN, inter],
-                    ),
-                    pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
-                    pl.reshape(
-                        pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
-                        [n_local_experts, HIDDEN, inter],
-                    ),
-                    pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
-                    pl.reshape(
-                        pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off, 0]),
-                        [n_local_experts, inter, HIDDEN],
-                    ),
-                    pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off, 0]),
-                    pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
-                    pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
-                    pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
-                    h_moe,
-                    dbg_moe,
-                    resid_hold_moe,
-                    pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
-                    pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off, 0]),
-                    pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off, 0]),
-                    pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
-                    pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
-                    pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
-                    pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
-                    pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
-                    pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
-                    pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
-                    pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off, 0]),
-                    pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
-                    norm_layer_idx,
-                    0,
-                    my_rank,
-                )
-            else:
-                # swa_idx = number of swa layers before this layer_idx =
-                # layer_idx - (number of full_moe layers before it).
-                # full_moe sits at layer_idx % 4 == 1 ({1,5,9,...}); count of
-                # full layers strictly before layer_idx = (layer_idx + 2) // 4.
-                full_before = (layer_idx + 2) // 4
-                swa_idx = layer_idx - full_before
-                swa_w_off = swa_idx * HIDDEN
-                swa_wo_off = swa_idx * hidden_q_swa
-                swa_gate_r_off = swa_idx * nh_swa_pad
-                h_moe = self.swa_moe_chip_orch(
-                    prev_hidden,
-                    input_rms,
-                    pl.slice(moe_swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
-                    pl.slice(moe_swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
-                    pl.slice(moe_swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
-                    q_norm,
-                    k_norm,
-                    seq_lens,
-                    block_table,
-                    slot_mapping,
-                    rope_cos_swa,
-                    rope_sin_swa,
-                    k_cache,
-                    v_cache,
-                    pl.slice(moe_swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off, 0]),
-                    pl.slice(moe_swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off, 0]),
-                    pl.slice(moe_swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off, 0]),
-                    post_rms,
-                    pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off, 0]),
-                    pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off]),
-                    pl.reshape(
-                        pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
-                        [n_local_experts, HIDDEN, inter],
-                    ),
-                    pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
-                    pl.reshape(
-                        pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
-                        [n_local_experts, HIDDEN, inter],
-                    ),
-                    pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
-                    pl.reshape(
-                        pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off, 0]),
-                        [n_local_experts, inter, HIDDEN],
-                    ),
-                    pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off, 0]),
-                    pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
-                    pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
-                    pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
-                    h_moe,
-                    dbg_moe,
-                    resid_hold_moe,
-                    pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
-                    pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off, 0]),
-                    pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off, 0]),
-                    pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
-                    pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
-                    pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
-                    pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
-                    pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
-                    pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
-                    pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
-                    pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off, 0]),
-                    pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
-                    pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
-                    norm_layer_idx,
-                    0,
-                    my_rank,
-                )
-            prev_hidden = h_moe
+        # OPT_STOP_AFTER bisect: 0=NUM_MOE_LAYERS(40, 零回归); 3=OPT_MOE_LAYERS;
+        # 1/2=skip (carry = prev_hidden 不变).
+        _opt_moe_n = NUM_MOE_LAYERS if OPT_STOP_AFTER == 0 else (
+            OPT_MOE_LAYERS if OPT_STOP_AFTER == 3 else 0
+        )
+        if _opt_moe_n > 0:
+            for layer_idx in pl.range(_opt_moe_n):
+                phys_layer = layer_idx + 3
+                norm_layer_idx = pl.cast(phys_layer, pl.INT32)
+                # MoE weight/window offset = layer_idx * slot (0-indexed into the
+                # 40-layer stacks).
+                moe_w_off = layer_idx * HIDDEN
+                moe_bias_off = layer_idx * N_EXPERTS
+                moe_r_off = layer_idx * (n_local_experts * HIDDEN)
+                moe_r_down_off = layer_idx * (n_local_experts * inter)
+                moe_r_scale_off = layer_idx * n_local_experts
+                moe_sh_down_off = layer_idx * sh_inter_local
+                moe_win_off = layer_idx * BATCH
+                moe_sig_off = layer_idx * COMM_SIGNAL_STRIDE_I32
+                moe_pub_off = layer_idx * (n_ranks * n_ranks)
+                moe_recv_off = layer_idx * local_recv_max
+                moe_route_off = layer_idx * n_routes_per_rank
+                h_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                dbg_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                resid_hold_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                # full_moe at layer_idx % 4 == 1 (physical 4,8,12,...). full_idx =
+                # (layer_idx - 1) // 4 maps {1,5,9,...} -> {0,1,2,...,9}.
+                # swa_idx = layer_idx - full_count_so_far; computed inside branch.
+                if layer_idx % 4 == 1:
+                    full_idx = (layer_idx - 1) // 4
+                    fa_w_off = full_idx * HIDDEN
+                    fa_wo_off = full_idx * hidden_q_full
+                    fa_gate_r_off = full_idx * nh_full_pad
+                    h_moe = self.full_moe_chip_orch(
+                        prev_hidden,
+                        input_rms,
+                        pl.slice(moe_full_wq, [HIDDEN, hidden_q_full], [fa_w_off, 0]),
+                        pl.slice(moe_full_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [fa_w_off, 0]),
+                        pl.slice(moe_full_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [fa_w_off, 0]),
+                        q_norm,
+                        k_norm,
+                        seq_lens,
+                        block_table,
+                        slot_mapping,
+                        rope_cos_full,
+                        rope_sin_full,
+                        k_cache,
+                        v_cache,
+                        pl.slice(moe_full_wo, [hidden_q_full, HIDDEN], [fa_wo_off, 0]),
+                        pl.slice(moe_full_w_g, [HIDDEN, nh_full_pad], [fa_w_off, 0]),
+                        pl.slice(moe_full_gate_r, [nh_full_pad, hidden_q_full], [fa_gate_r_off, 0]),
+                        post_rms,
+                        pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off, 0]),
+                        pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off]),
+                        pl.reshape(
+                            pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
+                            [n_local_experts, HIDDEN, inter],
+                        ),
+                        pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
+                        pl.reshape(
+                            pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
+                            [n_local_experts, HIDDEN, inter],
+                        ),
+                        pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
+                        pl.reshape(
+                            pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off, 0]),
+                            [n_local_experts, inter, HIDDEN],
+                        ),
+                        pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off, 0]),
+                        pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
+                        pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
+                        pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
+                        h_moe,
+                        dbg_moe,
+                        resid_hold_moe,
+                        pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
+                        pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off, 0]),
+                        pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off, 0]),
+                        pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
+                        pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
+                        pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
+                        pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
+                        pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
+                        pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
+                        pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off, 0]),
+                        pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
+                        norm_layer_idx,
+                        0,
+                        my_rank,
+                    )
+                else:
+                    # swa_idx = number of swa layers before this layer_idx =
+                    # layer_idx - (number of full_moe layers before it).
+                    # full_moe sits at layer_idx % 4 == 1 ({1,5,9,...}); count of
+                    # full layers strictly before layer_idx = (layer_idx + 2) // 4.
+                    full_before = (layer_idx + 2) // 4
+                    swa_idx = layer_idx - full_before
+                    swa_w_off = swa_idx * HIDDEN
+                    swa_wo_off = swa_idx * hidden_q_swa
+                    swa_gate_r_off = swa_idx * nh_swa_pad
+                    h_moe = self.swa_moe_chip_orch(
+                        prev_hidden,
+                        input_rms,
+                        pl.slice(moe_swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off, 0]),
+                        pl.slice(moe_swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
+                        pl.slice(moe_swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off, 0]),
+                        q_norm,
+                        k_norm,
+                        seq_lens,
+                        block_table,
+                        slot_mapping,
+                        rope_cos_swa,
+                        rope_sin_swa,
+                        k_cache,
+                        v_cache,
+                        pl.slice(moe_swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off, 0]),
+                        pl.slice(moe_swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off, 0]),
+                        pl.slice(moe_swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off, 0]),
+                        post_rms,
+                        pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off, 0]),
+                        pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off]),
+                        pl.reshape(
+                            pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
+                            [n_local_experts, HIDDEN, inter],
+                        ),
+                        pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
+                        pl.reshape(
+                            pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
+                            [n_local_experts, HIDDEN, inter],
+                        ),
+                        pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off, 0]),
+                        pl.reshape(
+                            pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off, 0]),
+                            [n_local_experts, inter, HIDDEN],
+                        ),
+                        pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off, 0]),
+                        pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
+                        pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
+                        pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
+                        h_moe,
+                        dbg_moe,
+                        resid_hold_moe,
+                        pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
+                        pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off, 0]),
+                        pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off, 0]),
+                        pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
+                        pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
+                        pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
+                        pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
+                        pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off, 0]),
+                        pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off, 0]),
+                        pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
+                        pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off, 0]),
+                        pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off, 0]),
+                        pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off, 0]),
+                        norm_layer_idx,
+                        0,
+                        my_rank,
+                    )
+                prev_hidden = h_moe
 
         # ── Phase 4: L43/L44 post-loop explicit specialization layers ──
         # L43 = swa_moe_swiglu7_silu (routed_lim=7.0, shared_lim=0.0): swa attn
@@ -4391,167 +4412,186 @@ class WholeDecodeOpt:
         # L44 = full_moe_swiglu7_swiglu16 (routed_lim=7.0, shared_lim=16.0):
         # full attn weight offset 11 (the 12th full layer), MoE offset 41, norm 44.
         # swiglu7 / swiglu16 constants resolved at module level (always-True).
-        h_layer_43 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        dbg_layer_43 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid_hold_layer_43 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        swa_w_off_43 = 32 * HIDDEN
-        swa_wo_off_43 = 32 * hidden_q_swa
-        swa_gate_r_off_43 = 32 * nh_swa_pad
-        moe_w_off_43 = 40 * HIDDEN
-        moe_bias_off_43 = 40 * N_EXPERTS
-        moe_r_off_43 = 40 * (n_local_experts * HIDDEN)
-        moe_r_scale_off_43 = 40 * n_local_experts
-        moe_r_down_off_43 = 40 * (n_local_experts * inter)
-        moe_sh_down_off_43 = 40 * sh_inter_local
-        moe_win_off_43 = 40 * BATCH
-        moe_sig_off_43 = 40 * COMM_SIGNAL_STRIDE_I32
-        moe_pub_off_43 = 40 * (n_ranks * n_ranks)
-        moe_recv_off_43 = 40 * local_recv_max
-        moe_route_off_43 = 40 * n_routes_per_rank
-        norm_layer_idx_43 = pl.cast(43, pl.INT32)
-        h_layer_43 = self.swa_moe_chip_orch_swiglu7_silu(
-            prev_hidden,
-            input_rms,
-            pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off_43, 0]),
-            pl.slice(swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off_43, 0]),
-            pl.slice(swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off_43, 0]),
-            q_norm,
-            k_norm,
-            seq_lens,
-            block_table,
-            slot_mapping,
-            rope_cos_swa,
-            rope_sin_swa,
-            k_cache,
-            v_cache,
-            pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off_43, 0]),
-            pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off_43, 0]),
-            pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off_43, 0]),
-            post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off_43, 0]),
-            pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off_43]),
-            pl.reshape(
-                pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off_43, 0]),
-                [n_local_experts, HIDDEN, inter],
-            ),
-            pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off_43, 0]),
-            pl.reshape(
-                pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off_43, 0]),
-                [n_local_experts, HIDDEN, inter],
-            ),
-            pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off_43, 0]),
-            pl.reshape(
-                pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off_43, 0]),
-                [n_local_experts, inter, HIDDEN],
-            ),
-            pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off_43, 0]),
-            pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off_43, 0]),
-            pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off_43, 0]),
-            pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off_43, 0]),
-            h_layer_43,
-            dbg_layer_43,
-            resid_hold_layer_43,
-            pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off_43, 0]),
-            pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off_43, 0]),
-            pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off_43, 0]),
-            pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
-            pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
-            pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off_43, 0]),
-            pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
-            pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off_43, 0]),
-            pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
-            pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off_43, 0]),
-            pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off_43, 0]),
-            pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_43, 0]),
-            pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off_43, 0]),
-            pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off_43, 0]),
-            pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
-            pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
-            norm_layer_idx_43,
-            0,
-            my_rank,
-        )
-        prev_hidden = h_layer_43
-
-        resid_hold_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        dbg_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        full_w_off_44 = 11 * HIDDEN
-        full_wo_off_44 = 11 * hidden_q_full
-        full_gate_r_off_44 = 11 * nh_full_pad
-        moe_w_off_44 = 41 * HIDDEN
-        moe_bias_off_44 = 41 * N_EXPERTS
-        moe_r_off_44 = 41 * (n_local_experts * HIDDEN)
-        moe_r_scale_off_44 = 41 * n_local_experts
-        moe_r_down_off_44 = 41 * (n_local_experts * inter)
-        moe_sh_down_off_44 = 41 * sh_inter_local
-        moe_win_off_44 = 41 * BATCH
-        moe_sig_off_44 = 41 * COMM_SIGNAL_STRIDE_I32
-        moe_pub_off_44 = 41 * (n_ranks * n_ranks)
-        moe_recv_off_44 = 41 * local_recv_max
-        moe_route_off_44 = 41 * n_routes_per_rank
-        norm_layer_idx_44 = pl.cast(44, pl.INT32)
-        next_hidden_out = self.full_moe_chip_orch_swiglu7_swiglu16(
-            prev_hidden,
-            input_rms,
-            pl.slice(full_wq, [HIDDEN, hidden_q_full], [full_w_off_44, 0]),
-            pl.slice(full_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [full_w_off_44, 0]),
-            pl.slice(full_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [full_w_off_44, 0]),
-            q_norm,
-            k_norm,
-            seq_lens,
-            block_table,
-            slot_mapping,
-            rope_cos_full,
-            rope_sin_full,
-            k_cache,
-            v_cache,
-            pl.slice(full_wo, [hidden_q_full, HIDDEN], [full_wo_off_44, 0]),
-            pl.slice(full_w_g, [HIDDEN, nh_full_pad], [full_w_off_44, 0]),
-            pl.slice(full_gate_r, [nh_full_pad, hidden_q_full], [full_gate_r_off_44, 0]),
-            post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off_44, 0]),
-            pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off_44]),
-            pl.reshape(
-                pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off_44, 0]),
-                [n_local_experts, HIDDEN, inter],
-            ),
-            pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off_44, 0]),
-            pl.reshape(
-                pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off_44, 0]),
-                [n_local_experts, HIDDEN, inter],
-            ),
-            pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off_44, 0]),
-            pl.reshape(
-                pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off_44, 0]),
-                [n_local_experts, inter, HIDDEN],
-            ),
-            pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off_44, 0]),
-            pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off_44, 0]),
-            pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off_44, 0]),
-            pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off_44, 0]),
-            next_hidden_out,
-            dbg_layer_44,
-            resid_hold_layer_44,
-            pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off_44, 0]),
-            pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off_44, 0]),
-            pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off_44, 0]),
-            pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
-            pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
-            pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off_44, 0]),
-            pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
-            pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off_44, 0]),
-            pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
-            pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off_44, 0]),
-            pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off_44, 0]),
-            pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_44, 0]),
-            pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off_44, 0]),
-            pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off_44, 0]),
-            pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
-            pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
-            norm_layer_idx_44,
-            0,
-            my_rank,
-        )
+        # OPT_STOP_AFTER bisect: L43/L44 只在 OPT_STOP_AFTER==0 (全跑) 时执行；
+        # 截断时 skip，final next_hidden_out 由 carry-thread 写回分支补上。
+        if OPT_STOP_AFTER == 0:
+            h_layer_43 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            dbg_layer_43 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            resid_hold_layer_43 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            swa_w_off_43 = 32 * HIDDEN
+            swa_wo_off_43 = 32 * hidden_q_swa
+            swa_gate_r_off_43 = 32 * nh_swa_pad
+            moe_w_off_43 = 40 * HIDDEN
+            moe_bias_off_43 = 40 * N_EXPERTS
+            moe_r_off_43 = 40 * (n_local_experts * HIDDEN)
+            moe_r_scale_off_43 = 40 * n_local_experts
+            moe_r_down_off_43 = 40 * (n_local_experts * inter)
+            moe_sh_down_off_43 = 40 * sh_inter_local
+            moe_win_off_43 = 40 * BATCH
+            moe_sig_off_43 = 40 * COMM_SIGNAL_STRIDE_I32
+            moe_pub_off_43 = 40 * (n_ranks * n_ranks)
+            moe_recv_off_43 = 40 * local_recv_max
+            moe_route_off_43 = 40 * n_routes_per_rank
+            norm_layer_idx_43 = pl.cast(43, pl.INT32)
+            h_layer_43 = self.swa_moe_chip_orch_swiglu7_silu(
+                prev_hidden,
+                input_rms,
+                pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [swa_w_off_43, 0]),
+                pl.slice(swa_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off_43, 0]),
+                pl.slice(swa_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [swa_w_off_43, 0]),
+                q_norm,
+                k_norm,
+                seq_lens,
+                block_table,
+                slot_mapping,
+                rope_cos_swa,
+                rope_sin_swa,
+                k_cache,
+                v_cache,
+                pl.slice(swa_wo, [hidden_q_swa, HIDDEN], [swa_wo_off_43, 0]),
+                pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off_43, 0]),
+                pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off_43, 0]),
+                post_rms,
+                pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off_43, 0]),
+                pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off_43]),
+                pl.reshape(
+                    pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off_43, 0]),
+                    [n_local_experts, HIDDEN, inter],
+                ),
+                pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off_43, 0]),
+                pl.reshape(
+                    pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off_43, 0]),
+                    [n_local_experts, HIDDEN, inter],
+                ),
+                pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off_43, 0]),
+                pl.reshape(
+                    pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off_43, 0]),
+                    [n_local_experts, inter, HIDDEN],
+                ),
+                pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off_43, 0]),
+                pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off_43, 0]),
+                pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off_43, 0]),
+                pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off_43, 0]),
+                h_layer_43,
+                dbg_layer_43,
+                resid_hold_layer_43,
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off_43, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off_43, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off_43, 0]),
+                pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off_43, 0]),
+                pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off_43, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off_43, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off_43, 0]),
+                pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_43, 0]),
+                pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off_43, 0]),
+                pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off_43, 0]),
+                pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off_43, 0]),
+                norm_layer_idx_43,
+                0,
+                my_rank,
+            )
+            prev_hidden = h_layer_43
+    
+            resid_hold_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            dbg_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            full_w_off_44 = 11 * HIDDEN
+            full_wo_off_44 = 11 * hidden_q_full
+            full_gate_r_off_44 = 11 * nh_full_pad
+            moe_w_off_44 = 41 * HIDDEN
+            moe_bias_off_44 = 41 * N_EXPERTS
+            moe_r_off_44 = 41 * (n_local_experts * HIDDEN)
+            moe_r_scale_off_44 = 41 * n_local_experts
+            moe_r_down_off_44 = 41 * (n_local_experts * inter)
+            moe_sh_down_off_44 = 41 * sh_inter_local
+            moe_win_off_44 = 41 * BATCH
+            moe_sig_off_44 = 41 * COMM_SIGNAL_STRIDE_I32
+            moe_pub_off_44 = 41 * (n_ranks * n_ranks)
+            moe_recv_off_44 = 41 * local_recv_max
+            moe_route_off_44 = 41 * n_routes_per_rank
+            norm_layer_idx_44 = pl.cast(44, pl.INT32)
+            next_hidden_out = self.full_moe_chip_orch_swiglu7_swiglu16(
+                prev_hidden,
+                input_rms,
+                pl.slice(full_wq, [HIDDEN, hidden_q_full], [full_w_off_44, 0]),
+                pl.slice(full_wk, [HIDDEN, KV_HIDDEN_LOCAL_R], [full_w_off_44, 0]),
+                pl.slice(full_wv, [HIDDEN, KV_HIDDEN_LOCAL_R], [full_w_off_44, 0]),
+                q_norm,
+                k_norm,
+                seq_lens,
+                block_table,
+                slot_mapping,
+                rope_cos_full,
+                rope_sin_full,
+                k_cache,
+                v_cache,
+                pl.slice(full_wo, [hidden_q_full, HIDDEN], [full_wo_off_44, 0]),
+                pl.slice(full_w_g, [HIDDEN, nh_full_pad], [full_w_off_44, 0]),
+                pl.slice(full_gate_r, [nh_full_pad, hidden_q_full], [full_gate_r_off_44, 0]),
+                post_rms,
+                pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off_44, 0]),
+                pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off_44]),
+                pl.reshape(
+                    pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off_44, 0]),
+                    [n_local_experts, HIDDEN, inter],
+                ),
+                pl.slice(moe_w_gate_r_scale, [n_local_experts, inter], [moe_r_scale_off_44, 0]),
+                pl.reshape(
+                    pl.slice(moe_w_up_r, [n_local_experts * HIDDEN, inter], [moe_r_off_44, 0]),
+                    [n_local_experts, HIDDEN, inter],
+                ),
+                pl.slice(moe_w_up_r_scale, [n_local_experts, inter], [moe_r_scale_off_44, 0]),
+                pl.reshape(
+                    pl.slice(moe_w_down_r, [n_local_experts * inter, HIDDEN], [moe_r_down_off_44, 0]),
+                    [n_local_experts, inter, HIDDEN],
+                ),
+                pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off_44, 0]),
+                pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off_44, 0]),
+                pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off_44, 0]),
+                pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off_44, 0]),
+                next_hidden_out,
+                dbg_layer_44,
+                resid_hold_layer_44,
+                pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off_44, 0]),
+                pl.slice(moe_attn_signal_stack, [tp_size, 1], [moe_sig_off_44, 0]),
+                pl.slice(moe_pub_counts_stack, [n_ranks * n_ranks, n_local_experts_pad], [moe_pub_off_44, 0]),
+                pl.slice(moe_count_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_recv_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
+                pl.slice(moe_recv_scale_stack, [local_recv_max, 8], [moe_recv_off_44, 0]),
+                pl.slice(moe_data_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_recv_r_route_stack, [local_recv_max, idx_pad], [moe_recv_off_44, 0]),
+                pl.slice(moe_send_x_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
+                pl.slice(moe_send_scale_stack, [local_recv_max, 8], [moe_recv_off_44, 0]),
+                pl.slice(moe_send_route_stack, [local_recv_max, idx_pad], [moe_recv_off_44, 0]),
+                pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_44, 0]),
+                pl.slice(moe_sh_signal_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [moe_route_off_44, 0]),
+                pl.slice(moe_combine_done_sig_stack, [n_ranks, 1], [moe_win_off_44, 0]),
+                pl.slice(moe_routed_src_buf_stack, [local_recv_max, HIDDEN], [moe_recv_off_44, 0]),
+                norm_layer_idx_44,
+                0,
+                my_rank,
+            )
+        else:
+            # Carry-thread write-back: L44 被 skip，把最后真正执行的 block 的
+            # hidden (prev_hidden) 写进 next_hidden_out。P1=swa-dense loop 末轮
+            # prev_hidden; P0=L0 h_layer_0 (prev_hidden 初始即 h_layer_0).
+            # chunked pl.assemble copy 对齐 moe_residual_add 写法 (L2420).
+            _carry_blocks = HIDDEN // K_CHUNK
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="opt_carry_writeback",
+            ):
+                for kb in pl.range(_carry_blocks):
+                    k0 = kb * K_CHUNK
+                    next_hidden_out = pl.assemble(
+                        next_hidden_out,
+                        pl.slice(prev_hidden, [BATCH, K_CHUNK], [0, k0]),
+                        [0, k0],
+                    )
         return next_hidden_out
 
     @pl.function(

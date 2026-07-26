@@ -156,7 +156,8 @@ def test_live_holder_and_sidecar_default_to_hidden_only():
 
 def test_holder_run_exposes_only_raw_hidden():
     holder = _HOLDER.read_text()
-    assert 'return {"next_hidden": self._next_hidden_out}' in holder
+    assert 'return {"next_hidden": self._next_hidden_out,' in holder
+    assert '"per_layer_hidden": self._per_layer_hidden' in holder
     assert "h_mid=self." not in holder
     assert "dbg=self." not in holder
     assert "nh_row0_max=" not in holder

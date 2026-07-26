@@ -337,7 +337,17 @@ def import_mtp_kv_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List
             raise MtpKvIpcMapError(
                 "TP ranks expose different MTP padding reserves"
             )
-    vas = rt.import_ipc_all(keys)
+    # The 0724 image runtime validates child-pointer provenance at dispatch.
+    # Selected MTP programs consume section_device_tensor() interior views,
+    # therefore register each imported MTP KV pool as a live region.
+    region_bytes = {
+        dev_offset + rank: int(maps[rank]["pool_bytes"])
+        for rank in range(tp)
+    }
+    vas = rt.import_ipc_all(
+        keys,
+        region_bytes=region_bytes,
+    )
     return [
         MtpKvIpcMap(vas[dev_offset + rank], maps[rank])
         for rank in range(tp)

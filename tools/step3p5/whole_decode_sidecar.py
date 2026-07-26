@@ -912,7 +912,9 @@ def _mtp_selftest() -> int:
     block[:3, 0] = torch.tensor([7, 8, 9], dtype=torch.int32)
     block[3:, 0] = torch.arange(16, 29, dtype=torch.int32)
     slots = torch.zeros(_BATCH, dtype=torch.int32)
-    slots[:3] = torch.tensor([896, 1024, 1152], dtype=torch.int32)
+    # slot_mapping is block_table[row, position] * BLOCK_SIZE + position.
+    # The first three rows use seq_lens 2, 3, 4, hence positions 1, 2, 3.
+    slots[:3] = torch.tensor([897, 1026, 1155], dtype=torch.int32)
     slots[3:] = torch.arange(16, 29, dtype=torch.int32) * 128
     meta = {
         "protocol_version": _PROTOCOL_VERSION,

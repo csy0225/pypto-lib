@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -146,12 +147,53 @@ def test_live_holder_and_sidecar_default_to_hidden_only():
     assert symbol in holder
     assert symbol in sidecar
     assert "layer_name=" not in holder
-    assert "--layer-name" not in sidecar
+    assert "--layer-module" in sidecar
+    assert "--layer-name" in sidecar
     assert "decode_layer_single_chip as dl" not in holder
     assert "KEY_FINAL_NORM" not in holder
     assert "KEY_LM_HEAD" not in holder
     assert '"argmax_debug": int(res["argmax"])' not in sidecar
     assert "live sidecar requires the hidden-only whole-net program" in sidecar
+
+
+def test_sidecar_main_program_selection_is_explicit_and_optional():
+    import tools.step3p5.whole_decode_sidecar as sidecar
+
+    assert sidecar._main_program_kwargs(SimpleNamespace(
+        layer_module=None,
+        layer_name=None,
+    )) == {}
+    assert sidecar._main_program_kwargs(SimpleNamespace(
+        layer_module="models.step3p5_opt.decode_fwd",
+        layer_name="whole_decode_opt",
+    )) == {
+        "layer_module": "models.step3p5_opt.decode_fwd",
+        "program": "whole_decode_opt",
+    }
+
+    for kwargs in (
+        {"layer_module": "models.step3p5_opt.decode_fwd", "layer_name": None},
+        {"layer_module": None, "layer_name": "whole_decode_opt"},
+    ):
+        try:
+            sidecar._main_program_kwargs(SimpleNamespace(**kwargs))
+        except ValueError as exc:
+            assert "must be provided together" in str(exc)
+        else:
+            raise AssertionError("half-configured Main program was accepted")
+
+
+def test_sidecar_forwards_main_program_selection_to_both_main_entrypoints():
+    source = _SIDECAR.read_text()
+    tree = ast.parse(source)
+    helper_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_main_program_kwargs"
+    ]
+    assert len(helper_calls) == 2
 
 
 def test_holder_run_exposes_only_raw_hidden():

@@ -681,6 +681,25 @@ def make_combined_decode_fn(main_holder, mtp_holder):
     return decode_fn
 
 
+def _main_program_kwargs(args) -> dict:
+    """Return optional Main program selection for the resident holder.
+
+    The canonical 0724 baseline remains the default.  Opt-in replacement
+    programs are deliberately explicit and must provide both the importable
+    module and the exported program symbol so a half-configured sidecar
+    cannot silently fall back to a different implementation.
+    """
+    module = getattr(args, "layer_module", None)
+    name = getattr(args, "layer_name", None)
+    if (module is None) != (name is None):
+        raise ValueError(
+            "--layer-module and --layer-name must be provided together"
+        )
+    if module is None:
+        return {}
+    return {"layer_module": module, "program": name}
+
+
 def run_sidecar(args) -> int:
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
@@ -691,6 +710,7 @@ def run_sidecar(args) -> int:
     holder = WholeDecodeHolder(
         device_ids=device_ids, out_dir=args.out, ckpt=args.ckpt,
         platform=args.platform, kv_ipc=args.kv_ipc,
+        **_main_program_kwargs(args),
     ).build()
     with holder:
         server = WholeDecodeServer(args.sock, make_holder_decode_fn(holder))
@@ -753,6 +773,7 @@ def run_combined_sidecar(args) -> int:
         ckpt=args.ckpt,
         platform=args.platform,
         kv_ipc=args.kv_ipc,
+        **_main_program_kwargs(args),
     ).build()
     mtp_holder = MtpLayerHolder(
         device_ids=device_ids,
@@ -993,6 +1014,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("-d", "--device", default="0,1,2,3,4,5,6,7")
     p.add_argument("--ckpt", default="/mnt/hw910test-jfs/models/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp")
     p.add_argument("--out", default="/tmp/n1_weight_ipc")
+    p.add_argument(
+        "--layer-module",
+        default=None,
+        help=(
+            "optional Main program module; must be paired with --layer-name. "
+            "Default uses the canonical 0724 baseline Main"
+        ),
+    )
+    p.add_argument(
+        "--layer-name",
+        default=None,
+        help=(
+            "optional Main program symbol; must be paired with "
+            "--layer-module"
+        ),
+    )
     p.add_argument(
         "--mtp-kv-out",
         default=None,

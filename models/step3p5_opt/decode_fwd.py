@@ -4475,7 +4475,7 @@ class WholeDecodeOpt:
                     [43, 0, 0],
                 )
             prev_hidden = h_layer_43
-    
+
             resid_hold_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             dbg_layer_44 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             full_w_off_44 = 11 * HIDDEN

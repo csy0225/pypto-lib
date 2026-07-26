@@ -1020,17 +1020,13 @@ def import_weights_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> Lis
         )
         device_key_map[dev_offset + r] = key
         maps_json.append(pool_map)
-    # Register each imported pool as a live child allocation.  The current
-    # simpler runtime validates child provenance at dispatch time; the
-    # StackedDeviceTensor views below are interior pointers carved from these
-    # zero-copy IPC pools and therefore need the pool extent registered.
+    # Pass each rank's consolidated pool size so simpler registers the imported
+    # region as a live child allocation; without it the dispatch provenance guard
+    # rejects the interior DeviceTensor(peer_base + offset) weight pointers.
     region_bytes: Dict[int, int] = {
         dev_offset + r: int(maps_json[r]["pool_bytes"]) for r in range(tp)
     }
-    vas = rt.import_ipc_all(
-        device_key_map,
-        region_bytes=region_bytes,
-    )  # {device_id: peer VA}
+    vas = rt.import_ipc_all(device_key_map, region_bytes=region_bytes)  # {device_id: peer VA}
     print(
         "[weight-ipc importer] import_ipc_all peer_bases="
         + str([hex(vas[dev_offset + r]) for r in range(tp)]),

@@ -120,5 +120,6 @@ artifact：
 ```
 
 这证明正式化仅改变 module/program 名称和默认选择，不改变已验证的
-loop-form 数学实现；`step3p5_opt` 现在是兼容 shim，0724 baseline
-仍可通过 `--baseline-main` 显式回滚。
+loop-form 数学实现。后续清理已删除 `step3p5_opt` 包和
+`whole_decode_opt`/`WholeDecodeOpt` 别名；0724 baseline 仍可通过
+`--baseline-main` 显式回滚。

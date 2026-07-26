@@ -29,14 +29,6 @@ models/step3p5/decode_layer_single_chip_hidden.py
 whole_decode_faithful_real_single_chip_hidden_only
 ```
 
-历史兼容别名：
-
-```text
-models.step3p5_opt.decode_fwd:whole_decode_opt
-```
-
-该别名只转发到 canonical program，不定义第二份 PyPTO program。
-
 ### MTP45/46/47
 
 ```text
@@ -270,8 +262,9 @@ loop-form Main 已正式位于
 
 当前 release 不传参数时默认使用
 `models.step3p5.decode_fwd:whole_decode_step3p5`；只有显式传
-`--baseline-main` 时才回退到 0724 hidden-only baseline。旧的
-`models.step3p5_opt.decode_fwd:whole_decode_opt` 仅作为兼容入口保留。
+`--baseline-main` 时才回退到 0724 hidden-only baseline。历史
+`models.step3p5_opt.decode_fwd:whole_decode_opt` 包和别名均已删除，不再
+提供第二个默认入口或 import compatibility。
 
 在 0162 的 256-step 回归中，opt 与 current baseline：
 
@@ -312,8 +305,9 @@ step 127 / 128 / 255:             PASS
 ```
 
 因此本次正式化只改变 canonical module/program 名称与默认入口，不改变
-已验证的数学实现。`step3p5_opt` 目录只保留 import compatibility shim；
-0724 baseline 仍通过 `--baseline-main` 显式选择，不作为默认路径。
+已验证的数学实现。后续清理已删除 `step3p5_opt` 包和
+`whole_decode_opt`/`WholeDecodeOpt` 别名；0724 baseline 仍只通过
+`--baseline-main` 显式选择，不作为默认路径。
 
 ## 8. 已证实的精度根因
 

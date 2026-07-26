@@ -4770,6 +4770,3 @@ class WholeDecodeStep3p5:
 
 
 whole_decode_step3p5 = WholeDecodeStep3p5
-# Compatibility symbols for callers that still select the historical opt name.
-WholeDecodeOpt = WholeDecodeStep3p5
-whole_decode_opt = whole_decode_step3p5

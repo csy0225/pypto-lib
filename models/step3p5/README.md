@@ -11,10 +11,6 @@ Rollback baseline:
   decode_layer_single_chip_hidden.py
   whole_decode_faithful_real_single_chip_hidden_only
 
-Compatibility alias:
-  models.step3p5_opt.decode_fwd:whole_decode_opt
-  -> models.step3p5.decode_fwd:whole_decode_step3p5
-
 MTP45/46/47:
   mtp_hidden_fwd.py
   MTP_LAYER_HIDDEN_PROGRAMS

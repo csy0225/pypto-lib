@@ -5,8 +5,8 @@ Mirrors ``_compile_prefill_layer_moe.py``: builds each
 ``pypto.ir.compile`` against ``a2a3sim``. No NPU execution.
 
 Goal: confirm the baseline MTP factory compiles clean on the current
-perf2 base (independent of WholeDecodeOpt). Decision (A): MTP stays an
-independent program + host wiring, NOT merged into WholeDecodeOpt.
+perf2 base (independent of the canonical Main program). Decision (A): MTP
+stays an independent program + host wiring, not merged into the Main program.
 
 Usage (from pypto-lib/):
     PYPTO_PROG_BUILD_DIR=/tmp/mtp_smoke \\

@@ -13,7 +13,7 @@ _HIDDEN_PROGRAM = (
     _ROOT / "models" / "step3p5" / "decode_layer_single_chip_hidden.py"
 )
 _CANONICAL_PROGRAM = _ROOT / "models" / "step3p5" / "decode_fwd.py"
-_COMPAT_SHIM = _ROOT / "models" / "step3p5_opt" / "decode_fwd.py"
+_REMOVED_OPT_PACKAGE = _ROOT / "models" / "step3p5_opt"
 _HOLDER = _ROOT / "tools" / "step3p5" / "whole_decode_holder.py"
 _SIDECAR = _ROOT / "tools" / "step3p5" / "whole_decode_sidecar.py"
 
@@ -47,16 +47,15 @@ def test_canonical_loop_form_owns_the_default_main_entry():
     assert "@pl.program" in source
     assert "class WholeDecodeStep3p5" in source
     assert "whole_decode_step3p5 = WholeDecodeStep3p5" in source
+    assert "WholeDecodeOpt" not in source
+    assert "whole_decode_opt" not in source
     assert "for layer_idx in pl.range" in source
     assert "whole_decode_faithful_real_single_chip_hidden_only" not in source
 
 
-def test_step3p5_opt_is_only_a_compatibility_shim():
-    source = _COMPAT_SHIM.read_text()
-    assert "from models.step3p5.decode_fwd import *" in source
-    assert "whole_decode_opt = whole_decode_step3p5" in source
-    assert "class WholeDecodeOpt" not in source
-    assert "def host_orch" not in source
+def test_step3p5_opt_compatibility_package_is_removed():
+    assert not (_REMOVED_OPT_PACKAGE / "__init__.py").exists()
+    assert not (_REMOVED_OPT_PACKAGE / "decode_fwd.py").exists()
 
 
 def test_hidden_only_program_selects_swiglu_by_physical_layer():

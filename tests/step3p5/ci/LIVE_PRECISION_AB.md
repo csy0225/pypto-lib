@@ -48,3 +48,51 @@ bash tests/step3p5/ci/run_live_precision_ab.sh
 
 > 边界：本 gate 覆盖主网 45 层 hidden→vLLM tail 的 decode 对齐。MTP45/46/47 端到端对齐
 > 是独立 gate（另见 MTP CI）。
+
+## 2026-07-26 当前 B2 release 回归（0162，N=256）
+
+本次回归使用固定的 0724 镜像：
+
+```text
+image:  hub.i.basemind.com/stepcast/vllm-pypto:stepfun-develop-20260724
+digest: sha256:2b0dc4612796a34bea6720ccb4bf8fa3af4ea406cdd0f12add34586ca860d7e0
+seed:   6127
+steps:  256
+oracle: vanilla vLLM cards 0-7
+test:   current baseline/opt cards 8-15, teacher-forced
+```
+
+### 两个必须分开判定的 gate
+
+| gate | 结果 | 判定 |
+|------|------|------|
+| vanilla raw live alignment | opt `240/256 = 93.75%`；baseline `240/256 = 93.75%` | **raw 95% gate 未通过** |
+| replacement equivalence | opt vs baseline token `256/256`；hidden `256/256` exact；`max_abs_diff=0` | **通过** |
+
+这里的 `240/256` 不是 opt 相对 baseline 的回归损失：在同一 checkpoint、
+同一 0724 runtime、同一 oracle 和同一 8-15 设备集合上，canonical baseline
+逐步复现了完全相同的 240/256 结果。opt 与 baseline 每一步 token 完全一致，
+每一步主 hidden 逐字节一致，两个版本的 TP hidden spread 均为 `0.0`。
+
+跨 KV block 边界的 `step127`、`step128` 以及长序列末尾的 `step255` 均
+`token_exact=true`。所有 256 步 hidden 均 finite；16 个 raw miss 是：
+
+```text
+2, 20, 49, 52, 57, 62, 125, 131,
+151, 153, 161, 162, 187, 221, 231, 252
+```
+
+对这些 miss 使用相同显式 token 上下文对 vanilla 重复查询，观察到 fresh
+top-1 在多个位置切换或出现近似 tie。因此当前发布结论必须写成：
+
+> **B2 replacement regression PASS：current opt 不改变 0724-derived
+> canonical baseline 的 256-step 行为。vanilla raw 95% gate 仍是
+> 93.75%，不能写成无条件的 vanilla precision PASS。**
+
+回归产物（0162）：
+
+```text
+/tmp/live_ab_opt_ad478abb_n256_20260726/raw_alignment_summary.json
+/tmp/live_ab_opt_ad478abb_n256_20260726/baseline_opt_n256_compare.json
+/tmp/live_ab_opt_ad478abb_n256_20260726/vanilla_miss_requery.json
+```

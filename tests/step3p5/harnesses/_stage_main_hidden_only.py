@@ -36,6 +36,8 @@ DEFAULT_CKPT = (
 )
 # Vanilla 8000 greedy oracle for the canonical one-token decode.
 DEFAULT_ORACLE_TOKENS = [303, 1207, 19384, 872, 428, 6127, 4231, 2636]
+CURRENT_MAIN_MODULE = "models.step3p5_opt.decode_fwd"
+CURRENT_MAIN_PROGRAM = "whole_decode_opt"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -69,14 +71,25 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
     parser.add_argument(
+        "--baseline-main",
+        action="store_true",
+        help="explicit rollback: use the canonical 0724 baseline Main",
+    )
+    parser.add_argument(
         "--layer-module",
         default=None,
-        help="opt-mode: import this module for the program (e.g. models.step3p5_opt.decode_fwd); default None = canonical baseline",
+        help=(
+            "custom Main module; must be paired with --layer-name. "
+            "Default uses models.step3p5_opt.decode_fwd"
+        ),
     )
     parser.add_argument(
         "--layer-name",
         default=None,
-        help="opt-mode: program attr name in --layer-module (e.g. whole_decode_opt); must be given together with --layer-module",
+        help=(
+            "custom Main program name; must be paired with --layer-module. "
+            "Default uses whole_decode_opt"
+        ),
     )
     parser.add_argument(
         "--itl-context-lens",
@@ -641,14 +654,30 @@ def _run_worker(args: argparse.Namespace) -> int:
             and expected_tokens[0] != 303):
         raise ValueError("built-in canonical Main oracle must start with token 303")
 
+    layer_module = args.layer_module
+    layer_name = args.layer_name
+    if (layer_module is None) != (layer_name is None):
+        raise ValueError("--layer-module and --layer-name must be provided together")
+    if args.baseline_main and (layer_module is not None or layer_name is not None):
+        raise ValueError(
+            "--baseline-main cannot be combined with "
+            "--layer-module/--layer-name"
+        )
+    if args.baseline_main:
+        layer_module = None
+        layer_name = None
+    elif layer_module is None:
+        layer_module = CURRENT_MAIN_MODULE
+        layer_name = CURRENT_MAIN_PROGRAM
+
     holder = WholeDecodeHolder(
         device_ids=devices,
         out_dir=str(out),
         ckpt=args.ckpt,
         platform=args.platform,
         kv_ipc=True,
-        program=args.layer_name,
-        layer_module=args.layer_module,
+        program=layer_name,
+        layer_module=layer_module,
     ).build()
     reports: list[dict[str, object]] = []
     repeat_hidden: torch.Tensor | None = None

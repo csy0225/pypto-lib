@@ -242,7 +242,35 @@ scripts/run_pypto_mtp3_back8.sh
 tests/step3p5/ci/run_whole_network_ci.py
 ```
 
-## 7. 已证实的精度根因
+## 7. 当前 B2 replacement 状态（2026-07-26）
+
+当前实现位于 `perf/step3p5-bc-v2`。`models/step3p5_opt/decode_fwd.py`
+提供 loop-form Main opt，生产 sidecar 通过显式的：
+
+```text
+--layer-module models.step3p5_opt.decode_fwd
+--layer-name whole_decode_opt
+```
+
+选择自定义实现。当前 release 不传参数时默认使用
+`models.step3p5_opt.decode_fwd:whole_decode_opt`；只有显式传
+`--baseline-main` 时才回退到 canonical 0724 hidden-only baseline。
+
+在 0162 的 256-step 回归中，opt 与 current baseline：
+
+```text
+token:  256/256 exact
+hidden: 256/256 exact
+max_abs_diff: 0.0
+TP spread: 0.0
+```
+
+因此 replacement regression 通过。相同 vanilla oracle 的 raw 对齐为
+`240/256 = 93.75%`，baseline 也完全复现该结果；这低于历史 `>=95%`
+vanilla raw gate，不能把 raw 结果标记为无条件 PASS。详细数据见
+`tests/step3p5/ci/LIVE_PRECISION_AB.md`。
+
+## 8. 已证实的精度根因
 
 L7 首个 decode step 的错误已定位到 shared expert 宽 Vec tile：
 

@@ -140,7 +140,7 @@ def test_hidden_only_program_declares_persistent_kv_inout():
             )
 
 
-def test_live_holder_and_sidecar_default_to_hidden_only():
+def test_live_holder_and_sidecar_default_to_current_hidden_only():
     holder = _HOLDER.read_text()
     sidecar = _SIDECAR.read_text()
     symbol = "whole_decode_faithful_real_single_chip_hidden_only"
@@ -149,6 +149,8 @@ def test_live_holder_and_sidecar_default_to_hidden_only():
     assert "layer_name=" not in holder
     assert "--layer-module" in sidecar
     assert "--layer-name" in sidecar
+    assert "--baseline-main" in sidecar
+    assert "CURRENT_MAIN_PROGRAM = \"whole_decode_opt\"" in sidecar
     assert "decode_layer_single_chip as dl" not in holder
     assert "KEY_FINAL_NORM" not in holder
     assert "KEY_LM_HEAD" not in holder
@@ -156,14 +158,24 @@ def test_live_holder_and_sidecar_default_to_hidden_only():
     assert "live sidecar requires the hidden-only whole-net program" in sidecar
 
 
-def test_sidecar_main_program_selection_is_explicit_and_optional():
+def test_sidecar_main_program_selection_defaults_to_current_opt():
     import tools.step3p5.whole_decode_sidecar as sidecar
 
     assert sidecar._main_program_kwargs(SimpleNamespace(
+        baseline_main=False,
+        layer_module=None,
+        layer_name=None,
+    )) == {
+        "layer_module": "models.step3p5_opt.decode_fwd",
+        "program": "whole_decode_opt",
+    }
+    assert sidecar._main_program_kwargs(SimpleNamespace(
+        baseline_main=True,
         layer_module=None,
         layer_name=None,
     )) == {}
     assert sidecar._main_program_kwargs(SimpleNamespace(
+        baseline_main=False,
         layer_module="models.step3p5_opt.decode_fwd",
         layer_name="whole_decode_opt",
     )) == {
@@ -172,8 +184,16 @@ def test_sidecar_main_program_selection_is_explicit_and_optional():
     }
 
     for kwargs in (
-        {"layer_module": "models.step3p5_opt.decode_fwd", "layer_name": None},
-        {"layer_module": None, "layer_name": "whole_decode_opt"},
+        {
+            "baseline_main": False,
+            "layer_module": "models.step3p5_opt.decode_fwd",
+            "layer_name": None,
+        },
+        {
+            "baseline_main": False,
+            "layer_module": None,
+            "layer_name": "whole_decode_opt",
+        },
     ):
         try:
             sidecar._main_program_kwargs(SimpleNamespace(**kwargs))
@@ -181,6 +201,17 @@ def test_sidecar_main_program_selection_is_explicit_and_optional():
             assert "must be provided together" in str(exc)
         else:
             raise AssertionError("half-configured Main program was accepted")
+
+    try:
+        sidecar._main_program_kwargs(SimpleNamespace(
+            baseline_main=True,
+            layer_module="models.step3p5_opt.decode_fwd",
+            layer_name="whole_decode_opt",
+        ))
+    except ValueError as exc:
+        assert "cannot be combined" in str(exc)
+    else:
+        raise AssertionError("baseline/custom Main combination was accepted")
 
 
 def test_sidecar_forwards_main_program_selection_to_both_main_entrypoints():

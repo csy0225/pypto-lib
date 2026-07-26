@@ -54,6 +54,8 @@ _MAX_FRAME_BYTES = 2 << 30
 _BATCH = 16
 _HIDDEN = 4096
 MAIN_PROGRAM = "whole_decode_faithful_real_single_chip_hidden_only"
+CURRENT_MAIN_MODULE = "models.step3p5_opt.decode_fwd"
+CURRENT_MAIN_PROGRAM = "whole_decode_opt"
 
 
 class FrameProtocolError(ValueError):
@@ -682,21 +684,29 @@ def make_combined_decode_fn(main_holder, mtp_holder):
 
 
 def _main_program_kwargs(args) -> dict:
-    """Return optional Main program selection for the resident holder.
+    """Return the selected Main program for the resident holder.
 
-    The canonical 0724 baseline remains the default.  Opt-in replacement
-    programs are deliberately explicit and must provide both the importable
-    module and the exported program symbol so a half-configured sidecar
-    cannot silently fall back to a different implementation.
+    The validated loop-form replacement is the release default.  The 0724
+    canonical implementation remains available only through the explicit
+    ``--baseline-main`` rollback switch.  Custom replacement programs must
+    provide both the importable module and exported program symbol.
     """
     module = getattr(args, "layer_module", None)
     name = getattr(args, "layer_name", None)
+    if bool(getattr(args, "baseline_main", False)):
+        if module is not None or name is not None:
+            raise ValueError(
+                "--baseline-main cannot be combined with "
+                "--layer-module/--layer-name"
+            )
+        return {}
     if (module is None) != (name is None):
         raise ValueError(
             "--layer-module and --layer-name must be provided together"
         )
     if module is None:
-        return {}
+        module = CURRENT_MAIN_MODULE
+        name = CURRENT_MAIN_PROGRAM
     return {"layer_module": module, "program": name}
 
 
@@ -1015,19 +1025,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", default="/mnt/hw910test-jfs/models/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp")
     p.add_argument("--out", default="/tmp/n1_weight_ipc")
     p.add_argument(
+        "--baseline-main",
+        action="store_true",
+        help="explicit rollback: use the canonical 0724 baseline Main",
+    )
+    p.add_argument(
         "--layer-module",
         default=None,
         help=(
-            "optional Main program module; must be paired with --layer-name. "
-            "Default uses the canonical 0724 baseline Main"
+            "optional custom Main program module; must be paired with "
+            "--layer-name. Default uses models.step3p5_opt.decode_fwd"
         ),
     )
     p.add_argument(
         "--layer-name",
         default=None,
         help=(
-            "optional Main program symbol; must be paired with "
-            "--layer-module"
+            "optional custom Main program symbol; must be paired with "
+            "--layer-module. Default uses whole_decode_opt"
         ),
     )
     p.add_argument(

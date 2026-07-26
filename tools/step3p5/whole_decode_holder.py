@@ -36,8 +36,8 @@ _F32 = torch.float32
 _I32 = torch.int32
 MAIN_PROGRAM = "whole_decode_faithful_real_single_chip_hidden_only"
 
-# opt-mode slot maps (Diff B): canonical KEY_WQ_FULL[12] / KEY_WQ_SWA[33] split
-# into opt's 4 attn buckets. full_wq/swa_wq copy canonical 原样（dead slot 无害，
+# Loop-form slot maps (Diff B): baseline KEY_WQ_FULL[12] / KEY_WQ_SWA[33] split
+# into the canonical Main's 4 attention buckets. full_wq/swa_wq copy baseline 原样（dead slot 无害，
 # L44@full_wq[11] / L43@swa_wq[32] 的 slot 索引依赖 [12]/[33] 尺寸）；moe_full_wq
 # 取 canonical FULL slot 1-10（L4,8,…,40）；moe_swa_wq 取 canonical SWA slot 2-31
 # （30 个 MoE-swa 层，跳过 dense L1(slot0)/L2(slot1)/L43(slot32)）。
@@ -86,18 +86,19 @@ class WholeDecodeHolder:
         self.layer_name = MAIN_PROGRAM
         self.platform = platform
         self.kv_ipc = kv_ipc
-        # opt-mode: 指向 step3p5_opt 的 whole_decode_opt（循环式 4-bucket split）。
-        # default None = canonical baseline（hidden-only faithful_real_single_chip）。
-        # layer_module 形如 "models.step3p5_opt.decode_fwd"；program 形如
-        # "whole_decode_opt"。两者必须同时给或同时不给。
-        self.opt_mode = program is not None or layer_module is not None
-        if self.opt_mode:
+        # custom Main mode: 指向 canonical loop-form Main（循环式 4-bucket
+        # split）。default None = explicit 0724 baseline
+        # (hidden-only faithful_real_single_chip).
+        # layer_module 形如 "models.step3p5.decode_fwd"；program 形如
+        # "whole_decode_step3p5"。两者必须同时给或同时不给。
+        self.custom_main_mode = program is not None or layer_module is not None
+        if self.custom_main_mode:
             if program is None or layer_module is None:
                 raise ValueError(
-                    "opt 模式必须同时给 program= 和 layer_module="
+                    "custom Main 必须同时给 program= 和 layer_module="
                 )
-        self._opt_program_name = program
-        self._opt_layer_module = layer_module
+        self._custom_program_name = program
+        self._custom_layer_module = layer_module
 
         # populated by build()
         self.compiled = None
@@ -163,8 +164,8 @@ class WholeDecodeHolder:
 
     # ---- build (compile; no device prepare yet) ----------------------------
 
-    def _opt_const(self, name: str) -> int:
-        """读 step3p5_opt.decode_fwd 的模块级常量（opt 模式专用）。"""
+    def _main_const(self, name: str) -> int:
+        """读取 custom Main 模块的模块级常量。"""
         return int(getattr(self._dl, name))
 
     def build(self):
@@ -178,12 +179,13 @@ class WholeDecodeHolder:
         self._cfg = cfg
         self._K = K
         assert self.tp == cfg.TP_WORLD_SIZE, f"need {cfg.TP_WORLD_SIZE} cards; got {self.tp}"
-        if self.opt_mode:
+        if self.custom_main_mode:
             import importlib  # noqa: PLC0415
-            dl = importlib.import_module(self._opt_layer_module)
-            self.layer_name = self._opt_program_name
+            dl = importlib.import_module(self._custom_layer_module)
+            self.layer_name = self._custom_program_name
         else:
-            # 0162 release 只允许这一份 single-submit hidden-only program。
+            # Explicit rollback path: the 0724 single-submit hidden-only
+            # baseline remains available without custom Main arguments.
             import models.step3p5.decode_layer_single_chip_hidden as dl  # noqa: PLC0415
         self._dl = dl
 
@@ -248,11 +250,11 @@ class WholeDecodeHolder:
         self.current_hidden = _zsh(tp, BATCH, HIDDEN)
         self.gate_r_full = _zsh(tp, N_FULL, NHF_PAD, HQ_FULL)
         self.gate_r_swa = _zsh(tp, N_SWA, NHS_PAD, HQ_SWA)
-        if self.opt_mode:
-            # opt-mode 循环式 4-bucket split：full/swa 各对应 dense+post-loop 全量，
+        if self.custom_main_mode:
+            # canonical loop-form 4-bucket split：full/swa 各对应 dense+post-loop 全量，
             # moe_full/moe_swa 是 MoE loop 专用桶，需要各自的 block-diag R 常量。
-            n_moe_full = self._opt_const("NUM_FULL_MOE_LAYERS")
-            n_moe_swa = self._opt_const("NUM_SWA_MOE_LAYERS")
+            n_moe_full = self._main_const("NUM_FULL_MOE_LAYERS")
+            n_moe_swa = self._main_const("NUM_SWA_MOE_LAYERS")
             self.gate_r_moe_full = _zsh(tp, n_moe_full, NHF_PAD, HQ_FULL)
             self.gate_r_moe_swa = _zsh(tp, n_moe_swa, NHS_PAD, HQ_SWA)
             for _h in range(HQ_FULL // HEAD_DIM):
@@ -329,10 +331,10 @@ class WholeDecodeHolder:
             return build_stacked_weight(self._wmaps, key)
 
         def Wsub(key, slots):
-            """opt-mode 4-bucket split：从 canonical 整桶 [N,...] 里按 leading-dim
+            """loop-form 4-bucket split：从 baseline 整桶 [N,...] 里按 leading-dim
             slots 取零拷贝连续子视图（每 rank 独立切片，再叠成 StackedDeviceTensor）。
 
-            canonical KEY_WQ_FULL=[12] 全 12 个 FULL 层紧凑叠放；opt moe_full_wq[10]
+            baseline KEY_WQ_FULL=[12] 全 12 个 FULL 层紧凑叠放；loop-form moe_full_wq[10]
             取 slot 1-10（L4,8,…,40；slot0=L0 dense、slot11=L44 post-loop 留在
             full_wq 桶里）。KEY_WQ_SWA=[33] 同理，moe_swa_wq[30] 取 slot 2-31。
             DeviceTensor.__getitem__ 只允许 outermost partial slice（连续），满足。
@@ -343,8 +345,8 @@ class WholeDecodeHolder:
             full = (tp, *tuple(shards[0].shape))
             return StackedDeviceTensor(shards, full, list(range(tp)))
 
-        if self.opt_mode:
-            args = self._build_opt_args(W, Wsub)
+        if self.custom_main_mode:
+            args = self._build_loop_form_args(W, Wsub)
         else:
             args = [self.current_hidden]
             args += [W(K.KEY_INPUT_RMS), W(K.KEY_POST_ATTN_RMS), W(K.KEY_Q_NORM), W(K.KEY_K_NORM)]
@@ -374,13 +376,14 @@ class WholeDecodeHolder:
         )
         return self
 
-    def _build_opt_args(self, W, Wsub):
-        """opt-mode 53-arg host_orch arg-list（严格按 decode_fwd.py L4561-4616 签名）。
+    def _build_loop_form_args(self, W, Wsub):
+        """Canonical loop-form 53-arg host_orch arg-list
+        （严格按 models/step3p5/decode_fwd.py 签名）。
 
-        Diff A: 只 1 个 Out（next_hidden_out），跳过 canonical 的 h_mid_out + dbg_out。
-        Diff B: attn 4-bucket split（full/swa/moe_full/moe_swa），moe 桶从 canonical
+        Diff A: 只 1 个 Out（next_hidden_out），跳过 baseline 的 h_mid_out + dbg_out。
+        Diff B: attn 4-bucket split（full/swa/moe_full/moe_swa），moe 桶从 baseline
         KEY_WQ_FULL/SWA 按 _MOE_FULL_SLOTS/_MOE_SWA_SLOTS 取连续子视图。
-        常量名读 dl_opt.*（N_FULL_ATTN_LAYERS 等）。
+        常量名读当前 custom Main 模块（N_FULL_ATTN_LAYERS 等）。
         """
         K = self._K
         args = [self.current_hidden]

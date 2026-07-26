@@ -4,15 +4,23 @@
 
 ```text
 Main:
+  decode_fwd.py
+  whole_decode_step3p5
+
+Rollback baseline:
   decode_layer_single_chip_hidden.py
   whole_decode_faithful_real_single_chip_hidden_only
+
+Compatibility alias:
+  models.step3p5_opt.decode_fwd:whole_decode_opt
+  -> models.step3p5.decode_fwd:whole_decode_step3p5
 
 MTP45/46/47:
   mtp_hidden_fwd.py
   MTP_LAYER_HIDDEN_PROGRAMS
 ```
 
-Main 返回 pre-final-norm BF16 hidden；MTP 返回 raw pre-shared-head BF16
+canonical Main 返回 pre-final-norm BF16 hidden；MTP 返回 raw pre-shared-head BF16
 hidden。final norm、LM head、sampling 和 acceptance/rejection 不属于本目录
 的 production program。
 

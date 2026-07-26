@@ -12,6 +12,8 @@ _ROOT = Path(__file__).resolve().parents[3]
 _HIDDEN_PROGRAM = (
     _ROOT / "models" / "step3p5" / "decode_layer_single_chip_hidden.py"
 )
+_CANONICAL_PROGRAM = _ROOT / "models" / "step3p5" / "decode_fwd.py"
+_COMPAT_SHIM = _ROOT / "models" / "step3p5_opt" / "decode_fwd.py"
 _HOLDER = _ROOT / "tools" / "step3p5" / "whole_decode_holder.py"
 _SIDECAR = _ROOT / "tools" / "step3p5" / "whole_decode_sidecar.py"
 
@@ -38,6 +40,23 @@ def test_hidden_only_program_is_the_only_main_production_entry():
     source = _HIDDEN_PROGRAM.read_text()
     assert "whole_decode_faithful_real_single_chip_hidden_only" in source
     assert "whole_decode_faithful_real_single_chip =" not in source
+
+
+def test_canonical_loop_form_owns_the_default_main_entry():
+    source = _CANONICAL_PROGRAM.read_text()
+    assert "@pl.program" in source
+    assert "class WholeDecodeStep3p5" in source
+    assert "whole_decode_step3p5 = WholeDecodeStep3p5" in source
+    assert "for layer_idx in pl.range" in source
+    assert "whole_decode_faithful_real_single_chip_hidden_only" not in source
+
+
+def test_step3p5_opt_is_only_a_compatibility_shim():
+    source = _COMPAT_SHIM.read_text()
+    assert "from models.step3p5.decode_fwd import *" in source
+    assert "whole_decode_opt = whole_decode_step3p5" in source
+    assert "class WholeDecodeOpt" not in source
+    assert "def host_orch" not in source
 
 
 def test_hidden_only_program_selects_swiglu_by_physical_layer():
@@ -150,7 +169,8 @@ def test_live_holder_and_sidecar_default_to_current_hidden_only():
     assert "--layer-module" in sidecar
     assert "--layer-name" in sidecar
     assert "--baseline-main" in sidecar
-    assert "CURRENT_MAIN_PROGRAM = \"whole_decode_opt\"" in sidecar
+    assert "CURRENT_MAIN_MODULE = \"models.step3p5.decode_fwd\"" in sidecar
+    assert "CURRENT_MAIN_PROGRAM = \"whole_decode_step3p5\"" in sidecar
     assert "decode_layer_single_chip as dl" not in holder
     assert "KEY_FINAL_NORM" not in holder
     assert "KEY_LM_HEAD" not in holder
@@ -158,7 +178,7 @@ def test_live_holder_and_sidecar_default_to_current_hidden_only():
     assert "live sidecar requires the hidden-only whole-net program" in sidecar
 
 
-def test_sidecar_main_program_selection_defaults_to_current_opt():
+def test_sidecar_main_program_selection_defaults_to_canonical_loop_form():
     import tools.step3p5.whole_decode_sidecar as sidecar
 
     assert sidecar._main_program_kwargs(SimpleNamespace(
@@ -166,8 +186,8 @@ def test_sidecar_main_program_selection_defaults_to_current_opt():
         layer_module=None,
         layer_name=None,
     )) == {
-        "layer_module": "models.step3p5_opt.decode_fwd",
-        "program": "whole_decode_opt",
+        "layer_module": "models.step3p5.decode_fwd",
+        "program": "whole_decode_step3p5",
     }
     assert sidecar._main_program_kwargs(SimpleNamespace(
         baseline_main=True,
@@ -176,23 +196,23 @@ def test_sidecar_main_program_selection_defaults_to_current_opt():
     )) == {}
     assert sidecar._main_program_kwargs(SimpleNamespace(
         baseline_main=False,
-        layer_module="models.step3p5_opt.decode_fwd",
-        layer_name="whole_decode_opt",
+        layer_module="models.step3p5.decode_fwd",
+        layer_name="whole_decode_step3p5",
     )) == {
-        "layer_module": "models.step3p5_opt.decode_fwd",
-        "program": "whole_decode_opt",
+        "layer_module": "models.step3p5.decode_fwd",
+        "program": "whole_decode_step3p5",
     }
 
     for kwargs in (
         {
             "baseline_main": False,
-            "layer_module": "models.step3p5_opt.decode_fwd",
+            "layer_module": "models.step3p5.decode_fwd",
             "layer_name": None,
         },
         {
             "baseline_main": False,
             "layer_module": None,
-            "layer_name": "whole_decode_opt",
+            "layer_name": "whole_decode_step3p5",
         },
     ):
         try:
@@ -205,8 +225,8 @@ def test_sidecar_main_program_selection_defaults_to_current_opt():
     try:
         sidecar._main_program_kwargs(SimpleNamespace(
             baseline_main=True,
-            layer_module="models.step3p5_opt.decode_fwd",
-            layer_name="whole_decode_opt",
+            layer_module="models.step3p5.decode_fwd",
+            layer_name="whole_decode_step3p5",
         ))
     except ValueError as exc:
         assert "cannot be combined" in str(exc)

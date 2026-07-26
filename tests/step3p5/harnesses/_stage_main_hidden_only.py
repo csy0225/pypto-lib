@@ -36,8 +36,8 @@ DEFAULT_CKPT = (
 )
 # Vanilla 8000 greedy oracle for the canonical one-token decode.
 DEFAULT_ORACLE_TOKENS = [303, 1207, 19384, 872, 428, 6127, 4231, 2636]
-CURRENT_MAIN_MODULE = "models.step3p5_opt.decode_fwd"
-CURRENT_MAIN_PROGRAM = "whole_decode_opt"
+CURRENT_MAIN_MODULE = "models.step3p5.decode_fwd"
+CURRENT_MAIN_PROGRAM = "whole_decode_step3p5"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -80,7 +80,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "custom Main module; must be paired with --layer-name. "
-            "Default uses models.step3p5_opt.decode_fwd"
+            "Default uses models.step3p5.decode_fwd"
         ),
     )
     parser.add_argument(
@@ -88,7 +88,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "custom Main program name; must be paired with --layer-module. "
-            "Default uses whole_decode_opt"
+            "Default uses whole_decode_step3p5"
         ),
     )
     parser.add_argument(

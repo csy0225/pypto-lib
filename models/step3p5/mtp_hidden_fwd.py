@@ -52,6 +52,10 @@ from .attention_swa import (
     LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_SWA,
     attention_swa,
 )
+# The dense MLP kernel body remains shared with the explicit 0724 rollback
+# baseline.  The canonical loop-form Main imports the same helper; keeping
+# this dependency explicit avoids coupling MTP compilation to the Main
+# orchestration program.
 from .decode_layer_single_chip_hidden import _dense_mlp_body_tp
 
 

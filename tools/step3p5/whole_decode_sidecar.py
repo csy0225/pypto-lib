@@ -54,8 +54,8 @@ _MAX_FRAME_BYTES = 2 << 30
 _BATCH = 16
 _HIDDEN = 4096
 MAIN_PROGRAM = "whole_decode_faithful_real_single_chip_hidden_only"
-CURRENT_MAIN_MODULE = "models.step3p5_opt.decode_fwd"
-CURRENT_MAIN_PROGRAM = "whole_decode_opt"
+CURRENT_MAIN_MODULE = "models.step3p5.decode_fwd"
+CURRENT_MAIN_PROGRAM = "whole_decode_step3p5"
 
 
 class FrameProtocolError(ValueError):
@@ -1034,7 +1034,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "optional custom Main program module; must be paired with "
-            "--layer-name. Default uses models.step3p5_opt.decode_fwd"
+            "--layer-name. Default uses models.step3p5.decode_fwd"
         ),
     )
     p.add_argument(
@@ -1042,7 +1042,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "optional custom Main program symbol; must be paired with "
-            "--layer-module. Default uses whole_decode_opt"
+            "--layer-module. Default uses whole_decode_step3p5"
         ),
     )
     p.add_argument(

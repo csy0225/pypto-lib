@@ -96,3 +96,29 @@ top-1 在多个位置切换或出现近似 tie。因此当前发布结论必须�
 /tmp/live_ab_opt_ad478abb_n256_20260726/baseline_opt_n256_compare.json
 /tmp/live_ab_opt_ad478abb_n256_20260726/vanilla_miss_requery.json
 ```
+
+### 2026-07-26 canonical rename regression
+
+正式入口从历史 `models.step3p5_opt.decode_fwd:whole_decode_opt` 迁移到
+`models.step3p5.decode_fwd:whole_decode_step3p5` 后，使用同一镜像、
+checkpoint、oracle 和设备集合重新执行 N=256：
+
+| 比较项 | 结果 |
+|---|---:|
+| canonical 对 vanilla raw | `240/256 = 93.75%` |
+| pre-rename ↔ canonical token | `256/256 exact` |
+| pre-rename ↔ canonical hidden | `256/256 exact` |
+| `max_abs_diff` | `0.0` |
+| `TP spread max` | `0.0` |
+| step 127 / 128 / 255 | `PASS` |
+
+artifact：
+
+```text
+/tmp/canonical_step3p5_n256_20260726_1900/main_hidden_only_report.json
+/tmp/canonical_step3p5_n256_20260726_1900/canonical_vs_pre_rename.json
+```
+
+这证明正式化仅改变 module/program 名称和默认选择，不改变已验证的
+loop-form 数学实现；`step3p5_opt` 现在是兼容 shim，0724 baseline
+仍可通过 `--baseline-main` 显式回滚。

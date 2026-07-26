@@ -18,9 +18,24 @@ vLLM token embedding + paged-KV metadata
 唯一 program：
 
 ```text
+models/step3p5/decode_fwd.py
+whole_decode_step3p5
+```
+
+显式回滚 baseline：
+
+```text
 models/step3p5/decode_layer_single_chip_hidden.py
 whole_decode_faithful_real_single_chip_hidden_only
 ```
+
+历史兼容别名：
+
+```text
+models.step3p5_opt.decode_fwd:whole_decode_opt
+```
+
+该别名只转发到 canonical program，不定义第二份 PyPTO program。
 
 ### MTP45/46/47
 
@@ -51,7 +66,8 @@ LM head、target/draft sampling、accept/reject 和用户可见后处理全部�
 
 ```text
 models/step3p5/
-  decode_layer_single_chip_hidden.py
+  decode_fwd.py
+  decode_layer_single_chip_hidden.py  # explicit 0724 rollback baseline
   mtp_hidden_fwd.py
   attention_full.py
   attention_swa.py
@@ -244,17 +260,18 @@ tests/step3p5/ci/run_whole_network_ci.py
 
 ## 7. 当前 B2 replacement 状态（2026-07-26）
 
-当前实现位于 `perf/step3p5-bc-v2`。`models/step3p5_opt/decode_fwd.py`
-提供 loop-form Main opt，生产 sidecar 通过显式的：
+loop-form Main 已正式位于
+`models/step3p5/decode_fwd.py`，生产 sidecar 默认选择：
 
 ```text
---layer-module models.step3p5_opt.decode_fwd
---layer-name whole_decode_opt
+--layer-module models.step3p5.decode_fwd
+--layer-name whole_decode_step3p5
 ```
 
-选择自定义实现。当前 release 不传参数时默认使用
-`models.step3p5_opt.decode_fwd:whole_decode_opt`；只有显式传
-`--baseline-main` 时才回退到 canonical 0724 hidden-only baseline。
+当前 release 不传参数时默认使用
+`models.step3p5.decode_fwd:whole_decode_step3p5`；只有显式传
+`--baseline-main` 时才回退到 0724 hidden-only baseline。旧的
+`models.step3p5_opt.decode_fwd:whole_decode_opt` 仅作为兼容入口保留。
 
 在 0162 的 256-step 回归中，opt 与 current baseline：
 
@@ -269,6 +286,34 @@ TP spread: 0.0
 `240/256 = 93.75%`，baseline 也完全复现该结果；这低于历史 `>=95%`
 vanilla raw gate，不能把 raw 结果标记为无条件 PASS。详细数据见
 `tests/step3p5/ci/LIVE_PRECISION_AB.md`。
+
+### 7.1 canonical rename 回归
+
+`models.step3p5_opt.decode_fwd:whole_decode_opt` 正式迁移为
+`models.step3p5.decode_fwd:whole_decode_step3p5` 后，在相同的
+`stepfun-develop-20260726-opt-b2@sha256:0b22fcef...` 镜像环境、相同
+checkpoint、相同 256-step oracle 和 8-15 卡上重新运行默认入口：
+
+```text
+canonical raw alignment:          240/256 = 93.75%
+pre-rename ↔ canonical token:     256/256 exact
+pre-rename ↔ canonical hidden:    256/256 exact
+max_abs_diff:                     0.0
+TP spread max:                    0.0
+step 127 / 128 / 255:             PASS
+```
+
+0162 artifact：
+
+```text
+/tmp/canonical_step3p5_n256_20260726_1900/
+  main_hidden_only_report.json
+  canonical_vs_pre_rename.json
+```
+
+因此本次正式化只改变 canonical module/program 名称与默认入口，不改变
+已验证的数学实现。`step3p5_opt` 目录只保留 import compatibility shim；
+0724 baseline 仍通过 `--baseline-main` 显式选择，不作为默认路径。
 
 ## 8. 已证实的精度根因
 

@@ -134,6 +134,7 @@ def main() -> int:
                 rope_cos, rope_sin, k_cache, v_cache,
                 wo, w_g, gate_r, resid3_out,
                 norm_layer_idx, attn_layer_idx,
+                BATCH,
                 attn_tmp_window, attn_signal_window, my_rank,
             )
             return resid3_out

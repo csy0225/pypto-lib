@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Resident N=1 whole-net hidden-only decode holder.
 
-把 `whole_decode_faithful_real_single_chip_hidden_only` 的 compile -> prepare
+把 canonical `models.step3p5.decode_fwd:whole_decode_step3p5` 的 compile -> prepare
 -> import_weights -> rt.run 生命周期抽成一个常驻 holder：
 **build+prepare 一次**，之后每次 `run()` 复用同一个 prepared `rt`
 （不重新 prepare），逐步喂 hidden / attn-meta / KV。
@@ -34,10 +34,10 @@ import torch
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 _I32 = torch.int32
-MAIN_PROGRAM = "whole_decode_faithful_real_single_chip_hidden_only"
+MAIN_PROGRAM = "whole_decode_step3p5"
 
-# Loop-form slot maps (Diff B): baseline KEY_WQ_FULL[12] / KEY_WQ_SWA[33] split
-# into the canonical Main's 4 attention buckets. full_wq/swa_wq copy baseline 原样（dead slot 无害，
+# canonical Main 把 loader 的 KEY_WQ_FULL[12] / KEY_WQ_SWA[33] 拆成四个
+# attention bucket。full_wq/swa_wq 保留完整物理槽位（dead slot 无害，
 # L44@full_wq[11] / L43@swa_wq[32] 的 slot 索引依赖 [12]/[33] 尺寸）；moe_full_wq
 # 取 canonical FULL slot 1-10（L4,8,…,40）；moe_swa_wq 取 canonical SWA slot 2-31
 # （30 个 MoE-swa 层，跳过 dense L1(slot0)/L2(slot1)/L43(slot32)）。
@@ -75,30 +75,15 @@ class WholeDecodeHolder:
         *,
         platform="a2a3",
         kv_ipc=True,
-        program=None,
-        layer_module=None,
     ):
         self.device_ids = list(device_ids)
         self.tp = len(self.device_ids)
         self.dev_offset = self.device_ids[0]
         self.out_dir = out_dir
         self.ckpt = ckpt
-        self.layer_name = MAIN_PROGRAM
+        self.program_name = MAIN_PROGRAM
         self.platform = platform
         self.kv_ipc = kv_ipc
-        # custom Main mode: 指向 canonical loop-form Main（循环式 4-bucket
-        # split）。default None = explicit 0724 baseline
-        # (hidden-only faithful_real_single_chip).
-        # layer_module 形如 "models.step3p5.decode_fwd"；program 形如
-        # "whole_decode_step3p5"。两者必须同时给或同时不给。
-        self.custom_main_mode = program is not None or layer_module is not None
-        if self.custom_main_mode:
-            if program is None or layer_module is None:
-                raise ValueError(
-                    "custom Main 必须同时给 program= 和 layer_module="
-                )
-        self._custom_program_name = program
-        self._custom_layer_module = layer_module
 
         # populated by build()
         self.compiled = None
@@ -117,14 +102,14 @@ class WholeDecodeHolder:
         self._args_list = None
         # resident host tensors (mutated per-step)
         self.current_hidden = None
+        self.num_tokens_per_owner = None
         self.gate_r_full = self.gate_r_swa = None
         self.seq_lens = None
         self.block_table = None
         self.slot_mapping = None
         self.rope_cf = self.rope_sf = self.rope_cs = self.rope_ss = None
         self.k_cache = self.v_cache = None
-        self._h_mid_out = self._next_hidden_out = None
-        self._dbg_out = None
+        self._next_hidden_out = None
         self._last_run_sec = 0.0
         self._rope_ready = False
 
@@ -165,7 +150,7 @@ class WholeDecodeHolder:
     # ---- build (compile; no device prepare yet) ----------------------------
 
     def _main_const(self, name: str) -> int:
-        """读取 custom Main 模块的模块级常量。"""
+        """读取 canonical Main 模块的模块级常量。"""
         return int(getattr(self._dl, name))
 
     def build(self):
@@ -179,14 +164,7 @@ class WholeDecodeHolder:
         self._cfg = cfg
         self._K = K
         assert self.tp == cfg.TP_WORLD_SIZE, f"need {cfg.TP_WORLD_SIZE} cards; got {self.tp}"
-        if self.custom_main_mode:
-            import importlib  # noqa: PLC0415
-            dl = importlib.import_module(self._custom_layer_module)
-            self.layer_name = self._custom_program_name
-        else:
-            # Explicit rollback path: the 0724 single-submit hidden-only
-            # baseline remains available without custom Main arguments.
-            import models.step3p5.decode_layer_single_chip_hidden as dl  # noqa: PLC0415
+        import models.step3p5.decode_fwd as dl  # noqa: PLC0415
         self._dl = dl
 
         from pypto import ir  # noqa: PLC0415
@@ -195,13 +173,12 @@ class WholeDecodeHolder:
             "PYPTO_PROG_BUILD_DIR",
             "/data/chensiyu/hw_project/pypto/workspace/build_output",
         )
-        program = getattr(dl, self.layer_name)
         _mplan = None
         if os.environ.get("PYPTO_MEM_PLANNER", "").lower() == "ptoas":
             from pypto.pypto_core import passes as _passes  # noqa: PLC0415
             _mplan = _passes.MemoryPlanner.PTOAS
         self.compiled = ir.compile(
-            program, platform=self.platform,
+            dl.whole_decode_step3p5, platform=self.platform,
             distributed_config=DistributedConfig(device_ids=self.device_ids, num_sub_workers=0),
             skip_ptoas=False, dump_passes=False, memory_planner=_mplan,
         )
@@ -248,19 +225,25 @@ class WholeDecodeHolder:
 
         # resident host tensors (allocated BEFORE prepare so forked chips see them)
         self.current_hidden = _zsh(tp, BATCH, HIDDEN)
+        # G1: one shared runtime active-token count per owner.  The canonical
+        # graph takes max(owner counts) so every rank uses identical dynamic
+        # MoE bounds.
+        self.num_tokens_per_owner = torch.zeros(
+            (128,), dtype=_I32,
+        ).share_memory_()
+        self.num_tokens_per_owner[:tp].fill_(BATCH)
         self.gate_r_full = _zsh(tp, N_FULL, NHF_PAD, HQ_FULL)
         self.gate_r_swa = _zsh(tp, N_SWA, NHS_PAD, HQ_SWA)
-        if self.custom_main_mode:
-            # canonical loop-form 4-bucket split：full/swa 各对应 dense+post-loop 全量，
-            # moe_full/moe_swa 是 MoE loop 专用桶，需要各自的 block-diag R 常量。
-            n_moe_full = self._main_const("NUM_FULL_MOE_LAYERS")
-            n_moe_swa = self._main_const("NUM_SWA_MOE_LAYERS")
-            self.gate_r_moe_full = _zsh(tp, n_moe_full, NHF_PAD, HQ_FULL)
-            self.gate_r_moe_swa = _zsh(tp, n_moe_swa, NHS_PAD, HQ_SWA)
-            for _h in range(HQ_FULL // HEAD_DIM):
-                self.gate_r_moe_full[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
-            for _h in range(HQ_SWA // HEAD_DIM):
-                self.gate_r_moe_swa[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
+        # canonical loop-form 4-bucket split：full/swa 各对应 dense+post-loop
+        # 全量，moe_full/moe_swa 是 MoE loop 专用桶，各自拥有 block-diag R。
+        n_moe_full = self._main_const("NUM_FULL_MOE_LAYERS")
+        n_moe_swa = self._main_const("NUM_SWA_MOE_LAYERS")
+        self.gate_r_moe_full = _zsh(tp, n_moe_full, NHF_PAD, HQ_FULL)
+        self.gate_r_moe_swa = _zsh(tp, n_moe_swa, NHS_PAD, HQ_SWA)
+        for _h in range(HQ_FULL // HEAD_DIM):
+            self.gate_r_moe_full[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
+        for _h in range(HQ_SWA // HEAD_DIM):
+            self.gate_r_moe_swa[:, :, _h, _h * HEAD_DIM:(_h + 1) * HEAD_DIM] = 1.0
         # block-diag R constant (layer-independent): R[h, h*HEAD_DIM+d]=1 for real
         # local heads (count = HQ//HEAD_DIM), padded rows stay zero.
         for _h in range(HQ_FULL // HEAD_DIM):
@@ -273,21 +256,17 @@ class WholeDecodeHolder:
         self.rope_cf, self.rope_sf = _zsh(tp, RSD, ROT_FULL, dtype=_F32), _zsh(tp, RSD, ROT_FULL, dtype=_F32)
         self.rope_cs, self.rope_ss = _zsh(tp, RSD, ROT_SWA, dtype=_F32), _zsh(tp, RSD, ROT_SWA, dtype=_F32)
         self.k_cache, self.v_cache = _zsh(tp, KVC, HEAD_DIM), _zsh(tp, KVC, HEAD_DIM)
-        self._h_mid_out, self._next_hidden_out = (
-            _zsh(tp, BATCH, HIDDEN),
-            _zsh(tp, BATCH, HIDDEN),
-        )
-        self._dbg_out = _zsh(tp, BATCH, HIDDEN)
-        # Per-layer hidden dump buffer for accuracy bisect (opt + baseline both).
-        # Decode program runs 45 layers (L0..L44); shape [tp, 45, BATCH, HIDDEN].
-        self._per_layer_hidden = _zsh(tp, 45, BATCH, HIDDEN)
+        self._next_hidden_out = _zsh(tp, BATCH, HIDDEN)
         from tools.step3p5.pypto_weight_ipc import (  # noqa: PLC0415
             import_weights_all, build_stacked_weight,
         )
         K = self._K
 
-        # open the prepare() context manager and keep it resident
-        self._prepare_cm = self.compiled.prepare()
+        # Keep one Worker.run and one CommDomain resident across decode steps.
+        # The runtime clears every retained window before each request, so C1
+        # layer-local signal epochs restart at 1 without stale Ge thresholds
+        # or repeated HCCL domain allocation/release churn.
+        self._prepare_cm = self.compiled.prepare(persistent=True)
         self.rt = self._prepare_cm.__enter__()
         self._wmaps = import_weights_all(self.rt, self.out_dir, tp=tp, dev_offset=self.dev_offset)
 
@@ -331,11 +310,11 @@ class WholeDecodeHolder:
             return build_stacked_weight(self._wmaps, key)
 
         def Wsub(key, slots):
-            """loop-form 4-bucket split：从 baseline 整桶 [N,...] 里按 leading-dim
+            """canonical 4-bucket split：从 loader 整桶 [N,...] 里按 leading-dim
             slots 取零拷贝连续子视图（每 rank 独立切片，再叠成 StackedDeviceTensor）。
 
-            baseline KEY_WQ_FULL=[12] 全 12 个 FULL 层紧凑叠放；loop-form moe_full_wq[10]
-            取 slot 1-10（L4,8,…,40；slot0=L0 dense、slot11=L44 post-loop 留在
+            KEY_WQ_FULL=[12] 全 12 个 FULL 层紧凑叠放；moe_full_wq[10] 取
+            slot 1-10（L4,8,…,40；slot0=L0 dense、slot11=L44 post-loop 留在
             full_wq 桶里）。KEY_WQ_SWA=[33] 同理，moe_swa_wq[30] 取 slot 2-31。
             DeviceTensor.__getitem__ 只允许 outermost partial slice（连续），满足。
             """
@@ -345,33 +324,11 @@ class WholeDecodeHolder:
             full = (tp, *tuple(shards[0].shape))
             return StackedDeviceTensor(shards, full, list(range(tp)))
 
-        if self.custom_main_mode:
-            args = self._build_loop_form_args(W, Wsub)
-        else:
-            args = [self.current_hidden]
-            args += [W(K.KEY_INPUT_RMS), W(K.KEY_POST_ATTN_RMS), W(K.KEY_Q_NORM), W(K.KEY_K_NORM)]
-            args += [W(K.KEY_WQ_FULL), W(K.KEY_WK_FULL), W(K.KEY_WV_FULL), W(K.KEY_WO_FULL), W(K.KEY_WG_FULL),
-                     self.gate_r_full]
-            args += [W(K.KEY_WQ_SWA), W(K.KEY_WK_SWA), W(K.KEY_WV_SWA), W(K.KEY_WO_SWA), W(K.KEY_WG_SWA),
-                     self.gate_r_swa]
-            args += [W(K.KEY_DENSE_GATE), W(K.KEY_DENSE_UP), W(K.KEY_DENSE_DOWN)]
-            args += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS),
-                     W(K.KEY_MOE_W_GATE_R), W(K.KEY_MOE_W_GATE_R_SCALE),
-                     W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_UP_R_SCALE),
-                     W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_DOWN_R_SCALE),
-                     W(K.KEY_MOE_W_GATE_S),
-                     W(K.KEY_MOE_W_UP_S), W(K.KEY_MOE_W_DOWN_S)]
-            args += [self.seq_lens, self.block_table, self.slot_mapping,
-                     self.rope_cf, self.rope_sf, self.rope_cs, self.rope_ss,
-                     self.k_cache, self.v_cache]
-            args += [self._h_mid_out, self._next_hidden_out]
-            args += [self._dbg_out]
-            # per_layer_hidden Out (per-layer dump for accuracy bisect).
-            args += [self._per_layer_hidden]
+        args = self._build_loop_form_args(W, Wsub)
         self._args_list = args
         print(
             f"[holder] resident: built {len(args)} args; "
-            f"program={self.layer_name}",
+            f"program={self.program_name}",
             flush=True,
         )
         return self
@@ -380,53 +337,54 @@ class WholeDecodeHolder:
         """Canonical loop-form 53-arg host_orch arg-list
         （严格按 models/step3p5/decode_fwd.py 签名）。
 
-        Diff A: 只 1 个 Out（next_hidden_out），跳过 baseline 的 h_mid_out + dbg_out。
-        Diff B: attn 4-bucket split（full/swa/moe_full/moe_swa），moe 桶从 baseline
-        KEY_WQ_FULL/SWA 按 _MOE_FULL_SLOTS/_MOE_SWA_SLOTS 取连续子视图。
-        常量名读当前 custom Main 模块（N_FULL_ATTN_LAYERS 等）。
+        canonical Main 只有一个 Out（next_hidden_out）。
+        attention 采用 full/swa/moe_full/moe_swa 四个 bucket；MoE bucket
+        从 resident weight pool 取连续 zero-copy 子视图。
+        常量名读取 canonical Main 模块（N_FULL_ATTN_LAYERS 等）。
         """
         K = self._K
         args = [self.current_hidden]
-        # 5 activations / RMS (L4564-4567)
+        # 5 activations / RMS
         args += [W(K.KEY_INPUT_RMS), W(K.KEY_POST_ATTN_RMS), W(K.KEY_Q_NORM), W(K.KEY_K_NORM)]
-        # 6 dense-full-attn (L4568-4573): full_wq/wk/wv/wo/w_g + full_gate_r
+        # dense full-attention weights + block-diag gate R
         args += [W(K.KEY_WQ_FULL), W(K.KEY_WK_FULL), W(K.KEY_WV_FULL), W(K.KEY_WO_FULL), W(K.KEY_WG_FULL),
                  self.gate_r_full]
-        # 6 dense-swa-attn (L4574-4579): swa_wq/wk/wv/wo/w_g + swa_gate_r
+        # dense SWA weights + block-diag gate R
         args += [W(K.KEY_WQ_SWA), W(K.KEY_WK_SWA), W(K.KEY_WV_SWA), W(K.KEY_WO_SWA), W(K.KEY_WG_SWA),
                  self.gate_r_swa]
-        # 3 dense-MLP (L4580-4582)
+        # dense MLP
         args += [W(K.KEY_DENSE_GATE), W(K.KEY_DENSE_UP), W(K.KEY_DENSE_DOWN)]
-        # 6 MoE-full-attn (L4584-4589): moe_full_wq/wk/wv/wo/w_g + moe_full_gate_r
+        # MoE full-attention bucket
         args += [Wsub(K.KEY_WQ_FULL, _MOE_FULL_SLOTS),
                  Wsub(K.KEY_WK_FULL, _MOE_FULL_SLOTS),
                  Wsub(K.KEY_WV_FULL, _MOE_FULL_SLOTS),
                  Wsub(K.KEY_WO_FULL, _MOE_FULL_SLOTS),
                  Wsub(K.KEY_WG_FULL, _MOE_FULL_SLOTS),
                  self.gate_r_moe_full]
-        # 6 MoE-swa-attn (L4590-4595): moe_swa_wq/wk/wv/wo/w_g + moe_swa_gate_r
+        # MoE SWA bucket
         args += [Wsub(K.KEY_WQ_SWA, _MOE_SWA_SLOTS),
                  Wsub(K.KEY_WK_SWA, _MOE_SWA_SLOTS),
                  Wsub(K.KEY_WV_SWA, _MOE_SWA_SLOTS),
                  Wsub(K.KEY_WO_SWA, _MOE_SWA_SLOTS),
                  Wsub(K.KEY_WG_SWA, _MOE_SWA_SLOTS),
                  self.gate_r_moe_swa]
-        # 11 MoE expert/router (L4596-4606)
+        # MoE expert/router weights
         args += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS),
                  W(K.KEY_MOE_W_GATE_R), W(K.KEY_MOE_W_GATE_R_SCALE),
                  W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_UP_R_SCALE),
                  W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_DOWN_R_SCALE),
                  W(K.KEY_MOE_W_GATE_S),
                  W(K.KEY_MOE_W_UP_S), W(K.KEY_MOE_W_DOWN_S)]
-        # 7 KV/rope meta (L4607-4613)
+        # KV/RoPE metadata
         args += [self.seq_lens, self.block_table, self.slot_mapping,
                  self.rope_cf, self.rope_sf, self.rope_cs, self.rope_ss]
-        # 2 InOut cache (L4614-4615)
+        # InOut cache
         args += [self.k_cache, self.v_cache]
-        # 1 Out (L4616): only next_hidden_out (Diff A: skip h_mid_out + dbg_out)
+        # canonical output
         args += [self._next_hidden_out]
-        # per_layer_hidden Out (per-layer dump for accuracy bisect).
-        args += [self._per_layer_hidden]
+        # G1 runtime active-token counts.  This remains a tensor argument so
+        # the long-lived holder can update it before every rt.run().
+        args += [self.num_tokens_per_owner]
         return args
 
     def __exit__(self, exc_type, exc, tb):
@@ -443,6 +401,10 @@ class WholeDecodeHolder:
         self.current_hidden[:, 0, :] = emb_row
         if fill_batch:
             self.current_hidden[:, :, :] = emb_row
+        if self.num_tokens_per_owner is not None:
+            self.num_tokens_per_owner[: self.tp].fill_(
+                self._consts["BATCH"] if fill_batch else 1
+            )
 
     def set_hidden(self, hidden):
         """通用 per-step hidden 设置（sidecar/live）：hidden 可为 [BATCH,HIDDEN]（replicated 到每 rank）或 [tp,BATCH,HIDDEN]。"""
@@ -467,6 +429,8 @@ class WholeDecodeHolder:
                     f"got {tuple(hidden.shape)}"
                 )
             self.current_hidden.copy_(hidden.to(_BF16))
+        if self.num_tokens_per_owner is not None:
+            self.num_tokens_per_owner[: self.tp].fill_(self._consts["BATCH"])
 
     def set_meta(self, *, seq_lens=None, block_table=None, slot_mapping=None,
                  rope_cf=None, rope_sf=None, rope_cs=None, rope_ss=None):
@@ -598,6 +562,7 @@ class WholeDecodeHolder:
 
         self.current_hidden.zero_()
         self.current_hidden[:, :valid_tokens, :] = hidden
+        self.num_tokens_per_owner[: self.tp].fill_(valid_tokens)
         self.seq_lens.copy_(seq.unsqueeze(0).expand(self.tp, -1))
         self.block_table.copy_(table.reshape(1, -1).expand(self.tp, -1))
         self.slot_mapping.copy_(slots.unsqueeze(0).expand(self.tp, -1))
@@ -628,5 +593,5 @@ class WholeDecodeHolder:
         else:
             self.rt.run(self.compiled, *self._args_list)
         self._last_run_sec = time.time() - t0
-        return {"next_hidden": self._next_hidden_out,
-                "per_layer_hidden": self._per_layer_hidden}
+        result = {"next_hidden": self._next_hidden_out}
+        return result

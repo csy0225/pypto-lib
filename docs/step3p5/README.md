@@ -22,12 +22,8 @@ models/step3p5/decode_fwd.py
 whole_decode_step3p5
 ```
 
-显式回滚 baseline：
-
-```text
-models/step3p5/decode_layer_single_chip_hidden.py
-whole_decode_faithful_real_single_chip_hidden_only
-```
+历史 45× unroll Main、rollback selector 和自定义 Main module/name 参数均已
+删除。holder、sidecar、harness 和 CI 只允许上述 canonical symbol。
 
 ### MTP45/46/47
 
@@ -59,7 +55,7 @@ LM head、target/draft sampling、accept/reject 和用户可见后处理全部�
 ```text
 models/step3p5/
   decode_fwd.py
-  decode_layer_single_chip_hidden.py  # explicit 0724 rollback baseline
+  dense_mlp.py
   mtp_hidden_fwd.py
   attention_full.py
   attention_swa.py
@@ -107,31 +103,115 @@ canonical ABI 必须 fail-closed；禁止 vanilla、per-layer 或 silent fallbac
 - RMSNorm EPS 为 `1e-5`；
 - router bias 按 vLLM 的 BF16 round 语义对齐。
 
-### KV 和 fixed batch
+### KV ownership 和 fixed-storage batch ABI
 
-物理 batch 固定为 16。active row 保留 vLLM scheduler metadata；
-padding row 使用 allocator-owned 的 15 个 reserve blocks：
+这里的“固定 16”只指 **program tensor 的 storage shape / kernel tile ABI**，
+不表示 vLLM scheduler 的实际请求数固定为 16，也不表示每一步都按 16 个
+有效 token 做完整的 MoE routing。pure-decode 请求每个 request 贡献一个
+当前 token，因此一次调用的逻辑有效行数为：
 
 ```text
-scheduler domain: [0, scheduler_num_blocks)
-padding reserve:  [scheduler_num_blocks, scheduler_num_blocks + 15)
+1 <= valid_tokens == valid_requests <= 16
+storage_batch = 16
 ```
 
-每个 active row 必须满足：
+holder 保留前 `valid_tokens` 行的真实 hidden 和 scheduler metadata，并执行：
+
+```text
+current_hidden[valid_tokens:16] = 0
+num_tokens_per_owner[0:tp] = valid_tokens
+```
+
+当前 G1 实现已让 gate、dispatch、routed combine 等 MoE row-wise 阶段只处理
+前 `valid_tokens` 行；但 attention、dense/TP scratch 和部分固定 tile 仍保留
+`[16, ...]` storage/compute 形状。尤其 inactive row 当前仍可能执行 attention
+的 KV write，所以 padding metadata 不能省略，也不能指向 scheduler 正在管理
+的 block。sidecar 最终只返回输出的前 `valid_tokens` 行。
+
+#### KV ownership 与物理布局
+
+live 路径的 KV allocation 由 vLLM allocator 拥有。Main holder 在
+`prepare` 阶段只做一次 IPC import 和 stacked view 构造，之后把 K/V 以
+`pl.InOut` 传给 repeated `rt.run()`；每步不得重建、整池拷贝或清空历史 KV。
+standalone device gate 使用 exporter 代替 vLLM 成为 allocation owner，但
+消费的 map/layout 契约相同。
+
+每个 TP rank 有两个相互独立的 allocation domain：
+
+```text
+Main: K-major/V-major，45 个 decoder layer
+MTP:  K-major/V-major，MTP45/46/47 三个 selected layer
+```
+
+Main 与 MTP 不共享 pool base、IPC key、map 或 padding reserve。`slot_mapping`
+只表示**单层 KV section 内**的逻辑 slot，不包含 layer base；当前 layer 的
+K/V section offset 由 imported map/stacked view 提供，不能把 layer offset
+再次编码进 `slot_mapping`。
+
+#### Scheduler block 与 padding reserve
+
+设 vLLM scheduler 可见 block 数为 `S=scheduler_num_blocks`，实际 allocation
+容量为 `P=physical_num_blocks`。产品 ABI 要求：
+
+```text
+scheduler-owned block ids: [0, S)
+padding reserve block ids: [S, S + 15)
+physical capacity:         P >= S + 15
+```
+
+这里的 15 是 `storage_batch - 1`：因为一次合法调用至少有一个 active row，
+最多只需要 15 个 inactive-row slot。若 `valid_tokens=16`，本轮不消费 reserve；
+若物理 allocation 大于 `S+15`，多出的尾部容量也不属于 scheduler domain，
+不能据此改变上述固定 reserve ID。
+
+对每个 active row，vLLM 提供的 `seq_lens`、`block_table` 和 `slot_mapping`
+原样保留并严格校验：
 
 ```text
 position = seq_len - 1
-slot_mapping[row] =
-  block_table[row, position // 128] * 128 + position % 128
+table_col = position // 128
+block_id = block_table[row, table_col]       # 必须位于 [0, S)
+slot_mapping[row] = block_id * 128 + position % 128
 ```
 
-padding row 必须使用 `seq_len=1`、`position=0` 和互不重叠的 reserve
-block/slot。Main 与 MTP 使用独立 KV pool、map 和 reserve。
+对 `row >= valid_tokens` 的 inactive row，control plane 必须设置：
+
+```text
+seq_len = 1
+position = 0
+block_table[row, 0] = 一个本轮未重复使用的 reserve block id
+slot_mapping[row] = block_table[row, 0] * 128
+```
+
+因此 reserve 是为 fixed-storage attention 写入提供的地址隔离，不是 active
+request 的 KV 容量，也不是“把有效 batch 固定为 16”的手段。Main/MTP 虽使用
+同一套 metadata 语义，但必须在各自独立的 KV allocation 中拥有对应 reserve。
 
 ### 两个独立 gate
 
 数值正确和无 stall 必须分别通过。`RUN_CLEAN`、一次 token 正确、
 compile-only、P1/P20、随机输入或 BF16 fallback 都不能替代完整准出。
+
+### 512B control-signal stride 的作用域
+
+DeepSeek v4 的 512B 主要用于 data tile、L2 cache line 和 MTE 性能对齐，
+不是通用 control-signal ABI。step3p5 只对 canonical 中满足以下条件的
+control signal slot 做 512B 物理 stride 隔离：
+
+1. 被 `notify` / `wait` / `AtomicAdd` 使用；
+2. 多个 layer/slot 位于同一个 backing buffer，或同一个 slot 跨
+   `moe_epoch` 复用。
+
+这些 slot 使用：
+
+```text
+COMM_CONTROL_SIGNAL_BYTES = 512
+COMM_SIGNAL_STRIDE_I32 = 128
+formal/window/slice shape = [128, 1] INT32
+```
+
+通信 loop 仍只访问前 `n_ranks` 行。普通 data window 和 MTP 每次调用独立
+分配的 compact signal 不按该本地 false-sharing 约束机械扩成 512B。
 
 ## 4. single-step 与 multi-step
 
@@ -250,23 +330,21 @@ scripts/run_pypto_mtp3_back8.sh
 tests/step3p5/ci/run_whole_network_ci.py
 ```
 
-## 7. 当前 B2 replacement 状态（2026-07-26）
+## 7. 当前 canonical 状态（2026-07-27）
 
 loop-form Main 已正式位于
-`models/step3p5/decode_fwd.py`，生产 sidecar 默认选择：
+`models/step3p5/decode_fwd.py`，生产 holder 直接编译：
 
 ```text
---layer-module models.step3p5.decode_fwd
---layer-name whole_decode_step3p5
+models.step3p5.decode_fwd:whole_decode_step3p5
 ```
 
-当前 release 不传参数时默认使用
-`models.step3p5.decode_fwd:whole_decode_step3p5`；只有显式传
-`--baseline-main` 时才回退到 0724 hidden-only baseline。历史
-`models.step3p5_opt.decode_fwd:whole_decode_opt` 包和别名均已删除，不再
-提供第二个默认入口或 import compatibility。
+当前 release 不提供 rollback、自定义 Main module/name 或第二个 import
+compatibility 入口。Main 与 MTP 共用的 dense MLP kernel 已独立到
+`models/step3p5/dense_mlp.py`；该模块不包含 `@pl.program`、host ABI 或
+历史 whole-net 入口。
 
-在 0162 的 256-step 回归中，opt 与 current baseline：
+在 0162 的 256-step replacement 回归中，迁移前后：
 
 ```text
 token:  256/256 exact
@@ -276,13 +354,13 @@ TP spread: 0.0
 ```
 
 因此 replacement regression 通过。相同 vanilla oracle 的 raw 对齐为
-`240/256 = 93.75%`，baseline 也完全复现该结果；这低于历史 `>=95%`
-vanilla raw gate，不能把 raw 结果标记为无条件 PASS。详细数据见
+`240/256 = 93.75%`；这低于历史 `>=95%` vanilla raw gate，不能把 raw
+结果标记为无条件 PASS。详细数据见
 `tests/step3p5/ci/LIVE_PRECISION_AB.md`。
 
 ### 7.1 canonical rename 回归
 
-`models.step3p5_opt.decode_fwd:whole_decode_opt` 正式迁移为
+pre-canonical loop-form artifact 正式迁移为
 `models.step3p5.decode_fwd:whole_decode_step3p5` 后，在相同的
 `stepfun-develop-20260726-opt-b2@sha256:0b22fcef...` 镜像环境、相同
 checkpoint、相同 256-step oracle 和 8-15 卡上重新运行默认入口：
@@ -304,10 +382,9 @@ step 127 / 128 / 255:             PASS
   canonical_vs_pre_rename.json
 ```
 
-因此本次正式化只改变 canonical module/program 名称与默认入口，不改变
-已验证的数学实现。后续清理已删除 `step3p5_opt` 包和
-`whole_decode_opt`/`WholeDecodeOpt` 别名；0724 baseline 仍只通过
-`--baseline-main` 显式选择，不作为默认路径。
+因此本次正式化只改变 canonical module/program 名称，不改变已验证的数学
+实现。2026-07-27 的清理进一步删除了 retired unroll source、rollback
+selector 和自定义 Main 入口；后续实现与验收统一以 canonical 为 base。
 
 ## 8. 已证实的精度根因
 

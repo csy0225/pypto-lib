@@ -337,7 +337,7 @@ def preflight(config: WholeNetworkConfig) -> dict[str, Any]:
         raise RunnerError(f"repository root does not exist: {config.repo_root}")
     required_sources = (
         "models/step3p5/decode_fwd.py",
-        "models/step3p5/decode_layer_single_chip_hidden.py",
+        "models/step3p5/dense_mlp.py",
         "models/step3p5/mtp_hidden_fwd.py",
         "tests/step3p5/harnesses/_stage_main_hidden_only.py",
         "tests/step3p5/harnesses/_stage_mtp_hidden_selected.py",
@@ -575,9 +575,7 @@ def _initial_report(config: WholeNetworkConfig) -> dict[str, Any]:
         "finished_utc": None,
         "test": {
             "name": "step3p5_single_chip_hidden_only",
-            "program_main": (
-                "whole_decode_faithful_real_single_chip_hidden_only"
-            ),
+            "program_main": "whole_decode_step3p5",
             "program_mtp": "MTP_LAYER_HIDDEN_PROGRAMS",
             "canonical_document": "docs/step3p5/README.md",
             "run_id": time.strftime("%Y%m%d_%H%M%S"),

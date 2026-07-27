@@ -65,13 +65,15 @@ def test_production_program_has_no_legacy_main_or_mtp_imports():
     }
     assert "decode_layer" not in imports
     assert "mtp" not in imports
-    assert "decode_layer_single_chip_hidden" in imports
+    assert "dense_mlp" in imports
 
 
 def test_each_call_owns_fresh_collective_windows():
     source = _source()
     assert source.count("pld.alloc_window_buffer(BATCH * HIDDEN * 2)") == 3
-    assert source.count("pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)") == 3
+    assert source.count("pld.alloc_window_buffer(tp_size * 4)") == 3
+    assert "COMM_CONTROL_SIGNAL_BYTES" not in source
+    assert "COMM_SIGNAL_STRIDE_I32" not in source
     assert "run_gen" not in source
 
 

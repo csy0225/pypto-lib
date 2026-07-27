@@ -36,8 +36,6 @@ DEFAULT_CKPT = (
 )
 # Vanilla 8000 greedy oracle for the canonical one-token decode.
 DEFAULT_ORACLE_TOKENS = [303, 1207, 19384, 872, 428, 6127, 4231, 2636]
-CURRENT_MAIN_MODULE = "models.step3p5.decode_fwd"
-CURRENT_MAIN_PROGRAM = "whole_decode_step3p5"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -47,6 +45,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True)
     parser.add_argument("--num-blocks", type=int, default=32)
     parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument(
+        "--active-batch",
+        type=int,
+        default=1,
+        help=(
+            "number of live rows in the fixed BATCH=16 storage ABI; active "
+            "rows use identical ctx=1 metadata and padding rows use the "
+            "allocator-owned reserve"
+        ),
+    )
     parser.add_argument("--teacher-forced", action="store_true", help="feed oracle token each step; log all steps, never raise (per-position top-1 accuracy vs a live/greedy oracle)")
     parser.add_argument("--seed-token", type=int, default=6127, help="first decode input token (default 6127)")
     parser.add_argument("--oracle-token", action="append", type=int)
@@ -58,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "diagnostic-only: after each rt.run(), ask every allocation owner "
-            "to D2H-capture L0/L1/L44 slot0/slot1"
+            "to D2H-capture all 45 layers, K/V, and slots 0/1/2"
         ),
     )
     parser.add_argument(
@@ -70,27 +78,6 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
-    parser.add_argument(
-        "--baseline-main",
-        action="store_true",
-        help="explicit rollback: use the canonical 0724 baseline Main",
-    )
-    parser.add_argument(
-        "--layer-module",
-        default=None,
-        help=(
-            "custom Main module; must be paired with --layer-name. "
-            "Default uses models.step3p5.decode_fwd"
-        ),
-    )
-    parser.add_argument(
-        "--layer-name",
-        default=None,
-        help=(
-            "custom Main program name; must be paired with --layer-module. "
-            "Default uses whole_decode_step3p5"
-        ),
-    )
     parser.add_argument(
         "--itl-context-lens",
         default="",
@@ -334,8 +321,12 @@ def _collect_kv_probe(
     request = {
         "probe_id": probe_id,
         "step": int(step),
-        "layer_indices": [0, 1, 44],
-        "slots": [0, 1],
+        # PERF-B3 release evidence: cover every physical decode layer, both
+        # K/V sections, the two adjacent active scheduler rows, and one
+        # untouched history row. Padding writes use allocator-owned reserve
+        # blocks above the scheduler domain and cannot alias slots 0/1/2.
+        "layer_indices": list(range(45)),
+        "slots": [0, 1, 2],
     }
     for rank in range(TP):
         path = out / f"kv_probe_request.rank{rank}.json"
@@ -397,7 +388,7 @@ def _collect_kv_probe(
 
 
 def _kv_probe_summary(aggregate: dict[str, object]) -> dict[str, object]:
-    """Summarize slot zero/nonzero state across all owner ranks.
+    """Summarize all-layer slot state across all owner ranks.
 
     This is diagnostic evidence only.  The owner-side probe reads the exact
     exported rows after ``rt.run()``; it does not add a device operation to
@@ -415,10 +406,15 @@ def _kv_probe_summary(aggregate: dict[str, object]) -> dict[str, object]:
             raise ValueError("KV probe rank result has no summary")
         summaries.append(summary)
 
+    if aggregate.get("layer_indices") != list(range(45)):
+        raise ValueError("PERF-B3 KV probe must cover layers 0..44")
+    if aggregate.get("slots") != [0, 1, 2]:
+        raise ValueError("PERF-B3 KV probe must cover slots 0/1/2")
+
     def observations(slot: int) -> list[bool]:
         values: list[bool] = []
         for summary in summaries:
-            for layer in (0, 1, 44):
+            for layer in range(45):
                 for which in ("K", "V"):
                     key = f"L{layer}.{which}.slot{slot}"
                     entry = summary.get(key)
@@ -427,16 +423,35 @@ def _kv_probe_summary(aggregate: dict[str, object]) -> dict[str, object]:
                     values.append(int(entry.get("nonzero", -1)) > 0)
         return values
 
+    def hashes(slot: int) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for rank, summary in enumerate(summaries):
+            for layer in range(45):
+                for which in ("K", "V"):
+                    key = f"L{layer}.{which}.slot{slot}"
+                    entry = summary.get(key)
+                    if not isinstance(entry, dict):
+                        raise ValueError(f"KV probe is missing {key}")
+                    values[f"rank{rank}.{key}"] = str(entry.get("sha256", ""))
+        return values
+
     slot0 = observations(0)
     slot1 = observations(1)
+    slot2 = observations(2)
     return {
         "slot0_any_nonzero": any(slot0),
         "slot0_all_nonzero": all(slot0),
         "slot1_any_nonzero": any(slot1),
         "slot1_all_nonzero": all(slot1),
+        "slot2_any_nonzero": any(slot2),
+        "slot2_all_nonzero": all(slot2),
         "slot0_nonzero_count": sum(slot0),
         "slot1_nonzero_count": sum(slot1),
+        "slot2_nonzero_count": sum(slot2),
         "observed_values": len(slot0),
+        "slot0_hashes": hashes(0),
+        "slot1_hashes": hashes(1),
+        "slot2_hashes": hashes(2),
     }
 
 
@@ -493,12 +508,15 @@ def _step_metadata(
     *,
     step: int,
     scheduler_num_blocks: int,
+    valid_rows: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build scheduler-shaped metadata for a one-request direct decode.
+    """Build scheduler-shaped metadata for a direct decode batch.
 
     This is standalone direct-decode metadata only.  The active row uses the
-    scheduler domain; padding rows use the allocator-owned reserve.  No
-    active-row mapping is invented in the live vLLM bridge.
+    scheduler domain; padding rows use the allocator-owned reserve.  Active
+    rows share the same context length and use distinct slot rows within the
+    scheduler domain.  No active-row mapping is invented in the live vLLM
+    bridge.
     """
     from tools.step3p5.kv_padding import (
         make_padding_reserve,
@@ -509,6 +527,8 @@ def _step_metadata(
         scheduler_num_blocks,
         scheduler_num_blocks + 15,
     )
+    if not 1 <= int(valid_rows) <= BATCH:
+        raise ValueError(f"valid_rows must be in [1,{BATCH}], got {valid_rows}")
     seq = torch.ones(BATCH, dtype=torch.int32)
     pos = torch.zeros(BATCH, dtype=torch.int32)
     table = torch.zeros(BATCH, scheduler_num_blocks, dtype=torch.int32)
@@ -519,14 +539,24 @@ def _step_metadata(
         raise ValueError(
             f"step={step} exceeds scheduler capacity {scheduler_num_blocks}"
         )
-    table[0, : block_index + 1] = torch.arange(
-        block_index + 1,
-        dtype=torch.int32,
+    # Give every active row an independent scheduler-owned paged sequence.
+    # Interleaving block ids keeps each sequence's history disjoint:
+    # row ``r`` owns blocks ``r, r+valid_rows, ...``.
+    active_blocks = (
+        torch.arange(valid_rows, dtype=torch.int32).unsqueeze(1)
+        + valid_rows
+        * torch.arange(block_index + 1, dtype=torch.int32).unsqueeze(0)
     )
-    seq[0] = int(step) + 1
-    pos[0] = int(step)
-    slot[0] = block_index * BLOCK_SIZE + (int(step) % BLOCK_SIZE)
-    for padding_idx, block_id in enumerate(reserve.padding_block_ids, start=1):
+    table[:valid_rows, : block_index + 1] = active_blocks
+    seq[:valid_rows] = int(step) + 1
+    pos[:valid_rows] = int(step)
+    slot[:valid_rows] = (
+        active_blocks[:, block_index] * BLOCK_SIZE
+        + (int(step) % BLOCK_SIZE)
+    )
+    for padding_idx, block_id in enumerate(
+        reserve.padding_block_ids[: BATCH - valid_rows], start=valid_rows
+    ):
         table[padding_idx, 0] = int(block_id)
         slot[padding_idx] = int(block_id) * BLOCK_SIZE
 
@@ -535,7 +565,7 @@ def _step_metadata(
         positions=pos,
         block_table=table,
         slot_mapping=slot,
-        valid_rows=1,
+        valid_rows=valid_rows,
         reserve=reserve,
         where=f"standalone Main step {step}",
     )
@@ -610,6 +640,8 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
 
 def _run_worker(args: argparse.Namespace) -> int:
     devices = _devices(args.device)
+    if not 1 <= args.active_batch <= BATCH:
+        raise ValueError(f"--active-batch must be in [1,{BATCH}]")
     if not 1 <= args.steps <= args.num_blocks * BLOCK_SIZE:
         raise ValueError("--steps must be in [1, num_blocks*128]")
     if args.repeat_identical and args.steps != 2:
@@ -654,33 +686,16 @@ def _run_worker(args: argparse.Namespace) -> int:
             and expected_tokens[0] != 303):
         raise ValueError("built-in canonical Main oracle must start with token 303")
 
-    layer_module = args.layer_module
-    layer_name = args.layer_name
-    if (layer_module is None) != (layer_name is None):
-        raise ValueError("--layer-module and --layer-name must be provided together")
-    if args.baseline_main and (layer_module is not None or layer_name is not None):
-        raise ValueError(
-            "--baseline-main cannot be combined with "
-            "--layer-module/--layer-name"
-        )
-    if args.baseline_main:
-        layer_module = None
-        layer_name = None
-    elif layer_module is None:
-        layer_module = CURRENT_MAIN_MODULE
-        layer_name = CURRENT_MAIN_PROGRAM
-
     holder = WholeDecodeHolder(
         device_ids=devices,
         out_dir=str(out),
         ckpt=args.ckpt,
         platform=args.platform,
         kv_ipc=True,
-        program=layer_name,
-        layer_module=layer_module,
     ).build()
     reports: list[dict[str, object]] = []
     repeat_hidden: torch.Tensor | None = None
+    previous_kv_probe_summary: dict[str, object] | None = None
     try:
         with holder:
             if args.itl_context_lens:
@@ -692,9 +707,10 @@ def _run_worker(args: argparse.Namespace) -> int:
                 seq, pos, table, slot = _step_metadata(
                     step=metadata_step,
                     scheduler_num_blocks=args.num_blocks,
+                    valid_rows=args.active_batch,
                 )
                 holder.set_live_step(
-                    embedding.unsqueeze(0),
+                    embedding.unsqueeze(0).expand(args.active_batch, -1).contiguous(),
                     seq_lens=seq,
                     positions=pos,
                     block_table=table,
@@ -710,7 +726,18 @@ def _run_worker(args: argparse.Namespace) -> int:
                 )
                 hidden = result["next_hidden"]
                 hidden_snapshot = hidden.to(torch.bfloat16).clone()
+                torch.save(
+                    hidden_snapshot[:, : args.active_batch],
+                    out / f"main_step{step:02d}_active_hidden.pt",
+                )
                 row0 = hidden[0, 0].float().clone()
+                active_hidden = hidden[:, : args.active_batch].float()
+                active_finite = bool(torch.isfinite(active_hidden).all())
+                active_nonzero_rows = int(
+                    torch.count_nonzero(
+                        active_hidden.abs().amax(dim=-1) > 0
+                    ).item()
+                )
                 torch.save(
                     hidden_snapshot[0, 0],
                     out / f"main_step{step:02d}_hidden.pt",
@@ -727,14 +754,33 @@ def _run_worker(args: argparse.Namespace) -> int:
                             pl_hidden[0, li, 0].to(torch.bfloat16).clone(),
                             pl_dir / f"layer{li:02d}.pt",
                         )
+                        if args.active_batch > 1:
+                            torch.save(
+                                pl_hidden[
+                                    :, li, : args.active_batch
+                                ].to(torch.bfloat16).clone(),
+                                pl_dir / f"layer{li:02d}_active.pt",
+                            )
                 tp_spread = float(
-                    (hidden[:, 0].float() - hidden[0:1, 0].float())
+                    (
+                        hidden[:, : args.active_batch].float()
+                        - hidden[0:1, : args.active_batch].float()
+                    )
                     .abs()
                     .max()
                     .item()
                 )
                 if not torch.isfinite(row0).all():
                     raise AssertionError(f"Main hidden is non-finite at step {step}")
+                if not active_finite:
+                    raise AssertionError(
+                        f"Main active hidden is non-finite at step {step}"
+                    )
+                if active_nonzero_rows != args.active_batch * TP:
+                    raise AssertionError(
+                        f"Main active hidden has {active_nonzero_rows} "
+                        f"nonzero rank/rows, expected {args.active_batch * TP}"
+                    )
                 sampled = _cpu_tail_token(row0, ckpt=args.ckpt)
                 expected = (
                     303
@@ -751,6 +797,9 @@ def _run_worker(args: argparse.Namespace) -> int:
                     "run_sec": elapsed,
                     "hidden_shape": list(hidden.shape),
                     "hidden_finite": True,
+                    "active_batch": args.active_batch,
+                    "active_hidden_finite": active_finite,
+                    "active_hidden_nonzero_rank_rows": active_nonzero_rows,
                     "hidden_tp_spread": tp_spread,
                     "hidden_row0_abs_max": float(row0.abs().max().item()),
                 }
@@ -789,10 +838,13 @@ def _run_worker(args: argparse.Namespace) -> int:
                     if (
                         not args.repeat_identical
                         and step == 0
-                        and probe_summary["slot1_any_nonzero"]
+                        and (
+                            probe_summary["slot1_any_nonzero"]
+                            or probe_summary["slot2_any_nonzero"]
+                        )
                     ):
                         raise AssertionError(
-                            "Main step 0 unexpectedly wrote selected slot1 rows"
+                            "Main step 0 unexpectedly wrote slot1/slot2 history"
                         )
                     if (
                         not args.repeat_identical
@@ -803,6 +855,25 @@ def _run_worker(args: argparse.Namespace) -> int:
                             f"Main step {step}: selected layer/rank slot1 rows "
                             "were not all written"
                         )
+                    if (
+                        not args.repeat_identical
+                        and step >= 1
+                        and probe_summary["slot2_any_nonzero"]
+                    ):
+                        raise AssertionError(
+                            f"Main step {step}: untouched slot2 history changed"
+                        )
+                    if (
+                        not args.repeat_identical
+                        and step == 1
+                        and previous_kv_probe_summary is not None
+                        and probe_summary["slot0_hashes"]
+                        != previous_kv_probe_summary["slot0_hashes"]
+                    ):
+                        raise AssertionError(
+                            "Main step 1 modified slot0 history from step 0"
+                        )
+                    previous_kv_probe_summary = probe_summary
                 reports.append(report)
                 print(json.dumps(report, sort_keys=True), flush=True)
                 if sampled != expected and not getattr(args, "teacher_forced", False):
@@ -840,6 +911,10 @@ def _run_worker(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
+    # Canonical liveness marker consumed by the performance release runbook.
+    # Print it only after the resident holder has completed every requested
+    # invocation and the report has been durably written.
+    print("[worker] RUN done", flush=True)
     print(
         "RESULT="
         + (

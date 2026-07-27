@@ -18,13 +18,13 @@ decode_layer / moe / mtp 等)都把这些 helper 复制为 self.method(...) 形�
 
 ────── 以下为英文原 docstring ──────
 
-Step3p5 shared kernel helpers (Phase 3 dedup target).
+Step3p5 shared kernel helpers.
 
-Hoists the four inline helpers that were duplicated across the Phase 2
-drafts ``single_layer_decode_full_draft.py`` and
-``single_layer_decode_swa_draft.py`` into a single import surface so
-``attention_full.py`` / ``attention_swa.py`` consume identical building
-blocks.
+The canonical full-attention and SWA implementations consume these helpers
+through one import surface so both paths use identical building blocks.
+The Phase-2 standalone single-layer drafts that originally carried duplicate
+copies were retired after this module and the canonical attention modules
+became authoritative.
 
 Function names match the brief in MIGRATION_PLAN.md Phase 3 verbatim:
 

@@ -99,7 +99,7 @@ top-1 在多个位置切换或出现近似 tie。因此当前发布结论必须�
 
 ### 2026-07-26 canonical rename regression
 
-正式入口从历史 `models.step3p5_opt.decode_fwd:whole_decode_opt` 迁移到
+正式入口从 pre-canonical loop-form artifact 迁移到
 `models.step3p5.decode_fwd:whole_decode_step3p5` 后，使用同一镜像、
 checkpoint、oracle 和设备集合重新执行 N=256：
 
@@ -120,6 +120,5 @@ artifact：
 ```
 
 这证明正式化仅改变 module/program 名称和默认选择，不改变已验证的
-loop-form 数学实现。后续清理已删除 `step3p5_opt` 包和
-`whole_decode_opt`/`WholeDecodeOpt` 别名；0724 baseline 仍可通过
-`--baseline-main` 显式回滚。
+loop-form 数学实现。2026-07-27 已删除 retired unroll source、rollback
+selector 和自定义 Main module/name 参数，后续只验收 canonical。

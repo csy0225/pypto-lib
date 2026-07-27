@@ -52,14 +52,13 @@ from .attention_swa import (
     LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_SWA,
     attention_swa,
 )
-# The dense MLP kernel body remains shared with the explicit 0724 rollback
-# baseline.  The canonical loop-form Main imports the same helper; keeping
-# this dependency explicit avoids coupling MTP compilation to the Main
-# orchestration program.
-from .decode_layer_single_chip_hidden import _dense_mlp_body_tp
+from .dense_mlp import dense_mlp_body_tp
 
 
 NUM_MTP = NUM_NEXTN_PREDICT_LAYERS
+# The selected MTP programs use independent per-call compact signal buffers;
+# do not inherit canonical Main's stacked/reused 512B slot policy.
+SIGNAL_WINDOW_ROWS = TP_WORLD_SIZE
 HIDDEN_LOCAL = HIDDEN // TP_WORLD_SIZE
 INTER_LOCAL = INTERMEDIATE_LOCAL
 MTP_EH_ROWS = NUM_MTP * HIDDEN_LOCAL
@@ -67,7 +66,6 @@ MTP_HIDDEN_ROWS = NUM_MTP * HIDDEN
 MTP_QHIDDEN_ROWS = NUM_MTP * HIDDEN_Q_SWA_LOCAL
 MTP_INTER_ROWS = NUM_MTP * INTERMEDIATE_LOCAL
 MTP_CACHE_ROWS = NUM_MTP * MTP_KV_CACHE_ROWS_DYN
-COMM_CONTROL_SIGNAL_BYTES = 512
 MTP_EH_ROWS_DYN = pl.dynamic("MTP_EH_ROWS_DYN")
 EH_OUT_CHUNK = (
     OUT_PROJ_N_CHUNK
@@ -316,7 +314,7 @@ def _build_mtp_layer_hidden_program(
     # cross-function call target in this context.
     input_proj_inline = pl.inline(_mtp_input_proj_body._func)
     attention_inline = pl.inline(attention_swa._func)
-    dense_mlp_inline = pl.inline(_dense_mlp_body_tp._func)
+    dense_mlp_inline = pl.inline(dense_mlp_body_tp._func)
 
     @pl.program
     class MtpLayerHidden:
@@ -396,7 +394,7 @@ def _build_mtp_layer_hidden_program(
             active_mask: pl.Tensor[[BATCH], pl.INT32],
             output: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-            for b in pl.parallel(BATCH):
+            for b in pl.range(BATCH):
                 active = pl.read(active_mask, [b])
                 for k0 in pl.range(0, HIDDEN, 256):
                     if active != 0:
@@ -416,7 +414,7 @@ def _build_mtp_layer_hidden_program(
             embed_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             """Lookup the vLLM-sampled token and keep the position-0 contract."""
-            for b in pl.parallel(BATCH):
+            for b in pl.range(BATCH):
                 active = pl.read(active_mask, [b])
                 seq_len = pl.read(seq_lens, [b])
                 if active != 0:
@@ -551,6 +549,7 @@ def _build_mtp_layer_hidden_program(
                 resid1,
                 layer_idx,
                 layer_idx,
+                BATCH,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -654,11 +653,14 @@ def _build_mtp_layer_hidden_program(
             ],
         ) -> pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]:
             eh_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            eh_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
+            # 这三个 signal 各自拥有独立 backing，并不按 layer/slot 堆叠；
+            # 逻辑与物理范围都只需覆盖 tp_size 个 INT32。512B signal stride
+            # 仅用于同一 backing 中 stacked/reused 的 control slot。
+            eh_sig = pld.alloc_window_buffer(tp_size * 4)
             attn_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            attn_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
+            attn_sig = pld.alloc_window_buffer(tp_size * 4)
             mlp_tmp = pld.alloc_window_buffer(BATCH * HIDDEN * 2)
-            mlp_sig = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
+            mlp_sig = pld.alloc_window_buffer(tp_size * 4)
             for rank in pl.range(pld.world_size()):
                 self.layer_orch(
                     previous_hidden[rank],

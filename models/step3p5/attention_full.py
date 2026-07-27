@@ -61,8 +61,12 @@ documented shapes:
   - ``tmp_window``    : ``pld.DistributedTensor`` view of a
                          ``BATCH * (HIDDEN // TP_WORLD_SIZE) * 2 bytes``
                          ``alloc_window_buffer`` slot (BF16).
-  - ``signal_window`` : ``pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32]``,
-                        zero-initialised. Each call site allocates a fresh
+  - ``signal_window`` : ``pld.DistributedTensor[[SIGNAL_WINDOW_ROWS, 1],
+                        pl.INT32]``, zero-initialised. The standalone program
+                        binds ``SIGNAL_WINDOW_ROWS=TP_WORLD_SIZE`` for an
+                        independent compact backing. Canonical whole-net
+                        inlining binds it to its 512B stacked slot.
+                        Each call site allocates a fresh
                         signal-window slot because the ring all-reduce
                         increments the cells across its ``2 * (N - 1)``
                         steps; reusing a slot would corrupt the wait
@@ -139,6 +143,10 @@ ROTARY_DIM = ROTARY_HALF * 2
 ROTARY_PASS = HEAD_DIM - ROTARY_DIM
 Q_GROUPS = Q_PER_KV // Q_HEAD_BATCH                # 1
 TOTAL_Q_GROUPS = NUM_KV_HEADS_DIM * Q_GROUPS       # 1
+# This module's standalone wrapper uses a compact, independent signal
+# allocation.  Canonical whole-net inlining overrides the same symbolic
+# constant in its target module with COMM_SIGNAL_STRIDE_I32=128.
+SIGNAL_WINDOW_ROWS = TP_WORLD_SIZE
 
 # Local override for KV projection's output chunk: KV_HIDDEN_LOCAL (128) is
 # below the global KV_OUT_CHUNK=256 default, so we pick the whole local KV
@@ -188,10 +196,11 @@ def attention_full(
     resid1_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     norm_layer_idx: pl.Scalar[pl.INT32],
     attn_layer_idx: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[
         [BATCH, HIDDEN // TP_WORLD_SIZE], pl.BF16
     ],
-    signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
+    signal_window: pld.DistributedTensor[[SIGNAL_WINDOW_ROWS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
     """Step3p5 full-attention layer through TP-reduced o_proj + residual.
@@ -212,6 +221,11 @@ def attention_full(
     user_batch = pl.tensor.dim(seq_lens, 0)
     bt_stride = pl.tensor.dim(block_table, 0) // user_batch
     batch_padded = BATCH
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > BATCH:
+        active_tokens = pl.cast(BATCH, pl.INDEX)
 
     layer_hidden_base = attn_layer_idx * HIDDEN
     layer_qhidden_base = attn_layer_idx * HIDDEN_Q_FULL_LOCAL
@@ -420,6 +434,10 @@ def attention_full(
     # math below mirrors the single-card draft but the slot/cache strides
     # use KV_HEADS_LOCAL).
     attn_out = pl.create_tensor([BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="full_attn_out_zero"):
+        attn_out[:, :] = pl.full(
+            [BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16, value=0.0,
+        )
     all_q_padded = pl.create_tensor(
         [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL, HEAD_DIM], dtype=pl.BF16,
     )
@@ -554,7 +572,7 @@ def attention_full(
     # carrying raw scores, softmax exp + mi/li, and sv partials between
     # stages. ``pl.slice(..., valid_shape=...)`` replaces set_validshape +
     # fillpad so the VEC lowering goes through a different (proven-safe)
-    # path. mi/li stay flat as [Q_HEAD_BATCH_FULL, 1] -- no [16,1] reshape.
+    # path. mi/li 以合法宽行落盘，读取后再 reshape 为 reduction column。
     # See docs/step3p5/phases/15-singlerank-npu.md "Phase A route decision".
     MAX_CTX_BLOCKS = MAX_SEQ_DEFAULT // BLOCK_SIZE
     all_raw_scores = pl.create_tensor(
@@ -564,10 +582,10 @@ def attention_full(
         [BATCH * MAX_CTX_BLOCKS * Q_HEAD_PAD_FULL, BLOCK_SIZE], dtype=pl.BF16,
     )
     all_cur_mi = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS * Q_HEAD_BATCH_FULL, 1], dtype=pl.FP32,
+        [BATCH * MAX_CTX_BLOCKS, Q_HEAD_PAD_FULL], dtype=pl.FP32,
     )
     all_cur_li = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS * Q_HEAD_BATCH_FULL, 1], dtype=pl.FP32,
+        [BATCH * MAX_CTX_BLOCKS, Q_HEAD_PAD_FULL], dtype=pl.FP32,
     )
     all_oi_tmp = pl.create_tensor(
         [BATCH * MAX_CTX_BLOCKS * Q_HEAD_PAD_FULL, HEAD_DIM], dtype=pl.FP32,
@@ -575,124 +593,144 @@ def attention_full(
 
     # Stage 1: QK matmul (cube). One core per batch.
     for fa_b in pl.spmd(BATCH, name_hint="full_qk_matmul"):
-        fa_b_safe = pl.min(fa_b, user_batch - 1)
-        fa_ctx_len = pl.tensor.read(seq_lens, [fa_b_safe])
-        fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        fa_block_table_base = fa_b_safe * bt_stride
-        q_padded_row = fa_b * Q_HEAD_PAD_FULL  # KV_HEADS_LOCAL=1, Q_GROUPS=1
-        q_padded = pl.slice(
-            all_q_padded, [Q_HEAD_PAD_FULL, HEAD_DIM], [q_padded_row, 0],
-        )
-        for sb in pl.range(fa_ctx_blocks):
-            fa_pbid = pl.cast(
-                pl.tensor.read(block_table, [fa_block_table_base + sb]), pl.INDEX,
+        if fa_b < active_tokens:
+            fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
+            fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            fa_block_table_base = fa_b * bt_stride
+            q_padded_row = fa_b * Q_HEAD_PAD_FULL  # KV_HEADS_LOCAL=1, Q_GROUPS=1
+            q_padded = pl.slice(
+                all_q_padded, [Q_HEAD_PAD_FULL, HEAD_DIM], [q_padded_row, 0],
             )
-            fa_cache_row = layer_cache_base + fa_pbid * BLOCK_SIZE
-            k_tile = pl.slice(
-                k_cache, [BLOCK_SIZE, HEAD_DIM], [fa_cache_row, 0],
-            )
-            raw_scores = pl.matmul(
-                q_padded, k_tile, b_trans=True, out_dtype=pl.FP32,
-            )
-            scratch_row = (fa_b * MAX_CTX_BLOCKS + sb) * Q_HEAD_PAD_FULL
-            all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [scratch_row, 0])
+            for sb in pl.range(fa_ctx_blocks):
+                fa_pbid = pl.cast(
+                    pl.tensor.read(block_table, [fa_block_table_base + sb]), pl.INDEX,
+                )
+                fa_cache_row = layer_cache_base + fa_pbid * BLOCK_SIZE
+                k_tile = pl.slice(
+                    k_cache, [BLOCK_SIZE, HEAD_DIM], [fa_cache_row, 0],
+                )
+                raw_scores = pl.matmul(
+                    q_padded, k_tile, b_trans=True, out_dtype=pl.FP32,
+                )
+                scratch_row = (fa_b * MAX_CTX_BLOCKS + sb) * Q_HEAD_PAD_FULL
+                all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [scratch_row, 0])
 
     # Stage 2: softmax (vec). pl.slice(valid_shape=) marks the real
     # Q_HEAD_BATCH_FULL rows + valid_len columns; fillpad pushes -inf into the
     # masked tail so row_max ignores them. exp/row_sum/cast stay intra-tile
     # (no reshape).
     for fa_b in pl.spmd(BATCH, name_hint="full_softmax"):
-        fa_b_safe = pl.min(fa_b, user_batch - 1)
-        fa_ctx_len = pl.tensor.read(seq_lens, [fa_b_safe])
-        fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        for sb in pl.range(fa_ctx_blocks):
-            s0 = sb * BLOCK_SIZE
-            valid_len = pl.min(BLOCK_SIZE, fa_ctx_len - s0)
-            scratch_row = (fa_b * MAX_CTX_BLOCKS + sb) * Q_HEAD_PAD_FULL
-            scratch_lm_row = (fa_b * MAX_CTX_BLOCKS + sb) * Q_HEAD_BATCH_FULL
-            scores_valid = pl.slice(
-                all_raw_scores,
-                [Q_HEAD_BATCH_FULL, BLOCK_SIZE],
-                [scratch_row, 0],
-                valid_shape=[Q_HEAD_BATCH_FULL, valid_len],
-            )
-            scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-            scores = pl.mul(scores_padded, decode_attn_scale)
-            cur_mi = pl.row_max(scores)
-            exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-            exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-            exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
-            cur_li = pl.row_sum(exp_scores_fp32)
-            all_exp_padded = pl.assemble(
-                all_exp_padded, exp_scores_bf16, [scratch_row, 0],
-            )
-            all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [scratch_lm_row, 0])
-            all_cur_li = pl.assemble(all_cur_li, cur_li, [scratch_lm_row, 0])
+        if fa_b < active_tokens:
+            fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
+            fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            for sb in pl.range(fa_ctx_blocks):
+                s0 = sb * BLOCK_SIZE
+                valid_len = pl.min(BLOCK_SIZE, fa_ctx_len - s0)
+                scratch_row = (fa_b * MAX_CTX_BLOCKS + sb) * Q_HEAD_PAD_FULL
+                scores_valid = pl.slice(
+                    all_raw_scores,
+                    [Q_HEAD_BATCH_FULL, BLOCK_SIZE],
+                    [scratch_row, 0],
+                    valid_shape=[Q_HEAD_BATCH_FULL, valid_len],
+                )
+                scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
+                scores = pl.mul(scores_padded, decode_attn_scale)
+                cur_mi = pl.row_max(scores)
+                exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
+                cur_li = pl.row_sum(exp_scores_fp32)
+                all_exp_padded = pl.assemble(
+                    all_exp_padded, exp_scores_bf16, [scratch_row, 0],
+                )
+                lm_row = fa_b * MAX_CTX_BLOCKS + sb
+                all_cur_mi = pl.assemble(
+                    all_cur_mi,
+                    pl.reshape(cur_mi, [1, Q_HEAD_BATCH_FULL]),
+                    [lm_row, 0],
+                )
+                all_cur_li = pl.assemble(
+                    all_cur_li,
+                    pl.reshape(cur_li, [1, Q_HEAD_BATCH_FULL]),
+                    [lm_row, 0],
+                )
 
     # Stage 3: SV matmul (cube). exp_tile is BF16, v_tile is BF16, oi is FP32.
     for fa_b in pl.spmd(BATCH, name_hint="full_sv_matmul"):
-        fa_b_safe = pl.min(fa_b, user_batch - 1)
-        fa_ctx_len = pl.tensor.read(seq_lens, [fa_b_safe])
-        fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        fa_block_table_base = fa_b_safe * bt_stride
-        for sb in pl.range(fa_ctx_blocks):
-            fa_pbid = pl.cast(
-                pl.tensor.read(block_table, [fa_block_table_base + sb]), pl.INDEX,
-            )
-            fa_cache_row = layer_cache_base + fa_pbid * BLOCK_SIZE
-            v_tile = pl.slice(
-                v_cache, [BLOCK_SIZE, HEAD_DIM], [fa_cache_row, 0],
-            )
-            scratch_row = (fa_b * MAX_CTX_BLOCKS + sb) * Q_HEAD_PAD_FULL
-            exp_tile = pl.slice(
-                all_exp_padded,
-                [Q_HEAD_PAD_FULL, BLOCK_SIZE],
-                [scratch_row, 0],
-            )
-            oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
-            all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [scratch_row, 0])
+        if fa_b < active_tokens:
+            fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
+            fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            fa_block_table_base = fa_b * bt_stride
+            for sb in pl.range(fa_ctx_blocks):
+                fa_pbid = pl.cast(
+                    pl.tensor.read(block_table, [fa_block_table_base + sb]), pl.INDEX,
+                )
+                fa_cache_row = layer_cache_base + fa_pbid * BLOCK_SIZE
+                v_tile = pl.slice(
+                    v_cache, [BLOCK_SIZE, HEAD_DIM], [fa_cache_row, 0],
+                )
+                scratch_row = (fa_b * MAX_CTX_BLOCKS + sb) * Q_HEAD_PAD_FULL
+                exp_tile = pl.slice(
+                    all_exp_padded,
+                    [Q_HEAD_PAD_FULL, BLOCK_SIZE],
+                    [scratch_row, 0],
+                )
+                oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
+                all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [scratch_row, 0])
 
     # Stage 4: online softmax accumulation + final normalisation + attn_out
-    # write. mi/li/oi carried flat as [Q_HEAD_BATCH_FULL, 1] / [_, HEAD_DIM];
-    # no reshape touches the [Q_HEAD_PAD_FULL, 1] tile shape that previously
-    # tripped the VEC alignment check in the fused form.
+    # write. mi/li 从 [1, Q_HEAD_BATCH_FULL] 宽行读取，再 reshape 为
+    # row-wise broadcast 所需的 [Q_HEAD_BATCH_FULL, 1]；禁止直接 slice
+    # 构造窄列 FP32 tile。
     for fa_b in pl.spmd(BATCH, name_hint="full_online_softmax"):
-        fa_b_safe = pl.min(fa_b, user_batch - 1)
-        fa_ctx_len = pl.tensor.read(seq_lens, [fa_b_safe])
-        fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        oi_row0 = fa_b * MAX_CTX_BLOCKS * Q_HEAD_PAD_FULL
-        lm_row0 = fa_b * MAX_CTX_BLOCKS * Q_HEAD_BATCH_FULL
-        oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH_FULL, HEAD_DIM], [oi_row0, 0])
-        mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH_FULL, 1], [lm_row0, 0])
-        li = pl.slice(all_cur_li, [Q_HEAD_BATCH_FULL, 1], [lm_row0, 0])
-        for sb in pl.range(1, fa_ctx_blocks):
-            sb_oi_row = oi_row0 + sb * Q_HEAD_PAD_FULL
-            sb_lm_row = lm_row0 + sb * Q_HEAD_BATCH_FULL
-            oi_partial = pl.slice(
-                all_oi_tmp, [Q_HEAD_BATCH_FULL, HEAD_DIM], [sb_oi_row, 0],
+        if fa_b < active_tokens:
+            fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
+            fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            oi_row0 = fa_b * MAX_CTX_BLOCKS * Q_HEAD_PAD_FULL
+            lm_row0 = fa_b * MAX_CTX_BLOCKS
+            oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH_FULL, HEAD_DIM], [oi_row0, 0])
+            mi = pl.reshape(
+                pl.slice(all_cur_mi, [1, Q_HEAD_BATCH_FULL], [lm_row0, 0]),
+                [Q_HEAD_BATCH_FULL, 1],
             )
-            cur_mi = pl.slice(
-                all_cur_mi, [Q_HEAD_BATCH_FULL, 1], [sb_lm_row, 0],
+            li = pl.reshape(
+                pl.slice(all_cur_li, [1, Q_HEAD_BATCH_FULL], [lm_row0, 0]),
+                [Q_HEAD_BATCH_FULL, 1],
             )
-            cur_li = pl.slice(
-                all_cur_li, [Q_HEAD_BATCH_FULL, 1], [sb_lm_row, 0],
+            for sb in pl.range(1, fa_ctx_blocks):
+                sb_oi_row = oi_row0 + sb * Q_HEAD_PAD_FULL
+                sb_lm_row = lm_row0 + sb
+                oi_partial = pl.slice(
+                    all_oi_tmp, [Q_HEAD_BATCH_FULL, HEAD_DIM], [sb_oi_row, 0],
+                )
+                cur_mi = pl.reshape(
+                    pl.slice(
+                        all_cur_mi, [1, Q_HEAD_BATCH_FULL], [sb_lm_row, 0],
+                    ),
+                    [Q_HEAD_BATCH_FULL, 1],
+                )
+                cur_li = pl.reshape(
+                    pl.slice(
+                        all_cur_li, [1, Q_HEAD_BATCH_FULL], [sb_lm_row, 0],
+                    ),
+                    [Q_HEAD_BATCH_FULL, 1],
+                )
+                mi_new = pl.maximum(mi, cur_mi)
+                alpha = pl.exp(pl.sub(mi, mi_new))
+                beta = pl.exp(pl.sub(cur_mi, mi_new))
+                li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
+                oi = pl.add(
+                    pl.row_expand_mul(oi, alpha),
+                    pl.row_expand_mul(oi_partial, beta),
+                )
+                mi = mi_new
+            ctx = pl.row_expand_div(oi, li)
+            ctx_flat_bf16 = pl.cast(
+                pl.reshape(ctx, [1, Q_HEAD_BATCH_FULL * HEAD_DIM]),
+                target_type=pl.BF16,
             )
-            mi_new = pl.maximum(mi, cur_mi)
-            alpha = pl.exp(pl.sub(mi, mi_new))
-            beta = pl.exp(pl.sub(cur_mi, mi_new))
-            li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
-            oi = pl.add(
-                pl.row_expand_mul(oi, alpha),
-                pl.row_expand_mul(oi_partial, beta),
-            )
-            mi = mi_new
-        ctx = pl.row_expand_div(oi, li)
-        ctx_flat_bf16 = pl.cast(
-            pl.reshape(ctx, [1, Q_HEAD_BATCH_FULL * HEAD_DIM]),
-            target_type=pl.BF16,
-        )
-        # q_base = kvh * Q_PER_KV_FULL == 0 (KV_HEADS_LOCAL=1, kvh=0).
-        attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])
+            # q_base = kvh * Q_PER_KV_FULL == 0 (KV_HEADS_LOCAL=1, kvh=0).
+            attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])
 
     # ----- Scope 2.5 — head-wise sigmoid gate. -----
     # The gate is computed on-device in Scope 1.f (gate_exp) and applied inline
@@ -928,6 +966,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                 resid1_out,
                 norm_layer_idx,
                 attn_layer_idx,
+                BATCH,
                 tmp_window,
                 signal_window,
                 my_rank,

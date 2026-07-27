@@ -848,6 +848,97 @@ class WholeDecodeStep3p5:
         return x_i8_out, x_scale_out
 
 
+    @pl.function(type=pl.FunctionType.InCore)
+    def _norm_quant_moe_input(
+        self,
+        resid: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+        norm_layer_idx: pl.Scalar[pl.INT32],
+        post_norm_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+        x_i8_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.INT8]],
+        x_scale_out: pl.Out[
+            pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32]
+        ],
+        num_tokens: pl.Scalar[pl.INT32],
+    ) -> tuple[
+        pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        pl.Tensor[[BATCH, HIDDEN], pl.INT8],
+        pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32],
+    ]:
+        """V4-style deferred RMSNorm and INT8 producer.
+
+        The first pass forms ``xg = resid * (gamma + 1)`` while reducing both
+        ``sum(resid**2)`` and ``amax(xg)``.  The second pass emits the BF16
+        normalized value needed by the step3p5 BF16 shared expert and the
+        mathematically equivalent INT8 payload ``quant(xg)``.  Its dequant
+        scale carries the deferred positive RMS factor:
+        ``inv_rms * amax(xg) / 127``.
+        """
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > BATCH:
+            active_tokens = pl.cast(BATCH, pl.INDEX)
+
+        xg_buf = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+        sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+        xg_amax = pl.full([1, BATCH], dtype=pl.FP32, value=1e-4)
+        for kb in pl.range(HIDDEN // K_CHUNK):
+            k0 = kb * K_CHUNK
+            raw = pl.cast(
+                pl.slice(
+                    resid, [BATCH, K_CHUNK], [0, k0],
+                    valid_shape=[active_tokens, K_CHUNK],
+                ),
+                target_type=pl.FP32,
+            )
+            gamma = pl.slice(
+                post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
+            )
+            xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
+            xg_buf = pl.assemble(xg_buf, xg, [0, k0])
+            sq_sum = pl.add(
+                sq_sum,
+                pl.reshape(pl.row_sum(pl.mul(raw, raw)), [1, BATCH]),
+            )
+            xg_amax = pl.maximum(
+                xg_amax,
+                pl.reshape(
+                    pl.row_max(pl.maximum(xg, pl.neg(xg))), [1, BATCH],
+                ),
+            )
+
+        inv_rms_row = pl.recip(
+            pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+        )
+        inv_rms = pl.reshape(inv_rms_row, [BATCH, 1])
+        quant_mul_row = pl.div(
+            pl.full([1, BATCH], dtype=pl.FP32, value=127.0), xg_amax,
+        )
+        quant_mul = pl.reshape(quant_mul_row, [BATCH, 1])
+        dequant_scale = pl.reshape(
+            pl.mul(inv_rms_row, pl.mul(xg_amax, 1.0 / 127.0)),
+            [BATCH, 1],
+        )
+        x_scale_out[0:BATCH, 0:1] = dequant_scale
+
+        for kb2 in pl.range(HIDDEN // K_CHUNK):
+            k0 = kb2 * K_CHUNK
+            xg = pl.slice(xg_buf, [BATCH, K_CHUNK], [0, k0])
+            normed = pl.row_expand_mul(xg, inv_rms)
+            post_norm_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
+                normed, target_type=pl.BF16,
+            )
+            qi32 = pl.cast(
+                pl.row_expand_mul(xg, quant_mul),
+                target_type=pl.INT32, mode="rint",
+            )
+            qf16 = pl.cast(qi32, target_type=pl.FP16, mode="round")
+            x_i8_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
+                qf16, target_type=pl.INT8, mode="trunc",
+            )
+        return post_norm_out, x_i8_out, x_scale_out
+
     # ---------- Stage 2: dispatch (V4-Flash expert-lane PUSH + gather) ----------
     @pl.function(type=pl.FunctionType.Inline)
     def dispatch_step(  # noqa: PLR0913, PLR0915
@@ -1964,51 +2055,17 @@ class WholeDecodeStep3p5:
             num_tokens,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
+        # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
-        ):
-            for kb in pl.range(hidden_blocks):
-                k0 = kb * K_CHUNK
-                rchunk = pl.cast(
-                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
-                    target_type=pl.FP32,
-                )
-                resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
-
-            sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-            for kb2 in pl.range(hidden_blocks):
-                k0 = kb2 * K_CHUNK
-                ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(
-                        pl.row_sum(pl.mul(ck, ck)),
-                        [1, BATCH],
-                    ),
-                )
-            inv_rms_moe = pl.recip(
-                pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-            )
-            inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
-            for kb3 in pl.range(hidden_blocks):
-                k0 = kb3 * K_CHUNK
-                norm_chunk = pl.slice(
-                    resid1_fp32, [BATCH, K_CHUNK], [0, k0],
-                )
-                gamma = pl.slice(
-                    post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
-                )
-                scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
-                normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
-                post_norm = pl.assemble(
-                    post_norm,
-                    pl.cast(normed, target_type=pl.BF16),
-                    [0, k0],
-                )
+        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+        x_disp_scale = pl.create_tensor(
+            [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
+        )
+        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
+            resid_hold, post_rms_weight, norm_layer_idx,
+            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
         # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
@@ -2034,13 +2091,6 @@ class WholeDecodeStep3p5:
         )
 
 
-        # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
-        # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
-        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
-        (x_disp_i8, x_disp_scale) = self._quant_moe_input(
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
-        )
         # 3) Dispatch (V4-Flash expert-lane push/gather).
         local_routed_x = pl.create_tensor(
             [local_recv_max, HIDDEN], dtype=pl.INT8,
@@ -2199,51 +2249,17 @@ class WholeDecodeStep3p5:
             num_tokens,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
+        # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
-        ):
-            for kb in pl.range(hidden_blocks):
-                k0 = kb * K_CHUNK
-                rchunk = pl.cast(
-                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
-                    target_type=pl.FP32,
-                )
-                resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
-
-            sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-            for kb2 in pl.range(hidden_blocks):
-                k0 = kb2 * K_CHUNK
-                ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(
-                        pl.row_sum(pl.mul(ck, ck)),
-                        [1, BATCH],
-                    ),
-                )
-            inv_rms_moe = pl.recip(
-                pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-            )
-            inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
-            for kb3 in pl.range(hidden_blocks):
-                k0 = kb3 * K_CHUNK
-                norm_chunk = pl.slice(
-                    resid1_fp32, [BATCH, K_CHUNK], [0, k0],
-                )
-                gamma = pl.slice(
-                    post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
-                )
-                scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
-                normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
-                post_norm = pl.assemble(
-                    post_norm,
-                    pl.cast(normed, target_type=pl.BF16),
-                    [0, k0],
-                )
+        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+        x_disp_scale = pl.create_tensor(
+            [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
+        )
+        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
+            resid_hold, post_rms_weight, norm_layer_idx,
+            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
         # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
@@ -2269,13 +2285,6 @@ class WholeDecodeStep3p5:
         )
 
 
-        # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
-        # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
-        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
-        (x_disp_i8, x_disp_scale) = self._quant_moe_input(
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
-        )
         # 3) Dispatch (V4-Flash expert-lane push/gather).
         local_routed_x = pl.create_tensor(
             [local_recv_max, HIDDEN], dtype=pl.INT8,
@@ -3107,51 +3116,17 @@ class WholeDecodeStep3p5:
             num_tokens,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
+        # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
-        ):
-            for kb in pl.range(hidden_blocks):
-                k0 = kb * K_CHUNK
-                rchunk = pl.cast(
-                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
-                    target_type=pl.FP32,
-                )
-                resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
-
-            sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-            for kb2 in pl.range(hidden_blocks):
-                k0 = kb2 * K_CHUNK
-                ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(
-                        pl.row_sum(pl.mul(ck, ck)),
-                        [1, BATCH],
-                    ),
-                )
-            inv_rms_moe = pl.recip(
-                pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-            )
-            inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
-            for kb3 in pl.range(hidden_blocks):
-                k0 = kb3 * K_CHUNK
-                norm_chunk = pl.slice(
-                    resid1_fp32, [BATCH, K_CHUNK], [0, k0],
-                )
-                gamma = pl.slice(
-                    post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
-                )
-                scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
-                normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
-                post_norm = pl.assemble(
-                    post_norm,
-                    pl.cast(normed, target_type=pl.BF16),
-                    [0, k0],
-                )
+        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+        x_disp_scale = pl.create_tensor(
+            [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
+        )
+        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
+            resid_hold, post_rms_weight, norm_layer_idx,
+            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
         # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
@@ -3177,13 +3152,6 @@ class WholeDecodeStep3p5:
         )
 
 
-        # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
-        # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
-        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
-        (x_disp_i8, x_disp_scale) = self._quant_moe_input(
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
-        )
         # 3) Dispatch (V4-Flash expert-lane push/gather).
         local_routed_x = pl.create_tensor(
             [local_recv_max, HIDDEN], dtype=pl.INT8,
@@ -3337,51 +3305,17 @@ class WholeDecodeStep3p5:
             num_tokens,
             attn_tmp_window, attn_signal_window, my_rank,
         )
-        # ── B: post-attention zero-centred RMSNorm of resid_hold. ──
+        # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="moe_post_rmsnorm_zc",
-        ):
-            for kb in pl.range(hidden_blocks):
-                k0 = kb * K_CHUNK
-                rchunk = pl.cast(
-                    pl.slice(resid_hold, [BATCH, K_CHUNK], [0, k0]),
-                    target_type=pl.FP32,
-                )
-                resid1_fp32 = pl.assemble(resid1_fp32, rchunk, [0, k0])
-
-            sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-            for kb2 in pl.range(hidden_blocks):
-                k0 = kb2 * K_CHUNK
-                ck = pl.slice(resid1_fp32, [BATCH, K_CHUNK], [0, k0])
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(
-                        pl.row_sum(pl.mul(ck, ck)),
-                        [1, BATCH],
-                    ),
-                )
-            inv_rms_moe = pl.recip(
-                pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-            )
-            inv_rms_col = pl.reshape(inv_rms_moe, [BATCH, 1])
-            for kb3 in pl.range(hidden_blocks):
-                k0 = kb3 * K_CHUNK
-                norm_chunk = pl.slice(
-                    resid1_fp32, [BATCH, K_CHUNK], [0, k0],
-                )
-                gamma = pl.slice(
-                    post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
-                )
-                scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
-                normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
-                post_norm = pl.assemble(
-                    post_norm,
-                    pl.cast(normed, target_type=pl.BF16),
-                    [0, k0],
-                )
+        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+        x_disp_scale = pl.create_tensor(
+            [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
+        )
+        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
+            resid_hold, post_rms_weight, norm_layer_idx,
+            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
         # Body copied verbatim from ``moe.EpTpMoE.chip_orch``; calls the
@@ -3407,13 +3341,6 @@ class WholeDecodeStep3p5:
         )
 
 
-        # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
-        # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
-        x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
-        (x_disp_i8, x_disp_scale) = self._quant_moe_input(
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
-        )
         # 3) Dispatch (V4-Flash expert-lane push/gather).
         local_routed_x = pl.create_tensor(
             [local_recv_max, HIDDEN], dtype=pl.INT8,

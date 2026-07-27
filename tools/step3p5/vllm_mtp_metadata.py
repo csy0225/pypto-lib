@@ -19,9 +19,11 @@ from tools.step3p5.kv_padding import (
     PaddingReserve,
     PaddingReserveError,
     pad_fixed_batch_metadata,
+    STORAGE_BATCH,
 )
 
-_BATCH = 16
+# Compiled physical capacity; runtime valid tokens are supplied per invocation.
+_BATCH = STORAGE_BATCH
 _MTP_START = 45
 _MTP_LAYERS = 3
 

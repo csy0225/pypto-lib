@@ -53,18 +53,23 @@ def mtp_kv_layout(
 ) -> dict[str, Any]:
     """生成 validator 可消费的独立 MTP KV map。
 
-    ``num_blocks`` 是 scheduler-visible capacity；exporter 会另外分配 15 个
-    allocator-owned padding blocks，且 map entry 始终描述 physical capacity。
+    ``num_blocks`` 是 scheduler-visible capacity；exporter 会按当前编译
+    storage capacity 另外分配 ``capacity - 1`` 个 allocator-owned reserve
+    blocks，且 map entry 始终描述 physical capacity。
     """
     scheduler_num_blocks = int(num_blocks)
     if scheduler_num_blocks <= 0:
         raise ValueError("num_blocks must be positive")
-    from tools.step3p5.kv_padding import make_padding_reserve  # noqa: PLC0415
+    from tools.step3p5.kv_padding import (  # noqa: PLC0415
+        STORAGE_BATCH,
+        make_padding_reserve,
+    )
 
     reserve = make_padding_reserve(
         scheduler_num_blocks,
-        scheduler_num_blocks + 15,
+        scheduler_num_blocks + STORAGE_BATCH - 1,
         block_size=BLOCK_SIZE,
+        storage_capacity=STORAGE_BATCH,
     )
     physical_num_blocks = reserve.physical_num_blocks
     entry_bytes = (

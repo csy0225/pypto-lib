@@ -35,6 +35,7 @@ import torch
 from tools.step3p5.kv_padding import (
     PaddingReserve,
     PaddingReserveError,
+    STORAGE_BATCH,
     parse_padding_reserve,
     validate_fixed_batch_metadata,
 )
@@ -51,7 +52,7 @@ _PROTOCOL_VERSION = 2
 _MAX_HEADER_BYTES = 1 << 20
 _MAX_TENSOR_BYTES = 1 << 30
 _MAX_FRAME_BYTES = 2 << 30
-_BATCH = 16
+_BATCH = STORAGE_BATCH
 _HIDDEN = 4096
 
 
@@ -232,9 +233,19 @@ def validate_decode_request(meta: dict, tensors: dict) -> DecodeRequest:
     storage_batch = _meta_int(meta, "storage_batch")
     group_count = _meta_int(meta, "kv_group_count")
     if storage_batch != _BATCH:
-        raise FrameProtocolError(f"storage_batch={storage_batch} != {_BATCH}")
-    if not (1 <= valid_tokens <= _BATCH) or valid_requests != valid_tokens:
-        raise FrameProtocolError("pure decode requires 1..16 tokens and one token per request")
+        raise FrameProtocolError(
+            f"storage_batch={storage_batch} != configured capacity {_BATCH}"
+        )
+    declared_capacity = meta.get("storage_capacity", storage_batch)
+    if declared_capacity != storage_batch:
+        raise FrameProtocolError(
+            f"storage_capacity={declared_capacity} != storage_batch={storage_batch}"
+        )
+    if not (1 <= valid_tokens <= storage_batch) or valid_requests != valid_tokens:
+        raise FrameProtocolError(
+            f"pure decode requires 1..{storage_batch} active tokens and "
+            "one token per request"
+        )
     if group_count <= 0:
         raise FrameProtocolError("kv_group_count must be positive")
     query_lengths = meta.get("query_lengths")

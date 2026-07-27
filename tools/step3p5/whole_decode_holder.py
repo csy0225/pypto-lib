@@ -100,7 +100,9 @@ class WholeDecodeHolder:
         self._kv_maps = None
         self.padding_reserve = None
         self._args_list = None
-        # resident host tensors (mutated per-step)
+        # resident host tensors (mutated per-step).  Their leading batch
+        # dimension is static storage capacity; active rows are supplied by
+        # set_live_step/num_tokens_per_owner for each invocation.
         self.current_hidden = None
         self.num_tokens_per_owner = None
         self.gate_r_full = self.gate_r_swa = None
@@ -127,10 +129,12 @@ class WholeDecodeHolder:
             rows = int(obj["map"]["L0.K"]["num_slots"])
             physical = int(obj["physical_num_blocks"])
             scheduler = int(obj["scheduler_num_blocks"])
-            if physical < scheduler + 15:
+            from tools.step3p5.kv_padding import STORAGE_BATCH  # noqa: PLC0415
+            required_physical = scheduler + STORAGE_BATCH - 1
+            if physical < required_physical:
                 raise ValueError(
-                    f"Main KV map physical={physical} lacks 15-block reserve "
-                    f"above scheduler={scheduler}"
+                    f"Main KV map physical={physical} lacks capacity-derived "
+                    f"reserve above scheduler={scheduler}; required>={required_physical}"
                 )
         except FileNotFoundError:
             return
@@ -288,6 +292,7 @@ class WholeDecodeHolder:
                 summary.scheduler_num_blocks,
                 summary.physical_num_blocks,
                 block_size=summary.block_size,
+                storage_capacity=BATCH,
             )
             self.k_cache, self.v_cache = build_stacked_kv_pool(self._kv_maps)
             imported_rows = int(self._kv_maps[0].section_spec("K")[1][0])
@@ -407,7 +412,11 @@ class WholeDecodeHolder:
             )
 
     def set_hidden(self, hidden):
-        """通用 per-step hidden 设置（sidecar/live）：hidden 可为 [BATCH,HIDDEN]（replicated 到每 rank）或 [tp,BATCH,HIDDEN]。"""
+        """Set a full-capacity hidden buffer for offline/sidecar callers.
+
+        Live variable-batch callers should use :meth:`set_live_step`, which
+        accepts active rows and updates the runtime token metadata separately.
+        """
         self.current_hidden.zero_()
         if hidden.dim() == 2:
             expected = (self._consts["BATCH"], self._consts["HIDDEN"])
@@ -502,6 +511,10 @@ class WholeDecodeHolder:
             )
         valid_tokens = int(hidden.shape[0])
         batch = self._consts["BATCH"]
+        if valid_tokens > batch:
+            raise ValueError(
+                f"active batch/tokens={valid_tokens} exceeds storage capacity {batch}"
+            )
         hidden_size = self._consts["HIDDEN"]
         user_batch = self._consts["UBD"]
         if not (1 <= valid_tokens <= batch) or hidden.shape[1] != hidden_size:

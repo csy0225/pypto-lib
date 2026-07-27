@@ -4,12 +4,12 @@
 Covers the batch/padding/eligibility contract the whole-net ABI depends on
 (hard emphasis: dtype, padding, single- vs multi-batch, memory init):
 
-  - storage_batch is always 16 for T in {1,2,8,16};
+  - storage_batch is a configured static capacity; active T may vary up to it;
   - seq_lens padding = 1 (so position = seq_len-1 never becomes -1);
   - positions padding = 0;
   - slot_mapping / block_table padding use allocator-owned reserve blocks;
   - speculative target verification is decomposed into ordered N=1 rounds;
-  - reject prefill / PP>1 / profile / T=0 / T>16 active requests /
+  - reject prefill / PP>1 / profile / T=0 / T>storage capacity active requests /
     positions!=seq_lens-1 / missing decoder layer / non-positive seq_lens;
   - the KV group map covers all 45 decoder layers with no layer in two groups;
   - protocol tensor/meta shapes are stable.
@@ -37,11 +37,15 @@ from tools.step3p5.vllm_decode_metadata import (  # noqa: E402
     extract_pypto_decode_meta,
     extract_pypto_decode_plan,
 )
-from tools.step3p5.kv_padding import make_padding_reserve  # noqa: E402
+from tools.step3p5.kv_padding import (  # noqa: E402
+    STORAGE_BATCH,
+    make_padding_reserve,
+)
 
 _NUM_LAYERS = 45
 _SCHEDULER_BLOCKS = 64
-_PHYSICAL_BLOCKS = _SCHEDULER_BLOCKS + 15
+_DEFAULT_STORAGE_CAPACITY = STORAGE_BATCH
+_PHYSICAL_BLOCKS = _SCHEDULER_BLOCKS + STORAGE_BATCH - 1
 
 
 def _make_context(
@@ -52,6 +56,7 @@ def _make_context(
     seq_lens=None,
     positions=None,
     pipeline_parallel_size: int = 1,
+    storage_capacity: int = _DEFAULT_STORAGE_CAPACITY,
     **meta_overrides,
 ):
     """Build a fake pure-decode ForwardContext for ``valid`` one-token requests.
@@ -80,7 +85,10 @@ def _make_context(
     meta.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     meta.positions = torch.tensor(positions, dtype=torch.int32)
     meta.query_start_loc = torch.arange(n + 1, dtype=torch.int32)
-    meta.block_tables = torch.arange(n * 4, dtype=torch.int32).reshape(n, 4)
+    meta.block_tables = (
+        torch.arange(n * 4, dtype=torch.int32).reshape(n, 4)
+        % _SCHEDULER_BLOCKS
+    )
     meta.slot_mapping = torch.tensor(
         [
             int(meta.block_tables[row, (int(seq_lens[row]) - 1) // 128])
@@ -127,7 +135,8 @@ def _make_context(
     ctx.vllm_config = Cfg()
     ctx.pypto_padding_reserve = make_padding_reserve(
         _SCHEDULER_BLOCKS,
-        _PHYSICAL_BLOCKS,
+        _SCHEDULER_BLOCKS + storage_capacity - 1,
+        storage_capacity=storage_capacity,
     )
     return ctx, Cfg()
 
@@ -139,6 +148,7 @@ def _make_spec_context(
     positions=None,
     num_groups: int = 2,
     num_speculative_tokens: int = 3,
+    storage_capacity: int = _DEFAULT_STORAGE_CAPACITY,
 ):
     """Build request-major target-verification metadata.
 
@@ -235,25 +245,26 @@ def _make_spec_context(
     ctx.vllm_config = Cfg()
     ctx.pypto_padding_reserve = make_padding_reserve(
         _SCHEDULER_BLOCKS,
-        _PHYSICAL_BLOCKS,
+        _SCHEDULER_BLOCKS + storage_capacity - 1,
+        storage_capacity=storage_capacity,
     )
     return ctx, Cfg()
 
 
 class TestDecodeMetadataBatches:
-    @pytest.mark.parametrize("valid", [1, 2, 8, 16])
+    @pytest.mark.parametrize("valid", [1, 2, 8, min(16, STORAGE_BATCH)])
     def test_storage_batch_and_valid_requests(self, valid):
         ctx, cfg = _make_context(valid)
         meta = extract_pypto_decode_meta(ctx, vllm_config=cfg)
-        assert meta.storage_batch == 16
+        assert meta.storage_batch == STORAGE_BATCH
         assert meta.valid_tokens == valid
         assert meta.valid_requests == valid
-        assert meta.seq_lens.shape == (16,)
-        assert meta.positions.shape == (16,)
+        assert meta.seq_lens.shape == (STORAGE_BATCH,)
+        assert meta.positions.shape == (STORAGE_BATCH,)
         assert meta.seq_lens.dtype == torch.int32
         assert meta.positions.dtype == torch.int32
 
-    @pytest.mark.parametrize("valid", [1, 2, 8, 16])
+    @pytest.mark.parametrize("valid", [1, 2, 8, min(16, STORAGE_BATCH)])
     def test_padding_initialization(self, valid):
         ctx, cfg = _make_context(valid)
         meta = extract_pypto_decode_meta(ctx, vllm_config=cfg)
@@ -261,10 +272,10 @@ class TestDecodeMetadataBatches:
         assert torch.all(meta.seq_lens[valid:] == 1)
         assert torch.all(meta.positions[valid:] == 0)
         for group in meta.groups:
-            assert group.slot_mapping.shape == (16,)
+            assert group.slot_mapping.shape == (STORAGE_BATCH,)
             expected_blocks = torch.arange(
                 _SCHEDULER_BLOCKS,
-                _SCHEDULER_BLOCKS + 16 - valid,
+                _SCHEDULER_BLOCKS + STORAGE_BATCH - valid,
                 dtype=torch.int32,
             )
             assert torch.equal(
@@ -277,7 +288,7 @@ class TestDecodeMetadataBatches:
                 expected_blocks * 128,
             )
 
-    @pytest.mark.parametrize("valid", [1, 2, 8, 16])
+    @pytest.mark.parametrize("valid", [1, 2, 8, min(16, STORAGE_BATCH)])
     def test_active_block_and_slot_rows_are_preserved(self, valid):
         ctx, cfg = _make_context(valid)
         source = next(iter(ctx.attn_metadata.values()))
@@ -288,7 +299,7 @@ class TestDecodeMetadataBatches:
             assert torch.equal(group.block_table[:valid], active_blocks)
             assert torch.equal(group.slot_mapping[:valid], active_slots)
 
-    @pytest.mark.parametrize("valid", [1, 16])
+    @pytest.mark.parametrize("valid", [1, min(16, STORAGE_BATCH)])
     def test_valid_rows_preserved(self, valid):
         seq = list(range(3, 3 + valid))
         ctx, cfg = _make_context(valid, seq_lens=seq)
@@ -315,14 +326,14 @@ class TestDecodeMetadataGroups:
         ctx, cfg = _make_context(4, num_groups=2)
         meta = extract_pypto_decode_meta(ctx, vllm_config=cfg)
         tensors = meta.protocol_tensors()
-        assert tensors["meta_seq_lens"].shape == (16,)
-        assert tensors["meta_positions"].shape == (16,)
+        assert tensors["meta_seq_lens"].shape == (STORAGE_BATCH,)
+        assert tensors["meta_positions"].shape == (STORAGE_BATCH,)
         for g in range(2):
-            assert tensors[f"meta_slot_mapping_g{g}"].shape == (16,)
-            assert tensors[f"meta_block_table_g{g}"].shape[0] == 16
+            assert tensors[f"meta_slot_mapping_g{g}"].shape == (STORAGE_BATCH,)
+            assert tensors[f"meta_block_table_g{g}"].shape[0] == STORAGE_BATCH
         pmeta = meta.protocol_meta()
         assert pmeta["protocol_version"] == 2
-        assert pmeta["storage_batch"] == 16
+        assert pmeta["storage_batch"] == STORAGE_BATCH
         assert pmeta["valid_tokens"] == 4
         assert pmeta["kv_group_count"] == 2
         assert len(pmeta["layer_to_group"]) == _NUM_LAYERS
@@ -333,7 +344,7 @@ class TestDecodeMetadataGroups:
             "padding_block_ids": list(
                 range(_SCHEDULER_BLOCKS, _PHYSICAL_BLOCKS)
             ),
-            "padding_block_count": 15,
+            "padding_block_count": STORAGE_BATCH - 1,
             "block_size": 128,
         }
 
@@ -432,7 +443,7 @@ class TestSpeculativeTargetVerification:
 
                 # Every inactive physical row owns a distinct reserve block
                 # and slot; reserve rows are never aliased with active rows.
-                padding_count = 16 - step.valid_tokens
+                padding_count = STORAGE_BATCH - step.valid_tokens
                 expected_padding_blocks = torch.arange(
                     _SCHEDULER_BLOCKS,
                     _SCHEDULER_BLOCKS + padding_count,
@@ -472,6 +483,25 @@ class TestSpeculativeTargetVerification:
             extract_pypto_decode_plan(ctx, vllm_config=cfg)
 
 
+class TestDecodeMetadataCapacity:
+    def test_configured_capacity_allows_runtime_active_batch_above_16(self):
+        capacity = 32
+        ctx, cfg = _make_context(17, storage_capacity=capacity)
+        meta = extract_pypto_decode_meta(
+            ctx, vllm_config=cfg, max_batch=capacity
+        )
+        assert meta.storage_batch == capacity
+        assert meta.valid_tokens == 17
+        assert meta.seq_lens.shape == (capacity,)
+        assert meta.groups[0].block_table.shape[0] == capacity
+        assert meta.protocol_meta()["storage_capacity"] == capacity
+
+    def test_reserve_capacity_must_match_compiled_capacity(self):
+        ctx, cfg = _make_context(2, storage_capacity=16)
+        with pytest.raises(DecodeMetadataError, match="reserve capacity"):
+            extract_pypto_decode_meta(ctx, vllm_config=cfg, max_batch=32)
+
+
 class TestDecodeMetadataRejects:
     def test_reject_zero_tokens(self):
         ctx, cfg = _make_context(0)
@@ -479,9 +509,16 @@ class TestDecodeMetadataRejects:
             extract_pypto_decode_meta(ctx, vllm_config=cfg)
 
     def test_reject_over_max_batch(self):
-        ctx, cfg = _make_context(17, seq_lens=list(range(2, 19)))
+        invalid = STORAGE_BATCH + 1
+        ctx, cfg = _make_context(
+            invalid,
+            seq_lens=list(range(2, 2 + invalid)),
+            storage_capacity=invalid,
+        )
         with pytest.raises(DecodeMetadataError):
-            extract_pypto_decode_meta(ctx, vllm_config=cfg)
+            extract_pypto_decode_meta(
+                ctx, vllm_config=cfg, max_batch=STORAGE_BATCH
+            )
 
     def test_reject_prefill(self):
         ctx, cfg = _make_context(2, num_prefills=1)

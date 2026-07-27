@@ -384,10 +384,15 @@ def build_stacked_mtp_kv_pool(maps: List[MtpKvIpcMap]):
 
 def _synthetic_map(
     *,
-    num_blocks: int = 32,
+    num_blocks: int | None = None,
     scheduler_num_blocks: int = 17,
     bad: str | None = None,
 ) -> dict[str, Any]:
+    from tools.step3p5.kv_padding import STORAGE_BATCH  # noqa: PLC0415
+
+    if num_blocks is None:
+        num_blocks = scheduler_num_blocks + STORAGE_BATCH - 1
+    padding_block_count = num_blocks - scheduler_num_blocks
     entry_bytes = num_blocks * _BLOCK_SIZE * _NUM_KV_HEADS * _HEAD_DIM * _KV_ITEMSIZE
     entries: dict[str, Any] = {}
     k_bytes = _NUM_LAYERS * entry_bytes
@@ -421,9 +426,9 @@ def _synthetic_map(
         "physical_num_blocks": num_blocks,
         "reserve_start": scheduler_num_blocks,
         "padding_block_ids": list(
-            range(scheduler_num_blocks, scheduler_num_blocks + 15)
+            range(scheduler_num_blocks, scheduler_num_blocks + padding_block_count)
         ),
-        "padding_block_count": 15,
+        "padding_block_count": padding_block_count,
         "sections": {
             "K": {"offset": 0, "nbytes": k_bytes},
             "V": {"offset": v_off, "nbytes": k_bytes},
@@ -439,7 +444,7 @@ def _synthetic_map(
     elif bad == "reserve_overlap":
         obj["padding_block_ids"][0] = scheduler_num_blocks - 1
     elif bad == "reserve_out_of_range":
-        obj["physical_num_blocks"] = scheduler_num_blocks + 14
+        obj["physical_num_blocks"] = num_blocks - 1
     return obj
 
 

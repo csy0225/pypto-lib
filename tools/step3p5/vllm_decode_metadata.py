@@ -31,7 +31,7 @@ acceptance/rejection.
 
 Requirements:
 
-* 1 <= active requests <= 16;
+* 1 <= active requests <= configured storage capacity;
 * every query length is in ``[1, num_speculative_tokens + 1]``;
 * no prefill, chunked-prefill, CP/PCP, or PP handoff;
 * every layer has complete group metadata;
@@ -55,11 +55,12 @@ import torch
 from tools.step3p5.kv_padding import (
     PaddingReserve,
     PaddingReserveError,
+    STORAGE_BATCH,
     pad_fixed_batch_metadata,
 )
 
 _LAYER_RE = re.compile(r"(?:^|[.]layers[.])(\d+)(?:[.]|$)")
-_MAX_BATCH = 16
+_MAX_BATCH = STORAGE_BATCH
 _NUM_LAYERS = 45
 
 
@@ -220,6 +221,7 @@ class PyPtoDecodeMeta:
             "valid_tokens": self.valid_tokens,
             "valid_requests": self.valid_requests,
             "storage_batch": self.storage_batch,
+            "storage_capacity": self.storage_batch,
             "kv_group_count": len(self.groups),
             "layer_to_group": list(self.layer_to_group),
             "query_lengths": list(self.query_lengths),
@@ -378,10 +380,16 @@ def extract_pypto_decode_plan(
     max_batch: int = _MAX_BATCH,
     padding_reserve: PaddingReserve | Mapping[str, Any] | None = None,
 ) -> PyPtoDecodePlan:
-    """Build ordered one-token PyPTO rounds for one vLLM target forward."""
-    if max_batch != _MAX_BATCH:
+    """Build ordered rounds for one vLLM target forward.
+
+    ``max_batch`` is the compile-time static storage capacity, not the
+    runtime active batch.  The latter is derived from each input metadata and
+    must be no greater than this capacity.
+    """
+    max_batch = int(max_batch)
+    if max_batch <= 0:
         raise DecodeMetadataError(
-            f"PyPTO whole-net ABI requires storage_batch={_MAX_BATCH}"
+            f"storage capacity must be positive, got {max_batch}"
         )
     if bool(getattr(forward_context, "in_profile_run", False)):
         raise DecodeMetadataError("profile/dummy runs are not supported")
@@ -433,10 +441,10 @@ def extract_pypto_decode_plan(
         raise DecodeMetadataError(
             f"decode requires positive actual tokens, got {valid_tokens}"
         )
-    if not (1 <= valid_requests <= _MAX_BATCH):
+    if not (1 <= valid_requests <= max_batch):
         raise DecodeMetadataError(
-            f"decode requires 1..{_MAX_BATCH} active requests, "
-            f"got {valid_requests}"
+            f"decode requires 1..{max_batch} active requests for the "
+            f"configured storage capacity, got {valid_requests}"
         )
     if reported_requests is not None and reported_requests < valid_requests:
         raise DecodeMetadataError(
@@ -542,6 +550,11 @@ def extract_pypto_decode_plan(
         forward_context,
         padding_reserve=padding_reserve,
     )
+    if reserve.storage_capacity != max_batch:
+        raise DecodeMetadataError(
+            f"padding reserve capacity={reserve.storage_capacity} does not "
+            f"match compiled storage capacity={max_batch}"
+        )
     group_specs = _group_layer_indices(vllm_config, metadata_by_layer)
     layer_to_group = [-1] * _NUM_LAYERS
     for group_id, indices in group_specs:

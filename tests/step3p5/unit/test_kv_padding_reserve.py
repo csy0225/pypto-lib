@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tools.step3p5.kv_padding import (
+    STORAGE_BATCH,
     PaddingReserveError,
     configure_standalone_main_storage_env,
     make_padding_reserve,
@@ -30,7 +31,7 @@ from tools.step3p5.vllm_mtp_metadata import (
 
 
 SCHEDULER_BLOCKS = 64
-PHYSICAL_BLOCKS = SCHEDULER_BLOCKS + 15
+PHYSICAL_BLOCKS = SCHEDULER_BLOCKS + STORAGE_BATCH - 1
 
 
 def _active_metadata(valid: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -45,7 +46,7 @@ def _active_metadata(valid: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tens
     return seq_lens, block_table, slot_mapping
 
 
-@pytest.mark.parametrize("valid", [1, 2, 8, 16])
+@pytest.mark.parametrize("valid", [1, 2, 8, min(16, STORAGE_BATCH)])
 def test_main_and_mtp_share_fixed_batch_reserve_semantics(valid: int) -> None:
     reserve = make_padding_reserve(SCHEDULER_BLOCKS, PHYSICAL_BLOCKS)
     seq_lens, active_table, active_slots = _active_metadata(valid)
@@ -57,23 +58,23 @@ def test_main_and_mtp_share_fixed_batch_reserve_semantics(valid: int) -> None:
         reserve=reserve,
         where="unit",
     )
-    padded_seq = torch.ones(16, dtype=torch.int32)
+    padded_seq = torch.ones(STORAGE_BATCH, dtype=torch.int32)
     padded_seq[:valid] = seq_lens
-    positions = torch.zeros(16, dtype=torch.int32)
+    positions = torch.zeros(STORAGE_BATCH, dtype=torch.int32)
     positions[:valid] = seq_lens - 1
 
     assert torch.equal(block_table[:valid], active_table)
     assert torch.equal(slot_mapping[:valid], active_slots)
     expected_blocks = torch.arange(
         SCHEDULER_BLOCKS,
-        SCHEDULER_BLOCKS + 16 - valid,
+        SCHEDULER_BLOCKS + STORAGE_BATCH - valid,
         dtype=torch.int32,
     )
     assert torch.equal(block_table[valid:, 0], expected_blocks)
     assert torch.count_nonzero(block_table[valid:, 1:]) == 0
     assert torch.equal(slot_mapping[valid:], expected_blocks * 128)
-    assert len(torch.unique(block_table[valid:, 0])) == 16 - valid
-    assert len(torch.unique(slot_mapping[valid:])) == 16 - valid
+    assert len(torch.unique(block_table[valid:, 0])) == STORAGE_BATCH - valid
+    assert len(torch.unique(slot_mapping[valid:])) == STORAGE_BATCH - valid
 
     validate_fixed_batch_metadata(
         seq_lens=padded_seq,
@@ -119,8 +120,8 @@ def test_padding_metadata_rejects_slot_zero_and_row_alias() -> None:
         valid_rows=1,
         reserve=reserve,
     )
-    padded_seq = torch.ones(16, dtype=torch.int32)
-    positions = torch.zeros(16, dtype=torch.int32)
+    padded_seq = torch.ones(STORAGE_BATCH, dtype=torch.int32)
+    positions = torch.zeros(STORAGE_BATCH, dtype=torch.int32)
 
     bad_slot = slot_mapping.clone()
     bad_slot[1] = 0
@@ -160,9 +161,9 @@ def test_active_slot_must_match_block_table_and_position() -> None:
         valid_rows=1,
         reserve=reserve,
     )
-    padded_seq = torch.ones(16, dtype=torch.int32)
+    padded_seq = torch.ones(STORAGE_BATCH, dtype=torch.int32)
     padded_seq[0] = 129
-    positions = torch.zeros(16, dtype=torch.int32)
+    positions = torch.zeros(STORAGE_BATCH, dtype=torch.int32)
     positions[0] = 128
     validate_fixed_batch_metadata(
         seq_lens=padded_seq,
@@ -194,18 +195,19 @@ def test_standalone_main_storage_reserves_physical_kv_rows(monkeypatch) -> None:
 
     result = configure_standalone_main_storage_env()
 
+    physical_blocks = 32 + STORAGE_BATCH - 1
     assert result == {
         "scheduler_num_blocks": 32,
-        "physical_num_blocks": 47,
-        "kv_cache_rows": 45 * 47 * 128,
-        "block_table_flat": 32 * 16,
+        "physical_num_blocks": physical_blocks,
+        "kv_cache_rows": 45 * physical_blocks * 128,
+        "block_table_flat": 32 * STORAGE_BATCH,
         "rope_seq": 4096,
     }
     assert int(__import__("os").environ["PYPTO_STEP3P5_KV_CACHE_ROWS"]) == (
-        45 * 47 * 128
+        45 * physical_blocks * 128
     )
     assert int(__import__("os").environ["PYPTO_STEP3P5_BLOCK_TABLE_FLAT"]) == (
-        32 * 16
+        32 * STORAGE_BATCH
     )
 
 
@@ -240,7 +242,7 @@ def test_mtp_map_validator_rejects_invalid_reserve(mutation: str) -> None:
         validate_mtp_pool_map(obj)
 
 
-@pytest.mark.parametrize("valid", [1, 2, 8, 16])
+@pytest.mark.parametrize("valid", [1, 2, 8, min(16, STORAGE_BATCH)])
 def test_mtp_metadata_bridge_uses_the_same_reserve_semantics(valid: int) -> None:
     reserve = make_padding_reserve(SCHEDULER_BLOCKS, PHYSICAL_BLOCKS)
     seq_lens, block_table, slot_mapping = _active_metadata(valid)
@@ -268,9 +270,46 @@ def test_mtp_metadata_bridge_uses_the_same_reserve_semantics(valid: int) -> None
     assert torch.equal(result.slot_mapping[:valid], slot_mapping)
     expected_blocks = torch.arange(
         SCHEDULER_BLOCKS,
-        SCHEDULER_BLOCKS + 16 - valid,
+        SCHEDULER_BLOCKS + STORAGE_BATCH - valid,
         dtype=torch.int32,
     )
     assert torch.equal(result.block_table[valid:, 0], expected_blocks)
     assert torch.equal(result.slot_mapping[valid:], expected_blocks * 128)
     assert result.protocol_meta()["padding_reserve"] == reserve.as_dict()
+
+
+def test_capacity_derived_reserve_supports_non_default_static_capacity() -> None:
+    capacity = 32
+    reserve = make_padding_reserve(
+        SCHEDULER_BLOCKS,
+        SCHEDULER_BLOCKS + capacity - 1,
+        storage_capacity=capacity,
+    )
+    assert reserve.storage_capacity == capacity
+    assert len(reserve.padding_block_ids) == capacity - 1
+    assert reserve.padding_block_ids[-1] == SCHEDULER_BLOCKS + capacity - 2
+
+    seq_lens, active_table, active_slots = _active_metadata(17)
+    block_table, slot_mapping = pad_fixed_batch_metadata(
+        seq_lens=seq_lens,
+        block_table=active_table,
+        slot_mapping=active_slots,
+        valid_rows=17,
+        reserve=reserve,
+        storage_batch=capacity,
+        where="capacity-32 unit",
+    )
+    padded_seq = torch.ones(capacity, dtype=torch.int32)
+    padded_seq[:17] = seq_lens
+    positions = torch.zeros(capacity, dtype=torch.int32)
+    positions[:17] = seq_lens - 1
+    validate_fixed_batch_metadata(
+        seq_lens=padded_seq,
+        positions=positions,
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+        valid_rows=17,
+        reserve=reserve,
+        storage_batch=capacity,
+        where="capacity-32 unit",
+    )

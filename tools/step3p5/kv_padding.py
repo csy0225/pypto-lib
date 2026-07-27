@@ -1,14 +1,16 @@
 # Copyright (c) PyPTO Contributors.
 # SPDX-License-Identifier: Apache-2.0
-"""Main/MTP 共用的 fixed-batch KV padding reserve 契约。
+"""Main/MTP 共用的静态-capacity KV padding reserve 契约。
 
-PyPTO 的 Main 和 selected-MTP program 都固定执行 16 行。inactive row 仍会
-执行 attention KV write，因此不能把 padding row 指向 scheduler block 0。
-本模块只描述和校验 allocator-owned reserve：
+PyPTO program 按可配置的静态 storage capacity 分配 tensor；每次调用的
+runtime active rows 可以变化。inactive row 仍可能执行 attention KV write，
+因此不能把 padding row 指向 scheduler block 0。allocator 必须为最坏情况
+``active_rows == 1`` 独立保留 ``storage_capacity - 1`` 个 block：
 
 ```
 scheduler domain: [0, scheduler_num_blocks)
-padding reserve:  [scheduler_num_blocks, scheduler_num_blocks + 15)
+padding reserve:  [scheduler_num_blocks,
+                   scheduler_num_blocks + storage_capacity - 1)
 ```
 
 Main/MTP 使用同一种语义，但各自由独立 KV allocation 拥有自己的 reserve。
@@ -21,7 +23,27 @@ from typing import Any, Mapping
 
 import torch
 
-STORAGE_BATCH = 16
+# Keep this host-only module importable without the PyPTO DSL package.  The
+# compile-side config reads the same environment contract.
+DEFAULT_STORAGE_BATCH_CAPACITY = 16
+try:
+    STORAGE_BATCH = int(
+        os.environ.get(
+            "PYPTO_STEP3P5_STORAGE_BATCH_CAPACITY",
+            str(DEFAULT_STORAGE_BATCH_CAPACITY),
+        )
+    )
+except ValueError as exc:
+    raise ValueError(
+        "PYPTO_STEP3P5_STORAGE_BATCH_CAPACITY must be an integer"
+    ) from exc
+if STORAGE_BATCH <= 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_STORAGE_BATCH_CAPACITY must be positive"
+    )
+
+# Backward-compatible export.  It now reflects the configured compile-time
+# storage capacity instead of encoding a product-wide batch of 16.
 PADDING_BLOCK_COUNT = STORAGE_BATCH - 1
 BLOCK_SIZE = 128
 
@@ -53,6 +75,11 @@ class PaddingReserve:
     def reserve_start(self) -> int:
         return self.scheduler_num_blocks
 
+    @property
+    def storage_capacity(self) -> int:
+        """Static row capacity covered by this worst-case padding reserve."""
+        return len(self.padding_block_ids) + 1
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "scheduler_num_blocks": self.scheduler_num_blocks,
@@ -69,21 +96,27 @@ def make_padding_reserve(
     physical_num_blocks: int,
     *,
     block_size: int = BLOCK_SIZE,
+    storage_capacity: int = STORAGE_BATCH,
 ) -> PaddingReserve:
     scheduler_num_blocks = int(scheduler_num_blocks)
     physical_num_blocks = int(physical_num_blocks)
     block_size = int(block_size)
+    storage_capacity = int(storage_capacity)
     if scheduler_num_blocks <= 0:
         raise PaddingReserveError("scheduler_num_blocks must be positive")
     if block_size != BLOCK_SIZE:
         raise PaddingReserveError(
             f"block_size={block_size} != required {BLOCK_SIZE}"
         )
-    minimum_physical = scheduler_num_blocks + PADDING_BLOCK_COUNT
+    if storage_capacity <= 0:
+        raise PaddingReserveError("storage_capacity must be positive")
+    padding_block_count = storage_capacity - 1
+    minimum_physical = scheduler_num_blocks + padding_block_count
     if physical_num_blocks < minimum_physical:
         raise PaddingReserveError(
-            "physical KV capacity does not contain the 15-block padding "
-            f"reserve: physical={physical_num_blocks}, "
+            "physical KV capacity does not contain the capacity-derived "
+            f"{padding_block_count}-block padding reserve: "
+            f"physical={physical_num_blocks}, "
             f"required>={minimum_physical}"
         )
     padding_block_ids = tuple(
@@ -110,6 +143,16 @@ def parse_padding_reserve(
     reserve_start = _integer(obj, "reserve_start", where=where)
     block_size = _integer(obj, "block_size", where=where)
     count = _integer(obj, "padding_block_count", where=where)
+    raw_capacity = obj.get("storage_capacity")
+    if raw_capacity is None:
+        capacity = count + 1  # backward-compatible IPC maps
+    else:
+        capacity = _integer(obj, "storage_capacity", where=where)
+        if capacity != count + 1:
+            raise PaddingReserveError(
+                f"{where}: storage_capacity={capacity} != "
+                f"padding_block_count+1={count + 1}"
+            )
     raw_ids = obj.get("padding_block_ids")
     if not isinstance(raw_ids, (list, tuple)):
         raise PaddingReserveError(
@@ -126,20 +169,20 @@ def parse_padding_reserve(
             f"{where}: padding_block_ids contains a non-integer"
         ) from exc
 
+    if count < 0:
+        raise PaddingReserveError(
+            f"{where}: padding_block_count must be non-negative"
+        )
     expected = make_padding_reserve(
         scheduler,
         physical,
         block_size=block_size,
+        storage_capacity=capacity,
     )
     if reserve_start != expected.reserve_start:
         raise PaddingReserveError(
             f"{where}: reserve_start={reserve_start} != "
             f"scheduler_num_blocks={expected.reserve_start}"
-        )
-    if count != PADDING_BLOCK_COUNT:
-        raise PaddingReserveError(
-            f"{where}: padding_block_count={count} != "
-            f"{PADDING_BLOCK_COUNT}"
         )
     if ids != expected.padding_block_ids:
         raise PaddingReserveError(
@@ -208,9 +251,10 @@ def pad_fixed_batch_metadata(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """保留 active rows，并用 reserve 初始化 fixed-batch padding rows。"""
     valid_rows = int(valid_rows)
-    if storage_batch != STORAGE_BATCH:
+    if storage_batch != reserve.storage_capacity:
         raise PaddingReserveError(
-            f"{where}: storage_batch={storage_batch} != {STORAGE_BATCH}"
+            f"{where}: storage_batch={storage_batch} != reserve capacity "
+            f"{reserve.storage_capacity}"
         )
     if not 1 <= valid_rows <= storage_batch:
         raise PaddingReserveError(
@@ -340,10 +384,8 @@ def diagnostic_reserve_from_compiled_shape(
     """从 standalone program 的固定 block-table shape 推导诊断 reserve。"""
     block_table_flat = int(block_table_flat)
     storage_batch = int(storage_batch)
-    if storage_batch != STORAGE_BATCH:
-        raise PaddingReserveError(
-            f"diagnostic storage_batch={storage_batch} != {STORAGE_BATCH}"
-        )
+    if storage_batch <= 0:
+        raise PaddingReserveError("diagnostic storage_batch must be positive")
     if block_table_flat <= 0 or block_table_flat % storage_batch:
         raise PaddingReserveError(
             "diagnostic block_table_flat must be positive and divisible by "
@@ -352,8 +394,9 @@ def diagnostic_reserve_from_compiled_shape(
     scheduler_num_blocks = block_table_flat // storage_batch
     return make_padding_reserve(
         scheduler_num_blocks,
-        scheduler_num_blocks + PADDING_BLOCK_COUNT,
+        scheduler_num_blocks + storage_batch - 1,
         block_size=block_size,
+        storage_capacity=storage_batch,
     )
 
 
@@ -367,11 +410,11 @@ def configure_standalone_main_storage_env(
 
     This helper is intentionally *not* used by the live vLLM path.  Standalone
     harnesses do not have a scheduler-owned allocator, so they must reserve
-    fifteen physical padding blocks themselves before importing ``config``.
+    ``storage_capacity - 1`` physical padding blocks themselves before importing ``config``.
     The compiled Main program stores one K/V section per decoder layer; its
     physical row capacity is therefore:
 
-    ``num_layers * (scheduler_blocks + 15) * block_size``.
+    ``num_layers * (scheduler_blocks + storage_capacity - 1) * block_size``.
 
     Existing explicit environment values are checked rather than overwritten.
     A stale ``PYPTO_STEP3P5_KV_CACHE_ROWS`` must fail closed instead of causing
@@ -380,10 +423,8 @@ def configure_standalone_main_storage_env(
     storage_batch = int(storage_batch)
     num_layers = int(num_layers)
     block_size = int(block_size)
-    if storage_batch != STORAGE_BATCH:
-        raise PaddingReserveError(
-            f"standalone storage batch must be {STORAGE_BATCH}, got {storage_batch}"
-        )
+    if storage_batch <= 0:
+        raise PaddingReserveError("standalone storage capacity must be positive")
     if num_layers <= 0 or block_size <= 0:
         raise PaddingReserveError("standalone layer/block dimensions must be positive")
 
@@ -414,7 +455,8 @@ def configure_standalone_main_storage_env(
             )
         scheduler_blocks = block_table_flat // storage_batch
 
-    physical_blocks = scheduler_blocks + PADDING_BLOCK_COUNT
+    padding_block_count = storage_batch - 1
+    physical_blocks = scheduler_blocks + padding_block_count
     expected_kv_rows = num_layers * physical_blocks * block_size
     raw_kv = os.environ.get("PYPTO_STEP3P5_KV_CACHE_ROWS")
     if raw_kv is not None:
@@ -428,7 +470,7 @@ def configure_standalone_main_storage_env(
             raise PaddingReserveError(
                 "standalone Main KV rows disagree with allocator-owned reserve: "
                 f"configured={raw_kv}, expected={expected_kv_rows} "
-                f"(45*({scheduler_blocks}+{PADDING_BLOCK_COUNT})*{block_size})"
+                f"({num_layers}*({scheduler_blocks}+{padding_block_count})*{block_size})"
             )
     os.environ["PYPTO_STEP3P5_KV_CACHE_ROWS"] = str(expected_kv_rows)
 
@@ -469,9 +511,10 @@ def validate_fixed_batch_metadata(
 ) -> None:
     """Fail-closed 校验 active scheduler rows 和 padding reserve rows。"""
     valid_rows = int(valid_rows)
-    if storage_batch != STORAGE_BATCH:
+    if storage_batch != reserve.storage_capacity:
         raise PaddingReserveError(
-            f"{where}: storage_batch={storage_batch} != {STORAGE_BATCH}"
+            f"{where}: storage_batch={storage_batch} != reserve capacity "
+            f"{reserve.storage_capacity}"
         )
     if not 1 <= valid_rows <= storage_batch:
         raise PaddingReserveError(
@@ -559,6 +602,7 @@ def validate_fixed_batch_metadata(
 
 __all__ = [
     "BLOCK_SIZE",
+    "DEFAULT_STORAGE_BATCH_CAPACITY",
     "PADDING_BLOCK_COUNT",
     "STORAGE_BATCH",
     "PaddingReserve",

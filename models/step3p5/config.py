@@ -58,7 +58,22 @@ import pypto.language as pl
 # Numeric values are the static ABI constants consumed by the single-chip
 # hidden-only Main and selected-MTP programs.
 # -----------------------------------------------------------------------------
-USER_BATCH_DYN = 16                        # = BATCH (line below)
+DEFAULT_STORAGE_BATCH_CAPACITY = 16
+STORAGE_BATCH_CAPACITY = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_STORAGE_BATCH_CAPACITY",
+        str(DEFAULT_STORAGE_BATCH_CAPACITY),
+    ),
+)
+# Current attention/LM-head kernels tile the static storage rows in groups of
+# 16.  The capacity is configurable at compile time, while each invocation
+# supplies its own runtime active-row count.
+if STORAGE_BATCH_CAPACITY <= 0 or STORAGE_BATCH_CAPACITY % 16 != 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_STORAGE_BATCH_CAPACITY must be a positive multiple "
+        f"of current batch tile 16, got {STORAGE_BATCH_CAPACITY}",
+    )
+USER_BATCH_DYN = STORAGE_BATCH_CAPACITY
 _LIVE_MAX_SEQ = int(os.environ.get("PYPTO_STEP3P5_MAX_SEQ", "4096"))
 if _LIVE_MAX_SEQ <= 0 or _LIVE_MAX_SEQ % 128 != 0:
     raise ValueError(
@@ -330,7 +345,9 @@ def rotary_half_for_layer(layer_idx: int) -> int:
 # Tiling defaults shared across all step3p5 kernels.
 # Per-kernel kernels may override locally; these are the safe starting points.
 # -----------------------------------------------------------------------------
-BATCH = 16                              # default kernel-level batch
+# Static tensor-storage capacity.  Runtime active batch/token count is carried
+# separately by host metadata and must be <= this capacity.
+BATCH = STORAGE_BATCH_CAPACITY
 BATCH_TILE = 16
 BLOCK_SIZE = 128                        # paged-cache block (also K/V SEQ_TILE)
 SEQ_TILE = 128
@@ -526,6 +543,8 @@ def ep_global_expert_id(rank: int, local_id: int) -> int:
 
 __all__ = [
     # dynamic dims
+    "DEFAULT_STORAGE_BATCH_CAPACITY",
+    "STORAGE_BATCH_CAPACITY",
     "USER_BATCH_DYN",
     "KV_CACHE_ROWS_DYN",
     "MTP_KV_CACHE_ROWS_DYN",

@@ -1063,9 +1063,11 @@ class WholeDecodeStep3p5:
             compact = pl.cast(0, pl.INDEX)
             lane_e_base = e * dispatch_recv_per_expert
             for src in pl.range(n_ranks):
-                n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
+                route_count = pl.cast(
+                    pl.read(recv_meta_local, [src, e]), pl.INDEX,
+                )
                 src_base = lane_e_base + src * dispatch_max_per_src
-                for slot in pl.range(n):
+                for slot in pl.range(route_count):
                     in_row = src_base + slot
                     out_row = out_base + compact + slot
                     local_routed_x_out[out_row : out_row + 1, :] = (

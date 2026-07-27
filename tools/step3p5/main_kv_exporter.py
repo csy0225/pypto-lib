@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 from tools.step3p5.ipc_session import (
@@ -396,6 +398,105 @@ class MainKvExporter:
                         "byte_offset": int(row_offset),
                     }
         return rows, summary
+
+    def snapshot_full_pool(
+        self,
+        *,
+        out_dir: str,
+        probe_id: str,
+        chunk_rows: int = 8192,
+    ) -> dict[str, Any]:
+        """Hash every physical KV row without adding a production op.
+
+        This is a diagnostics-only D2H scan used by the B3 acceptance probe.
+        The pool is copied in contiguous chunks, while one SHA-256 digest is
+        emitted for the whole pool and every transfer chunk.  The raw D2H
+        bytes are written to a temporary diagnostic sidecar so the caller can
+        compare all physical rows exactly without millions of Python hash
+        calls.  The sidecar is outside the production program and is removed
+        by the acceptance probe after each comparison.
+        """
+        if self._pool_ptr is None or self._pool_map is None:
+            raise RuntimeError("Main KV pool is not exported")
+        chunk_rows = int(chunk_rows)
+        if chunk_rows <= 0:
+            raise ValueError(f"chunk_rows must be positive, got {chunk_rows}")
+
+        row_bytes = HEAD_DIM * KV_ITEMSIZE
+        if self._pool_bytes % row_bytes:
+            raise RuntimeError(
+                f"pool bytes {self._pool_bytes} is not row aligned"
+            )
+        total_rows = self._pool_bytes // row_bytes
+        chunk_bytes = chunk_rows * row_bytes
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        snapshot_path = out / (
+            f"kv_pool_snapshot_{probe_id}.rank{self._pool_map['rank']}.bin"
+        )
+        snapshot_tmp = snapshot_path.with_name(
+            f"{snapshot_path.name}.tmp.{os.getpid()}"
+        )
+        pool_digest = hashlib.sha256()
+        chunk_digests: list[str] = []
+        row_count = 0
+        try:
+            with snapshot_tmp.open("wb") as snapshot_file:
+                for chunk_offset in range(0, self._pool_bytes, chunk_bytes):
+                    nbytes = min(chunk_bytes, self._pool_bytes - chunk_offset)
+                    if nbytes % row_bytes:
+                        raise RuntimeError(
+                            f"scan chunk {nbytes} is not row aligned"
+                        )
+                    host = ctypes.create_string_buffer(nbytes)
+                    rc = self._acl.aclrtMemcpy(
+                        ctypes.cast(host, ctypes.c_void_p),
+                        ctypes.c_size_t(nbytes),
+                        ctypes.c_void_p(self._pool_ptr + chunk_offset),
+                        ctypes.c_size_t(nbytes),
+                        ctypes.c_int(_D2H),
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"aclrtMemcpy full-pool D2H rc={rc} "
+                            f"offset={chunk_offset} nbytes={nbytes}"
+                        )
+                    raw = bytes(host.raw)
+                    pool_digest.update(raw)
+                    chunk_digests.append(hashlib.sha256(raw).hexdigest())
+                    snapshot_file.write(raw)
+                    row_count += nbytes // row_bytes
+                snapshot_file.flush()
+                os.fsync(snapshot_file.fileno())
+            os.replace(snapshot_tmp, snapshot_path)
+        except BaseException:
+            try:
+                snapshot_tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+        num_slots = int(self._pool_map["map"]["L0.K"]["num_slots"])
+        return {
+            "scan_kind": "full_pool_row_diff_v1",
+            "pool_map_digest": hashlib.sha256(
+                json.dumps(
+                    self._pool_map,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "pool_sha256": pool_digest.hexdigest(),
+            "pool_bytes": int(self._pool_bytes),
+            "row_bytes": int(row_bytes),
+            "row_count": int(row_count),
+            "num_slots": num_slots,
+            "chunk_rows": int(chunk_rows),
+            "chunk_sha256": chunk_digests,
+            "snapshot_path": str(snapshot_path),
+            "pool_base_debug": int(self._pool_ptr),
+            "rank": int(self._pool_map["rank"]),
+        }
 
     def teardown(self) -> None:
         if self._export_key is not None:

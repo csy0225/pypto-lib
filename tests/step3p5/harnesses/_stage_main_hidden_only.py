@@ -179,6 +179,15 @@ def _export_rank(args: argparse.Namespace) -> int:
                                     int(item) for item in request["slots"]
                                 ],
                             )
+                            full_pool = None
+                            if bool(request.get("full_pool", False)):
+                                full_pool = kv_owner.snapshot_full_pool(
+                                    out_dir=str(out),
+                                    probe_id=probe_id,
+                                    chunk_rows=int(
+                                        request.get("full_pool_chunk_rows", 8192)
+                                    ),
+                                )
                             tensor_path = out / (
                                 f"kv_probe_{probe_id}."
                                 f"rank{args.export_rank}.pt"
@@ -196,6 +205,7 @@ def _export_rank(args: argparse.Namespace) -> int:
                                 "device": args.dev,
                                 "tensor_path": str(tensor_path),
                                 "summary": summary,
+                                "full_pool": full_pool,
                             }
                             result_path = out / (
                                 f"kv_probe_{probe_id}."
@@ -315,12 +325,18 @@ def _collect_kv_probe(
     *,
     step: int,
     timeout_sec: float = 60.0,
+    phase: str = "",
+    full_pool: bool = False,
+    full_pool_chunk_rows: int = 8192,
 ) -> dict[str, Any]:
     """Collect post-run owner-side KV evidence from all eight ranks."""
     probe_id = f"step{int(step)}-{uuid.uuid4().hex}"
     request = {
         "probe_id": probe_id,
         "step": int(step),
+        "phase": str(phase),
+        "full_pool": bool(full_pool),
+        "full_pool_chunk_rows": int(full_pool_chunk_rows),
         # PERF-B3 release evidence: cover every physical decode layer, both
         # K/V sections, the two adjacent active scheduler rows, and one
         # untouched history row. Padding writes use allocator-owned reserve
@@ -367,7 +383,8 @@ def _collect_kv_probe(
         "slots": request["slots"],
         "ranks": results,
     }
-    aggregate_path = out / f"kv_probe_step{int(step)}.json"
+    suffix = f"_{phase}" if phase else ""
+    aggregate_path = out / f"kv_probe_step{int(step)}{suffix}.json"
     aggregate_path.write_text(
         json.dumps(aggregate, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -377,6 +394,8 @@ def _collect_kv_probe(
             {
                 "kv_probe": probe_id,
                 "step": int(step),
+                "phase": str(phase),
+                "full_pool": bool(full_pool),
                 "ranks": TP,
                 "path": str(aggregate_path),
             },

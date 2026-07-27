@@ -6,6 +6,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.step3p5.probes._probe_g1_active_batch import _executable_match
+
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CANONICAL = _ROOT / "models" / "step3p5" / "decode_fwd.py"
@@ -51,6 +53,73 @@ def _method_calls(tree: ast.AST, name: str) -> list[ast.Call]:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == name
     ]
+
+
+def _single_function(source: str) -> ast.FunctionDef:
+    tree = ast.parse(source)
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    ]
+    assert len(functions) == 1
+    return functions[0]
+
+
+def test_g1_executable_match_is_exact_and_fail_closed() -> None:
+    function = _single_function(
+        """
+def sample():
+    # for t in pl.range(active_tokens):
+    "active_tokens = pl.cast(num_tokens, pl.INDEX)"
+    for t in pl.range(storage_batch):
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        pl.read(num_tokens_per_owner, [owner_rank])
+"""
+    )
+    assert _executable_match(
+        function,
+        "active_tokens = pl.cast(num_tokens, pl.INDEX)",
+    )["present"]
+    assert _executable_match(
+        function,
+        "pl.read(num_tokens_per_owner, [owner_rank])",
+    )["present"]
+
+    # A comment/string cannot satisfy the loop pattern, and the outer For
+    # cannot inherit a match from executable statements in its body.
+    loop = _executable_match(
+        function,
+        "for t in pl.range(active_tokens):",
+    )
+    assert not loop["present"]
+    assert "pattern_error" not in loop
+
+    # A formal argument alone is not executable evidence.
+    formal_only = _single_function(
+        """
+def sample(local_expert_count):
+    return None
+"""
+    )
+    assert not _executable_match(
+        formal_only,
+        "pl.read(local_expert_count, [e])",
+    )["present"]
+
+    nested_only = _single_function(
+        """
+def sample():
+    def fake():
+        for t in pl.range(active_tokens):
+            pass
+    return fake
+"""
+    )
+    assert not _executable_match(
+        nested_only,
+        "for t in pl.range(active_tokens):",
+    )["present"]
 
 
 def test_b3_canonical_kv_is_resident_inout_and_holder_never_copies_pool() -> None:

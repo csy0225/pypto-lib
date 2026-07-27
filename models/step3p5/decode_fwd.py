@@ -1057,7 +1057,7 @@ class WholeDecodeStep3p5:
             name_hint="dispatch_gather",
             deps=[wait_tid, meta_tid],
             allow_early_resolve=True,
-        ):
+        ) as dispatch_gather_tid:
             e = pl.tile.get_block_idx()
             out_base = pl.cast(pl.read(local_expert_offset, [e]), pl.INDEX)
             compact = pl.cast(0, pl.INDEX)
@@ -1866,7 +1866,7 @@ class WholeDecodeStep3p5:
             name_hint="combine_reduce",
             deps=[combine_wait_tid],
             allow_early_resolve=True,
-        ):
+        ) as combine_reduce_tid:
             t = pl.tile.get_block_idx()
             if t < active_tokens:
                 acc = pl.cast(

@@ -959,9 +959,9 @@ class WholeDecodeStep3p5:
                 pl.write(local_expert_offset, [e], total)
                 count = pl.cast(0, pl.INT32)
                 for src in pl.range(n_ranks):
-                    n = pl.read(recv_meta, [src, e])
-                    pl.write(recv_meta_local, [src, e], n)
-                    count = count + n
+                    meta_count = pl.read(recv_meta, [src, e])
+                    pl.write(recv_meta_local, [src, e], meta_count)
+                    count = count + meta_count
                 pl.write(local_expert_count, [e], count)
                 total = total + count
 
@@ -1090,7 +1090,7 @@ class WholeDecodeStep3p5:
                             inverse_map, [t, k],
                             pl.cast(my_rank * local_recv_max + out_row, pl.INT32),
                         )
-                compact = compact + n
+                compact = compact + route_count
 
         return (
             local_routed_x_out,

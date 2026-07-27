@@ -963,7 +963,7 @@ class WholeDecodeStep3p5:
             n_local_experts,
             name_hint="dispatch_push",
             allow_early_resolve=True,
-        ):
+        ) as dispatch_push_tid:
             loc_e = pl.tile.get_block_idx()
             active_tokens = pl.cast(num_tokens, pl.INDEX)
             if active_tokens < 0:
@@ -1028,6 +1028,7 @@ class WholeDecodeStep3p5:
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="dispatch_wait",
+            deps=[dispatch_push_tid],
             allow_early_resolve=True,
         ) as wait_tid:
             _route_anchor = pl.read(expert_indices, [0, 0])
@@ -1794,7 +1795,7 @@ class WholeDecodeStep3p5:
             n_local_experts,
             name_hint="combine_scatter",
             allow_early_resolve=True,
-        ):
+        ) as combine_scatter_tid:
             e = pl.tile.get_block_idx()
             compact_base = pl.cast(
                 pl.read(local_expert_offset, [e]), pl.INDEX,
@@ -1835,6 +1836,7 @@ class WholeDecodeStep3p5:
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="combine_wait",
+            deps=[combine_scatter_tid],
             allow_early_resolve=True,
         ) as combine_wait_tid:
             _routed_anchor = pl.read(local_routed_y, [0, 0])

@@ -154,7 +154,9 @@ def test_b3_attention_only_writes_slot_addressed_head_rows() -> None:
     ):
         source = path.read_text(encoding="utf-8")
         assert "for b in pl.parallel(BATCH):" in source
-        assert "slot = pl.tensor.read(slot_mapping, [b_safe])" in source
+        assert "if b < active_tokens:" in source
+        assert "slot = pl.tensor.read(slot_mapping, [b])" in source
+        assert "slot_mapping, [b_safe]" not in source
         assert "layer_cache_base" in source
         assert "cache_row = (" in source
         assert name_hint in source

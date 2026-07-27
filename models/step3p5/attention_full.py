@@ -220,6 +220,10 @@ def attention_full(
     decode_layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
     user_batch = pl.tensor.dim(seq_lens, 0)
     bt_stride = pl.tensor.dim(block_table, 0) // user_batch
+    # ``BATCH`` is only the static storage/formal capacity.  All per-request
+    # row work is bounded by the runtime scalar supplied by the canonical
+    # whole-net caller.  Do not use a clamped/padding row as a substitute for
+    # an inactive request: that can alias its RoPE/KV write into another slot.
     batch_padded = BATCH
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
@@ -442,126 +446,119 @@ def attention_full(
         [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL, HEAD_DIM], dtype=pl.BF16,
     )
 
-    # Phase A reverse-audit (2026-06-12): qwen3/32b uses `for b in pl.parallel(BATCH)`
-    # (static constant) here; step3p5 was using `pl.parallel(user_batch)` where
-    # user_batch is a DYNAMIC scalar from `pl.tensor.dim(seq_lens, 0)`. The IR
-    # for dynamic vs static parallel bounds differs significantly — dynamic
-    # generates a host-side C++ loop emitting one rt_submit per iter (each
-    # potentially with different UB lifetime), static fully unrolls. The
-    # dynamic form is the suspected source of `aicore_kernel_0_mix_aic tslot:6
-    # VEC UB not aligned`. Pad batches (b >= user_batch) are already guarded
-    # below via `fa_b_safe = pl.min(b, user_batch - 1)` in the 4 attention
-    # spmds; here we extend the same guard pattern: clamp the per-batch reads
-    # with `b_safe` for pad batches.
+    # Keep a static parallel bound for the current tiling/codegen profile, but
+    # guard the complete per-row body with the runtime active bound.  Inactive
+    # rows must not read a substituted ``b_safe`` request and must not perform
+    # RoPE or assemble into K/V cache.
     for b in pl.parallel(BATCH):
-        b_safe = pl.min(b, user_batch - 1)
-        ctx_len = pl.tensor.read(seq_lens, [b_safe])
-        pos = ctx_len - 1
-        slot = pl.tensor.read(slot_mapping, [b_safe])
-        slot_block = slot // BLOCK_SIZE
-        slot_offset = slot - slot_block * BLOCK_SIZE
-        cos_lo = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, 0])
-        cos_hi = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
-        sin_lo = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, 0])
-        sin_hi = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
+        if b < active_tokens:
+            ctx_len = pl.tensor.read(seq_lens, [b])
+            pos = ctx_len - 1
+            slot = pl.tensor.read(slot_mapping, [b])
+            slot_block = slot // BLOCK_SIZE
+            slot_offset = slot - slot_block * BLOCK_SIZE
+            cos_lo = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, 0])
+            cos_hi = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
+            sin_lo = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, 0])
+            sin_hi = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="full_rope_kv_cache"):
-            for ki in pl.range(KV_HEADS_LOCAL):
-                kv_col = ki * HEAD_DIM
-                cache_row = (
-                    layer_cache_base
-                    + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
-                    + slot_offset
-                )
-                k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col])
-                k_hi = pl.slice(
-                    k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col + ROTARY_HALF_FULL],
-                )
-                rot_k_lo = pl.sub(
-                    pl.col_expand_mul(k_lo, cos_lo),
-                    pl.col_expand_mul(k_hi, sin_lo),
-                )
-                rot_k_hi = pl.add(
-                    pl.col_expand_mul(k_hi, cos_hi),
-                    pl.col_expand_mul(k_lo, sin_hi),
-                )
-                # Phase A (2026-06-11): use qwen3/32b's full-row-cast-then-
-                # overwrite idiom instead of the (compile-required, runtime-
-                # broken) `pl.add(k_pass, 0.0)` workaround. Cast the entire
-                # [1, HEAD_DIM] k_proj_norm row to BF16 once (which is the
-                # exact pattern qwen3/32b's v_cache write uses and which
-                # AICore lowers cleanly), then overwrite cols 0..2*HALF with
-                # the RoPE'd halves. The pass-through tail (cols 2*HALF..)
-                # is left as the initial full-row cast.
-                k_cache = pl.assemble(
-                    k_cache,
-                    pl.cast(
-                        pl.slice(k_proj_norm, [1, HEAD_DIM], [b, kv_col]),
-                        target_type=pl.BF16,
-                    ),
-                    [cache_row, 0],
-                )
-                k_cache = pl.assemble(
-                    k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
-                )
-                k_cache = pl.assemble(
-                    k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
-                    [cache_row, ROTARY_HALF_FULL],
-                )
-                v_cache = pl.assemble(
-                    v_cache,
-                    pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
-                            target_type=pl.BF16),
-                    [cache_row, 0],
-                )
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="full_rope_kv_cache"):
+                for ki in pl.range(KV_HEADS_LOCAL):
+                    kv_col = ki * HEAD_DIM
+                    cache_row = (
+                        layer_cache_base
+                        + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
+                        + slot_offset
+                    )
+                    k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col])
+                    k_hi = pl.slice(
+                        k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col + ROTARY_HALF_FULL],
+                    )
+                    rot_k_lo = pl.sub(
+                        pl.col_expand_mul(k_lo, cos_lo),
+                        pl.col_expand_mul(k_hi, sin_lo),
+                    )
+                    rot_k_hi = pl.add(
+                        pl.col_expand_mul(k_hi, cos_hi),
+                        pl.col_expand_mul(k_lo, sin_hi),
+                    )
+                    # Phase A (2026-06-11): use qwen3/32b's full-row-cast-then-
+                    # overwrite idiom instead of the (compile-required, runtime-
+                    # broken) `pl.add(k_pass, 0.0)` workaround. Cast the entire
+                    # [1, HEAD_DIM] k_proj_norm row to BF16 once (which is the
+                    # exact pattern qwen3/32b's v_cache write uses and which
+                    # AICore lowers cleanly), then overwrite cols 0..2*HALF with
+                    # the RoPE'd halves. The pass-through tail (cols 2*HALF..)
+                    # is left as the initial full-row cast.
+                    k_cache = pl.assemble(
+                        k_cache,
+                        pl.cast(
+                            pl.slice(k_proj_norm, [1, HEAD_DIM], [b, kv_col]),
+                            target_type=pl.BF16,
+                        ),
+                        [cache_row, 0],
+                    )
+                    k_cache = pl.assemble(
+                        k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
+                    )
+                    k_cache = pl.assemble(
+                        k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
+                        [cache_row, ROTARY_HALF_FULL],
+                    )
+                    v_cache = pl.assemble(
+                        v_cache,
+                        pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
+                                target_type=pl.BF16),
+                        [cache_row, 0],
+                    )
 
-                # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_FULL] slices of
-                # q_proj_norm, mirroring the K path above. This replaces the
-                # earlier reshape(q_proj_norm -> [Q_HEAD_BATCH_FULL, HEAD_DIM])
-                # + [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL] col-offset slice, which
-                # miscompiled the rot_q_hi (cols ROTARY_HALF_FULL..ROTARY_DIM)
-                # write into all_q_padded -> wrong q.k scores for ctx>1 (invisible
-                # at ctx=1 since output=V). Verified via _stage_scope12_qk.py:
-                # per-rank crossrow scores bad_ratio 0.25/0.90 -> ~0.
-                q_base = ki * Q_PER_KV_FULL
-                pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL + ki * Q_HEAD_PAD_FULL
-                for qh in pl.range(Q_HEAD_BATCH_FULL):
-                    qh_col = (q_base + qh) * HEAD_DIM
-                    q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col])
-                    q_hi_h = pl.slice(
-                        q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col + ROTARY_HALF_FULL],
-                    )
-                    rot_q_lo_h = pl.sub(
-                        pl.col_expand_mul(q_lo_h, cos_lo),
-                        pl.col_expand_mul(q_hi_h, sin_lo),
-                    )
-                    rot_q_hi_h = pl.add(
-                        pl.col_expand_mul(q_hi_h, cos_hi),
-                        pl.col_expand_mul(q_lo_h, sin_hi),
-                    )
-                    q_row = pad_row_base + qh
+                    # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_FULL] slices of
+                    # q_proj_norm, mirroring the K path above. This replaces the
+                    # earlier reshape(q_proj_norm -> [Q_HEAD_BATCH_FULL, HEAD_DIM])
+                    # + [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL] col-offset slice, which
+                    # miscompiled the rot_q_hi (cols ROTARY_HALF_FULL..ROTARY_DIM)
+                    # write into all_q_padded -> wrong q.k scores for ctx>1 (invisible
+                    # at ctx=1 since output=V). Verified via _stage_scope12_qk.py:
+                    # per-rank crossrow scores bad_ratio 0.25/0.90 -> ~0.
+                    q_base = ki * Q_PER_KV_FULL
+                    pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL + ki * Q_HEAD_PAD_FULL
+                    for qh in pl.range(Q_HEAD_BATCH_FULL):
+                        qh_col = (q_base + qh) * HEAD_DIM
+                        q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col])
+                        q_hi_h = pl.slice(
+                            q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col + ROTARY_HALF_FULL],
+                        )
+                        rot_q_lo_h = pl.sub(
+                            pl.col_expand_mul(q_lo_h, cos_lo),
+                            pl.col_expand_mul(q_hi_h, sin_lo),
+                        )
+                        rot_q_hi_h = pl.add(
+                            pl.col_expand_mul(q_hi_h, cos_hi),
+                            pl.col_expand_mul(q_lo_h, sin_hi),
+                        )
+                        q_row = pad_row_base + qh
+                        all_q_padded = pl.assemble(
+                            all_q_padded,
+                            pl.cast(pl.slice(q_proj_norm, [1, HEAD_DIM], [b, qh_col]),
+                                    target_type=pl.BF16),
+                            [q_row, 0],
+                        )
+                        all_q_padded = pl.assemble(
+                            all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
+                        )
+                        all_q_padded = pl.assemble(
+                            all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
+                            [q_row, ROTARY_HALF_FULL],
+                        )
                     all_q_padded = pl.assemble(
                         all_q_padded,
-                        pl.cast(pl.slice(q_proj_norm, [1, HEAD_DIM], [b, qh_col]),
-                                target_type=pl.BF16),
-                        [q_row, 0],
+                        pl.cast(
+                            pl.full([Q_HEAD_PAD_FULL - Q_HEAD_BATCH_FULL, HEAD_DIM],
+                                    dtype=pl.FP32, value=0.0),
+                            target_type=pl.BF16,
+                        ),
+                        [pad_row_base + Q_HEAD_BATCH_FULL, 0],
                     )
-                    all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
-                    )
-                    all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
-                        [q_row, ROTARY_HALF_FULL],
-                    )
-                all_q_padded = pl.assemble(
-                    all_q_padded,
-                    pl.cast(
-                        pl.full([Q_HEAD_PAD_FULL - Q_HEAD_BATCH_FULL, HEAD_DIM],
-                                dtype=pl.FP32, value=0.0),
-                        target_type=pl.BF16,
-                    ),
-                    [pad_row_base + Q_HEAD_BATCH_FULL, 0],
-                )
 
     # ----- fa_fused — Phase A (2026-06-11): qwen3/32b-style 4-spmd split. -----
     # The previous fused mixed AIC+AIV single root tripped 507018 / VEC UB
@@ -951,6 +948,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             norm_layer_idx: pl.Scalar[pl.INT32],
             attn_layer_idx: pl.Scalar[pl.INT32],
+            num_tokens: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             resid1_out = attention_full_inline(
@@ -966,7 +964,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                 resid1_out,
                 norm_layer_idx,
                 attn_layer_idx,
-                BATCH,
+                num_tokens,
                 tmp_window,
                 signal_window,
                 my_rank,
@@ -1002,6 +1000,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             resid1_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
             norm_layer_idx: pl.Scalar[pl.INT32],
             attn_layer_idx: pl.Scalar[pl.INT32],
+            num_tokens: pl.Scalar[pl.INT32],
         ):
             tmp_buf = pld.alloc_window_buffer(BATCH * HIDDEN * 2)  # BF16
             sig_buf = pld.alloc_window_buffer(tp_size * 4)           # INT32
@@ -1024,6 +1023,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                     signal_window,
                     norm_layer_idx,
                     attn_layer_idx,
+                    num_tokens,
                     r,
                     device=r,
                 )

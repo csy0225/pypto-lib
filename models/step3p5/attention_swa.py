@@ -442,97 +442,98 @@ def attention_swa(
         [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.BF16,
     )
 
-    # Keep the Scope-2 producer contract identical to the already validated
-    # full-attention path.  ``user_batch`` comes from ``pl.tensor.dim`` and is
-    # therefore a dynamic scalar even though the resident ABI has a fixed
-    # BATCH=16 storage shape.  A dynamic parallel bound lowers differently
-    # from the static form and can change submit/UB-lifetime behaviour.  Run
-    # the fixed storage extent and clamp metadata reads for any padding rows.
+    # Scope-2 runtime bound: BATCH is storage capacity, not logical batch.
+    # Keep the static extent for the compiler/tiling ABI, but predicate the
+    # complete per-row RoPE/KV producer by ``active_tokens``.  Inactive rows
+    # must not read clamped metadata and must never write a padding slot: the
+    # reserve is storage/allocator metadata, not an attention output sink.
+    # This also keeps the formal seq_lens/slot_mapping capacity independent of
+    # the runtime active-token count.
     for b in pl.parallel(BATCH):
-        b_safe = pl.min(b, user_batch - 1)
-        ctx_len = pl.tensor.read(seq_lens, [b_safe])
-        pos = ctx_len - 1
-        slot = pl.tensor.read(slot_mapping, [b_safe])
-        slot_block = slot // BLOCK_SIZE
-        slot_offset = slot - slot_block * BLOCK_SIZE
-        cos_row = pl.slice(rope_cos, [1, ROTARY_HALF_SWA * 2], [pos, 0])
-        sin_row = pl.slice(rope_sin, [1, ROTARY_HALF_SWA * 2], [pos, 0])
-        cos_lo = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, 0])
-        cos_hi = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
-        sin_lo = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, 0])
-        sin_hi = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
+        if b < active_tokens:
+            ctx_len = pl.tensor.read(seq_lens, [b])
+            pos = ctx_len - 1
+            slot = pl.tensor.read(slot_mapping, [b])
+            slot_block = slot // BLOCK_SIZE
+            slot_offset = slot - slot_block * BLOCK_SIZE
+            cos_row = pl.slice(rope_cos, [1, ROTARY_HALF_SWA * 2], [pos, 0])
+            sin_row = pl.slice(rope_sin, [1, ROTARY_HALF_SWA * 2], [pos, 0])
+            cos_lo = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, 0])
+            cos_hi = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
+            sin_lo = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, 0])
+            sin_hi = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_kv_cache"):
-            for ki in pl.range(KV_HEADS_LOCAL):
-                kv_col = ki * HEAD_DIM
-                cache_row = (
-                    layer_cache_base
-                    + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
-                    + slot_offset
-                )
-                k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col])
-                k_hi = pl.slice(
-                    k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col + ROTARY_HALF_SWA],
-                )
-                rot_k_lo = pl.sub(
-                    pl.col_expand_mul(k_lo, cos_lo),
-                    pl.col_expand_mul(k_hi, sin_lo),
-                )
-                rot_k_hi = pl.add(
-                    pl.col_expand_mul(k_hi, cos_hi),
-                    pl.col_expand_mul(k_lo, sin_hi),
-                )
-                k_cache = pl.assemble(
-                    k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
-                )
-                k_cache = pl.assemble(
-                    k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
-                    [cache_row, ROTARY_HALF_SWA],
-                )
-                v_cache = pl.assemble(
-                    v_cache,
-                    pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
-                            target_type=pl.BF16),
-                    [cache_row, 0],
-                )
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_kv_cache"):
+                for ki in pl.range(KV_HEADS_LOCAL):
+                    kv_col = ki * HEAD_DIM
+                    cache_row = (
+                        layer_cache_base
+                        + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
+                        + slot_offset
+                    )
+                    k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col])
+                    k_hi = pl.slice(
+                        k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col + ROTARY_HALF_SWA],
+                    )
+                    rot_k_lo = pl.sub(
+                        pl.col_expand_mul(k_lo, cos_lo),
+                        pl.col_expand_mul(k_hi, sin_lo),
+                    )
+                    rot_k_hi = pl.add(
+                        pl.col_expand_mul(k_hi, cos_hi),
+                        pl.col_expand_mul(k_lo, sin_hi),
+                    )
+                    k_cache = pl.assemble(
+                        k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
+                    )
+                    k_cache = pl.assemble(
+                        k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
+                        [cache_row, ROTARY_HALF_SWA],
+                    )
+                    v_cache = pl.assemble(
+                        v_cache,
+                        pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
+                                target_type=pl.BF16),
+                        [cache_row, 0],
+                    )
 
-                # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_SWA] slices of
-                # q_proj_norm (mirrors the K path), replacing reshape([.,HEAD_DIM])
-                # + col-offset slice which miscompiled the rot_q_hi write into
-                # all_q_padded. See attention_full.py Scope 2 / _stage_scope12_qk.py.
-                q_base = ki * Q_PER_KV_SWA
-                pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED + ki * SWA_Q_PAD_ALIGNED
-                for qh in pl.range(Q_HEAD_BATCH_SWA):
-                    qh_col = (q_base + qh) * HEAD_DIM
-                    q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col])
-                    q_hi_h = pl.slice(
-                        q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col + ROTARY_HALF_SWA],
-                    )
-                    rot_q_lo_h = pl.sub(
-                        pl.col_expand_mul(q_lo_h, cos_lo),
-                        pl.col_expand_mul(q_hi_h, sin_lo),
-                    )
-                    rot_q_hi_h = pl.add(
-                        pl.col_expand_mul(q_hi_h, cos_hi),
-                        pl.col_expand_mul(q_lo_h, sin_hi),
-                    )
-                    q_row = pad_row_base + qh
+                    # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_SWA] slices of
+                    # q_proj_norm (mirrors the K path), replacing reshape([.,HEAD_DIM])
+                    # + col-offset slice which miscompiled the rot_q_hi write into
+                    # all_q_padded. See attention_full.py Scope 2 / _stage_scope12_qk.py.
+                    q_base = ki * Q_PER_KV_SWA
+                    pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED + ki * SWA_Q_PAD_ALIGNED
+                    for qh in pl.range(Q_HEAD_BATCH_SWA):
+                        qh_col = (q_base + qh) * HEAD_DIM
+                        q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col])
+                        q_hi_h = pl.slice(
+                            q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col + ROTARY_HALF_SWA],
+                        )
+                        rot_q_lo_h = pl.sub(
+                            pl.col_expand_mul(q_lo_h, cos_lo),
+                            pl.col_expand_mul(q_hi_h, sin_lo),
+                        )
+                        rot_q_hi_h = pl.add(
+                            pl.col_expand_mul(q_hi_h, cos_hi),
+                            pl.col_expand_mul(q_lo_h, sin_hi),
+                        )
+                        q_row = pad_row_base + qh
+                        all_q_padded = pl.assemble(
+                            all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
+                        )
+                        all_q_padded = pl.assemble(
+                            all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
+                            [q_row, ROTARY_HALF_SWA],
+                        )
                     all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
+                        all_q_padded,
+                        pl.cast(
+                            pl.full([SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA, HEAD_DIM],
+                                    dtype=pl.FP32, value=0.0),
+                            target_type=pl.BF16,
+                        ),
+                        [pad_row_base + Q_HEAD_BATCH_SWA, 0],
                     )
-                    all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
-                        [q_row, ROTARY_HALF_SWA],
-                    )
-                all_q_padded = pl.assemble(
-                    all_q_padded,
-                    pl.cast(
-                        pl.full([SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA, HEAD_DIM],
-                                dtype=pl.FP32, value=0.0),
-                        target_type=pl.BF16,
-                    ),
-                    [pad_row_base + Q_HEAD_BATCH_SWA, 0],
-                )
 
     # ----- fa_fused (SWA) — Phase A (2026-06-11): qwen3/32b-style 4-spmd. -----
     # Mirror of attention_full.py's Phase A rewrite. SWA differs only in:

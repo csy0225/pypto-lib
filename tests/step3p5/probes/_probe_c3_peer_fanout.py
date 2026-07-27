@@ -402,29 +402,29 @@ def _source_contract() -> dict[str, Any]:
         )
     )
 
-    peer_with = _spmd_with(chip_orch, name_hint="c3_peer_pull")
-    peer_with_node = peer_with[0] if peer_with else None
-    peer_with_item = peer_with[1] if peer_with else None
-    peer_call = (
-        peer_with_item.context_expr
-        if peer_with_item is not None
-        and isinstance(peer_with_item.context_expr, ast.Call)
-        else None
+    peer_submit_assign = None
+    for node in ast.walk(chip_orch):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Tuple)
+            and len(node.targets[0].elts) == 2
+            and isinstance(node.targets[0].elts[1], ast.Name)
+            and node.targets[0].elts[1].id == "peer_pull_tid"
+            and isinstance(node.value, ast.Call)
+            and _dotted_name(node.value.func) == "pl.spmd_submit"
+        ):
+            peer_submit_assign = node
+            break
+    peer_submit = peer_submit_assign.value if peer_submit_assign else None
+    peer_core_num = _keyword(peer_submit, "core_num") if peer_submit else None
+    peer_kernel = (
+        _dotted_name(peer_submit.args[0])
+        if peer_submit and peer_submit.args else None
     )
-    peer_task_name = (
-        peer_with_item.optional_vars.id
-        if peer_with_item is not None
-        and isinstance(peer_with_item.optional_vars, ast.Name)
-        else None
-    )
-    peer_extent_ok = bool(
-        peer_call
-        and peer_call.args
-        and isinstance(peer_call.args[0], ast.Name)
-        and peer_call.args[0].id == "N_RANKS"
-    )
+    peer_worker = methods.get("_peer_pull_worker")
     has_peer_block_id = bool(
-        peer_with_node
+        peer_worker
         and any(
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
@@ -432,18 +432,19 @@ def _source_contract() -> dict[str, Any]:
             and node.targets[0].id == "peer"
             and isinstance(node.value, ast.Call)
             and _dotted_name(node.value.func) == "pl.tile.get_block_idx"
-            for node in ast.walk(peer_with_node)
+            for node in ast.walk(peer_worker)
         )
     )
     checks.append(
         _check(
             "orchestration_spmd_peer_fanout",
-            peer_extent_ok
-            and peer_task_name == "peer_pull_tid"
+            peer_kernel == "self._peer_pull_worker"
+            and _dotted_name(peer_core_num) == "N_RANKS"
             and has_peer_block_id,
             (
-                "c3_peer_pull is an N_RANKS grid captured as peer_pull_tid; "
-                "peer comes from pl.tile.get_block_idx()"
+                "chip_orch captures peer_pull_tid from "
+                "pl.spmd_submit(self._peer_pull_worker, core_num=N_RANKS); "
+                "the worker derives peer from pl.tile.get_block_idx()"
             ),
         )
     )
@@ -473,40 +474,33 @@ def _source_contract() -> dict[str, Any]:
         )
     )
 
-    peer_gets = (
-        _calls(peer_with_node, "pld.tensor.get")
-        if peer_with_node is not None
-        else []
-    )
-    peer_stores = (
-        _calls(peer_with_node, "pl.store")
-        if peer_with_node is not None
-        else []
-    )
+    worker_gets = _calls(peer_worker, "pld.tensor.get") if peer_worker else []
+    worker_stores = _calls(peer_worker, "pl.store") if peer_worker else []
     remote_disjoint = any(
-        call.args
-        and _dotted_name(call.args[0]) == "peer_slab"
-        and _is_peer_major_base(_offset_first(call))
-        for call in peer_gets
+        _is_peer_major_base(_offset_first(call))
+        for call in worker_gets
         if _offset_first(call) is not None
     )
     local_disjoint = any(
-        _store_target(call) == "peer_slab"
+        _store_target(call) == "peer_slab_out"
         and _is_peer_major_row(_offset_first(call))
-        for call in peer_stores
+        for call in worker_stores
         if _offset_first(call) is not None
     )
-    peer_writes_moe_out = bool(
-        peer_with_node and _writes_symbol(peer_with_node, "moe_out")
+    worker_writes_moe_out = bool(
+        peer_worker and _writes_symbol(peer_worker, "moe_out")
     )
     checks.append(
         _check(
             "write_disjoint_peer_tasks",
-            remote_disjoint and local_disjoint and not peer_writes_moe_out,
+            _function_type(peer_worker) == "pl.FunctionType.InCore"
+            and remote_disjoint
+            and local_disjoint
+            and not worker_writes_moe_out,
             (
-                "remote and self-peer paths write only "
-                "peer_slab[peer * TOKENS + token, :]; peer tasks do not "
-                "write moe_out"
+                "peer worker block `peer` writes only rows "
+                "[peer*TOKENS,(peer+1)*TOKENS) of the peer-major slab in "
+                "both remote and self paths, and never writes moe_out"
             ),
         )
     )
@@ -517,60 +511,69 @@ def _source_contract() -> dict[str, Any]:
         dotted="pl.system.task_dummy",
     )
     join_deps = _name_list(_keyword(join_call, "deps")) if join_call else None
-    reduce_with = _spmd_with(chip_orch, name_hint="c3_token_reduce")
-    reduce_node = reduce_with[0] if reduce_with else None
-    reduce_item = reduce_with[1] if reduce_with else None
-    reduce_call = (
-        reduce_item.context_expr
-        if reduce_item is not None
-        and isinstance(reduce_item.context_expr, ast.Call)
-        else None
-    )
-    reduce_deps = _name_list(_keyword(reduce_call, "deps")) if reduce_call else None
-    reduce_extent_ok = bool(
-        reduce_call
-        and reduce_call.args
-        and _dotted_name(reduce_call.args[0]) == "TOKENS"
-    )
+    reduce_submit = None
+    for node in ast.walk(chip_orch):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Tuple)
+            and isinstance(node.value, ast.Call)
+            and _dotted_name(node.value.func) == "pl.spmd_submit"
+            and node.value.args
+            and _dotted_name(node.value.args[0])
+            == "self._token_reduce_worker"
+        ):
+            reduce_submit = node.value
+            break
+    reduce_deps = _name_list(_keyword(reduce_submit, "deps")) if reduce_submit else None
+    reduce_core_num = _keyword(reduce_submit, "core_num") if reduce_submit else None
     checks.append(
         _check(
             "grid_taskid_explicit_join",
             join_deps == ["peer_pull_tid"]
             and reduce_deps == ["peer_pull_join"]
-            and reduce_extent_ok,
+            and _dotted_name(reduce_core_num) == "TOKENS",
             (
                 "peer_pull_tid -> task_dummy peer_pull_join -> "
-                "TOKENS reduction grid"
+                "spmd_submit token reducer"
             ),
         )
     )
 
-    reduce_stores = _calls(reduce_node, "pl.store") if reduce_node else []
-    output_write_sites = _write_sites(chip_orch, "moe_out")
+    reducer = methods.get("_token_reduce_worker")
     reduction_reads_slab = bool(
-        reduce_node
+        reducer
         and any(
             call.args
             and _dotted_name(call.args[0]) == "peer_slab"
-            for call in _calls(reduce_node, "pl.load")
+            for call in _calls(reducer, "pl.load")
         )
     )
-    token_output_write = any(
-        _store_target(call) == "moe_out"
-        and isinstance(_offset_first(call), ast.Name)
-        and _offset_first(call).id == "token"
-        for call in reduce_stores
-        if _offset_first(call) is not None
+    token_output_write = bool(
+        reducer
+        and any(
+            _store_target(call) == "moe_out"
+            and isinstance(_offset_first(call), ast.Name)
+            and _offset_first(call).id == "token"
+            for call in _calls(reducer, "pl.store")
+            if _offset_first(call) is not None
+        )
     )
+    output_writer_methods = [
+        method.name
+        for method in methods.values()
+        if _writes_symbol(method, "moe_out")
+    ]
     checks.append(
         _check(
             "peer_pull_then_token_reduction",
-            reduction_reads_slab
+            reduce_submit is not None
+            and reduction_reads_slab
             and token_output_write
-            and len(output_write_sites) == 1,
+            and output_writer_methods == ["_token_reduce_worker"],
             (
-                "the joined token grid reads peer_slab and is the sole "
-                "writer of moe_out[token, :]"
+                "the joined token-grid submit calls one reducer worker; it "
+                "reads peer_slab and is the sole writer of moe_out[token, :]"
             ),
         )
     )
@@ -1200,122 +1203,168 @@ def _build_program() -> Any:
 
     @pl.program
     class C3PeerFanoutProbe:
+        @pl.function(type=pl.FunctionType.InCore)
+        def _publish_worker(
+            self,
+            local_routes: pl.Tensor[[TOKENS, HIDDEN], pl.BF16],
+            peer_routes: pl.InOut[
+                pld.DistributedTensor[[TOKENS, HIDDEN], pl.BF16]
+            ],
+            publish_token_out: pl.Out[pl.Tensor[[TOKENS], pl.INT32]],
+        ) -> pl.Tensor[[TOKENS], pl.INT32]:
+            token = pl.tile.get_block_idx()
+            route_row = pl.load(
+                local_routes, [token, 0], [1, HIDDEN],
+            )
+            pl.store(route_row, [token, 0], peer_routes)
+            pl.write(publish_token_out, [token], pl.cast(1, pl.INT32))
+            return publish_token_out
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _ready_worker(
+            self,
+            ready: pl.InOut[
+                pld.DistributedTensor[[N_RANKS, 1], pl.INT32]
+            ],
+            ready_token_out: pl.Out[pl.Tensor[[1], pl.INT32]],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[1], pl.INT32]:
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=ready,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for source_peer in pl.range(N_RANKS):
+                if source_peer != my_rank:
+                    pld.system.wait(
+                        signal=ready,
+                        offsets=[source_peer, 0],
+                        expected=1,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+            pl.write(ready_token_out, [0], pl.cast(1, pl.INT32))
+            return ready_token_out
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _peer_pull_worker(
+            self,
+            peer_routes: pl.InOut[
+                pld.DistributedTensor[[TOKENS, HIDDEN], pl.BF16]
+            ],
+            peer_slab_out: pl.Out[
+                pl.Tensor[[N_RANKS * TOKENS, HIDDEN], pl.BF16]
+            ],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[N_RANKS * TOKENS, HIDDEN], pl.BF16]:
+            peer = pl.tile.get_block_idx()
+            if peer == my_rank:
+                for token in pl.range(TOKENS):
+                    self_row = pl.load(
+                        peer_routes, [token, 0], [1, HIDDEN],
+                    )
+                    pl.store(
+                        self_row,
+                        [peer * TOKENS + token, 0],
+                        peer_slab_out,
+                    )
+            else:
+                pld.tensor.get(
+                    peer_slab_out,
+                    peer=peer,
+                    src=peer_routes,
+                    dst_offsets=[peer * TOKENS, 0],
+                    src_offsets=[0, 0],
+                    shape=[TOKENS, HIDDEN],
+                )
+            return peer_slab_out
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def _token_reduce_worker(
+            self,
+            peer_slab: pl.Tensor[
+                [N_RANKS * TOKENS, HIDDEN], pl.BF16
+            ],
+            moe_out: pl.Out[pl.Tensor[[TOKENS, HIDDEN], pl.BF16]],
+        ) -> pl.Tensor[[TOKENS, HIDDEN], pl.BF16]:
+            token = pl.tile.get_block_idx()
+            acc = pl.cast(
+                pl.load(peer_slab, [token, 0], [1, HIDDEN]),
+                target_type=pl.FP32,
+            )
+            for peer in pl.range(1, N_RANKS):
+                peer_row = pl.load(
+                    peer_slab,
+                    [peer * TOKENS + token, 0],
+                    [1, HIDDEN],
+                )
+                acc = pl.add(
+                    acc,
+                    pl.cast(peer_row, target_type=pl.FP32),
+                )
+            pl.store(
+                pl.cast(acc, target_type=pl.BF16, mode="rint"),
+                [token, 0],
+                moe_out,
+            )
+            return moe_out
+
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_orch(
             self,
             local_routes: pl.Tensor[[TOKENS, HIDDEN], pl.BF16],
             moe_out: pl.Out[pl.Tensor[[TOKENS, HIDDEN], pl.BF16]],
-            peer_routes: pld.DistributedTensor[
-                [TOKENS, HIDDEN], pl.BF16
+            peer_routes: pl.InOut[
+                pld.DistributedTensor[[TOKENS, HIDDEN], pl.BF16]
             ],
-            ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+            ready: pl.InOut[
+                pld.DistributedTensor[[N_RANKS, 1], pl.INT32]
+            ],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[TOKENS, HIDDEN], pl.BF16]:
-            # Publish this rank's complete token slab. The captured grid
-            # TaskId is a real data-production edge into the readiness task.
-            with pl.spmd(
-                TOKENS,
-                name_hint="c3_publish_local_routes",
-            ) as publish_tid:
-                token = pl.tile.get_block_idx()
-                route_row = pl.load(
-                    local_routes, [token, 0], [1, HIDDEN],
+            with pl.manual_scope():
+                publish_token = pl.create_tensor(
+                    [TOKENS], dtype=pl.INT32,
                 )
-                pl.store(route_row, [token, 0], peer_routes)
-
-            # Cross-rank readiness is distinct from the grid join. It ensures
-            # every peer window is populated before any TGET starts.
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="c3_peer_ready",
-                deps=[publish_tid],
-            ) as ready_tid:
-                for peer in pl.range(N_RANKS):
-                    if peer != my_rank:
-                        pld.system.notify(
-                            target=ready,
-                            peer=peer,
-                            offsets=[my_rank, 0],
-                            value=1,
-                            op=pld.NotifyOp.AtomicAdd,
-                        )
-                for source_peer in pl.range(N_RANKS):
-                    if source_peer != my_rank:
-                        pld.system.wait(
-                            signal=ready,
-                            offsets=[source_peer, 0],
-                            expected=1,
-                            cmp=pld.WaitCmp.Ge,
-                        )
-
-            # Peer-major local GM slab. Grid block `peer` owns exactly rows
-            # [peer * TOKENS, (peer + 1) * TOKENS), so all writers are
-            # disjoint even though the peer pulls execute concurrently.
-            peer_slab = pl.create_tensor(
-                [N_RANKS * TOKENS, HIDDEN],
-                dtype=pl.BF16,
-            )
-            with pl.spmd(
-                N_RANKS,
-                name_hint="c3_peer_pull",
-                deps=[ready_tid],
-            ) as peer_pull_tid:
-                peer = pl.tile.get_block_idx()
-                if peer == my_rank:
-                    for token in pl.range(TOKENS):
-                        self_row = pl.load(
-                            peer_routes, [token, 0], [1, HIDDEN],
-                        )
-                        pl.store(
-                            self_row,
-                            [peer * TOKENS + token, 0],
-                            peer_slab,
-                        )
-                else:
-                    pld.tensor.get(
-                        peer_slab,
-                        peer=peer,
-                        src=peer_routes,
-                        dst_offsets=[peer * TOKENS, 0],
-                        src_offsets=[0, 0],
-                        shape=[TOKENS, HIDDEN],
-                    )
-
-            # A grid TaskId represents the whole peer fan-out. Materialize an
-            # explicit join before the token consumers; no fake tensor edge.
-            peer_pull_join = pl.system.task_dummy(deps=[peer_pull_tid])
-
-            # One task owns one output token. Peer rows are consumed only
-            # after the explicit grid join, so peer tasks never race on
-            # moe_out and no shared [1,HIDDEN] staging row is needed.
-            with pl.spmd(
-                TOKENS,
-                name_hint="c3_token_reduce",
-                deps=[peer_pull_join],
-            ) as token_reduce_tid:
-                token = pl.tile.get_block_idx()
-                acc = pl.cast(
-                    pl.load(peer_slab, [token, 0], [1, HIDDEN]),
-                    target_type=pl.FP32,
+                publish_token, publish_tid = pl.spmd_submit(
+                    self._publish_worker,
+                    local_routes,
+                    peer_routes,
+                    publish_token,
+                    core_num=TOKENS,
                 )
-                for peer in pl.range(1, N_RANKS):
-                    peer_row = pl.load(
-                        peer_slab,
-                        [peer * TOKENS + token, 0],
-                        [1, HIDDEN],
-                    )
-                    acc = pl.add(
-                        acc,
-                        pl.cast(peer_row, target_type=pl.FP32),
-                    )
-                pl.store(
-                    pl.cast(
-                        acc,
-                        target_type=pl.BF16,
-                        mode="rint",
-                    ),
-                    [token, 0],
+                ready_token = pl.create_tensor([1], dtype=pl.INT32)
+                ready_token, ready_tid = pl.submit(
+                    self._ready_worker,
+                    ready,
+                    ready_token,
+                    my_rank,
+                    deps=[publish_tid],
+                )
+                peer_slab = pl.create_tensor(
+                    [N_RANKS * TOKENS, HIDDEN],
+                    dtype=pl.BF16,
+                )
+                peer_slab, peer_pull_tid = pl.spmd_submit(
+                    self._peer_pull_worker,
+                    peer_routes,
+                    peer_slab,
+                    my_rank,
+                    core_num=N_RANKS,
+                    deps=[ready_tid],
+                )
+                peer_pull_join = pl.system.task_dummy(
+                    deps=[peer_pull_tid],
+                )
+                moe_out, _ = pl.spmd_submit(
+                    self._token_reduce_worker,
+                    peer_slab,
                     moe_out,
+                    core_num=TOKENS,
+                    deps=[peer_pull_join],
                 )
             return moe_out
 

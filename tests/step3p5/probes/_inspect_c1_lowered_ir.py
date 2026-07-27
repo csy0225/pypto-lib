@@ -132,7 +132,7 @@ _CANONICAL_SIGNAL_SLOT_SPECS = {
         "backing": "moe_combine_arrived_stack_buf", "slot_kind": "reused",
         "extent": None, "protocol": "combine_arrival",
         "consumers": ("combine_step",),
-        "binding_needles": ("combine_arrived", "recv_route_compact, routed_y_buf"),
+        "binding_needles": ("combine_arrived", "local_route, routed_y_buf"),
     },
 }
 _CANONICAL_SIGNAL_PROTOCOL_FUNCTIONS = {

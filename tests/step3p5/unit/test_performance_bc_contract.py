@@ -216,8 +216,8 @@ def test_c3_combine_owns_scatter_wait_and_plain_fp32_reduce() -> None:
     assert names == [
         "local_routed_y", "sh_y", "moe_out",
         "combine_arrived", "local_route", "routed_y_buf",
-        "local_expert_count", "local_expert_offset", "num_tokens",
-        "my_rank", "moe_epoch",
+        "local_expert_count", "local_expert_offset", "recv_meta_local",
+        "num_tokens", "my_rank", "moe_epoch",
     ]
     body = _segment(source, function)
     assert 'name_hint="combine_scatter"' in body

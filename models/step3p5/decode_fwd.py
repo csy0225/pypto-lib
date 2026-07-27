@@ -1802,6 +1802,7 @@ class WholeDecodeStep3p5:
         ],
         local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
         local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
+        recv_meta_local: pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
         moe_epoch: pl.Scalar[pl.INT32],
@@ -1815,24 +1816,29 @@ class WholeDecodeStep3p5:
             compact_base = pl.cast(
                 pl.read(local_expert_offset, [e]), pl.INDEX,
             )
-            count = pl.cast(pl.read(local_expert_count, [e]), pl.INDEX)
-            for row in pl.range(count):
-                compact_row = compact_base + row
-                packed_route = pl.read(local_route, [compact_row])
-                dst = packed_route // pl.cast(n_routes_per_rank, pl.INT32)
-                route = pl.cast(
-                    packed_route
-                    - dst * pl.cast(n_routes_per_rank, pl.INT32),
-                    pl.INDEX,
+            # ``local_route`` is the V4 route id (token * TOPK + k), not a
+            # packed source-rank route.  Preserve source provenance from the
+            # dispatch lane: compact rows are [expert, source, slot], and
+            # recv_meta_local supplies the exact source prefix for each lane.
+            compact_prefix = pl.cast(0, pl.INDEX)
+            for src in pl.range(n_ranks):
+                src_count = pl.cast(
+                    pl.read(recv_meta_local, [src, e]), pl.INDEX,
                 )
-                pld.tensor.put(
-                    dst=routed_y_buf,
-                    peer=dst,
-                    src=local_routed_y,
-                    dst_offsets=[route, 0],
-                    src_offsets=[compact_row, 0],
-                    shape=[1, HIDDEN],
-                )
+                for slot in pl.range(src_count):
+                    compact_row = compact_base + compact_prefix + slot
+                    route = pl.cast(
+                        pl.read(local_route, [compact_row]), pl.INDEX,
+                    )
+                    pld.tensor.put(
+                        dst=routed_y_buf,
+                        peer=src,
+                        src=local_routed_y,
+                        dst_offsets=[route, 0],
+                        src_offsets=[compact_row, 0],
+                        shape=[1, HIDDEN],
+                    )
+                compact_prefix = compact_prefix + src_count
             for peer in pl.range(n_ranks):
                 if peer != my_rank:
                     pld.system.notify(
@@ -2102,7 +2108,7 @@ class WholeDecodeStep3p5:
             moe_out,
             combine_arrived,
             local_route, routed_y_buf,
-            local_expert_count, local_expert_offset,
+            local_expert_count, local_expert_offset, recv_meta_local,
             num_tokens, my_rank, moe_epoch,
         )
 
@@ -2337,7 +2343,7 @@ class WholeDecodeStep3p5:
             moe_out,
             combine_arrived,
             local_route, routed_y_buf,
-            local_expert_count, local_expert_offset,
+            local_expert_count, local_expert_offset, recv_meta_local,
             num_tokens, my_rank, moe_epoch,
         )
 
@@ -3245,7 +3251,7 @@ class WholeDecodeStep3p5:
             moe_out,
             combine_arrived,
             local_route, routed_y_buf,
-            local_expert_count, local_expert_offset,
+            local_expert_count, local_expert_offset, recv_meta_local,
             num_tokens, my_rank, moe_epoch,
         )
 
@@ -3475,7 +3481,7 @@ class WholeDecodeStep3p5:
             moe_out,
             combine_arrived,
             local_route, routed_y_buf,
-            local_expert_count, local_expert_offset,
+            local_expert_count, local_expert_offset, recv_meta_local,
             num_tokens, my_rank, moe_epoch,
         )
 

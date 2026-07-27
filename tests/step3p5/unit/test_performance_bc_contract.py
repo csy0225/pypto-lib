@@ -358,7 +358,7 @@ def test_g1_threads_runtime_active_tokens_through_moe_and_holder() -> None:
     assert "NUM_TOKENS_STORAGE_I32" in source
     assert "NUM_TOKENS_STORAGE_I32 = COMM_SIGNAL_STRIDE_I32" not in source
     for name in (
-        "_gate", "_quant_moe_input", "dispatch_step", "combine_step",
+        "_gate", "_norm_quant_moe_input", "dispatch_step", "combine_step",
         "full_moe_chip_orch", "swa_moe_chip_orch",
         "full_moe_chip_orch_swiglu7_swiglu16",
         "swa_moe_chip_orch_swiglu7_silu",

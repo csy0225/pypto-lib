@@ -736,118 +736,6 @@ class WholeDecodeStep3p5:
                 pl.cast(prev_off + prev_cnt, pl.INT32),
             )
 
-    @pl.function(type=pl.FunctionType.Inline)
-    def _build_inverse_map(
-        self,
-        indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
-        pub_counts: pld.DistributedTensor[
-            [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
-        ],
-        inverse_map: pl.Tensor[[BATCH, TOPK], pl.INT32],
-        my_rank: pl.Scalar[pl.INT32],
-    ):
-        """Encode (dst_rank, dst_row_in_recv_buf) into one INT32 per (t,k)."""
-        cursor = pl.create_tensor(
-            [per_rank_buckets], dtype=pl.INT32,
-        )
-        for bkt in pl.range(per_rank_buckets):
-            pl.write(cursor, [bkt], pl.cast(0, pl.INT32))
-
-        for t in pl.range(BATCH):
-            for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
-                dst = eid // n_local_experts
-                loc_e = eid - dst * n_local_experts
-                bkt = dst * n_local_experts + loc_e
-
-                src_off = pl.cast(0, pl.INT32)
-                for s in pl.range(n_ranks):
-                    if s < my_rank:
-                        src_off = src_off + pl.read(
-                            pub_counts, [s * n_ranks + dst, loc_e],
-                        )
-
-                loc_e_off = pl.cast(0, pl.INT32)
-                for prev_e in pl.range(n_local_experts):
-                    if prev_e < loc_e:
-                        for s in pl.range(n_ranks):
-                            loc_e_off = loc_e_off + pl.read(
-                                pub_counts,
-                                [s * n_ranks + dst, prev_e],
-                            )
-
-                my_cursor_val = pl.read(cursor, [bkt])
-                dst_row = loc_e_off + src_off + my_cursor_val
-                packed = (
-                    dst * pl.cast(local_recv_max, pl.INT32) + dst_row
-                )
-                pl.write(inverse_map, [t, k], pl.cast(packed, pl.INT32))
-                pl.write(
-                    cursor, [bkt],
-                    pl.cast(my_cursor_val + 1, pl.INT32),
-                )
-
-    @pl.function(type=pl.FunctionType.InCore)
-    def _quant_moe_input(
-        self,
-        x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        x_i8_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.INT8]],
-        x_scale_out: pl.Out[pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32]],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > BATCH:
-            active_tokens = pl.cast(BATCH, pl.INDEX)
-        # Keep the proven 16-row vector tile but attach a runtime valid shape.
-        # This avoids the 1-row UB/alignment path while suppressing inactive
-        # rows in the vector quant chain.
-        q_amax = pl.full([1, BATCH], dtype=pl.FP32, value=1e-4)
-        for qab in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
-            qa0 = qab * ROUTED_GATE_K_CHUNK
-            qac = pl.cast(
-                pl.slice(
-                    x,
-                    [BATCH, ROUTED_GATE_K_CHUNK],
-                    [0, qa0],
-                    valid_shape=[active_tokens, ROUTED_GATE_K_CHUNK],
-                ),
-                target_type=pl.FP32,
-            )
-            q_amax = pl.maximum(
-                q_amax,
-                pl.reshape(
-                    pl.row_max(pl.maximum(qac, pl.neg(qac))), [1, BATCH],
-                ),
-            )
-        q_inv_row = pl.div(
-            pl.full([1, BATCH], dtype=pl.FP32, value=127.0), q_amax,
-        )
-        q_inv = pl.reshape(q_inv_row, [BATCH, 1])
-        q_scale = pl.reshape(pl.recip(q_inv_row), [BATCH, 1])
-        x_scale_out[0:BATCH, 0:1] = q_scale
-        for qnb in pl.range(HIDDEN // ROUTED_GATE_K_CHUNK):
-            qn0 = qnb * ROUTED_GATE_K_CHUNK
-            qch = pl.cast(
-                pl.slice(
-                    x,
-                    [BATCH, ROUTED_GATE_K_CHUNK],
-                    [0, qn0],
-                    valid_shape=[active_tokens, ROUTED_GATE_K_CHUNK],
-                ),
-                target_type=pl.FP32,
-            )
-            qq = pl.cast(
-                pl.row_expand_mul(qch, q_inv),
-                target_type=pl.INT32, mode="rint",
-            )
-            qf = pl.cast(qq, target_type=pl.FP16, mode="round")
-            qi8 = pl.cast(qf, target_type=pl.INT8, mode="trunc")
-            x_i8_out[0:BATCH, qn0 : qn0 + ROUTED_GATE_K_CHUNK] = qi8
-        return x_i8_out, x_scale_out
-
-
     @pl.function(type=pl.FunctionType.InCore)
     def _norm_quant_moe_input(
         self,
@@ -3551,9 +3439,12 @@ class WholeDecodeStep3p5:
         num_tokens_per_owner: pl.Tensor[[NUM_TOKENS_STORAGE_I32], pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ):
-        # G1 runtime active-token ABI.  Every owner publishes its number of
-        # real decode rows; all ranks use the same max so dynamic MoE loop
-        # bounds and communication counts remain rank-symmetric.
+        # G1 packed-global batch contract: the holder writes the same active
+        # row count to every TP owner and replicates valid rows/metadata.  The
+        # owner vector is retained for the runtime ABI and diagnostics; taking
+        # its max does not make owner-local heterogeneous rows valid.  All
+        # active rows [0:num_tokens) must therefore be initialized on every
+        # rank before attention/KV/MoE execution.
         num_tokens = pl.cast(0, pl.INT32)
         for owner_rank in pl.range(n_ranks):
             num_tokens = pl.max(

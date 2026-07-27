@@ -69,19 +69,19 @@ _SIGNAL_WORDS = (
 )
 _TOKEN_WORDS = ("active_token", "notify_token", "reuse_token", "token")
 _EP_DATA_WORDS = (
-    "pub_counts",
+    "recv_meta",
     "recv_x",
-    "recv_scale",
-    "send_x",
-    "send_scale",
-    "routed_src",
-    "routed_y",
-    "routed_x",
+    "recv_aux",
+    "recv_route",
+    "meta_arrived",
+    "data_arrived",
+    "combine_arrived",
+    "recv_meta_local",
+    "local_route",
     "local_routed",
-    "route_stage",
+    "routed_y_buf",
     "expert_indices",
     "expert_weights",
-    "inverse_map",
 )
 _WAIT_WORDS = (
     "_wait_",

@@ -603,139 +603,7 @@ class WholeDecodeStep3p5:
         )
         return expert_indices, expert_weights
 
-    # ---------- Stage 2: dispatch (EP all-to-all) ----------
-    @pl.function(type=pl.FunctionType.Inline)
-    def _histogram_and_prefix_sum(
-        self,
-        indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
-        send_counts_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
-        send_counts_per_rank: pl.Tensor[[n_ranks], pl.INT32],
-        send_offsets_per_rank: pl.Tensor[[n_ranks], pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        """Local histogram + per-rank prefix-sum prelude."""
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > BATCH:
-            active_tokens = pl.cast(BATCH, pl.INDEX)
-        for bkt in pl.range(per_rank_buckets):
-            pl.write(
-                send_counts_per_bucket, [bkt], pl.cast(0, pl.INT32),
-            )
-        for r in pl.range(n_ranks):
-            pl.write(
-                send_counts_per_rank, [r], pl.cast(0, pl.INT32),
-            )
-
-        for t in pl.range(active_tokens):
-            for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
-                dst = eid // n_local_experts
-                loc_e = eid - dst * n_local_experts
-                bkt = dst * n_local_experts + loc_e
-                cur = pl.read(send_counts_per_bucket, [bkt])
-                pl.write(
-                    send_counts_per_bucket, [bkt],
-                    pl.cast(cur + 1, pl.INT32),
-                )
-                r_cur = pl.read(send_counts_per_rank, [dst])
-                pl.write(
-                    send_counts_per_rank, [dst],
-                    pl.cast(r_cur + 1, pl.INT32),
-                )
-
-        pl.write(send_offsets_per_rank, [0], pl.cast(0, pl.INT32))
-        for r in pl.range(1, n_ranks):
-            prev_off = pl.read(send_offsets_per_rank, [r - 1])
-            prev_cnt = pl.read(send_counts_per_rank, [r - 1])
-            pl.write(
-                send_offsets_per_rank, [r],
-                pl.cast(prev_off + prev_cnt, pl.INT32),
-            )
-
-    @pl.function(type=pl.FunctionType.Inline)
-    def _pack_send_payload(
-        self,
-        x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
-        send_counts_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
-        send_offsets_per_rank: pl.Tensor[[n_ranks], pl.INT32],
-        send_buf: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
-        cursor_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
-        bucket_offset: pl.Tensor[[per_rank_buckets], pl.INT32],
-    ):
-        """Pack outgoing tokens into ``send_buf`` ordered by (dst, loc_e)."""
-        for r in pl.range(n_ranks):
-            rank_off = pl.read(send_offsets_per_rank, [r])
-            pl.write(
-                bucket_offset, [r * n_local_experts],
-                pl.cast(rank_off, pl.INT32),
-            )
-            pl.write(
-                cursor_per_bucket, [r * n_local_experts],
-                pl.cast(rank_off, pl.INT32),
-            )
-            for e in pl.range(1, n_local_experts):
-                prev_off = pl.read(
-                    bucket_offset, [r * n_local_experts + e - 1],
-                )
-                prev_cnt = pl.read(
-                    send_counts_per_bucket,
-                    [r * n_local_experts + e - 1],
-                )
-                new_off = pl.cast(prev_off + prev_cnt, pl.INT32)
-                pl.write(
-                    bucket_offset, [r * n_local_experts + e], new_off,
-                )
-                pl.write(
-                    cursor_per_bucket, [r * n_local_experts + e],
-                    new_off,
-                )
-
-        for t in pl.range(BATCH):
-            for k in pl.range(TOPK):
-                eid = pl.read(indices, [t, k])
-                dst = eid // n_local_experts
-                loc_e = eid - dst * n_local_experts
-                bkt = dst * n_local_experts + loc_e
-                slot_i32 = pl.read(cursor_per_bucket, [bkt])
-                slot = pl.cast(slot_i32, pl.INDEX)
-                x_tile = pl.load(x, [t, 0], [1, HIDDEN])
-                pl.store(x_tile, [slot, 0], send_buf)
-                pl.write(
-                    cursor_per_bucket, [bkt],
-                    pl.cast(slot_i32 + 1, pl.INT32),
-                )
-
-    @pl.function(type=pl.FunctionType.Inline)
-    def _build_local_expert_csr(
-        self,
-        pub_counts: pld.DistributedTensor[
-            [n_ranks * n_ranks, n_local_experts_pad], pl.INT32
-        ],
-        local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
-        my_rank: pl.Scalar[pl.INT32],
-    ):
-        """Receiver-side CSR: scan pub_counts for my dst slot."""
-        for e in pl.range(n_local_experts):
-            acc = pl.cast(0, pl.INT32)
-            for s in pl.range(n_ranks):
-                acc = acc + pl.read(
-                    pub_counts, [s * n_ranks + my_rank, e],
-                )
-            pl.write(local_expert_count, [e], pl.cast(acc, pl.INT32))
-
-        pl.write(local_expert_offset, [0], pl.cast(0, pl.INT32))
-        for e in pl.range(1, n_local_experts):
-            prev_off = pl.read(local_expert_offset, [e - 1])
-            prev_cnt = pl.read(local_expert_count, [e - 1])
-            pl.write(
-                local_expert_offset, [e],
-                pl.cast(prev_off + prev_cnt, pl.INT32),
-            )
-
+    # ---------- Stage 2: V4-Flash norm/quant + expert-lane dispatch ----------
     @pl.function(type=pl.FunctionType.InCore)
     def _norm_quant_moe_input(
         self,
@@ -3552,11 +3420,14 @@ class WholeDecodeStep3p5:
         # layer_idx % 4 == 1. DeepSeek decode_layer.py:201-226 proves pypto
         # supports runtime `if`/`elif` on a loop scalar dispatching to different
         # chip_orch methods — we mirror that here.
-        # C1 protocol: EP dispatch/combine reuse one window set. A 1-based
-        # moe_epoch drives ready/read-complete waits at 2e-1/2e, preventing a
-        # fast rank from overwriting producer-owned send_*/routed_src while a
-        # slow peer still reads the previous layer. Attention/shared TP
-        # all-reduce scratch remains per-layer with fixed expected=1/2.
+        # C1 protocol: EP dispatch/combine reuse one V4-Flash-style window
+        # set across MoE epochs. ``moe_epoch`` tags metadata, payload, and
+        # combine arrival lineages; a slot is reusable only after its final
+        # semantic consumer from the previous epoch has completed. This is
+        # distinct from the per-layer attention/shared TP all-reduce scratch,
+        # whose expected count remains fixed at 1/2. The 512B stride is only a
+        # step3p5 backend/profile isolation for stacked/reused control slots,
+        # not a general DeepSeek signal/window ABI.
         for layer_idx in pl.range(NUM_MOE_LAYERS):
             phys_layer = layer_idx + 3
             norm_layer_idx = pl.cast(phys_layer, pl.INT32)

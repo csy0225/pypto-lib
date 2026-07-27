@@ -164,7 +164,7 @@ dispatch_recv_per_expert = n_ranks * dispatch_max_per_src
 dispatch_lane_rows = n_local_experts * dispatch_recv_per_expert
 DISPATCH_SCALE_COLS = 8
 dispatch_weight_col = DISPATCH_SCALE_COLS
-dispatch_aux_pad = DISPATCH_SCALE_COLS + 1
+dispatch_aux_pad = 16  # 64B physical row; logical cols 0..8
 inter = MOE_INTERMEDIATE
 sh_inter_local = INTER_S_LOCAL
 local_recv_max = LOCAL_RECV_MAX  # 1024 compact expert capacity
@@ -892,8 +892,10 @@ class WholeDecodeStep3p5:
     ]:
         """V4-Flash dispatch ABI; combine conversion is intentionally separate.
 
-        ``recv_aux`` reserves columns 0..7 for the complete quant scale row and
-        column 8 for the route weight. ``recv_route`` carries ``t * TOPK + k``.
+        ``recv_aux`` reserves logical columns 0..7 for the complete quant scale
+        row and column 8 for the route weight. Columns 9..15 are physical
+        padding for the current PTOAS 32-byte row-alignment ABI; they carry
+        no model semantics. ``recv_route`` carries ``t * TOPK + k``.
         Physical lane capacity remains static while every token loop is bounded
         by the clamped runtime ``num_tokens`` value.
         """

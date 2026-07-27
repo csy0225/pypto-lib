@@ -1,19 +1,20 @@
-"""Canonical Step3.5 hidden-only whole-net decode program.
+"""Canonical whole-net Step3.5 decode program.
 
-The 45-layer graph keeps L0/L43/L44 explicit and expresses the repeated
-L1-L2 and L3-L42 bodies with runtime ``pl.range`` loops over resident,
-leading-dimension weight/KV views.  K/V are ``pl.InOut`` tensors owned by the
-long-lived holder, so every decode dispatch updates the imported vLLM pool in
-place rather than copying or replacing it.
+The 45-layer graph uses runtime ``pl.range`` loops over resident leading-
+dimension weight/KV views.  Physical tensor shapes are compile-time capacity;
+``num_tokens_per_owner`` supplies the runtime active-row bound.
 
-MoE uses the fixed-slot pull protocol.  Dispatch/combine EP windows are one
-shared set across all 42 MoE calls and are protected by a 1-based
-``moe_epoch`` double-wave rendezvous: producer-ready waits at ``2e-1`` and
-remote-read-complete waits at ``2e``, always ``AtomicAdd`` + ``WaitCmp.Ge``.
-Attention/shared TP all-reduce scratch deliberately remains per-layer because
-its independent two-wave protocol still uses fixed thresholds 1/2.  InCore
-loops remain sequential; C3 peer-loop fan-out must be implemented at an
-orchestration/SPMD boundary rather than by placing ``pl.parallel`` in InCore.
+MoE communication is being unified with the DeepSeek V4-Flash baseline:
+local-expert-lane dispatch push/gather, independent metadata/payload arrivals,
+combine scatter/arrival, and token-level FP32 reduction.  EP data windows are
+one shared set across all 42 MoE calls and use a monotonic 1-based
+``moe_epoch``.  The fixed-slot pull helpers still present below are migration
+source only, not the target ABI; their ready/read-complete double wave must not
+be retained after the V4-Flash arrival lineages land.
+
+Attention/shared TP all-reduce scratch remains independent from EP windows.
+Its peer order, single FP32 accumulator, and final one-time BF16 store are not
+part of the MoE communication migration.
 """
 
 from __future__ import annotations

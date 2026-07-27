@@ -62,8 +62,9 @@ C1_MANIFEST_NAME = "c1_build_manifest.json"
 _SIGNAL_WORDS = (
     "signal",
     "sig",
-    "count_done",
-    "combine_done",
+    "meta_arrived",
+    "data_arrived",
+    "combine_arrived",
     "arrived",
 )
 _TOKEN_WORDS = ("active_token", "notify_token", "reuse_token", "token")
@@ -92,103 +93,54 @@ _WAIT_WORDS = (
 )
 _CANONICAL_SIGNAL_SLOT_SPECS = {
     "dense_attn_signal_stack": {
-        "backing": "dense_attn_signal_stack_buf",
-        "slot_kind": "stacked",
-        "extent": "NUM_DENSE_LAYERS",
-        "protocol": "tp_all_reduce",
+        "backing": "dense_attn_signal_stack_buf", "slot_kind": "stacked",
+        "extent": "NUM_DENSE_LAYERS", "protocol": "tp_all_reduce",
         "consumers": ("full_chip_orch", "swa_chip_orch"),
-        "binding_needles": (
-            "attn_tmp_window, attn_signal_window, my_rank",
-        ),
+        "binding_needles": ("attn_tmp_window, attn_signal_window, my_rank",),
     },
     "dense_mlp_signal_stack": {
-        "backing": "dense_mlp_signal_stack_buf",
-        "slot_kind": "stacked",
-        "extent": "NUM_DENSE_LAYERS",
-        "protocol": "tp_all_reduce",
+        "backing": "dense_mlp_signal_stack_buf", "slot_kind": "stacked",
+        "extent": "NUM_DENSE_LAYERS", "protocol": "tp_all_reduce",
         "consumers": ("full_chip_orch", "swa_chip_orch"),
-        "binding_needles": (
-            "mlp_tmp_window, mlp_signal_window, my_rank",
-        ),
+        "binding_needles": ("mlp_tmp_window, mlp_signal_window, my_rank",),
     },
     "moe_attn_signal_stack": {
-        "backing": "moe_attn_signal_stack_buf",
-        "slot_kind": "stacked",
-        "extent": "NUM_MOE_LAYERS_TOTAL",
-        "protocol": "tp_all_reduce",
-        "consumers": (
-            "full_moe_chip_orch",
-            "swa_moe_chip_orch",
-            "full_moe_chip_orch_swiglu7_swiglu16",
-            "swa_moe_chip_orch_swiglu7_silu",
-        ),
-        "binding_needles": (
-            "attn_tmp_window, attn_signal_window, my_rank",
-        ),
+        "backing": "moe_attn_signal_stack_buf", "slot_kind": "stacked",
+        "extent": "NUM_MOE_LAYERS_TOTAL", "protocol": "tp_all_reduce",
+        "consumers": ("full_moe_chip_orch", "swa_moe_chip_orch"),
+        "binding_needles": ("attn_tmp_window, attn_signal_window, my_rank",),
     },
-    "moe_count_done_sig_stack": {
-        "backing": "moe_count_done_sig_stack_buf",
-        "slot_kind": "reused",
-        "extent": None,
-        "protocol": "count_done_epoch",
-        "consumers": (
-            "full_moe_chip_orch",
-            "swa_moe_chip_orch",
-            "full_moe_chip_orch_swiglu7_swiglu16",
-            "swa_moe_chip_orch_swiglu7_silu",
-        ),
-        "binding_needles": (
-            "count_done_sig, my_rank,",
-            "count_done_sig, my_rank, moe_epoch",
-        ),
+    "moe_meta_arrived_stack": {
+        "backing": "moe_meta_arrived_stack_buf", "slot_kind": "reused",
+        "extent": None, "protocol": "dispatch_arrival",
+        "consumers": ("dispatch_step",),
+        "binding_needles": ("recv_meta, meta_arrived, recv_x, recv_aux",),
+    },
+    "moe_data_arrived_stack": {
+        "backing": "moe_data_arrived_stack_buf", "slot_kind": "reused",
+        "extent": None, "protocol": "dispatch_arrival",
+        "consumers": ("dispatch_step",),
+        "binding_needles": ("recv_route, data_arrived",),
     },
     "moe_sh_signal_stack": {
-        "backing": "moe_sh_signal_stack_buf",
-        "slot_kind": "stacked",
-        "extent": "NUM_MOE_LAYERS_TOTAL",
-        "protocol": "tp_all_reduce",
-        "consumers": (
-            "full_moe_chip_orch",
-            "swa_moe_chip_orch",
-            "full_moe_chip_orch_swiglu7_swiglu16",
-            "swa_moe_chip_orch_swiglu7_silu",
-        ),
-        "binding_needles": (
-            "sh_y, sh_tmp_window, sh_signal_window, my_rank",
-        ),
+        "backing": "moe_sh_signal_stack_buf", "slot_kind": "stacked",
+        "extent": "NUM_MOE_LAYERS_TOTAL", "protocol": "tp_all_reduce",
+        "consumers": ("full_moe_chip_orch", "swa_moe_chip_orch"),
+        "binding_needles": ("sh_y, sh_tmp_window, sh_signal_window, my_rank",),
     },
-    "moe_combine_done_sig_stack": {
-        "backing": "moe_combine_done_sig_stack_buf",
-        "slot_kind": "reused",
-        "extent": None,
-        "protocol": "combine_done_epoch",
-        "consumers": (
-            "full_moe_chip_orch",
-            "swa_moe_chip_orch",
-            "full_moe_chip_orch_swiglu7_swiglu16",
-            "swa_moe_chip_orch_swiglu7_silu",
-        ),
-        "binding_needles": (
-            "combine_done_sig,",
-            "my_rank, moe_epoch",
-        ),
+    "moe_combine_arrived_stack": {
+        "backing": "moe_combine_arrived_stack_buf", "slot_kind": "reused",
+        "extent": None, "protocol": "combine_arrival",
+        "consumers": ("combine_step",),
+        "binding_needles": ("combine_arrived", "recv_route_compact, routed_y_buf"),
     },
 }
 _CANONICAL_SIGNAL_PROTOCOL_FUNCTIONS = {
     "tp_all_reduce": ("tp_all_reduce",),
-    "count_done_epoch": (
-        "_wait_previous_dispatch",
-        "_dispatch_pack_publish",
-        "_wait_dispatch_ready",
-        "_dispatch_stage",
-    ),
-    "combine_done_epoch": (
-        "_wait_previous_combine",
-        "_stage_routed_src",
-        "_wait_combine_ready",
-        "_pull_routed_y",
-    ),
+    "dispatch_arrival": ("dispatch_step",),
+    "combine_arrival": ("combine_step",),
 }
+
 
 
 def _ensure_repo_on_path() -> None:
@@ -642,17 +594,14 @@ def _source_contract(path: Path, *, canonical: bool) -> dict[str, Any]:
             ),
         )
         check(
-            "canonical_wait_control_only_source",
-            all(
-                name in source
-                for name in (
-                    "_wait_previous_dispatch",
-                    "_wait_dispatch_ready",
-                    "_wait_previous_combine",
-                    "_wait_combine_ready",
-                )
-            ),
-            "all four C1 wait helpers are present",
+            "canonical_three_arrival_lineages",
+            all(name in source for name in (
+                "meta_arrived", "data_arrived", "combine_arrived",
+            ))
+            and "expected=moe_epoch" in source
+            and source.count("moe_epoch * n_local_experts") >= 2
+            and "moe_epoch * 2" not in source,
+            "meta waits for epoch; payload/combine wait for epoch*N_LOCAL",
         )
         check(
             "canonical_512b_stacked_reused_control_scope",
@@ -986,9 +935,10 @@ _CANONICAL_SIGNAL_STACK_SYMBOLS = {
     "ext_dense_attn_signal_stack",
     "ext_dense_mlp_signal_stack",
     "ext_moe_attn_signal_stack",
-    "ext_moe_count_done_sig_stack",
+    "ext_moe_meta_arrived_stack",
+    "ext_moe_data_arrived_stack",
     "ext_moe_sh_signal_stack",
-    "ext_moe_combine_done_sig_stack",
+    "ext_moe_combine_arrived_stack",
 }
 _MTP_SIGNAL_WINDOW_SYMBOLS = {
     "ext_eh_signal_window",

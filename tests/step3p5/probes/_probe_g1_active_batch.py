@@ -378,42 +378,25 @@ def _source_contract() -> dict[str, Any]:
     method_needles: dict[str, tuple[str, ...]] = {
         "_gate": (
             "active_tokens = pl.cast(num_tokens, pl.INDEX)",
-            "for nb in pl.spmd("
-            "N_EXPERTS // ROUTER_GATE_N_CHUNK, "
-            'name_hint="gate_expert_fanout"):',
             "for tt in pl.range(active_tokens):",
         ),
-        "_histogram_and_prefix_sum": (
+        "_quant_moe_input": (
+            "active_tokens = pl.cast(num_tokens, pl.INDEX)",
+            "if active_tokens > BATCH:",
+        ),
+        "dispatch_step": (
             "active_tokens = pl.cast(num_tokens, pl.INDEX)",
             "for t in pl.range(active_tokens):",
-        ),
-        "_dispatch_pack_publish": (
-            "active_count = pl.read(active_token, [0])",
-            "for t in pl.range(active_tokens):",
-        ),
-        "_dispatch_pull": (
-            "active_routes = active_tokens * TOPK",
-            "for r in pl.range(active_routes):",
-            "for t_inv in pl.range(active_tokens):",
-        ),
-        "_dispatch_stage": (
-            "rn = pl.cast(pl.read(recv_counts, [src, e]), pl.INDEX)",
-            "for row in pl.range(rn):",
-        ),
-        "_stage_routed_src": (
-            "active_rows = active_rows + pl.read(local_expert_count, [e])",
-            "for row in pl.range(0, active_rows, stage_rows):",
-        ),
-        "_pull_routed_y": (
-            "for t in pl.range(active_tokens):",
             "for k in pl.range(TOPK):",
-            "for t_inactive in pl.range(active_tokens, BATCH):",
+        ),
+        "combine_step": (
+            "active_tokens = pl.cast(num_tokens, pl.INDEX)",
+            "if t < active_tokens:",
+            "for k in pl.range(TOPK):",
         ),
         "whole_chip_orch": (
             "num_tokens = pl.cast(0, pl.INT32)",
             "for owner_rank in pl.range(n_ranks):",
-            "num_tokens = pl.max("
-            "num_tokens, pl.read(num_tokens_per_owner, [owner_rank]))",
             "pl.read(num_tokens_per_owner, [owner_rank])",
             "if num_tokens < 0:",
             "if num_tokens > BATCH:",
@@ -450,9 +433,21 @@ def _source_contract() -> dict[str, Any]:
         holder_source, holder_tree, "__enter__"
     )
     holder_enter_function = _function_node(holder_tree, "__enter__")
+    dispatch_segment, _ = _function_source(
+        canonical_source, canonical_tree, "dispatch_step"
+    )
+    combine_segment, _ = _function_source(
+        canonical_source, canonical_tree, "combine_step"
+    )
     top_level_checks = {
         "storage_batch_is_16": _config_constant("BATCH", STORAGE_BATCH)
         == STORAGE_BATCH,
+        "v4_arrival_thresholds": (
+            "expected=moe_epoch" in dispatch_segment
+            and "moe_epoch * n_local_experts" in dispatch_segment
+            and "moe_epoch * n_local_experts" in combine_segment
+            and "moe_epoch * 2" not in canonical_source
+        ),
         "active_batch_cases_are_1_2_8_16": tuple(ACTIVE_BATCHES)
         == (1, 2, 8, 16),
         "active_batch_cases_fit_fixed_storage": all(

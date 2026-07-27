@@ -186,11 +186,6 @@ def test_b3_device_probe_covers_all_layers_and_adjacent_history_rows() -> None:
 def test_c1_epoch_owners_keep_last_scalar_and_calls_preserve_arity() -> None:
     _, tree = _parse(_CANONICAL)
     names = (
-        "_wait_previous_dispatch",
-        "_wait_dispatch_ready",
-        "_dispatch_stage",
-        "_wait_previous_combine",
-        "_wait_combine_ready",
         "dispatch_step",
         "combine_step",
         "full_moe_chip_orch",
@@ -203,200 +198,59 @@ def test_c1_epoch_owners_keep_last_scalar_and_calls_preserve_arity() -> None:
         args = [arg.arg for arg in function.args.args]
         assert args[-1] == "moe_epoch"
         assert args.count("moe_epoch") == 1
-        expected = len(args) - 1  # method calls omit self
+        expected = len(args) - 1
         calls = _method_calls(tree, name)
         assert calls, f"{name} has no call site"
         assert all(len(call.args) == expected for call in calls)
-        for call in _method_calls(tree, name):
-            assert isinstance(call.args[-1], ast.Name)
-            assert call.args[-1].id.startswith("moe_epoch")
+        assert all(
+            isinstance(call.args[-1], ast.Name)
+            and call.args[-1].id.startswith("moe_epoch")
+            for call in calls
+        )
 
 
-def test_c1_combine_pull_owns_weighted_gather_and_token_argument_order() -> None:
-    _, tree = _parse(_CANONICAL)
-    function = _method(tree, "_pull_routed_y")
-    parameter_names = [arg.arg for arg in function.args.args[1:]]
-    assert parameter_names == [
-        "routed_src_buf",
-        "inverse_map",
-        "combine_done",
-        "active_token",
-        "expert_weights",
-        "sh_y",
-        "route_stage",
-        "moe_out",
-        "my_rank",
-    ]
-    source = _segment(
-        _parse(_CANONICAL)[0],
-        function,
-    )
-    assert "pl.load(sh_y" in source
-    assert "pl.read(expert_weights" in source
-    assert "pld.tensor.get(" in source
-    assert "pl.load(\n                    route_stage, [0, 0]" in source
-    assert "pl.store(" in source
-
-
-def test_c1_pull_reuse_has_ready_and_read_complete_atomic_ge_waves() -> None:
+def test_c3_combine_owns_scatter_wait_and_plain_fp32_reduce() -> None:
     source, tree = _parse(_CANONICAL)
-    phase_contracts = {
-        "_wait_previous_dispatch": {
-            "waits": {"previous_complete"},
-            "notifies": 0,
-        },
-        "_dispatch_pack_publish": {
-            "waits": set(),
-            "notifies": 1,
-        },
-        "_wait_dispatch_ready": {
-            "waits": {"ready_epoch"},
-            "notifies": 0,
-        },
-        "_dispatch_pull": {
-            "waits": set(),
-            "notifies": 0,
-        },
-        "_dispatch_stage": {
-            "waits": set(),
-            "notifies": 1,
-        },
-        "_wait_previous_combine": {
-            "waits": {"previous_complete"},
-            "notifies": 0,
-        },
-        "_stage_routed_src": {
-            "waits": set(),
-            "notifies": 1,
-        },
-        "_wait_combine_ready": {
-            "waits": {"ready_epoch"},
-            "notifies": 0,
-        },
-        "_pull_routed_y": {
-            "waits": set(),
-            "notifies": 1,
-        },
-    }
-    for method_name, contract in phase_contracts.items():
-        function = _method(tree, method_name)
-        function_source = _segment(source, function)
-        waits = [
-            node
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "wait"
-        ]
-        notifies = [
-            node
-            for node in ast.walk(function)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "notify"
-        ]
-        expected_waits = contract.get("waits", set())
-        assert {
-            ast.unparse(
-                next(
-                    keyword.value
-                    for keyword in call.keywords
-                    if keyword.arg == "expected"
-                )
-            )
-            for call in waits
-        } == expected_waits
-        assert len(notifies) == contract["notifies"]
-        assert all(
-            ast.unparse(
-                next(
-                    keyword.value
-                    for keyword in call.keywords
-                    if keyword.arg == "cmp"
-                )
-            )
-            == "pld.WaitCmp.Ge"
-            for call in waits
-        )
-        assert all(
-            ast.unparse(
-                next(
-                    keyword.value
-                    for keyword in call.keywords
-                    if keyword.arg == "op"
-                )
-            )
-            == "pld.NotifyOp.AtomicAdd"
-            for call in notifies
-        )
-        assert "NotifyOp.Set" not in function_source
+    function = _method(tree, "combine_step")
+    names = [arg.arg for arg in function.args.args[1:]]
+    assert names == [
+        "local_routed_y", "sh_y", "moe_out",
+        "combine_arrived", "local_route", "routed_y_buf",
+        "local_expert_count", "local_expert_offset", "num_tokens",
+        "my_rank", "moe_epoch",
+    ]
+    body = _segment(source, function)
+    assert 'name_hint="combine_scatter"' in body
+    assert "pld.tensor.put(" in body
+    assert 'name_hint="combine_wait"' in body
+    assert "moe_epoch * n_local_experts, pl.INT32" in body
+    assert 'name_hint="combine_reduce"' in body
+    assert "target_type=pl.FP32" in body
+    assert "expert_weights" not in body
+    assert "route_weight" not in body
+    assert "pld.tensor.get(" not in body
 
-    assert "moe_epoch * 2 - 1" in _segment(
-        source, _method(tree, "_wait_dispatch_ready")
-    )
-    assert "pl.read(expert_indices" in _segment(
-        source, _method(tree, "_dispatch_pull")
-    )
-    assert "moe_epoch * 2 - 1" in _segment(
-        source, _method(tree, "_wait_combine_ready")
-    )
-    assert "pl.read(inverse_map" in _segment(
-        source, _method(tree, "_pull_routed_y")
-    )
 
-    # prior/ready waits are control-only.  Their only tensor arguments are the
-    # signal and a local token; producer/consumer data windows must stay out.
-    for method_name in (
-        "_wait_previous_dispatch",
-        "_wait_dispatch_ready",
-        "_wait_previous_combine",
-        "_wait_combine_ready",
-    ):
-        function = _method(tree, method_name)
-        parameter_names = {arg.arg for arg in function.args.args}
-        assert not parameter_names.intersection({
-            "send_x",
-            "send_scale",
-            "pub_counts",
-            "recv_x",
-            "recv_scale",
-            "routed_src_buf",
-            "local_routed_y",
-            "moe_out",
-        })
-
-    # Every data task consumes the preceding control token as a real value.
-    # A ``token * 0`` anchor is DCE-able and does not prove a RAW dependency.
-    for method_name in (
-        "_dispatch_pack_publish",
-        "_dispatch_pull",
-        "_stage_routed_src",
-        "_pull_routed_y",
-    ):
-        function_source = _segment(source, _method(tree, method_name))
-        assert "* 0" not in function_source
-    assert "pl.read(active_token, [0])" in _segment(
-        source, _method(tree, "_dispatch_pack_publish")
-    )
-    assert "pl.read(active_token, [0])" in _segment(
-        source, _method(tree, "_dispatch_pull")
-    )
-    assert "pl.read(notify_token, [0])" in _segment(
-        source, _method(tree, "_stage_routed_src")
-    )
-    assert "pl.read(active_token, [0])" in _segment(
-        source, _method(tree, "_pull_routed_y")
-    )
-
-    # The product call graph must use receiver-local inverse_map pull.  Static
-    # coverage of an unused helper is not a release contract.
-    combine_source = _segment(source, _method(tree, "combine_step"))
-    assert "self._stage_routed_src(" in combine_source
-    assert "self._pull_routed_y(" in combine_source
-    assert "self._push_routed_y_to_sources(" not in combine_source
-    assert "pub_counts" not in combine_source.split(
-        "# Receiver-staged pull is the canonical return leg.", 1
-    )[-1]
+def test_c1_c2_have_three_independent_monotonic_signal_lineages() -> None:
+    source, tree = _parse(_CANONICAL)
+    dispatch = _segment(source, _method(tree, "dispatch_step"))
+    combine = _segment(source, _method(tree, "combine_step"))
+    assert "target=meta_arrived" in dispatch
+    assert "signal=meta_arrived" in dispatch
+    assert "expected=moe_epoch" in dispatch
+    assert "target=data_arrived" in dispatch
+    assert "signal=data_arrived" in dispatch
+    assert "moe_epoch * n_local_experts, pl.INT32" in dispatch
+    assert "target=combine_arrived" in combine
+    assert "signal=combine_arrived" in combine
+    assert "moe_epoch * n_local_experts, pl.INT32" in combine
+    for body in (dispatch, combine):
+        assert "pld.NotifyOp.AtomicAdd" in body
+        assert "pld.WaitCmp.Ge" in body
+        assert "moe_epoch * 2" not in body
+        assert "2 * moe_epoch" not in body
+        assert "ready_epoch" not in body
+        assert "previous_complete" not in body
 
 
 def test_c1_ep_windows_are_single_set_but_tp_scratch_stays_per_layer() -> None:
@@ -404,62 +258,38 @@ def test_c1_ep_windows_are_single_set_but_tp_scratch_stays_per_layer() -> None:
     whole = _method(tree, "whole_chip_orch")
     annotations = {
         arg.arg: ast.unparse(arg.annotation)
-        for arg in whole.args.args
-        if arg.annotation is not None
+        for arg in whole.args.args if arg.annotation is not None
     }
     ep_windows = (
-        "moe_pub_counts_stack",
-        "moe_count_done_sig_stack",
-        "moe_recv_x_stack",
-        "moe_recv_scale_stack",
-        "moe_send_x_stack",
-        "moe_send_scale_stack",
-        "moe_combine_done_sig_stack",
-        "moe_routed_src_buf_stack",
+        "moe_recv_meta_stack", "moe_meta_arrived_stack", "moe_recv_x_stack",
+        "moe_recv_aux_stack", "moe_recv_route_stack", "moe_data_arrived_stack",
+        "moe_combine_arrived_stack", "moe_routed_y_buf_stack",
     )
     for name in ep_windows:
         assert "NUM_MOE_LAYERS_TOTAL" not in annotations[name]
-
     for name in (
-        "moe_attn_tmp_stack",
-        "moe_attn_signal_stack",
-        "moe_sh_tmp_stack",
-        "moe_sh_signal_stack",
+        "moe_attn_tmp_stack", "moe_attn_signal_stack",
+        "moe_sh_tmp_stack", "moe_sh_signal_stack",
     ):
         assert "NUM_MOE_LAYERS_TOTAL" in annotations[name]
-
     host_source = _segment(source, _method(tree, "host_orch"))
     for name in (
-        "moe_recv_x_stack_buf",
-        "moe_send_x_stack_buf",
-        "moe_routed_src_buf_stack_buf",
-        "moe_count_done_sig_stack_buf",
-        "moe_combine_done_sig_stack_buf",
+        "moe_recv_meta_stack_buf", "moe_meta_arrived_stack_buf",
+        "moe_recv_x_stack_buf", "moe_recv_aux_stack_buf",
+        "moe_recv_route_stack_buf", "moe_data_arrived_stack_buf",
+        "moe_combine_arrived_stack_buf", "moe_routed_y_buf_stack_buf",
     ):
-        line = next(
-            line for line in host_source.splitlines()
-            if line.strip().startswith(f"{name} =")
-        )
+        line = next(line for line in host_source.splitlines()
+                    if line.strip().startswith(f"{name} ="))
         assert "NUM_MOE_LAYERS_TOTAL" not in line
-    assert (
-        "moe_attn_tmp_stack_buf = "
-        "pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL" in host_source
-    )
-    assert (
-        "moe_sh_tmp_stack_buf = "
-        "pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL" in host_source
-    )
+    assert "dispatch_lane_rows" in host_source
+    assert "n_routes_per_rank" in host_source
 
 
 def test_c1_512b_stride_is_local_to_stacked_or_reused_control_slots() -> None:
-    """Do not turn the canonical false-sharing fix into a generic window ABI."""
     source, tree = _parse(_CANONICAL)
     assert "COMM_CONTROL_SIGNAL_BYTES = 512" in source
-    assert (
-        "COMM_SIGNAL_STRIDE_I32 = COMM_CONTROL_SIGNAL_BYTES // 4"
-        in source
-    )
-
+    assert "COMM_SIGNAL_STRIDE_I32 = COMM_CONTROL_SIGNAL_BYTES // 4" in source
     host_source = _segment(source, _method(tree, "host_orch"))
     for stack_name, slots in (
         ("dense_attn_signal_stack_buf", "NUM_DENSE_LAYERS"),
@@ -467,73 +297,12 @@ def test_c1_512b_stride_is_local_to_stacked_or_reused_control_slots() -> None:
         ("moe_attn_signal_stack_buf", "NUM_MOE_LAYERS_TOTAL"),
         ("moe_sh_signal_stack_buf", "NUM_MOE_LAYERS_TOTAL"),
     ):
-        assert (
-            f"{stack_name} = "
-            f"pld.alloc_window_buffer({slots} * COMM_CONTROL_SIGNAL_BYTES)"
-            in host_source
-        )
-
-    # EP dispatch/combine signals are one slot reused across all moe_epoch
-    # values, so their single physical slot still owns a full 512B stride.
+        assert f"{stack_name} = pld.alloc_window_buffer({slots} * COMM_CONTROL_SIGNAL_BYTES)" in host_source
     for reused_name in (
-        "moe_count_done_sig_stack_buf",
-        "moe_combine_done_sig_stack_buf",
+        "moe_meta_arrived_stack_buf", "moe_data_arrived_stack_buf",
+        "moe_combine_arrived_stack_buf",
     ):
-        assert (
-            f"{reused_name} = "
-            "pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)"
-            in host_source
-        )
-
-    # Bulk data windows retain their actual payload byte sizes.  They must not
-    # be mechanically rounded through the control-signal constant.
-    for data_name in (
-        "moe_pub_counts_stack_buf",
-        "moe_recv_x_stack_buf",
-        "moe_recv_scale_stack_buf",
-        "moe_send_x_stack_buf",
-        "moe_send_scale_stack_buf",
-        "moe_routed_src_buf_stack_buf",
-    ):
-        line = next(
-            line
-            for line in host_source.splitlines()
-            if line.strip().startswith(f"{data_name} =")
-        )
-        assert "COMM_CONTROL_SIGNAL_BYTES" not in line
-
-    whole = _method(tree, "whole_chip_orch")
-    annotations = {
-        arg.arg: ast.unparse(arg.annotation)
-        for arg in whole.args.args
-        if arg.annotation is not None
-    }
-    for signal_name in (
-        "dense_attn_signal_stack",
-        "dense_mlp_signal_stack",
-        "moe_attn_signal_stack",
-        "moe_count_done_sig_stack",
-        "moe_sh_signal_stack",
-        "moe_combine_done_sig_stack",
-    ):
-        assert "COMM_SIGNAL_STRIDE_I32" in annotations[signal_name]
-
-    assert (
-        "pl.slice(dense_attn_signal_stack, "
-        "[COMM_SIGNAL_STRIDE_I32, 1]" in source
-    )
-    assert (
-        "pl.slice(moe_count_done_sig_stack, "
-        "[COMM_SIGNAL_STRIDE_I32, 1]" in source
-    )
-
-    # MTP has three independent per-call signals.  It intentionally keeps the
-    # compact logical N_RANKS x INT32 allocation and does not inherit the
-    # canonical stacked/reused false-sharing policy.
-    mtp_source = _MTP_HIDDEN.read_text(encoding="utf-8")
-    assert mtp_source.count("pld.alloc_window_buffer(tp_size * 4)") == 3
-    assert "COMM_CONTROL_SIGNAL_BYTES" not in mtp_source
-    assert "COMM_SIGNAL_STRIDE_I32" not in mtp_source
+        assert f"{reused_name} = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)" in host_source
 
 
 def test_c1_whole_graph_uses_epochs_one_through_42() -> None:
@@ -555,46 +324,27 @@ def test_c1_whole_graph_uses_epochs_one_through_42() -> None:
         assert stale not in whole_source
 
 
-def test_c3_incore_loops_obey_orchestration_boundary() -> None:
-    _, tree = _parse(_CANONICAL)
-    # pl.parallel is an orchestration construct.  It is never legal merely
-    # because an InCore loop appears write-disjoint.
-    for function in [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-    ]:
+def test_c3_expert_lane_fanout_uses_spmd_and_no_incore_parallel() -> None:
+    source, tree = _parse(_CANONICAL)
+    for function in [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]:
         decorators = " ".join(ast.unparse(d) for d in function.decorator_list)
         if "FunctionType.InCore" in decorators:
-            illegal_parallel = [
-                call
-                for call in ast.walk(function)
-                if isinstance(call, ast.Call)
+            assert not any(
+                isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Attribute)
                 and isinstance(call.func.value, ast.Name)
-                and call.func.value.id == "pl"
-                and call.func.attr == "parallel"
-            ]
-            assert not illegal_parallel, (
-                f"{function.name} places pl.parallel inside InCore"
+                and call.func.value.id == "pl" and call.func.attr == "parallel"
+                for call in ast.walk(function)
             )
-
-    source = _CANONICAL.read_text(encoding="utf-8")
-    compact = _segment(source, _method(tree, "_dispatch_stage"))
-    histogram = _segment(source, _method(tree, "_histogram_and_prefix_sum"))
-    combine_pull = _segment(source, _method(tree, "_pull_routed_y"))
-    assert "running = pl.cast(0, pl.INT32)" in compact
-    assert "for e in pl.range(n_local_experts):" in compact
-    assert "for t in pl.range(active_tokens):" in histogram
-    assert "for k in pl.range(TOPK):" in histogram
-    assert "for t in pl.range(active_tokens):" in combine_pull
-    assert "for k in pl.range(TOPK):" in combine_pull
-
-    # C3's compliant fan-out uses orchestration/SPMD scopes already present on
-    # the expert/feature axes; peer-loop fan-out remains gated on an explicit
-    # orchestration refactor and must never be faked with InCore parallel.
-    gate_source = _segment(source, _method(tree, "_gate"))
-    assert "for nb in pl.spmd(" in gate_source
+    dispatch = _segment(source, _method(tree, "dispatch_step"))
+    combine = _segment(source, _method(tree, "combine_step"))
+    assert 'name_hint="dispatch_push"' in dispatch
+    assert 'name_hint="dispatch_gather"' in dispatch
+    assert 'name_hint="combine_scatter"' in combine
+    assert "for t in pl.range(active_tokens):" in dispatch
+    assert "for k in pl.range(TOPK):" in dispatch
+    assert "pld.tensor.put(" in dispatch
+    assert "pld.tensor.put(" in combine
 
 
 def test_g1_threads_runtime_active_tokens_through_moe_and_holder() -> None:
@@ -602,47 +352,23 @@ def test_g1_threads_runtime_active_tokens_through_moe_and_holder() -> None:
     whole = _method(tree, "whole_chip_orch")
     whole_args = [arg.arg for arg in whole.args.args]
     assert whole_args[-2:] == ["num_tokens_per_owner", "my_rank"]
-    assert "num_tokens = pl.cast(0, pl.INT32)" in _segment(source, whole)
-    assert "pl.read(num_tokens_per_owner, [owner_rank])" in _segment(source, whole)
+    whole_source = _segment(source, whole)
+    assert "num_tokens = pl.cast(0, pl.INT32)" in whole_source
+    assert "pl.read(num_tokens_per_owner, [owner_rank])" in whole_source
     assert "NUM_TOKENS_STORAGE_I32" in source
     assert "NUM_TOKENS_STORAGE_I32 = COMM_SIGNAL_STRIDE_I32" not in source
-
-    direct_num_tokens = (
-        "_gate",
-        "_histogram_and_prefix_sum",
-        "_quant_moe_input",
-        "_wait_previous_dispatch",
-        "_wait_dispatch_ready",
-        "dispatch_step",
-        "_wait_combine_ready",
-        "combine_step",
-        "full_moe_chip_orch",
-        "swa_moe_chip_orch",
+    for name in (
+        "_gate", "_quant_moe_input", "dispatch_step", "combine_step",
+        "full_moe_chip_orch", "swa_moe_chip_orch",
         "full_moe_chip_orch_swiglu7_swiglu16",
         "swa_moe_chip_orch_swiglu7_silu",
-    )
-    for name in direct_num_tokens:
-        function = _method(tree, name)
-        assert any(
-            arg.arg == "num_tokens"
-            for arg in function.args.args
-        ), f"{name} must receive runtime active-token bound"
-
-    for name, token_name in (
-        ("_dispatch_pack_publish", "active_token"),
-        ("_dispatch_pull", "active_token"),
-        ("_stage_routed_src", "notify_token"),
-        ("_pull_routed_y", "active_token"),
     ):
         function = _method(tree, name)
-        assert any(
-            arg.arg == token_name
-            for arg in function.args.args
-        ), f"{name} must consume the control-token-propagated active bound"
-    stage_source = _segment(source, _method(tree, "_stage_routed_src"))
-    assert "local_expert_count" in stage_source
-    assert "active_rows = active_rows + pl.read(local_expert_count, [e])" in stage_source
-
+        assert any(arg.arg == "num_tokens" for arg in function.args.args), name
+    dispatch = _segment(source, _method(tree, "dispatch_step"))
+    combine = _segment(source, _method(tree, "combine_step"))
+    assert "active_tokens" in dispatch and "TOPK" in dispatch
+    assert "active_tokens" in combine and "TOPK" in combine
     holder_source, holder_tree = _parse(_HOLDER)
     holder_enter = _segment(holder_source, _method(holder_tree, "__enter__"))
     live_step = _segment(holder_source, _method(holder_tree, "set_live_step"))

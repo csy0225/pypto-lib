@@ -162,9 +162,9 @@ idx_pad = 8
 dispatch_max_per_src = BATCH
 dispatch_recv_per_expert = n_ranks * dispatch_max_per_src
 dispatch_lane_rows = n_local_experts * dispatch_recv_per_expert
-DISPATCH_SCALE_COLS = 8
-dispatch_weight_col = DISPATCH_SCALE_COLS
-dispatch_aux_pad = 16  # 64B physical row; logical cols 0..8
+DISPATCH_SCALE_COLS = 1  # V4-Flash: one per-token activation scale
+dispatch_weight_col = 1  # aux[0]=scale, aux[1]=route weight
+dispatch_aux_pad = 8  # physical FP32 row tile; logical cols 0..1
 inter = MOE_INTERMEDIATE
 sh_inter_local = INTER_S_LOCAL
 local_recv_max = LOCAL_RECV_MAX  # 1024 compact expert capacity
@@ -792,7 +792,7 @@ class WholeDecodeStep3p5:
         self,
         x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         x_i8_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.INT8]],
-        x_scale_out: pl.Out[pl.Tensor[[BATCH, 8], pl.FP32]],
+        x_scale_out: pl.Out[pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32]],
         num_tokens: pl.Scalar[pl.INT32],
     ):
         active_tokens = pl.cast(num_tokens, pl.INDEX)
@@ -853,7 +853,7 @@ class WholeDecodeStep3p5:
     def dispatch_step(  # noqa: PLR0913, PLR0915
         self,
         x: pl.Tensor[[BATCH, HIDDEN], pl.INT8],
-        x_scale: pl.Tensor[[BATCH, 8], pl.FP32],
+        x_scale: pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32],
         expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
         expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
         local_routed_x_out: pl.Out[
@@ -892,10 +892,10 @@ class WholeDecodeStep3p5:
     ]:
         """V4-Flash dispatch ABI; combine conversion is intentionally separate.
 
-        ``recv_aux`` reserves logical columns 0..7 for the complete quant scale
-        row and column 8 for the route weight. Columns 9..15 are physical
-        padding for the current PTOAS 32-byte row-alignment ABI; they carry
-        no model semantics. ``recv_route`` carries ``t * TOPK + k``.
+        ``recv_aux`` follows the V4-Flash ABI: logical column 0 carries the
+        per-token activation scale and column 1 carries the route weight.
+        Columns 2..7 are physical FP32 padding for the current PTOAS tile
+        alignment ABI; they carry no model semantics. ``recv_route`` carries ``t * TOPK + k``.
         Physical lane capacity remains static while every token loop is bounded
         by the clamped runtime ``num_tokens`` value.
         """
@@ -2040,7 +2040,7 @@ class WholeDecodeStep3p5:
         # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
         # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, 8], dtype=pl.FP32)
+        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
         (x_disp_i8, x_disp_scale) = self._quant_moe_input(
             post_norm, x_disp_i8, x_disp_scale, num_tokens,
         )
@@ -2275,7 +2275,7 @@ class WholeDecodeStep3p5:
         # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
         # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, 8], dtype=pl.FP32)
+        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
         (x_disp_i8, x_disp_scale) = self._quant_moe_input(
             post_norm, x_disp_i8, x_disp_scale, num_tokens,
         )
@@ -3183,7 +3183,7 @@ class WholeDecodeStep3p5:
         # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
         # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, 8], dtype=pl.FP32)
+        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
         (x_disp_i8, x_disp_scale) = self._quant_moe_input(
             post_norm, x_disp_i8, x_disp_scale, num_tokens,
         )
@@ -3413,7 +3413,7 @@ class WholeDecodeStep3p5:
         # 1A: per-token INT8 dynamic-quant of the MoE input BEFORE
         # dispatch (dispatch-side; shrinks recv_x 8→4MB/layer).
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
-        x_disp_scale = pl.create_tensor([BATCH, 8], dtype=pl.FP32)
+        x_disp_scale = pl.create_tensor([BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32)
         (x_disp_i8, x_disp_scale) = self._quant_moe_input(
             post_norm, x_disp_i8, x_disp_scale, num_tokens,
         )

@@ -169,6 +169,11 @@ sh_tp_chunk = HIDDEN // tp_size
 # from the general 512B tensor-shape invariant and deliberately does not reuse
 # COMM_SIGNAL_STRIDE_I32 as an ABI concept.
 NUM_TOKENS_STORAGE_I32 = 128
+# Whole-net host ABI uses the same ordinary padded INT32 storage as the
+# per-layer active-token tensor.  Keep a distinct alias for the outer program
+# signature so the storage contract is explicit rather than accidentally
+# depending on an undefined symbolic shape.
+NUM_TOKENS_RUNTIME = NUM_TOKENS_STORAGE_I32
 # Canonical product graph is fixed; diagnostics/truncation live in probes.
 
 # MoE-layer counts for the loop form. L3..L42 = 40 MoE silu_silu layers split
@@ -258,16 +263,22 @@ class WholeDecodeStep3p5:
             )
             for peer in pl.range(group_size):
                 if peer == my_rank:
-                    recv = own_tile
+                    acc = pl.add(
+                        acc,
+                        pl.cast(own_tile, target_type=pl.FP32),
+                    )
                 else:
-                    recv = pld.tile.remote_load(
+                    remote_tile = pld.tile.remote_load(
                         tmp_window, peer=peer,
                         offsets=[0, k0], shape=[BATCH, ar_chunk],
+                    )
+                    acc = pl.add(
+                        acc,
+                        pl.cast(remote_tile, target_type=pl.FP32),
                     )
                 # Every TP rank accumulates in the same canonical peer order
                 # 0..N-1.  Starting from the local shard made BF16 rounding
                 # rank-dependent even though all ranks consumed the same set.
-                acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
             pl.store(
                 pl.cast(acc, target_type=pl.BF16),
                 [0, k0], local,
@@ -1973,7 +1984,11 @@ class WholeDecodeStep3p5:
                     cmp=pld.WaitCmp.Ge,
                 )
         # stage task 将该 token 直接作为 AtomicAdd 增量，形成不可省略的 RAW。
-        pl.write(notify_token_out, [0], pl.min(moe_epoch, 1))
+        pl.write(
+            notify_token_out,
+            [0],
+            pl.cast(pl.min(moe_epoch, 1), target_type=pl.INT32),
+        )
         return notify_token_out
 
     @pl.function(type=pl.FunctionType.InCore)

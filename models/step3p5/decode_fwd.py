@@ -868,7 +868,8 @@ class WholeDecodeStep3p5:
         """V4-style deferred RMSNorm and INT8 producer.
 
         The first pass forms ``xg = resid * (gamma + 1)`` while reducing both
-        ``sum(resid**2)`` and ``amax(xg)``.  The second pass emits the BF16
+        ``sum(resid**2)`` and ``amax(xg)``.  The current backend recomputes xg
+        chunk-wise in the second pass, which emits the BF16
         normalized value needed by the step3p5 BF16 shared expert and the
         mathematically equivalent INT8 payload ``quant(xg)``.  Its dequant
         scale carries the deferred positive RMS factor:
@@ -880,7 +881,6 @@ class WholeDecodeStep3p5:
         if active_tokens > BATCH:
             active_tokens = pl.cast(BATCH, pl.INDEX)
 
-        xg_buf = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
         xg_amax = pl.full([1, BATCH], dtype=pl.FP32, value=1e-4)
         for kb in pl.range(HIDDEN // K_CHUNK):
@@ -896,7 +896,6 @@ class WholeDecodeStep3p5:
                 post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
             )
             xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
-            xg_buf = pl.assemble(xg_buf, xg, [0, k0])
             sq_sum = pl.add(
                 sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(raw, raw)), [1, BATCH]),
@@ -924,7 +923,21 @@ class WholeDecodeStep3p5:
 
         for kb2 in pl.range(HIDDEN // K_CHUNK):
             k0 = kb2 * K_CHUNK
-            xg = pl.slice(xg_buf, [BATCH, K_CHUNK], [0, k0])
+            raw = pl.cast(
+                pl.slice(
+                    resid, [BATCH, K_CHUNK], [0, k0],
+                    valid_shape=[active_tokens, K_CHUNK],
+                ),
+                target_type=pl.FP32,
+            )
+            gamma = pl.slice(
+                post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
+            )
+            # Current 0726 backend UB cannot retain a full [BATCH,HIDDEN]
+            # FP32 xg buffer, so recompute xg in the emission pass.  This is a
+            # backend/profile trade-off only; norm and quant still share one
+            # producer and the same inv_rms/amax values.
+            xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
             normed = pl.row_expand_mul(xg, inv_rms)
             post_norm_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
                 normed, target_type=pl.BF16,

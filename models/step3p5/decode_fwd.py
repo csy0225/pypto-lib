@@ -3805,7 +3805,7 @@ class WholeDecodeStep3p5:
                             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
                     pl.slice(moe_sh_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], [moe_sig_off, 0]),
                             pl.slice(moe_combine_arrived_stack, [COMM_SIGNAL_STRIDE_I32, 1], [0, 0]),
-                    pl.slice(moe_routed_y_buf_stack, [local_recv_max, HIDDEN], [0, 0]),
+                    pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [0, 0]),
                     norm_layer_idx,
                     0,
                     num_tokens,
@@ -3874,7 +3874,7 @@ class WholeDecodeStep3p5:
                             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
                     pl.slice(moe_sh_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], [moe_sig_off, 0]),
                             pl.slice(moe_combine_arrived_stack, [COMM_SIGNAL_STRIDE_I32, 1], [0, 0]),
-                    pl.slice(moe_routed_y_buf_stack, [local_recv_max, HIDDEN], [0, 0]),
+                    pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [0, 0]),
                     norm_layer_idx,
                     0,
                     num_tokens,
@@ -3956,7 +3956,7 @@ class WholeDecodeStep3p5:
             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_43, 0]),
             pl.slice(moe_sh_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], [moe_sig_off_43, 0]),
             pl.slice(moe_combine_arrived_stack, [COMM_SIGNAL_STRIDE_I32, 1], [0, 0]),
-            pl.slice(moe_routed_y_buf_stack, [local_recv_max, HIDDEN], [0, 0]),
+            pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [0, 0]),
             norm_layer_idx_43,
             0,
             num_tokens,
@@ -4031,7 +4031,7 @@ class WholeDecodeStep3p5:
             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [moe_win_off_44, 0]),
             pl.slice(moe_sh_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], [moe_sig_off_44, 0]),
             pl.slice(moe_combine_arrived_stack, [COMM_SIGNAL_STRIDE_I32, 1], [0, 0]),
-            pl.slice(moe_routed_y_buf_stack, [local_recv_max, HIDDEN], [0, 0]),
+            pl.slice(moe_routed_y_buf_stack, [n_routes_per_rank, HIDDEN], [0, 0]),
             norm_layer_idx_44,
             0,
             num_tokens,
@@ -4125,7 +4125,7 @@ class WholeDecodeStep3p5:
         moe_sh_tmp_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * BATCH * HIDDEN * 2)
         moe_sh_signal_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
         moe_combine_arrived_stack_buf = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
-        moe_routed_y_buf_stack_buf = pld.alloc_window_buffer(local_recv_max * HIDDEN * 2)
+        moe_routed_y_buf_stack_buf = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
         for r in pl.range(pld.world_size()):
             self.whole_chip_orch(
                 current_hidden[r],

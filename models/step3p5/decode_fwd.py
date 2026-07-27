@@ -888,7 +888,7 @@ class WholeDecodeStep3p5:
         pl.Tensor[[local_recv_max], pl.INT32],
         pl.Tensor[[n_local_experts], pl.INT32],
         pl.Tensor[[n_local_experts], pl.INT32],
-        pl.Tensor[[BATCH, TOPK], pl.INT32],
+        pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
     ]:
         """V4-Flash dispatch ABI; combine conversion is intentionally separate.
 
@@ -902,8 +902,6 @@ class WholeDecodeStep3p5:
         recv_meta_local = pl.create_tensor(
             [n_ranks, n_local_experts_pad], dtype=pl.INT32, manual_dep=True,
         )
-        inverse_map = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
-
         # Metadata has an independent arrival lineage so expert counts become
         # available without waiting for the bulk x/aux/route payload.
         with pl.at(
@@ -1085,13 +1083,6 @@ class WholeDecodeStep3p5:
                     )
                     route = pl.read(recv_route, [in_row, 0])
                     pl.write(local_route_out, [out_row], route)
-                    if src == my_rank:
-                        t = route // TOPK
-                        k = route - t * TOPK
-                        pl.write(
-                            inverse_map, [t, k],
-                            pl.cast(my_rank * local_recv_max + out_row, pl.INT32),
-                        )
                 compact = compact + route_count
 
         return (
@@ -1101,7 +1092,7 @@ class WholeDecodeStep3p5:
             local_route_out,
             local_expert_offset,
             local_expert_count,
-            inverse_map,
+            recv_meta_local,
         )
 
     # ---------- Stage 3a: expert_routed (local 36 experts) ----------
@@ -2076,7 +2067,7 @@ class WholeDecodeStep3p5:
             local_route,
             local_expert_offset,
             local_expert_count,
-            inverse_map,
+            recv_meta_local,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
@@ -2311,7 +2302,7 @@ class WholeDecodeStep3p5:
             local_route,
             local_expert_offset,
             local_expert_count,
-            inverse_map,
+            recv_meta_local,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
@@ -3219,7 +3210,7 @@ class WholeDecodeStep3p5:
             local_route,
             local_expert_offset,
             local_expert_count,
-            inverse_map,
+            recv_meta_local,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
@@ -3449,7 +3440,7 @@ class WholeDecodeStep3p5:
             local_route,
             local_expert_offset,
             local_expert_count,
-            inverse_map,
+            recv_meta_local,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,

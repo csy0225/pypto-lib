@@ -197,9 +197,10 @@ def attention_full(
     norm_layer_idx: pl.Scalar[pl.INT32],
     attn_layer_idx: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    tmp_window: pld.DistributedTensor[
-        [BATCH, HIDDEN // TP_WORLD_SIZE], pl.BF16
-    ],
+    # The collective stages and remotely loads the complete hidden row.
+    # Keep the inline formal span equal to the real [BATCH,HIDDEN] access; a
+    # narrowed HIDDEN//TP formal corrupts provenance for non-zero stacked slots.
+    tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     signal_window: pld.DistributedTensor[[SIGNAL_WINDOW_ROWS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
@@ -230,6 +231,13 @@ def attention_full(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > BATCH:
         active_tokens = pl.cast(BATCH, pl.INDEX)
+
+    # Persist the replicated residual before the long attention task chain.
+    # Runtime-loop lowering must not recover current_hidden through a stale
+    # pre-call SSA version after the TP collective; the caller-owned output
+    # formal provides an explicit producer/consumer lineage.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_residual_hold"):
+        resid1_out[:, :] = current_hidden[:, :]
 
     layer_hidden_base = attn_layer_idx * HIDDEN
     layer_qhidden_base = attn_layer_idx * HIDDEN_Q_FULL_LOCAL
@@ -829,7 +837,7 @@ def attention_full(
                 target_type=pl.FP32,
             )
             resid = pl.cast(
-                pl.slice(current_hidden, [BATCH_TILE, OUT_PROJ_N_CHUNK], [b0, o0]),
+                pl.slice(resid1_out, [BATCH_TILE, OUT_PROJ_N_CHUNK], [b0, o0]),
                 target_type=pl.FP32,
             )
             resid_sum = pl.add(reduced, resid)

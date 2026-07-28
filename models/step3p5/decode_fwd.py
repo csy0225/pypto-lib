@@ -424,7 +424,10 @@ class WholeDecodeStep3p5:
     @pl.function(type=pl.FunctionType.Inline)
     def _gate(
         self,
-        x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        resid: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+        norm_layer_idx: pl.Scalar[pl.INT32],
+        inv_rms: pl.Tensor[[BATCH, 1], pl.FP32],
         gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
@@ -466,10 +469,18 @@ class WholeDecodeStep3p5:
             name_hint="gate_expert_fanout",
         ):
             n0 = nb * ROUTER_GATE_N_CHUNK
-            x0 = pl.cast(
-                pl.slice(x, [BATCH, ROUTER_GATE_K_CHUNK], [0, 0]),
+            raw0 = pl.cast(
+                pl.slice(resid, [BATCH, ROUTER_GATE_K_CHUNK], [0, 0]),
                 target_type=pl.FP32,
             )
+            gamma0 = pl.slice(
+                post_rms_weight, [1, ROUTER_GATE_K_CHUNK],
+                [norm_layer_idx, 0],
+            )
+            # V4 deferred RMSNorm: gate consumes FP32 xg = resid*(gamma+1).
+            # The full xg tensor is recomputed chunk-wise because the 0726
+            # backend UB cannot retain [BATCH,HIDDEN] FP32 as one tile.
+            x0 = pl.col_expand_mul(raw0, pl.add(gamma0, 1.0))
             w0 = pl.slice(
                 gate_w,
                 [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
@@ -478,18 +489,26 @@ class WholeDecodeStep3p5:
             logits_n = pl.matmul(x0, w0, out_dtype=pl.FP32)
             for kb in pl.range(1, HIDDEN // ROUTER_GATE_K_CHUNK):
                 k0 = kb * ROUTER_GATE_K_CHUNK
-                xk = pl.cast(
+                rawk = pl.cast(
                     pl.slice(
-                        x, [BATCH, ROUTER_GATE_K_CHUNK], [0, k0],
+                        resid, [BATCH, ROUTER_GATE_K_CHUNK], [0, k0],
                     ),
                     target_type=pl.FP32,
                 )
+                gammak = pl.slice(
+                    post_rms_weight, [1, ROUTER_GATE_K_CHUNK],
+                    [norm_layer_idx, k0],
+                )
+                xk = pl.col_expand_mul(rawk, pl.add(gammak, 1.0))
                 wk = pl.slice(
                     gate_w,
                     [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
                     [k0, n0],
                 )
                 logits_n = pl.matmul_acc(logits_n, xk, wk)
+            # xg omits the positive per-token inv_rms factor. Apply it after
+            # the FP32 matmul, exactly as V4-Flash, before step3p5 sigmoid.
+            logits_n = pl.row_expand_mul(logits_n, inv_rms)
             # Apply sigmoid per N-chunk — vec ops convert cube→vec
             # block layout, avoiding blayout mismatch when storing
             # into pre-created score_buf / biased_buf (vec layout).
@@ -587,7 +606,10 @@ class WholeDecodeStep3p5:
     @pl.function(type=pl.FunctionType.Inline)
     def gate_step(
         self,
-        x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        resid: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+        norm_layer_idx: pl.Scalar[pl.INT32],
+        inv_rms: pl.Tensor[[BATCH, 1], pl.FP32],
         gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         expert_indices: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
@@ -598,8 +620,8 @@ class WholeDecodeStep3p5:
         pl.Tensor[[BATCH, TOPK], pl.FP32]
     ]:
         self._gate(
-            x, gate_w, router_bias, expert_indices, expert_weights,
-            num_tokens,
+            resid, post_rms_weight, norm_layer_idx, inv_rms,
+            gate_w, router_bias, expert_indices, expert_weights, num_tokens,
         )
         return expert_indices, expert_weights
 
@@ -611,6 +633,7 @@ class WholeDecodeStep3p5:
         post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
         norm_layer_idx: pl.Scalar[pl.INT32],
         post_norm_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+        inv_rms_out: pl.Out[pl.Tensor[[BATCH, 1], pl.FP32]],
         x_i8_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.INT8]],
         x_scale_out: pl.Out[
             pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32]
@@ -618,6 +641,7 @@ class WholeDecodeStep3p5:
         num_tokens: pl.Scalar[pl.INT32],
     ) -> tuple[
         pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        pl.Tensor[[BATCH, 1], pl.FP32],
         pl.Tensor[[BATCH, HIDDEN], pl.INT8],
         pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32],
     ]:
@@ -636,6 +660,13 @@ class WholeDecodeStep3p5:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > BATCH:
             active_tokens = pl.cast(BATCH, pl.INDEX)
+        # Match V4-Flash's physical gate-tile contract: norm/quant/gate work on
+        # complete 16-row cube tiles, while routing, dispatch and observable
+        # outputs remain bounded by the logical active_tokens prefix.
+        active_gate_tiles = (active_tokens + 15) // 16
+        active_gate_tokens = active_gate_tiles * 16
+        if active_gate_tokens > BATCH:
+            active_gate_tokens = pl.cast(BATCH, pl.INDEX)
 
         sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
         xg_amax = pl.full([1, BATCH], dtype=pl.FP32, value=1e-4)
@@ -644,7 +675,7 @@ class WholeDecodeStep3p5:
             raw = pl.cast(
                 pl.slice(
                     resid, [BATCH, K_CHUNK], [0, k0],
-                    valid_shape=[active_tokens, K_CHUNK],
+                    valid_shape=[active_gate_tokens, K_CHUNK],
                 ),
                 target_type=pl.FP32,
             )
@@ -667,6 +698,7 @@ class WholeDecodeStep3p5:
             pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
         )
         inv_rms = pl.reshape(inv_rms_row, [BATCH, 1])
+        inv_rms_out[0:BATCH, 0:1] = inv_rms
         quant_mul_row = pl.div(
             pl.full([1, BATCH], dtype=pl.FP32, value=127.0), xg_amax,
         )
@@ -682,7 +714,7 @@ class WholeDecodeStep3p5:
             raw = pl.cast(
                 pl.slice(
                     resid, [BATCH, K_CHUNK], [0, k0],
-                    valid_shape=[active_tokens, K_CHUNK],
+                    valid_shape=[active_gate_tokens, K_CHUNK],
                 ),
                 target_type=pl.FP32,
             )
@@ -706,7 +738,7 @@ class WholeDecodeStep3p5:
             x_i8_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
                 qf16, target_type=pl.INT8, mode="trunc",
             )
-        return post_norm_out, x_i8_out, x_scale_out
+        return post_norm_out, inv_rms_out, x_i8_out, x_scale_out
 
     # ---------- Stage 2: dispatch (V4-Flash expert-lane PUSH + gather) ----------
     @pl.function(type=pl.FunctionType.Inline)
@@ -1829,13 +1861,16 @@ class WholeDecodeStep3p5:
         # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        moe_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
         x_disp_scale = pl.create_tensor(
             [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
         )
-        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
-            resid_hold, post_rms_weight, norm_layer_idx,
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        post_norm, moe_inv_rms, x_disp_i8, x_disp_scale = (
+            self._norm_quant_moe_input(
+                resid_hold, post_rms_weight, norm_layer_idx,
+                post_norm, moe_inv_rms, x_disp_i8, x_disp_scale, num_tokens,
+            )
         )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
@@ -1850,8 +1885,8 @@ class WholeDecodeStep3p5:
         expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
         expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
         expert_indices, expert_weights = self.gate_step(
-            post_norm, gate_w, router_bias,
-            expert_indices, expert_weights, num_tokens,
+            resid_hold, post_rms_weight, norm_layer_idx, moe_inv_rms,
+            gate_w, router_bias, expert_indices, expert_weights, num_tokens,
         )
 
         # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
@@ -2023,13 +2058,16 @@ class WholeDecodeStep3p5:
         # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        moe_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
         x_disp_scale = pl.create_tensor(
             [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
         )
-        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
-            resid_hold, post_rms_weight, norm_layer_idx,
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        post_norm, moe_inv_rms, x_disp_i8, x_disp_scale = (
+            self._norm_quant_moe_input(
+                resid_hold, post_rms_weight, norm_layer_idx,
+                post_norm, moe_inv_rms, x_disp_i8, x_disp_scale, num_tokens,
+            )
         )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
@@ -2044,8 +2082,8 @@ class WholeDecodeStep3p5:
         expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
         expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
         expert_indices, expert_weights = self.gate_step(
-            post_norm, gate_w, router_bias,
-            expert_indices, expert_weights, num_tokens,
+            resid_hold, post_rms_weight, norm_layer_idx, moe_inv_rms,
+            gate_w, router_bias, expert_indices, expert_weights, num_tokens,
         )
 
         # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
@@ -2890,13 +2928,16 @@ class WholeDecodeStep3p5:
         # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        moe_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
         x_disp_scale = pl.create_tensor(
             [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
         )
-        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
-            resid_hold, post_rms_weight, norm_layer_idx,
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        post_norm, moe_inv_rms, x_disp_i8, x_disp_scale = (
+            self._norm_quant_moe_input(
+                resid_hold, post_rms_weight, norm_layer_idx,
+                post_norm, moe_inv_rms, x_disp_i8, x_disp_scale, num_tokens,
+            )
         )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
@@ -2911,8 +2952,8 @@ class WholeDecodeStep3p5:
         expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
         expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
         expert_indices, expert_weights = self.gate_step(
-            post_norm, gate_w, router_bias,
-            expert_indices, expert_weights, num_tokens,
+            resid_hold, post_rms_weight, norm_layer_idx, moe_inv_rms,
+            gate_w, router_bias, expert_indices, expert_weights, num_tokens,
         )
 
         # 2) Shared-expert lane (TP-sliced + tp_all_reduce).
@@ -3079,13 +3120,16 @@ class WholeDecodeStep3p5:
         # ── B: V4-style deferred RMSNorm + INT8/scale producer. ──
         hidden_blocks = HIDDEN // K_CHUNK
         post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        moe_inv_rms = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
         x_disp_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
         x_disp_scale = pl.create_tensor(
             [BATCH, DISPATCH_SCALE_COLS], dtype=pl.FP32,
         )
-        post_norm, x_disp_i8, x_disp_scale = self._norm_quant_moe_input(
-            resid_hold, post_rms_weight, norm_layer_idx,
-            post_norm, x_disp_i8, x_disp_scale, num_tokens,
+        post_norm, moe_inv_rms, x_disp_i8, x_disp_scale = (
+            self._norm_quant_moe_input(
+                resid_hold, post_rms_weight, norm_layer_idx,
+                post_norm, moe_inv_rms, x_disp_i8, x_disp_scale, num_tokens,
+            )
         )
 
         # ── C: EP+TP MoE chip_orch -> moe_out (Phase X.8 inlined). ─
@@ -3100,8 +3144,8 @@ class WholeDecodeStep3p5:
         expert_indices = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
         expert_weights = pl.create_tensor([BATCH, TOPK], dtype=pl.FP32)
         expert_indices, expert_weights = self.gate_step(
-            post_norm, gate_w, router_bias,
-            expert_indices, expert_weights, num_tokens,
+            resid_hold, post_rms_weight, norm_layer_idx, moe_inv_rms,
+            gate_w, router_bias, expert_indices, expert_weights, num_tokens,
         )
 
         # 2) Shared-expert lane (TP-sliced + tp_all_reduce).

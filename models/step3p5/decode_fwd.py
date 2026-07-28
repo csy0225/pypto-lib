@@ -277,12 +277,11 @@ class WholeDecodeStep3p5:
 
         # Phase 1: stage-in — publish the shards OTHER ranks own into my
         # tmp_window slot; peer p reads my columns [p*shard, (p+1)*shard).  My own
-        # shard is deliberately NOT staged: Phase 3 writes the reduced value
-        # there, so every column region of tmp_window is written exactly once per
-        # call.  Staging it first would make the window write-twice (WAW on the
-        # same address with peers reading in between), and V4-Flash likewise keeps
-        # every comm window write-once per call rather than reusing one window for
-        # both a staging and a result phase.
+        # shard is deliberately NOT staged, which gives each column a single
+        # writer for the whole call: column p*shard is written here, read by peer
+        # p in its Phase 3, and afterwards overwritten only by peer p's own
+        # Phase-3 push; column my_rank*shard is never written in my window at all
+        # (Phase 3 lands my reduced shard straight into `local`, Phase 5 skips it).
         for s in pl.parallel(group_size):
             stage_off = s * shard
             if s != my_rank:
@@ -305,13 +304,14 @@ class WholeDecodeStep3p5:
                     expected=1, cmp=pld.WaitCmp.Ge,
                 )
 
-        # Phase 3: reduce-scatter — sum ONLY the shard this rank owns and publish
-        # it back into my tmp_window slot.  The owning shard is selected with an
-        # unrolled ``owner == my_rank`` guard (the V4-Flash ``lm_head_tp`` /
-        # ``load_all_owner_hidden_decoupled`` pattern) so every window offset
-        # stays loop-constant: ``tmp_window`` is a ``pl.slice`` of a stacked
-        # window at a runtime row offset, and a runtime-scalar *column* offset on
-        # top of that resolves against a lost parent stride.
+        # Phase 3: reduce-scatter — sum ONLY the shard this rank owns, land it in
+        # `local`, and push it to every peer.  The owner is selected by iterating
+        # ranks under an ``owner == my_rank`` guard, matching the V4-Flash
+        # collectives (``lm_head_tp`` / ``load_all_owner_hidden_decoupled``);
+        # note ``pl.range`` does NOT unroll (only ``pl.unroll`` does), so this is
+        # a plain runtime loop and ``base`` stays a runtime scalar -- that is
+        # fine, the full-mesh predecessor addressed the same window with a
+        # runtime column offset too.
         # Serial: the FP32 accumulator is a carried reduction, and keeping one
         # heavy remote read in flight per rank avoids saturating the cross-die
         # link.

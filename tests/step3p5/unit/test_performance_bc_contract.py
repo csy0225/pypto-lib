@@ -449,3 +449,22 @@ def test_signal_inline_formal_resolves_wide_only_in_canonical_main() -> None:
     mtp_source = _MTP_HIDDEN.read_text(encoding="utf-8")
     assert "SIGNAL_WINDOW_ROWS = TP_WORLD_SIZE" in mtp_source
     assert mtp_source.count("pld.alloc_window_buffer(tp_size * 4)") == 3
+
+
+def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
+    source, tree = _parse(_CANONICAL)
+    dispatch = _segment(source, _method(tree, "dispatch_step"))
+    expert = _segment(source, _method(tree, "_expert_routed"))
+    expert_swiglu7 = _segment(source, _method(tree, "_expert_routed_swiglu7"))
+    combine = _segment(source, _method(tree, "combine_step"))
+
+    assert "expert_recv_max = dispatch_recv_per_expert" in source
+    assert "local_recv_max = n_local_experts * expert_recv_max" in source
+    assert "pl.cast(e * expert_recv_max, pl.INT32)" in dispatch
+    assert "total = total + count" not in dispatch
+    assert "out_base = pl.cast(e * expert_recv_max, pl.INDEX)" in dispatch
+    for body in (expert, expert_swiglu7):
+        assert "offset = pl.cast(e * expert_recv_max, pl.INDEX)" in body
+        assert "pl.read(local_expert_offset, [e])" not in body
+    assert "expert_base = pl.cast(e * expert_recv_max, pl.INDEX)" in combine
+    assert "pl.read(local_expert_offset, [e])" not in combine

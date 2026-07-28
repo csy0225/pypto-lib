@@ -84,7 +84,7 @@ from models.step3p5.attention_full import (
 from models.step3p5.attention_swa import (
     LAYER_QHIDDEN_ROWS_DYN as LAYER_QHIDDEN_ROWS_DYN_SWA,
 )
-from models.step3p5.dispatch import LOCAL_RECV_MAX, N_RANKS_PAD, PER_RANK_BUCKETS
+from models.step3p5.dispatch import N_RANKS_PAD, PER_RANK_BUCKETS
 
 # Per-rank slice widths (TP=8). Single-card ST/UT iron rule: keep per-rank
 # widths, never unslice to full.
@@ -141,9 +141,7 @@ ROUTED_GATE_K_CHUNK = 64
 ROUTED_GATE_N_CHUNK = 64
 ROUTED_DOWN_K_CHUNK = 64
 ROUTED_DOWN_N_CHUNK = 128
-ROUTED_MAX_TILE = LOCAL_RECV_MAX
 RECV_TILE = 32
-N_RECV_TILES = ROUTED_MAX_TILE // RECV_TILE  # 32 outer iterations
 
 # Shared-expert kernel constants — mirrors expert_shared.py / moe.SHARED_*.
 SHARED_GATE_K_CHUNK = 256
@@ -162,12 +160,17 @@ idx_pad = 8
 dispatch_max_per_src = BATCH
 dispatch_recv_per_expert = n_ranks * dispatch_max_per_src
 dispatch_lane_rows = n_local_experts * dispatch_recv_per_expert
+expert_recv_max = dispatch_recv_per_expert
+N_RECV_TILES = expert_recv_max // RECV_TILE
 DISPATCH_SCALE_COLS = 1  # V4-Flash: one per-token activation scale
 dispatch_weight_col = 1  # aux[0]=scale, aux[1]=route weight
 dispatch_aux_pad = 8  # physical FP32 row tile; logical cols 0..1
 inter = MOE_INTERMEDIATE
 sh_inter_local = INTER_S_LOCAL
-local_recv_max = LOCAL_RECV_MAX  # 1024 compact expert capacity
+# The local expert ABI is a fixed [expert, source, token_slot] lane slab.
+# Counts describe valid rows only; they must not change the physical base of an
+# expert or the shape of the routed-expert loop.
+local_recv_max = n_local_experts * expert_recv_max
 stage_rows = 8
 n_routes_per_rank = BATCH * TOPK
 per_rank_buckets = PER_RANK_BUCKETS
@@ -846,16 +849,17 @@ class WholeDecodeStep3p5:
                         expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                     )
 
-            total = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
-                pl.write(local_expert_offset, [e], total)
+                pl.write(
+                    local_expert_offset, [e],
+                    pl.cast(e * expert_recv_max, pl.INT32),
+                )
                 count = pl.cast(0, pl.INT32)
                 for src in pl.range(n_ranks):
                     meta_count = pl.read(recv_meta, [src, e])
                     pl.write(recv_meta_local, [src, e], meta_count)
                     count = count + meta_count
                 pl.write(local_expert_count, [e], count)
-                total = total + count
 
         # One block owns one local-expert lane on every destination. This is
         # the V4-Flash push layout [expert, source, slot].
@@ -942,9 +946,8 @@ class WholeDecodeStep3p5:
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        # Compact expert lanes into the existing expert ABI. Route weight and
-        # route id are gathered in parallel for the future push-combine ABI;
-        # expert kernels themselves remain unchanged.
+        # Gather each expert into its fixed V4 lane. Route weight and route id
+        # stay beside the activation; counts only bound the valid prefix.
         with pl.spmd(
             n_local_experts,
             name_hint="dispatch_gather",
@@ -952,8 +955,8 @@ class WholeDecodeStep3p5:
             allow_early_resolve=True,
         ) as dispatch_gather_tid:
             e = pl.tile.get_block_idx()
-            out_base = pl.cast(pl.read(local_expert_offset, [e]), pl.INDEX)
-            compact = pl.cast(0, pl.INDEX)
+            out_base = pl.cast(e * expert_recv_max, pl.INDEX)
+            expert_prefix = pl.cast(0, pl.INDEX)
             lane_e_base = e * dispatch_recv_per_expert
             for src in pl.range(n_ranks):
                 route_count = pl.cast(
@@ -962,7 +965,7 @@ class WholeDecodeStep3p5:
                 src_base = lane_e_base + src * dispatch_max_per_src
                 for slot in pl.range(route_count):
                     in_row = src_base + slot
-                    out_row = out_base + compact + slot
+                    out_row = out_base + expert_prefix + slot
                     local_routed_x_out[out_row : out_row + 1, :] = (
                         recv_x[in_row : in_row + 1, :]
                     )
@@ -976,7 +979,7 @@ class WholeDecodeStep3p5:
                     )
                     route = pl.read(recv_route, [in_row, 0])
                     pl.write(local_route_out, [out_row], route)
-                compact = compact + route_count
+                expert_prefix = expert_prefix + route_count
 
         return (
             local_routed_x_out,
@@ -1015,8 +1018,7 @@ class WholeDecodeStep3p5:
     ):
         for e in pl.range(n_local_experts):
             n_rows = pl.read(local_expert_count, [e])
-            offset_i32 = pl.read(local_expert_offset, [e])
-            offset = pl.cast(offset_i32, pl.INDEX)
+            offset = pl.cast(e * expert_recv_max, pl.INDEX)
             for tile_idx in pl.range(N_RECV_TILES):
                 tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
                 tile_rem = n_rows - tile_row0_i32
@@ -1697,32 +1699,30 @@ class WholeDecodeStep3p5:
             allow_early_resolve=True,
         ) as combine_scatter_tid:
             e = pl.tile.get_block_idx()
-            compact_base = pl.cast(
-                pl.read(local_expert_offset, [e]), pl.INDEX,
-            )
+            expert_base = pl.cast(e * expert_recv_max, pl.INDEX)
             # ``local_route`` is the V4 route id (token * TOPK + k), not a
             # packed source-rank route.  Preserve source provenance from the
-            # dispatch lane: compact rows are [expert, source, slot], and
+            # dispatch lane: rows are [expert, source, slot], and
             # recv_meta_local supplies the exact source prefix for each lane.
-            compact_prefix = pl.cast(0, pl.INDEX)
+            source_prefix = pl.cast(0, pl.INDEX)
             for src in pl.range(n_ranks):
                 src_count = pl.cast(
                     pl.read(recv_meta_local, [src, e]), pl.INDEX,
                 )
                 for slot in pl.range(src_count):
-                    compact_row = compact_base + compact_prefix + slot
+                    expert_row = expert_base + source_prefix + slot
                     route = pl.cast(
-                        pl.read(local_route, [compact_row]), pl.INDEX,
+                        pl.read(local_route, [expert_row]), pl.INDEX,
                     )
                     pld.tensor.put(
                         dst=routed_y_buf,
                         peer=src,
                         src=local_routed_y,
                         dst_offsets=[route, 0],
-                        src_offsets=[compact_row, 0],
+                        src_offsets=[expert_row, 0],
                         shape=[1, HIDDEN],
                     )
-                compact_prefix = compact_prefix + src_count
+                source_prefix = source_prefix + src_count
             for peer in pl.range(n_ranks):
                 if peer != my_rank:
                     pld.system.notify(
@@ -2199,8 +2199,7 @@ class WholeDecodeStep3p5:
     ):
         for e in pl.range(n_local_experts):
             n_rows = pl.read(local_expert_count, [e])
-            offset_i32 = pl.read(local_expert_offset, [e])
-            offset = pl.cast(offset_i32, pl.INDEX)
+            offset = pl.cast(e * expert_recv_max, pl.INDEX)
             for tile_idx in pl.range(N_RECV_TILES):
                 tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
                 tile_rem = n_rows - tile_row0_i32

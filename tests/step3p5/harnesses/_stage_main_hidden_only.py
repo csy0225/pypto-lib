@@ -761,25 +761,6 @@ def _run_worker(args: argparse.Namespace) -> int:
                     hidden_snapshot[0, 0],
                     out / f"main_step{step:02d}_hidden.pt",
                 )
-                # Per-layer hidden dump for accuracy bisect. Shape [tp, 45, BATCH, HIDDEN];
-                # save rank-0 row0 per layer (matches main_step hidden convention).
-                if "per_layer_hidden" in result:
-                    pl_hidden = result["per_layer_hidden"]
-                    pl_dir = out / f"per_layer_step{step:02d}"
-                    pl_dir.mkdir(parents=True, exist_ok=True)
-                    n_layers = pl_hidden.shape[1] if pl_hidden.dim() >= 3 else 0
-                    for li in range(n_layers):
-                        torch.save(
-                            pl_hidden[0, li, 0].to(torch.bfloat16).clone(),
-                            pl_dir / f"layer{li:02d}.pt",
-                        )
-                        if args.active_batch > 1:
-                            torch.save(
-                                pl_hidden[
-                                    :, li, : args.active_batch
-                                ].to(torch.bfloat16).clone(),
-                                pl_dir / f"layer{li:02d}_active.pt",
-                            )
                 tp_spread = float(
                     (
                         hidden[:, : args.active_batch].float()

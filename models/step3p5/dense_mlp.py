@@ -237,7 +237,7 @@ def dense_mlp_body_tp(
         )
 
     if TP_WORLD_SIZE > 1:
-        self.tp_all_reduce(
+        partial_hidden = self.tp_all_reduce(
             partial_hidden, tmp_window, signal_window, my_rank,
         )
 

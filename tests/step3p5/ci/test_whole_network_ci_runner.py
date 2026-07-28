@@ -20,6 +20,7 @@ from tests.step3p5.ci._whole_network_ci_common import (
     RunnerError,
     active_exporter_pids,
     scrub_environment,
+    terminate_process_group,
 )
 from tests.step3p5.ci.run_whole_network_ci import (
     WholeNetworkConfig,
@@ -150,6 +151,23 @@ def test_active_exporter_scan_ignores_shell_command_text(
         ]
 
 
+def test_terminate_process_group_ignores_zombie_only_group() -> None:
+    process = subprocess.Popen(["sleep", "0"])
+    process.wait()
+    ps_output = f"{process.pid} {process.pid} Z\n"
+    completed = subprocess.CompletedProcess(
+        args=["ps"],
+        returncode=0,
+        stdout=ps_output,
+        stderr="",
+    )
+    with patch(
+        "tests.step3p5.ci._whole_network_ci_common.subprocess.run",
+        return_value=completed,
+    ):
+        assert terminate_process_group(process, grace_seconds=0.1)
+
+
 def test_preflight_protects_front8_and_requires_contiguous_devices(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -184,6 +202,29 @@ def test_preflight_protects_front8_and_requires_contiguous_devices(
     report = preflight(_config(tmp_path, ckpt))
     assert report["ok"]
     assert report["checkpoint"]["native_w8a8_index_pairs"] == 42
+
+
+def test_skip_mtp_dry_run_is_recorded_in_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    _write_checkpoint_index(ckpt)
+    isa = tmp_path / "pto-isa"
+    isa.mkdir()
+    monkeypatch.setenv("PTO_ISA_ROOT", str(isa))
+
+    config = WholeNetworkConfig(
+        **{
+            **_config(tmp_path, ckpt).__dict__,
+            "dry_run": True,
+            "run_mtp": False,
+        }
+    )
+    report = run(config)
+    assert report["ok"]
+    assert report["config"]["run_mtp"] is False
 
 
 def test_dry_run_writes_success_report_without_touching_devices(

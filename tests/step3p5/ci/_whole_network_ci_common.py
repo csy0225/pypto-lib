@@ -144,12 +144,32 @@ def terminate_process_group(
 
     def group_exists() -> bool:
         try:
-            os.killpg(group_id, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
+            completed = subprocess.run(
+                ["ps", "-eo", "pid=,pgid=,stat="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            try:
+                os.killpg(group_id, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
             return True
-        return True
+
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            try:
+                process_group = int(fields[1])
+            except ValueError:
+                continue
+            if process_group == group_id and not fields[2].startswith("Z"):
+                return True
+        return False
 
     if not group_exists():
         return True

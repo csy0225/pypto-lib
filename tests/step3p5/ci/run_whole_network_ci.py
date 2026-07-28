@@ -61,6 +61,7 @@ class WholeNetworkConfig:
     artifact_dir: Path = Path("/tmp/n1_single_chip_hidden_ci_artifacts")
     active_batch: int = 1
     run_batch16: bool = True
+    run_mtp: bool = True
     hidden_token: int = CANONICAL_HIDDEN_TOKEN
     first_token: int = CANONICAL_FIRST_TOKEN
     main_timeout: float = 1800.0
@@ -180,6 +181,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> WholeNetworkConfig:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--skip-mtp", action="store_true")
     parser.add_argument("--hidden-token", type=int, default=CANONICAL_HIDDEN_TOKEN)
     parser.add_argument("--first-token", type=int, default=CANONICAL_FIRST_TOKEN)
     parser.add_argument("--main-timeout", type=float, default=1800.0)
@@ -208,6 +210,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> WholeNetworkConfig:
         artifact_dir=artifact_dir,
         active_batch=args.active_batch,
         run_batch16=args.run_batch16,
+        run_mtp=not args.skip_mtp,
         hidden_token=args.hidden_token,
         first_token=args.first_token,
         main_timeout=args.main_timeout,
@@ -592,6 +595,7 @@ def _initial_report(config: WholeNetworkConfig) -> dict[str, Any]:
             "devices": list(config.devices),
             "active_batch": config.active_batch,
             "run_batch16": config.run_batch16,
+            "run_mtp": config.run_mtp,
             "dry_run": config.dry_run,
             "timeouts_sec": {
                 "main": config.main_timeout,
@@ -676,19 +680,29 @@ def run(config: WholeNetworkConfig) -> dict[str, Any]:
             }
         else:
             state.report["main"] = _run_main(state)
-            state.report["mtp_single"] = _run_mtp(
-                state,
-                name="mtp_hidden_single",
-                active_batch=config.active_batch,
-                timeout_seconds=config.mtp_timeout,
-            )
-            if config.run_batch16:
-                state.report["mtp_batch16"] = _run_mtp(
+            if config.run_mtp:
+                state.report["mtp_single"] = _run_mtp(
                     state,
-                    name="mtp_hidden_batch16",
-                    active_batch=16,
-                    timeout_seconds=config.batch16_timeout,
+                    name="mtp_hidden_single",
+                    active_batch=config.active_batch,
+                    timeout_seconds=config.mtp_timeout,
                 )
+                if config.run_batch16:
+                    state.report["mtp_batch16"] = _run_mtp(
+                        state,
+                        name="mtp_hidden_batch16",
+                        active_batch=16,
+                        timeout_seconds=config.batch16_timeout,
+                    )
+            else:
+                state.report["mtp_single"] = {
+                    "skipped": True,
+                    "reason": "--skip-mtp",
+                }
+                state.report["mtp_batch16"] = {
+                    "skipped": True,
+                    "reason": "--skip-mtp",
+                }
     except Exception as exc:  # noqa: BLE001
         state.report["failure"] = {
             "type": type(exc).__name__,

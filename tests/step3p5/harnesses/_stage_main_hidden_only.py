@@ -602,6 +602,14 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
     """
     import statistics
 
+    # ITL honours --active-batch: `valid_rows` active decode rows, each with its
+    # own scheduler-owned paged sequence.  Row r owns blocks r, r+R, r+2R, ...
+    # (see _step_metadata), so the block table needs R * ceil(L/BLOCK_SIZE)
+    # scheduler blocks -- R times more than a single-row run at the same context.
+    active = int(getattr(args, "active_batch", 1) or 1)
+    if not 1 <= active <= BATCH:
+        raise ValueError(f"--active-batch must be in [1,{BATCH}], got {active}")
+
     ctx_lens = [int(x) for x in str(args.itl_context_lens).split(",") if x.strip()]
     cap = args.num_blocks * BLOCK_SIZE
     for length in ctx_lens:
@@ -610,13 +618,29 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
                 f"itl context {length} out of range [1, {cap}] "
                 f"(raise --num-blocks; need >= {(length + BLOCK_SIZE - 1) // BLOCK_SIZE})"
             )
+        need = active * ((length + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        if need > args.num_blocks:
+            raise ValueError(
+                f"itl context {length} with --active-batch {active} needs "
+                f">= {need} scheduler blocks (each of the {active} active rows "
+                f"owns its own paged sequence), got --num-blocks "
+                f"{args.num_blocks}"
+            )
 
-    # Fixed dummy embedding — content is irrelevant to decode-step timing.
-    embedding = _load_embedding_row(args.ckpt, args.seed_token).unsqueeze(0)
+    # Fixed dummy embedding — content is irrelevant to decode-step timing.  One
+    # row per active decode slot.
+    embedding = (
+        _load_embedding_row(args.ckpt, args.seed_token)
+        .unsqueeze(0)
+        .expand(active, -1)
+        .contiguous()
+    )
     results: list[dict[str, object]] = []
     for length in ctx_lens:
         seq, pos, table, slot = _step_metadata(
-            step=length - 1, scheduler_num_blocks=args.num_blocks
+            step=length - 1,
+            scheduler_num_blocks=args.num_blocks,
+            valid_rows=active,
         )
         set_kwargs = dict(
             seq_lens=seq, positions=pos, block_table=table, slot_mapping=slot
@@ -648,7 +672,10 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
         "kind": "decode_itl",
         "num_blocks": args.num_blocks,
         "block_size": BLOCK_SIZE,
-        "batch": BATCH,
+        # ``batch_capacity`` is the fixed storage upper bound (the BATCH formal);
+        # ``active_batch`` is how many decode rows this run actually drove.
+        "batch_capacity": BATCH,
+        "active_batch": active,
         "warmup": args.itl_warmup,
         "results": results,
     }

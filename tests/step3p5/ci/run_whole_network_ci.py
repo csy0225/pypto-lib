@@ -541,7 +541,7 @@ def _run_mtp(
 ) -> dict[str, Any]:
     config = state.config
     out = config.out / name
-    previous_hidden = config.out / "main" / "main_step00_hidden.pt"
+    main_step0_hidden = config.out / "main" / "main_step00_hidden.pt"
     mtp_args = [
         "--device",
         ",".join(map(str, config.devices)),
@@ -549,13 +549,18 @@ def _run_mtp(
         config.ckpt,
         "--out",
         out,
-        "--previous-hidden",
-        previous_hidden,
         "--active-batch",
         active_batch,
     ]
     if config.mtp_oracle_dir is not None:
+        # Feed the oracle's paired input (dumps/P42_nh_row0.pt, the harness
+        # default), NOT this run's Main step-0 hidden: the golden
+        # mtp3_hidden.pt was captured from that exact input, so pairing them
+        # keeps the MTP gate a self-consistent kernel-correctness check that
+        # does not drift when the Main hidden changes.
         mtp_args += ["--oracle-dir", config.mtp_oracle_dir]
+    else:
+        mtp_args += ["--previous-hidden", main_step0_hidden]
     stage = _run_stage(
         state,
         name=name,
@@ -576,7 +581,7 @@ def _run_mtp(
         "result_clean": "RESULT=MTP_SELECTED_HIDDEN_DEVICE_PASS" in text,
         "three_layers": len(rows) == 3,
         "tokens_exact": tokens == list(CANONICAL_MTP_TOKENS),
-        "main_step0_consumed": previous_hidden.is_file(),
+        "main_step0_consumed": main_step0_hidden.is_file(),
         "pypto_hidden_only": (
             payload.get("ownership", {}).get("pypto_output")
             == "raw BF16 mtp_hidden only"

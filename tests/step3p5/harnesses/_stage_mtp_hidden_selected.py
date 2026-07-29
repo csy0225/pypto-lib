@@ -37,13 +37,16 @@ TP = 8
 BATCH = 16
 HIDDEN = 4096
 BLOCK_SIZE = 128
-DEFAULT_CKPT = (
-    "/data/chensiyu/step3p5_flash_release_hf_mtp3_w8a8_0328-copy-mtp"
-)
-DEFAULT_ORACLE = (
-    "/data/chensiyu/hw_project/pypto/workspace/logs_n1/"
-    "live_mtp3_patch_ci4_inline_runtime_20260718_220645"
-)
+
+# Canonical MTP diagnostic chain: Main first token -> MTP45 -> MTP46 -> MTP47.
+# Kept in sync with run_whole_network_ci.py::CANONICAL_MTP_TOKENS.
+MTP_SEED_TOKEN = 303
+CANONICAL_MTP_TOKENS = (6178, 410, 303)
+
+# Checkpoint and offline oracle come from the environment or CLI, so this
+# harness carries no host-specific absolute paths (repo rule: no private paths).
+DEFAULT_CKPT = os.environ.get("STEP3P5_CKPT_DIR", "")
+DEFAULT_ORACLE = os.environ.get("STEP3P5_MTP_ORACLE_DIR", "")
 
 
 def _args() -> argparse.Namespace:
@@ -326,6 +329,11 @@ def _run_worker(args: argparse.Namespace) -> int:
             f"{args.active_batch}, got {args.num_blocks}"
         )
 
+    if not args.oracle_dir:
+        raise ValueError(
+            "MTP oracle dir not set; pass --oracle-dir or set "
+            "STEP3P5_MTP_ORACLE_DIR (harness carries no default host path)"
+        )
     previous = _load_previous(args.previous_hidden, args.oracle_dir)
     oracle = _load_oracle(args.oracle_dir)
     reserve = make_padding_reserve(args.num_blocks, args.num_blocks + 15)
@@ -349,7 +357,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             current = previous.unsqueeze(0).expand(
                 args.active_batch, -1
             ).contiguous()
-            token = 303
+            token = MTP_SEED_TOKEN
             reports: list[dict[str, object]] = []
             for layer_idx in range(3):
                 token_ids = torch.zeros(BATCH, dtype=torch.int32)
@@ -403,7 +411,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                         "absolute_layer": 45 + layer_idx,
                         "input_token": token,
                         "output_token": next_token,
-                        "expected_token": [6178, 410, 303][layer_idx],
+                        "expected_token": CANONICAL_MTP_TOKENS[layer_idx],
                         "hidden_pass_rate": pass_rate,
                         "hidden_max_abs_diff": float(diff.max().item()),
                         "hidden_tp_spread": spread,
@@ -412,7 +420,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                 )
                 if pass_rate < 0.97 or spread != 0.0:
                     raise AssertionError(reports[-1])
-                if next_token != [6178, 410, 303][layer_idx]:
+                if next_token != CANONICAL_MTP_TOKENS[layer_idx]:
                     raise AssertionError(reports[-1])
                 current = hidden
                 token = next_token

@@ -69,6 +69,7 @@ class WholeNetworkConfig:
     batch16_timeout: float = 1200.0
     dry_run: bool = False
     json_report: Path | None = None
+    mtp_oracle_dir: Path | None = None
 
     @property
     def report_path(self) -> Path:
@@ -158,6 +159,11 @@ def config_from_environment() -> WholeNetworkConfig:
             if os.environ.get("STEP3P5_JSON_REPORT")
             else None
         ),
+        mtp_oracle_dir=(
+            Path(os.environ["STEP3P5_MTP_ORACLE_DIR"]).expanduser().resolve()
+            if os.environ.get("STEP3P5_MTP_ORACLE_DIR")
+            else None
+        ),
     )
 
 
@@ -189,6 +195,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> WholeNetworkConfig:
     parser.add_argument("--batch16-timeout", type=float, default=1200.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json-report", type=Path)
+    parser.add_argument(
+        "--mtp-oracle-dir",
+        type=Path,
+        default=(
+            Path(os.environ["STEP3P5_MTP_ORACLE_DIR"])
+            if os.environ.get("STEP3P5_MTP_ORACLE_DIR")
+            else None
+        ),
+        help=(
+            "Offline MTP oracle dir (dumps/single/mtp3_hidden.pt). Required to "
+            "run the MTP stage; not baked into the image (no host paths)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     out = args.out.expanduser().resolve()
@@ -220,6 +239,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> WholeNetworkConfig:
         json_report=(
             args.json_report.expanduser().resolve()
             if args.json_report is not None
+            else None
+        ),
+        mtp_oracle_dir=(
+            args.mtp_oracle_dir.expanduser().resolve()
+            if args.mtp_oracle_dir is not None
             else None
         ),
     )
@@ -518,23 +542,26 @@ def _run_mtp(
     config = state.config
     out = config.out / name
     previous_hidden = config.out / "main" / "main_step00_hidden.pt"
+    mtp_args = [
+        "--device",
+        ",".join(map(str, config.devices)),
+        "--ckpt",
+        config.ckpt,
+        "--out",
+        out,
+        "--previous-hidden",
+        previous_hidden,
+        "--active-batch",
+        active_batch,
+    ]
+    if config.mtp_oracle_dir is not None:
+        mtp_args += ["--oracle-dir", config.mtp_oracle_dir]
     stage = _run_stage(
         state,
         name=name,
         command=_stage_command(
             "tests.step3p5.harnesses._stage_mtp_hidden_selected",
-            args=(
-                "--device",
-                ",".join(map(str, config.devices)),
-                "--ckpt",
-                config.ckpt,
-                "--out",
-                out,
-                "--previous-hidden",
-                previous_hidden,
-                "--active-batch",
-                active_batch,
-            ),
+            args=tuple(mtp_args),
         ),
         log_path=state.report["paths"]["logs"] / f"{name}.log",
         timeout_seconds=timeout_seconds,
@@ -680,7 +707,17 @@ def run(config: WholeNetworkConfig) -> dict[str, Any]:
             }
         else:
             state.report["main"] = _run_main(state)
-            if config.run_mtp:
+            if config.run_mtp and config.mtp_oracle_dir is None:
+                skip = {
+                    "skipped": True,
+                    "reason": (
+                        "no --mtp-oracle-dir / STEP3P5_MTP_ORACLE_DIR; the MTP "
+                        "oracle is not baked into the image"
+                    ),
+                }
+                state.report["mtp_single"] = skip
+                state.report["mtp_batch16"] = dict(skip)
+            elif config.run_mtp:
                 state.report["mtp_single"] = _run_mtp(
                     state,
                     name="mtp_hidden_single",

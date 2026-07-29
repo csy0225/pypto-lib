@@ -645,9 +645,21 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
         set_kwargs = dict(
             seq_lens=seq, positions=pos, block_table=table, slot_mapping=slot
         )
+        # Warmup runs must NOT emit DFX artifacts: the first cold run absorbs
+        # cross-rank startup skew (the first tp_all_reduce barrier waits for
+        # the slowest rank to finish init), and the holder merges every run's
+        # trace, so capturing warmup pollutes the swimlane with a one-time
+        # ~300ms skew bar that is not steady-state. Suppress N1_DFX/N1_PMU
+        # during warmup, restore for the measured iters (mirrors serving warmup).
+        _dfx_env = os.environ.pop("N1_DFX", None)
+        _pmu_env = os.environ.pop("N1_PMU", None)
         for _ in range(max(0, args.itl_warmup)):
             holder.set_live_step(embedding, **set_kwargs)
             holder.run()
+        if _dfx_env is not None:
+            os.environ["N1_DFX"] = _dfx_env
+        if _pmu_env is not None:
+            os.environ["N1_PMU"] = _pmu_env
         samples: list[float] = []
         for _ in range(max(1, args.itl_iters)):
             holder.set_live_step(embedding, **set_kwargs)

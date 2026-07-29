@@ -622,8 +622,9 @@ def attention_swa(
                 cur_mi = pl.row_max(scores)
                 exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
                 exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
-                cur_li = pl.row_sum(exp_scores_fp32)
+                # A.1: li sums FP32 exp directly (mirror v4 decode_sparse_attn
+                # qk_li = row_sum(qk_exp)); PV still consumes exp_scores_bf16.
+                cur_li = pl.row_sum(exp_scores)
                 all_exp_padded = pl.assemble(
                     all_exp_padded, exp_scores_bf16, [scratch_row, 0],
                 )

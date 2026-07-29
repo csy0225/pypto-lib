@@ -158,7 +158,7 @@ class MtpLayerHolder:
             )
         os.environ.setdefault(
             "PYPTO_PROG_BUILD_DIR",
-            "/data/chensiyu/hw_project/pypto/workspace/build_output",
+            "/tmp/pypto_build_output",
         )
         self.build_output_dirs = _mtp_build_output_dirs(
             os.environ["PYPTO_PROG_BUILD_DIR"],

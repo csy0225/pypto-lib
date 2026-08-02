@@ -236,11 +236,10 @@ dense_mlp_inline = pl.inline(dense_mlp_body_tp._func)
 @pl.program
 class WholeDecodeStep3p5:
     # ── TP all-reduce collective ────────────────────────────────────────
-    # attention_full / attention_swa / dense_mlp_body_tp 的 inlined body 里
-    # 都调 ``self.tp_all_reduce(...)`` 汇集 o_proj / down_proj 的 partial sum。
-    # pl.inline 把这些 body 拷进本 program 后，``self.tp_all_reduce`` 解析到本
-    # program 的 method，所以必须在这里定义。协议使用 two-wave completion
-    # barrier（expected=1/2 Ge）。
+    # The inlined attention and dense-MLP bodies call this method to gather
+    # o_proj and down_proj partial sums.  Keep the method on this program so
+    # pl.inline resolves those calls locally.  The protocol uses three
+    # completion waves with Ge thresholds 1, 2, and 3.
     @pl.function(type=pl.FunctionType.InCore)
     def tp_all_reduce(
         self,
@@ -314,8 +313,7 @@ class WholeDecodeStep3p5:
                     offsets=[0, owned_base],
                 )
 
-        # Wave 2 publishes all pushed result chunks and closes the existing
-        # two-wave signal/window lifetime without an extra orchestration task.
+        # Wave 2 publishes all pushed result chunks.
         for peer in pl.range(group_size):
             if peer != my_rank:
                 pld.system.notify(
@@ -336,6 +334,22 @@ class WholeDecodeStep3p5:
                 tmp_window, [0, k0], [BATCH, ar_chunk],
             )
             pl.store(result_tile, [0, k0], local)
+
+        # Wave 3 closes the communication-window read lifetime.  Every rank
+        # finishes its final local reads before the window can be reused.
+        for peer in pl.range(group_size):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=signal_window, peer=peer,
+                    offsets=[my_rank, 0], value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(group_size):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=signal_window, offsets=[src, 0],
+                    expected=3, cmp=pld.WaitCmp.Ge,
+                )
         return local
 
     @pl.function(

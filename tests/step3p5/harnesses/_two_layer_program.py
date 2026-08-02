@@ -173,8 +173,7 @@ class TwoLayerAttnPerf:
                     offsets=[0, owned_base],
                 )
 
-        # Wave 2 publishes all pushed result chunks and closes the existing
-        # two-wave signal/window lifetime without an extra orchestration task.
+        # Wave 2 publishes all pushed result chunks.
         for peer in pl.range(group_size):
             if peer != my_rank:
                 pld.system.notify(
@@ -195,6 +194,22 @@ class TwoLayerAttnPerf:
                 tmp_window, [0, k0], [BATCH, ar_chunk],
             )
             pl.store(result_tile, [0, k0], local)
+
+        # Wave 3 closes the communication-window read lifetime.  Every rank
+        # finishes its final local reads before the window can be reused.
+        for peer in pl.range(group_size):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=signal_window, peer=peer,
+                    offsets=[my_rank, 0], value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(group_size):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=signal_window, offsets=[src, 0],
+                    expected=3, cmp=pld.WaitCmp.Ge,
+                )
         return local
 
     # Mirrors WholeDecodeStep3p5.full_chip_orch.

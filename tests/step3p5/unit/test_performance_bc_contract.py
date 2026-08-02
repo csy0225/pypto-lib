@@ -22,6 +22,13 @@ _MAIN_HARNESS = (
     / "harnesses"
     / "_stage_main_hidden_only.py"
 )
+_TWO_LAYER_PROGRAM = (
+    _ROOT
+    / "tests"
+    / "step3p5"
+    / "harnesses"
+    / "_two_layer_program.py"
+)
 
 
 def _parse(path: Path) -> tuple[str, ast.Module]:
@@ -347,6 +354,17 @@ def test_c3_expert_lane_fanout_uses_spmd_and_no_incore_parallel() -> None:
     assert "for k in pl.range(TOPK):" in dispatch
     assert "pld.tensor.put(" in dispatch
     assert "pld.tensor.put(" in combine
+
+
+def test_two_layer_tp_all_reduce_matches_canonical() -> None:
+    _, canonical_tree = _parse(_CANONICAL)
+    _, two_layer_tree = _parse(_TWO_LAYER_PROGRAM)
+    canonical = _method(canonical_tree, "tp_all_reduce")
+    two_layer = _method(two_layer_tree, "tp_all_reduce")
+    assert ast.dump(canonical, include_attributes=False) == ast.dump(
+        two_layer,
+        include_attributes=False,
+    )
 
 
 def test_g1_threads_runtime_active_tokens_through_moe_and_holder() -> None:

@@ -361,7 +361,124 @@ KV_OUT_CHUNK = 256
 # Scope 3 tiling (output proj + MLP / MoE).
 K_CHUNK = 256
 OUT_PROJ_K_CHUNK = 256
-OUT_PROJ_N_CHUNK = 64  # 910B: out_proj matmul L0-sized (avoid #1601 Vec-LHS Mat->Mat tmov)
+# Keep decode full-attention and SWA output-projection grains independent:
+# their local-Q widths and surrounding stage timing differ, so architecture
+# calibration may select different N tiles.  Matmul and vector epilogues are
+# also independent: on 910B, an N=128 out-proj matmul currently fails target
+# lowering while the cast/residual vector kernels can still benefit from a
+# wider tile and fewer logical tasks.
+#
+# The defaults below are the calibrated A2A3 release profile from the 0162
+# bs=1/ctx=64k sweep: grouping=3 leaves 22 AIC logical tasks (one wave on
+# 24 AICs), while vec N=128 leaves 32 AIV tasks (one wave on 48 AIVs).
+# They are scheduling defaults, not semantic constants: another architecture
+# should override full/SWA independently from its own resource/task sweep.
+OUT_PROJ_N_CHUNK = 64  # Backward-compatible tile for non-attention callers.
+FULL_ATTN_OUT_PROJ_N_CHUNK = int(
+    os.environ.get("PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_N_CHUNK", "64"),
+)
+SWA_OUT_PROJ_N_CHUNK = int(
+    os.environ.get("PYPTO_STEP3P5_SWA_OUT_PROJ_N_CHUNK", "64"),
+)
+FULL_ATTN_OUT_PROJ_MATMUL_N_CHUNK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_MATMUL_N_CHUNK",
+        str(FULL_ATTN_OUT_PROJ_N_CHUNK),
+    ),
+)
+FULL_ATTN_OUT_PROJ_VEC_N_CHUNK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_VEC_N_CHUNK",
+        "128",
+    ),
+)
+SWA_OUT_PROJ_MATMUL_N_CHUNK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_SWA_OUT_PROJ_MATMUL_N_CHUNK",
+        str(SWA_OUT_PROJ_N_CHUNK),
+    ),
+)
+SWA_OUT_PROJ_VEC_N_CHUNK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_SWA_OUT_PROJ_VEC_N_CHUNK",
+        "128",
+    ),
+)
+FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK",
+        "3",
+    ),
+)
+SWA_OUT_PROJ_MATMUL_TILES_PER_TASK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_SWA_OUT_PROJ_MATMUL_TILES_PER_TASK",
+        "3",
+    ),
+)
+FULL_ATTN_OUT_PROJ_FUSE_CAST = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_FUSE_CAST",
+        "1",
+    ),
+)
+SWA_OUT_PROJ_FUSE_CAST = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_SWA_OUT_PROJ_FUSE_CAST",
+        "1",
+    ),
+)
+for _name, _value in (
+    ("PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_N_CHUNK", FULL_ATTN_OUT_PROJ_N_CHUNK),
+    ("PYPTO_STEP3P5_SWA_OUT_PROJ_N_CHUNK", SWA_OUT_PROJ_N_CHUNK),
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_MATMUL_N_CHUNK",
+        FULL_ATTN_OUT_PROJ_MATMUL_N_CHUNK,
+    ),
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_VEC_N_CHUNK",
+        FULL_ATTN_OUT_PROJ_VEC_N_CHUNK,
+    ),
+    (
+        "PYPTO_STEP3P5_SWA_OUT_PROJ_MATMUL_N_CHUNK",
+        SWA_OUT_PROJ_MATMUL_N_CHUNK,
+    ),
+    (
+        "PYPTO_STEP3P5_SWA_OUT_PROJ_VEC_N_CHUNK",
+        SWA_OUT_PROJ_VEC_N_CHUNK,
+    ),
+):
+    if _value <= 0 or HIDDEN % _value != 0:
+        raise ValueError(
+            f"{_name} must be positive and divide HIDDEN={HIDDEN}, "
+            f"got {_value}",
+        )
+for _name, _value, _n_chunk in (
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK",
+        FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK,
+        FULL_ATTN_OUT_PROJ_MATMUL_N_CHUNK,
+    ),
+    (
+        "PYPTO_STEP3P5_SWA_OUT_PROJ_MATMUL_TILES_PER_TASK",
+        SWA_OUT_PROJ_MATMUL_TILES_PER_TASK,
+        SWA_OUT_PROJ_MATMUL_N_CHUNK,
+    ),
+):
+    if _value <= 0:
+        raise ValueError(f"{_name} must be positive, got {_value}")
+    _out_proj_n_tiles = HIDDEN // _n_chunk
+    if _value > _out_proj_n_tiles:
+        raise ValueError(
+            f"{_name}={_value} exceeds the {_out_proj_n_tiles} legal "
+            f"N={_n_chunk} tiles in HIDDEN={HIDDEN}",
+        )
+for _name, _value in (
+    ("PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_FUSE_CAST", FULL_ATTN_OUT_PROJ_FUSE_CAST),
+    ("PYPTO_STEP3P5_SWA_OUT_PROJ_FUSE_CAST", SWA_OUT_PROJ_FUSE_CAST),
+):
+    if _value not in (0, 1):
+        raise ValueError(f"{_name} must be 0 or 1, got {_value}")
 # MLP_OUT_CHUNK must divide BOTH the world-level INTERMEDIATE (11264, used
 # by the historical single-card drafts) AND the per-card TP-sliced
 # INTERMEDIATE_LOCAL=1408 (used by the hidden-only dense MLP body).
@@ -369,6 +486,20 @@ OUT_PROJ_N_CHUNK = 64  # 910B: out_proj matmul L0-sized (avoid #1601 Vec-LHS Mat
 # of 2 that divides 1408 (1408 = 128 * 11) while still aligning with
 # the cube's 128B / 16-row friendly tiling.
 MLP_OUT_CHUNK = 128
+
+# TP all-reduce vector tile width.  This controls only the local stage/cast
+# and peer remote-load tile; it does not change the TP peer order, the FP32
+# accumulation order, or the two-wave completion protocol.  Keep the A2A3
+# release default at 512, while allowing architecture-specific calibration.
+TP_ALL_REDUCE_CHUNK = int(
+    os.environ.get("PYPTO_STEP3P5_TP_ALL_REDUCE_CHUNK", "512"),
+)
+if TP_ALL_REDUCE_CHUNK <= 0 or HIDDEN % TP_ALL_REDUCE_CHUNK != 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_TP_ALL_REDUCE_CHUNK must be positive and divide "
+        f"HIDDEN={HIDDEN}, got {TP_ALL_REDUCE_CHUNK}",
+    )
+
 MLP_SPMD_INNER = 2
 MLP_GROUP_CHUNK = MLP_SPMD_INNER * MLP_OUT_CHUNK
 DOWN_MLP_CHUNK = 256
@@ -396,6 +527,65 @@ Q_HEAD_PAD_FULL = 16                    # 16 % 4 == 0, 16/2 == 8 >= 8 (full)
 Q_HEAD_PAD_SWA = 24                     # 24 % 4 == 0, 24/2 == 12 >= 12 (swa)
 
 MAX_BLOCKS_PER_SEQ = (MAX_SEQ_DEFAULT + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+# Decode full-attention work granularity. Each logical SPMD block processes
+# this many paged-cache blocks; the runtime maps logical blocks onto the
+# architecture's available physical cores and dispatches extra blocks in waves.
+#
+# The online-softmax default is calibrated independently from QK/softmax/SV.
+# On 0162/A2A3 at bs=1/ctx=64k, grain=16 balances the parallel
+# SV+segment-recurrence span against the hierarchical reduce/finalize tail.
+# It is an architecture
+# profile, not a semantic constant; other targets should override it from their
+# own sweep.
+PTO2_LOGICAL_BLOCK_LIMIT = 2**15 - 1
+FULL_ATTN_QK_BLOCKS_PER_TASK = int(
+    os.environ.get("PYPTO_STEP3P5_FULL_ATTN_QK_BLOCKS_PER_TASK", "22"),
+)
+FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK = int(
+    os.environ.get("PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK", "12"),
+)
+FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",
+        "16",
+    ),
+)
+FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",
+        "8",
+    ),
+)
+for _name, _value in (
+    ("PYPTO_STEP3P5_FULL_ATTN_QK_BLOCKS_PER_TASK", FULL_ATTN_QK_BLOCKS_PER_TASK),
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK",
+        FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK,
+    ),
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",
+        FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK,
+    ),
+):
+    if _value <= 0:
+        raise ValueError(f"{_name} must be positive, got {_value}")
+    _max_logical_tasks = STORAGE_BATCH_CAPACITY * (
+        (MAX_BLOCKS_PER_SEQ + _value - 1) // _value
+    )
+    if _max_logical_tasks > PTO2_LOGICAL_BLOCK_LIMIT:
+        raise ValueError(
+            f"{_name}={_value} can launch {_max_logical_tasks} logical "
+            f"blocks at capacity, exceeding the PTO2 int16 limit "
+            f"{PTO2_LOGICAL_BLOCK_LIMIT}; increase task grain or widen "
+            "runtime launch counters",
+        )
+if FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK <= 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK "
+        "must be positive, got "
+        f"{FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK}",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -629,6 +819,16 @@ __all__ = [
     "K_CHUNK",
     "OUT_PROJ_K_CHUNK",
     "OUT_PROJ_N_CHUNK",
+    "FULL_ATTN_OUT_PROJ_N_CHUNK",
+    "SWA_OUT_PROJ_N_CHUNK",
+    "FULL_ATTN_OUT_PROJ_MATMUL_N_CHUNK",
+    "FULL_ATTN_OUT_PROJ_VEC_N_CHUNK",
+    "FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK",
+    "FULL_ATTN_OUT_PROJ_FUSE_CAST",
+    "SWA_OUT_PROJ_MATMUL_N_CHUNK",
+    "SWA_OUT_PROJ_VEC_N_CHUNK",
+    "SWA_OUT_PROJ_MATMUL_TILES_PER_TASK",
+    "SWA_OUT_PROJ_FUSE_CAST",
     "MLP_OUT_CHUNK",
     "MLP_SPMD_INNER",
     "MLP_GROUP_CHUNK",
@@ -642,6 +842,11 @@ __all__ = [
     "Q_HEAD_PAD_FULL",
     "Q_HEAD_PAD_SWA",
     "MAX_BLOCKS_PER_SEQ",
+    "PTO2_LOGICAL_BLOCK_LIMIT",
+    "FULL_ATTN_QK_BLOCKS_PER_TASK",
+    "FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK",
+    "FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",
+    "FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",
     # distributed topology
     "TP_WORLD_SIZE",
     "EP_WORLD_SIZE",

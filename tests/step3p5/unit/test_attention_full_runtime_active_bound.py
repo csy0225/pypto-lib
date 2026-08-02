@@ -53,6 +53,13 @@ def _is_active_guard(node: ast.If, row_name: str) -> bool:
     )
 
 
+def _contains_name(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(nested, ast.Name) and nested.id == name
+        for nested in ast.walk(node)
+    )
+
+
 def test_full_attention_rope_and_kv_writes_are_runtime_guarded() -> None:
     fn = _function("attention_full")
     assert "num_tokens" in {arg.arg for arg in fn.args.args}
@@ -89,25 +96,67 @@ def test_all_full_attention_request_spmd_stages_use_runtime_bound() -> None:
         "full_qk_matmul",
         "full_softmax",
         "full_sv_matmul",
-        "full_online_softmax",
+        "full_online_softmax_reduce",
+        "full_online_softmax_finalize",
     }
     guarded: set[str] = set()
     for node in ast.walk(fn):
-        if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
+        if not isinstance(node, (ast.For, ast.With)):
             continue
-        if _call_name(node.iter) != "pl.spmd":
+        if isinstance(node, ast.For):
+            if not isinstance(node.target, ast.Name):
+                continue
+            spmd_call = node.iter
+            loop_target = node.target.id
+            body = node.body
+        else:
+            if len(node.items) != 1:
+                continue
+            spmd_call = node.items[0].context_expr
+            loop_target = None
+            body = node.body
+        if _call_name(spmd_call) != "pl.spmd":
             continue
         hint = next(
             (
                 kw.value.value
-                for kw in node.iter.keywords
+                for kw in spmd_call.keywords
                 if kw.arg == "name_hint" and isinstance(kw.value, ast.Constant)
             ),
             None,
         )
-        if hint in required and node.body and isinstance(node.body[0], ast.If):
-            if _is_active_guard(node.body[0], node.target.id):
+        if hint not in required:
+            continue
+        if body and isinstance(body[0], ast.If):
+            if _is_active_guard(body[0], loop_target or ""):
                 guarded.add(hint)
+                continue
+        # A context-stage may either use a static-capacity lane grid with a
+        # nested active-row guard, or launch a runtime-sized logical grid whose
+        # extent is derived from active_tokens.  Both forms isolate inactive
+        # request rows; the latter is the work-quantized implementation.
+        if any(
+            isinstance(nested, ast.If)
+            and _is_active_guard(nested, loop_target or "fa_b")
+            for nested in ast.walk(node)
+        ):
+            guarded.add(hint)
+            continue
+        if spmd_call.args and (
+            _contains_name(spmd_call.args[0], "active_tokens")
+            or (
+                isinstance(spmd_call.args[0], ast.Name)
+                and spmd_call.args[0].id in {
+                    "full_qk_active_tasks",
+                    "full_softmax_active_tasks",
+                    "full_sv_active_tasks",
+                    "full_online_softmax_active_tasks",
+                    "full_online_softmax_reduce_tasks",
+                    "full_online_softmax_active_rows",
+                }
+            )
+        ):
+            guarded.add(hint)
     assert guarded == required
 
 
@@ -134,3 +183,56 @@ def test_standalone_tp_wrapper_forwards_runtime_num_tokens() -> None:
 
     chip_call = next(node for node in ast.walk(host) if _call_name(node) == "self.chip_orch")
     assert "num_tokens" in [ast.unparse(arg) for arg in chip_call.args]
+
+
+def test_full_online_softmax_writeback_casts_after_flatten() -> None:
+    """Finalize separately so out-proj consumes attn_out, not partial scratch."""
+    fn_source = ast.unparse(_function("attention_full"))
+    assert "name_hint='full_sv_matmul'" in fn_source
+    assert "pl.system.syncall(core_type='mix')" not in fn_source
+    assert "pl.split_aiv(2, mode=pl.SplitMode.NONE)" not in fn_source
+    assert "name_hint='full_online_softmax_pass_a'" not in fn_source
+    assert "name_hint='full_online_softmax_pass_b'" not in fn_source
+    assert "name_hint='full_online_softmax_pass_c'" not in fn_source
+    assert "name_hint='full_online_softmax_reduce'" in fn_source
+    assert "as full_online_softmax_reduce_tid" in fn_source
+    assert "name_hint='full_online_softmax_finalize'" in fn_source
+    assert "deps=[full_sv_online_tid]" in fn_source
+    assert "deps=[full_online_softmax_reduce_tid]" in fn_source
+    assert (
+        "online_partial_ml = pl.create_tensor([BATCH * MAX_CTX_BLOCKS, "
+        "2 * Q_HEAD_BATCH_FULL], dtype=pl.FP32)"
+        in fn_source
+    )
+    assert "online_partial_mi" not in fn_source
+    assert "online_partial_li" not in fn_source
+    assert "fa_sv_ml = pl.concat(fa_sv_mi_real, fa_sv_li_real)" in fn_source
+    assert (
+        "fa_acc_ml_new_row = pl.concat(fa_acc_mi_new_row, "
+        "fa_acc_li_new_row)"
+        in fn_source
+    )
+    assert (
+        "ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH_FULL * HEAD_DIM])"
+        in fn_source
+    )
+    assert (
+        "ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)"
+        in fn_source
+    )
+    assert "attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])" in fn_source
+    assert "ctx_bf16 = pl.cast(ctx, target_type=pl.BF16)" not in fn_source
+
+
+def test_full_online_softmax_default_grain_matches_a2a3_profile() -> None:
+    """The release default is calibrated, while remaining env-overridable."""
+    config_source = (_ROOT / "models" / "step3p5" / "config.py").read_text()
+    assert (
+        '"PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",\n'
+        '        "16",'
+    ) in config_source
+    assert '"FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK"' in config_source
+    assert (
+        '"PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",\n'
+        '        "8",'
+    ) in config_source

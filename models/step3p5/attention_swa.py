@@ -131,7 +131,10 @@ from .config import (
     NUM_HEADS_SWA_LOCAL,
     NUM_HEADS_SWA_LOCAL_PAD,
     OUT_PROJ_K_CHUNK,
-    OUT_PROJ_N_CHUNK,
+    SWA_OUT_PROJ_FUSE_CAST,
+    SWA_OUT_PROJ_MATMUL_N_CHUNK,
+    SWA_OUT_PROJ_MATMUL_TILES_PER_TASK,
+    SWA_OUT_PROJ_VEC_N_CHUNK,
     Q_HEAD_BATCH_SWA,
     Q_HEAD_PAD_SWA,
     Q_OUT_CHUNK,
@@ -181,7 +184,11 @@ assert BATCH % 2 == 0, (
     "fa_fused pipelines pairs of batches under TP, so BATCH must be even"
 )
 assert HIDDEN_Q % OUT_PROJ_K_CHUNK == 0
-assert HIDDEN % OUT_PROJ_N_CHUNK == 0
+assert HIDDEN % SWA_OUT_PROJ_MATMUL_N_CHUNK == 0
+assert HIDDEN % SWA_OUT_PROJ_VEC_N_CHUNK == 0
+assert 0 < SWA_OUT_PROJ_MATMUL_TILES_PER_TASK <= (
+    HIDDEN // SWA_OUT_PROJ_MATMUL_N_CHUNK
+)
 assert HIDDEN % TP_WORLD_SIZE == 0
 assert KV_HIDDEN_DIM == KV_OUT_CHUNK_LOCAL
 
@@ -256,6 +263,12 @@ def attention_swa(
     normed_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     gate_score_t = pl.create_tensor([BATCH, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.BF16)
     gate_exp = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
+    HEAD_GATE_K_SPLITS = 8
+    HEAD_GATE_K_PER_SPLIT = HIDDEN // HEAD_GATE_K_SPLITS
+    SWA_Q_OUT_CHUNK = Q_OUT_CHUNK // 2
+    gate_logits_partial = pl.create_tensor(
+        [BATCH, HEAD_GATE_K_SPLITS * NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.FP32,
+    )
     # Head-gate is computed on-device in Scope 1.f below (RESTORED, path (a)):
     # gate_exp = expand_per_head(sigmoid(normed_all @ w_g)) via block-diag R
     # (= gate_r input, layer-independent). The N=16 matmul_acc codegen bug that
@@ -300,88 +313,132 @@ def attention_swa(
     # gate_exp[b, h*HEAD_DIM + d] = sigmoid(normed_all @ w_g)[b, h], expanded
     # across HEAD_DIM via the block-diag constant R (= gate_r). Matches vLLM
     # modeling_step3p5 L489 + L527-531. Two scopes bound the UB working set.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_head_gate_logits"):
-        hg_x0 = pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, 0])
-        hg_w0 = pl.slice(
-            w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD], [layer_hidden_base, 0],
+    for hg_part in pl.spmd(
+        HEAD_GATE_K_SPLITS,
+        name_hint="swa_head_gate_logits_mm",
+        allow_early_resolve=True,
+    ):
+        hg_k0 = hg_part * HEAD_GATE_K_PER_SPLIT
+        hg_logits = pl.matmul(
+            pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, hg_k0]),
+            pl.slice(w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD],
+                     [layer_hidden_base + hg_k0, 0]),
+            out_dtype=pl.FP32,
         )
-        hg_logits = pl.matmul(hg_x0, hg_w0, out_dtype=pl.FP32)
-        for kb in pl.range(1, decode_scope1_hidden_blocks):
-            hg_k0 = kb * INPUT_PROJ_K_CHUNK
-            hg_xk = pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, hg_k0])
-            hg_wk = pl.slice(
-                w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD],
-                [layer_hidden_base + hg_k0, 0],
+        for kb in pl.range(1, HEAD_GATE_K_PER_SPLIT // INPUT_PROJ_K_CHUNK):
+            k0 = hg_k0 + kb * INPUT_PROJ_K_CHUNK
+            hg_logits = pl.matmul_acc(
+                hg_logits,
+                pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, k0]),
+                pl.slice(w_g, [INPUT_PROJ_K_CHUNK, NUM_HEADS_SWA_LOCAL_PAD],
+                         [layer_hidden_base + k0, 0]),
             )
-            hg_logits = pl.matmul_acc(hg_logits, hg_xk, hg_wk)
+        gate_logits_partial = pl.assemble(
+            gate_logits_partial,
+            hg_logits,
+            [0, hg_part * NUM_HEADS_SWA_LOCAL_PAD],
+        )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="swa_head_gate_sigmoid_expand",
+        allow_early_resolve=True,
+    ):
+        hg_logits = pl.slice(
+            gate_logits_partial,
+            [BATCH, NUM_HEADS_SWA_LOCAL_PAD],
+            [0, 0],
+        )
+        for hg_part in pl.range(1, HEAD_GATE_K_SPLITS):
+            hg_logits = pl.add(
+                hg_logits,
+                pl.slice(
+                    gate_logits_partial,
+                    [BATCH, NUM_HEADS_SWA_LOCAL_PAD],
+                    [0, hg_part * NUM_HEADS_SWA_LOCAL_PAD],
+                ),
+            )
         hg_score = pl.recip(pl.add(pl.exp(pl.neg(hg_logits)), 1.0))
         gate_score_t[:, :] = pl.cast(hg_score, target_type=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_head_gate_expand"):
-        for nb in pl.range(0, HIDDEN_Q_SWA_LOCAL // K_CHUNK):
-            hg_n0 = nb * K_CHUNK
-            hg_r = pl.slice(gate_r, [NUM_HEADS_SWA_LOCAL_PAD, K_CHUNK], [0, hg_n0])
-            hg_ge = pl.matmul(gate_score_t, hg_r, out_dtype=pl.FP32)
-            gate_exp[:, hg_n0:hg_n0 + K_CHUNK] = pl.cast(hg_ge, target_type=pl.BF16)
+    for hg_n0 in pl.spmd(
+        HIDDEN_Q_SWA_LOCAL // K_CHUNK,
+        name_hint="swa_head_gate_expand",
+        allow_early_resolve=True,
+    ):
+        hg_n0 = hg_n0 * K_CHUNK
+        hg_r = pl.slice(
+            gate_r, [NUM_HEADS_SWA_LOCAL_PAD, K_CHUNK], [0, hg_n0],
+        )
+        hg_ge = pl.matmul(gate_score_t, hg_r, out_dtype=pl.FP32)
+        gate_exp[:, hg_n0:hg_n0 + K_CHUNK] = pl.cast(
+            hg_ge, target_type=pl.BF16,
+        )
 
     # ----- Scope 1.b — Q projection. -----
     # wq is row-sliced (output dim → HIDDEN_Q_SWA_LOCAL = 1536 per rank).
     for q_spmd_idx in pl.spmd(
-        (BATCH // BATCH_TILE) * (HIDDEN_Q_SWA_LOCAL // Q_OUT_CHUNK), name_hint="swa_q_proj",
+        (BATCH // BATCH_TILE) * (HIDDEN_Q_SWA_LOCAL // SWA_Q_OUT_CHUNK),
+        name_hint="swa_q_proj",
+        allow_early_resolve=True,
     ):
-        q_b_idx = q_spmd_idx // (HIDDEN_Q_SWA_LOCAL // Q_OUT_CHUNK)
-        q_ob = q_spmd_idx % (HIDDEN_Q_SWA_LOCAL // Q_OUT_CHUNK)
+        q_b_idx = q_spmd_idx // (HIDDEN_Q_SWA_LOCAL // SWA_Q_OUT_CHUNK)
+        q_ob = q_spmd_idx % (HIDDEN_Q_SWA_LOCAL // SWA_Q_OUT_CHUNK)
         q_b0 = q_b_idx * BATCH_TILE
-        q_o0 = q_ob * Q_OUT_CHUNK
+        q_o0 = q_ob * SWA_Q_OUT_CHUNK
         q_tile_a_0 = pl.slice(normed_all, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [q_b0, 0])
-        q_tile_b_0 = pl.slice(wq, [INPUT_PROJ_K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, q_o0])
+        q_tile_b_0 = pl.slice(
+            wq, [INPUT_PROJ_K_CHUNK, SWA_Q_OUT_CHUNK], [layer_hidden_base, q_o0],
+        )
         q_acc = pl.matmul(q_tile_a_0, q_tile_b_0, out_dtype=pl.FP32)
         for kb in pl.range(1, decode_scope1_hidden_blocks):
             q_k0 = kb * INPUT_PROJ_K_CHUNK
             q_tile_a = pl.slice(normed_all, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [q_b0, q_k0])
             q_tile_b = pl.slice(
-                wq, [INPUT_PROJ_K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + q_k0, q_o0],
+                wq,
+                [INPUT_PROJ_K_CHUNK, SWA_Q_OUT_CHUNK],
+                [layer_hidden_base + q_k0, q_o0],
             )
             q_acc = pl.matmul_acc(q_acc, q_tile_a, q_tile_b)
         q_proj = pl.assemble(q_proj, q_acc, [q_b0, q_o0])
 
-    # ----- Scope 1.c — K projection. -----
+    # ----- Scope 1.c/1.d — K/V projections. -----
     # wk is row-sliced (output dim → KV_HEADS_LOCAL * HEAD_DIM = 128 per rank).
-    for k_spmd_idx in pl.spmd(BATCH // BATCH_TILE, name_hint="swa_k_proj"):
-        k_b0 = k_spmd_idx * BATCH_TILE
-        k_o0 = 0
-        k_tile_a_0 = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [k_b0, 0])
-        k_tile_b_0 = pl.slice(
-            wk, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base, k_o0],
-        )
-        k_acc = pl.matmul(k_tile_a_0, k_tile_b_0, out_dtype=pl.FP32)
-        for kb in pl.range(1, kv_proj_hidden_blocks):
-            k_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
-            k_tile_a = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [k_b0, k_k0])
-            k_tile_b = pl.slice(
-                wk, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL],
-                [layer_hidden_base + k_k0, k_o0],
+    for kv_spmd_idx in pl.spmd(
+        2 * (BATCH // BATCH_TILE),
+        name_hint="swa_kv_proj",
+        allow_early_resolve=True,
+    ):
+        kv_kind = kv_spmd_idx % 2
+        kv_b0 = (kv_spmd_idx // 2) * BATCH_TILE
+        if kv_kind == 0:
+            k_o0 = 0
+            k_tile_a = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, 0])
+            k_acc = pl.matmul(
+                k_tile_a,
+                pl.slice(wk, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base, k_o0]),
+                out_dtype=pl.FP32,
             )
-            k_acc = pl.matmul_acc(k_acc, k_tile_a, k_tile_b)
-        k_proj = pl.assemble(k_proj, k_acc, [k_b0, k_o0])
-
-    # ----- Scope 1.d — V projection. -----
-    for v_spmd_idx in pl.spmd(BATCH // BATCH_TILE, name_hint="swa_v_proj"):
-        v_b0 = v_spmd_idx * BATCH_TILE
-        v_o0 = 0
-        v_tile_a_0 = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [v_b0, 0])
-        v_tile_b_0 = pl.slice(
-            wv, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base, v_o0],
-        )
-        v_acc = pl.matmul(v_tile_a_0, v_tile_b_0, out_dtype=pl.FP32)
-        for kb in pl.range(1, kv_proj_hidden_blocks):
-            v_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
-            v_tile_a = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [v_b0, v_k0])
-            v_tile_b = pl.slice(
-                wv, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL],
-                [layer_hidden_base + v_k0, v_o0],
+            for kb in pl.range(1, kv_proj_hidden_blocks):
+                k_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
+                k_acc = pl.matmul_acc(
+                    k_acc, pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, k_k0]),
+                    pl.slice(wk, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base + k_k0, k_o0]),
+                )
+            k_proj = pl.assemble(k_proj, k_acc, [kv_b0, k_o0])
+        else:
+            v_o0 = 0
+            v_tile_a = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, 0])
+            v_acc = pl.matmul(
+                v_tile_a,
+                pl.slice(wv, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base, v_o0]),
+                out_dtype=pl.FP32,
             )
-            v_acc = pl.matmul_acc(v_acc, v_tile_a, v_tile_b)
-        v_proj = pl.assemble(v_proj, v_acc, [v_b0, v_o0])
+            for kb in pl.range(1, kv_proj_hidden_blocks):
+                v_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
+                v_acc = pl.matmul_acc(
+                    v_acc, pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, v_k0]),
+                    pl.slice(wv, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base + v_k0, v_o0]),
+                )
+            v_proj = pl.assemble(v_proj, v_acc, [kv_b0, v_o0])
 
     # ----- Scope 1.e — per-head zero-centred q_norm / k_norm. -----
     # q_norm / k_norm gamma [HEAD_DIM] are REPLICATED across TP ranks; only
@@ -574,9 +631,21 @@ def attention_swa(
     all_oi_tmp = pl.create_tensor(
         [BATCH * SWA_WIN_BLOCKS * SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.FP32,
     )
-
-    # Stage 1: QK matmul (cube). One core per batch.
-    for fa_b in pl.spmd(BATCH, name_hint="swa_qk_matmul"):
+    # Launch exactly one logical task per active row. Keep the launch extent
+    # as a loop-carried SSA value: older codegen can leave a direct
+    # ``active_tokens`` alias unresolved in ``set_block_num`` when this inline
+    # helper is embedded in chip orchestration. A zero-token request must be
+    # handled by the graph-level no-op/reject contract because later
+    # collectives are not valid for that case.
+    swa_active_tasks = pl.cast(0, pl.INDEX)
+    for swa_count_b in pl.range(active_tokens):
+        swa_active_tasks = swa_active_tasks + 1
+    # Stage 1: QK matmul (cube). One core per active batch row.
+    for fa_b in pl.spmd(
+        swa_active_tasks,
+        name_hint="swa_qk_matmul",
+        allow_early_resolve=True,
+    ):
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
@@ -602,7 +671,11 @@ def attention_swa(
 
     # Stage 2: softmax (vec). pl.slice(valid_shape=) marks Q_HEAD_BATCH_SWA real
     # rows + valid_len columns; fillpad pushes -inf into the masked tail.
-    for fa_b in pl.spmd(BATCH, name_hint="swa_softmax"):
+    for fa_b in pl.spmd(
+        swa_active_tasks,
+        name_hint="swa_softmax",
+        allow_early_resolve=True,
+    ):
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
@@ -642,7 +715,11 @@ def attention_swa(
     # Stage 3: SV matmul (cube). exp_tile uses the full SWA_Q_PAD_ALIGNED row
     # stride; matmul output's bottom (SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA)
     # rows are garbage from un-initialised GM but are never read by Stage 4.
-    for fa_b in pl.spmd(BATCH, name_hint="swa_sv_matmul"):
+    for fa_b in pl.spmd(
+        swa_active_tasks,
+        name_hint="swa_sv_matmul",
+        allow_early_resolve=True,
+    ):
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
@@ -672,7 +749,11 @@ def attention_swa(
     # the stage-4 slices because pypto's frontend rejects re-assigning a
     # valid_shape-tagged tile back through arithmetic ops that drop the
     # valid_shape attribute (e.g., `li = pl.add(pl.mul(alpha, li), ...)`).
-    for fa_b in pl.spmd(BATCH, name_hint="swa_online_softmax"):
+    for fa_b in pl.spmd(
+        swa_active_tasks,
+        name_hint="swa_online_softmax",
+        allow_early_resolve=True,
+    ):
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
@@ -755,66 +836,123 @@ def attention_swa(
     # matmul + vec cast into two separate spmds so PTOAS does not lower
     # this scope to a MixedKernels dispatch (the mixed-mode AICore root is
     # the 507018 VEC UB alignment crash site; see phase-15 doc).
+    # Declare both candidate destinations outside the compile-time feature
+    # branches.  PyPTO converts the DSL to SSA before it folds config-backed
+    # constant branches, so branch-local tensor declarations are otherwise
+    # diagnosed as escaping their defining scope.
+    partial_attn_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     partial_attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+    swa_out_proj_n_tiles = HIDDEN // SWA_OUT_PROJ_MATMUL_N_CHUNK
+    swa_out_proj_tasks = (
+        swa_out_proj_n_tiles
+        + SWA_OUT_PROJ_MATMUL_TILES_PER_TASK - 1
+    ) // SWA_OUT_PROJ_MATMUL_TILES_PER_TASK
     for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
-        for ob in pl.spmd(
-            HIDDEN // OUT_PROJ_N_CHUNK, name_hint="swa_out_proj_matmul",
+        for out_task in pl.spmd(
+            swa_out_proj_tasks,
+            name_hint="swa_out_proj_matmul",
             optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
         ):
-            o0 = ob * OUT_PROJ_N_CHUNK
-            # First K-chunk (kb=0). Gate applied inline via on-device gate_exp.
-            hg_exp_0 = pl.cast(
-                pl.slice(gate_exp, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0]),
-                target_type=pl.FP32,
-            )
-            a_chunk_raw_0 = pl.slice(
-                attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0],
-            )
-            a_gated_fp32_0 = pl.mul(
-                pl.cast(a_chunk_raw_0, target_type=pl.FP32), hg_exp_0,
-            )
-            a_chunk_0 = pl.cast(a_gated_fp32_0, target_type=pl.BF16)
-            w_chunk_0 = pl.slice(
-                wo, [OUT_PROJ_K_CHUNK, OUT_PROJ_N_CHUNK], [layer_qhidden_base, o0],
-            )
-            o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
-            for kb in pl.range(1, out_proj_k_blocks):
-                k0 = kb * OUT_PROJ_K_CHUNK
-                hg_exp = pl.cast(
-                    pl.slice(gate_exp, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0]),
-                    target_type=pl.FP32,
+            # Same scheduler-grain control as full attention.  The SWA K
+            # width is different, so it is tuned independently.
+            for out_local in pl.range(
+                SWA_OUT_PROJ_MATMUL_TILES_PER_TASK
+            ):
+                out_tile = (
+                    out_task * SWA_OUT_PROJ_MATMUL_TILES_PER_TASK
+                    + out_local
                 )
-                a_chunk_raw = pl.slice(
-                    attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0],
-                )
-                a_gated_fp32 = pl.mul(
-                    pl.cast(a_chunk_raw, target_type=pl.FP32), hg_exp,
-                )
-                a_chunk = pl.cast(a_gated_fp32, target_type=pl.BF16)
-                w_chunk = pl.slice(
-                    wo, [OUT_PROJ_K_CHUNK, OUT_PROJ_N_CHUNK],
-                    [layer_qhidden_base + k0, o0],
-                )
-                o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
-            partial_attn_proj_fp32 = pl.assemble(
-                partial_attn_proj_fp32, o_acc, [b0, o0],
-            )
+                if out_tile < swa_out_proj_n_tiles:
+                    o0 = out_tile * SWA_OUT_PROJ_MATMUL_N_CHUNK
+                    # First K-chunk (kb=0). Gate applied inline.
+                    hg_exp_0 = pl.cast(
+                        pl.slice(
+                            gate_exp,
+                            [BATCH_TILE, OUT_PROJ_K_CHUNK],
+                            [b0, 0],
+                        ),
+                        target_type=pl.FP32,
+                    )
+                    a_chunk_raw_0 = pl.slice(
+                        attn_out,
+                        [BATCH_TILE, OUT_PROJ_K_CHUNK],
+                        [b0, 0],
+                    )
+                    a_gated_fp32_0 = pl.mul(
+                        pl.cast(a_chunk_raw_0, target_type=pl.FP32),
+                        hg_exp_0,
+                    )
+                    a_chunk_0 = pl.cast(
+                        a_gated_fp32_0, target_type=pl.BF16,
+                    )
+                    w_chunk_0 = pl.slice(
+                        wo,
+                        [OUT_PROJ_K_CHUNK, SWA_OUT_PROJ_MATMUL_N_CHUNK],
+                        [layer_qhidden_base, o0],
+                    )
+                    o_acc = pl.matmul(
+                        a_chunk_0, w_chunk_0, out_dtype=pl.FP32,
+                    )
+                    for kb in pl.range(1, out_proj_k_blocks):
+                        k0 = kb * OUT_PROJ_K_CHUNK
+                        hg_exp = pl.cast(
+                            pl.slice(
+                                gate_exp,
+                                [BATCH_TILE, OUT_PROJ_K_CHUNK],
+                                [b0, k0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        a_chunk_raw = pl.slice(
+                            attn_out,
+                            [BATCH_TILE, OUT_PROJ_K_CHUNK],
+                            [b0, k0],
+                        )
+                        a_gated_fp32 = pl.mul(
+                            pl.cast(a_chunk_raw, target_type=pl.FP32),
+                            hg_exp,
+                        )
+                        a_chunk = pl.cast(
+                            a_gated_fp32, target_type=pl.BF16,
+                        )
+                        w_chunk = pl.slice(
+                            wo,
+                            [
+                                OUT_PROJ_K_CHUNK,
+                                SWA_OUT_PROJ_MATMUL_N_CHUNK,
+                            ],
+                            [layer_qhidden_base + k0, o0],
+                        )
+                        o_acc = pl.matmul_acc(
+                            o_acc, a_chunk, w_chunk,
+                        )
+                    if SWA_OUT_PROJ_FUSE_CAST != 0:
+                        partial_attn_proj = pl.assemble(
+                            partial_attn_proj,
+                            pl.cast(o_acc, target_type=pl.BF16),
+                            [b0, o0],
+                        )
+                    else:
+                        partial_attn_proj_fp32 = pl.assemble(
+                            partial_attn_proj_fp32, o_acc, [b0, o0],
+                        )
 
-    partial_attn_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
-        for ob in pl.spmd(
-            HIDDEN // OUT_PROJ_N_CHUNK, name_hint="swa_out_proj_cast",
-        ):
-            o0 = ob * OUT_PROJ_N_CHUNK
-            fp32_chunk = pl.slice(
-                partial_attn_proj_fp32,
-                [BATCH_TILE, OUT_PROJ_N_CHUNK], [b0, o0],
-            )
-            partial_attn_proj = pl.assemble(
-                partial_attn_proj,
-                pl.cast(fp32_chunk, target_type=pl.BF16),
-                [b0, o0],
-            )
+    if SWA_OUT_PROJ_FUSE_CAST == 0:
+        for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
+            for ob in pl.spmd(
+                HIDDEN // SWA_OUT_PROJ_VEC_N_CHUNK,
+                name_hint="swa_out_proj_cast",
+            ):
+                o0 = ob * SWA_OUT_PROJ_VEC_N_CHUNK
+                fp32_chunk = pl.slice(
+                    partial_attn_proj_fp32,
+                    [BATCH_TILE, SWA_OUT_PROJ_VEC_N_CHUNK], [b0, o0],
+                )
+                partial_attn_proj = pl.assemble(
+                    partial_attn_proj,
+                    pl.cast(fp32_chunk, target_type=pl.BF16),
+                    [b0, o0],
+                )
 
     # ----- Scope 3.b — TP all-reduce(sum) of the partial o_proj output. -----
     # The pull-side ring all-reduce body now lives as a class method on
@@ -835,15 +973,24 @@ def attention_swa(
     # ----- Scope 3.c — residual add (post-all-reduce). -----
     for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
         for ob in pl.spmd(
-            HIDDEN // OUT_PROJ_N_CHUNK, name_hint="swa_out_resid_add",
+            HIDDEN // SWA_OUT_PROJ_VEC_N_CHUNK,
+            name_hint="swa_out_resid_add",
         ):
-            o0 = ob * OUT_PROJ_N_CHUNK
+            o0 = ob * SWA_OUT_PROJ_VEC_N_CHUNK
             reduced = pl.cast(
-                pl.slice(partial_attn_proj, [BATCH_TILE, OUT_PROJ_N_CHUNK], [b0, o0]),
+                pl.slice(
+                    partial_attn_proj,
+                    [BATCH_TILE, SWA_OUT_PROJ_VEC_N_CHUNK],
+                    [b0, o0],
+                ),
                 target_type=pl.FP32,
             )
             resid = pl.cast(
-                pl.slice(resid1_out, [BATCH_TILE, OUT_PROJ_N_CHUNK], [b0, o0]),
+                pl.slice(
+                    resid1_out,
+                    [BATCH_TILE, SWA_OUT_PROJ_VEC_N_CHUNK],
+                    [b0, o0],
+                ),
                 target_type=pl.FP32,
             )
             resid_sum = pl.add(reduced, resid)

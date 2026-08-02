@@ -60,23 +60,16 @@ def dense_mlp_body_tp(
     layer_inter_base = mlp_layer_idx * INTER_LOCAL
 
     dm_post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    dm_resid1_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dense_post_rmsnorm_zc"):
-        for kb in pl.range(hidden_blocks):
-            k0 = kb * K_CHUNK
-            dm_rchunk = pl.cast(
-                pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
-                target_type=pl.FP32,
-            )
-            dm_resid1_fp32 = pl.assemble(
-                dm_resid1_fp32, dm_rchunk, [0, k0],
-            )
-
+        # Read BF16 residual tiles directly in both RMSNorm passes.  This removes
+        # the full [BATCH,HIDDEN] FP32 GM staging buffer while preserving the
+        # FP32 sum-of-squares, zero-centred gamma and BF16 projection boundary.
         dm_sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
         for kb2 in pl.range(hidden_blocks):
             k0 = kb2 * K_CHUNK
-            dm_ck = pl.slice(
-                dm_resid1_fp32, [BATCH, K_CHUNK], [0, k0],
+            dm_ck = pl.cast(
+                pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                target_type=pl.FP32,
             )
             dm_sq_sum = pl.add(
                 dm_sq_sum,
@@ -91,8 +84,9 @@ def dense_mlp_body_tp(
         dm_inv_rms_col = pl.reshape(inv_rms_dense, [BATCH, 1])
         for kb3 in pl.range(hidden_blocks):
             k0 = kb3 * K_CHUNK
-            dm_norm_chunk = pl.slice(
-                dm_resid1_fp32, [BATCH, K_CHUNK], [0, k0],
+            dm_norm_chunk = pl.cast(
+                pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                target_type=pl.FP32,
             )
             dm_gamma = pl.slice(
                 post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
@@ -181,8 +175,12 @@ def dense_mlp_body_tp(
             [0, mlp_o0],
         )
 
-    partial_hidden_fp32 = pl.create_tensor(
-        [BATCH, HIDDEN], dtype=pl.FP32,
+    # Fuse the down-projection FP32->BF16 epilogue into the same mixed task.
+    # Each task owns one disjoint hidden tile, so the cast can be performed
+    # immediately after the FP32 cube accumulator without a second SPMD
+    # dispatch or a full [BATCH,HIDDEN] FP32 GM staging tensor.
+    partial_hidden = pl.create_tensor(
+        [BATCH, HIDDEN], dtype=pl.BF16,
     )
     for dob in pl.spmd(
         hidden_blocks,
@@ -216,23 +214,9 @@ def dense_mlp_body_tp(
             down_acc = pl.matmul_acc(
                 down_acc, down_mlp_chunk_bf16, w_down_chunk,
             )
-        partial_hidden_fp32 = pl.assemble(
-            partial_hidden_fp32, down_acc, [0, d0],
-        )
-
-    partial_hidden = pl.create_tensor(
-        [BATCH, HIDDEN], dtype=pl.BF16,
-    )
-    for dob in pl.spmd(
-        hidden_blocks, name_hint="dense_down_cast_tp",
-    ):
-        d0 = dob * K_CHUNK
-        dense_fp32_chunk = pl.slice(
-            partial_hidden_fp32, [BATCH, K_CHUNK], [0, d0],
-        )
         partial_hidden = pl.assemble(
             partial_hidden,
-            pl.cast(dense_fp32_chunk, target_type=pl.BF16),
+            pl.cast(down_acc, target_type=pl.BF16),
             [0, d0],
         )
 
@@ -250,8 +234,9 @@ def dense_mlp_body_tp(
                 ),
                 target_type=pl.FP32,
             )
-            dm_r = pl.slice(
-                dm_resid1_fp32, [BATCH, K_CHUNK], [0, k0],
+            dm_r = pl.cast(
+                pl.slice(resid1, [BATCH, K_CHUNK], [0, k0]),
+                target_type=pl.FP32,
             )
             next_hidden = pl.assemble(
                 next_hidden,

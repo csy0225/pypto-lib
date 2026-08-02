@@ -39,6 +39,14 @@ from models.step3p5.config import (
     BLOCK_SIZE,
     BLOCK_TABLE_FLAT_DYN,
     EPS,
+    FULL_ATTN_OUT_PROJ_FUSE_CAST,
+    FULL_ATTN_OUT_PROJ_MATMUL_N_CHUNK,
+    FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK,
+    FULL_ATTN_OUT_PROJ_VEC_N_CHUNK,
+    FULL_ATTN_QK_BLOCKS_PER_TASK,
+    FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK,
+    FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK,
+    FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK,
     HEAD_DIM,
     HEAD_DIM_INV,
     HIDDEN,
@@ -63,7 +71,6 @@ from models.step3p5.config import (
     NUM_HEADS_FULL_LOCAL_PAD,
     NUM_HEADS_SWA_LOCAL_PAD,
     OUT_PROJ_K_CHUNK,
-    OUT_PROJ_N_CHUNK,
     Q_HEAD_BATCH_FULL,
     Q_HEAD_BATCH_SWA,
     Q_HEAD_PAD_FULL,
@@ -75,6 +82,11 @@ from models.step3p5.config import (
     ROTARY_HALF_SWA,
     SHARE_EXPERT_DIM_LOCAL,
     SLIDING_WINDOW,
+    SWA_OUT_PROJ_FUSE_CAST,
+    SWA_OUT_PROJ_MATMUL_N_CHUNK,
+    SWA_OUT_PROJ_MATMUL_TILES_PER_TASK,
+    SWA_OUT_PROJ_VEC_N_CHUNK,
+    TP_ALL_REDUCE_CHUNK,
     TP_WORLD_SIZE,
     USER_BATCH_DYN,
 )
@@ -227,42 +239,8 @@ class WholeDecodeStep3p5:
     # attention_full / attention_swa / dense_mlp_body_tp 的 inlined body 里
     # 都调 ``self.tp_all_reduce(...)`` 汇集 o_proj / down_proj 的 partial sum。
     # pl.inline 把这些 body 拷进本 program 后，``self.tp_all_reduce`` 解析到本
-    # program 的 method，所以必须在这里定义。
-    #
-    # Algorithm: reduce-scatter + push all-gather (``twophase_par`` in
-    # design/performance/03-tp-allreduce-algorithm-comparison.md).  Each rank
-    # reduces ONLY the ``HIDDEN/group_size`` shard it owns, then pushes that
-    # reduced shard to every peer.  Per-rank remote transfers drop from
-    # ``(HIDDEN/ar_chunk) * (P-1)`` full-width reads (56 at P=8) to ``2*(P-1)``
-    # shard-sized transfers (14), and per-rank remote bytes from ``(P-1)*N`` to
-    # ``1.75*N``.  Only the dependency-free loops (stage-in, barrier fan-out,
-    # final local gather) use ``pl.parallel``; the carried FP32 reduction stays
-    # ``pl.range`` so the heavy remote reads are never oversubscribed onto the
-    # cross-die link (``onephase_par`` measured slower for exactly that reason).
-    #
-    # The all-gather MUST be a push.  Publishing a shard by storing it into my
-    # own window and letting peers ``remote_load`` it after a notify is NOT
-    # ordered: the payload lands in my HBM while the notify lands in the peer's
-    # HBM, and a local V->MTE3 fence cannot order my store against the peer's
-    # read.  Device evidence: with an otherwise identical pull-form all-gather
-    # the 8 ranks disagreed on 6 of 8 decode steps (hidden_tp_spread up to 24),
-    # while the push form below is 0.0 on every step.  The full-mesh predecessor
-    # survived the same weak ordering only because it had ONE data-dependent
-    # barrier per call instead of two.  V4-Flash uses this same push-then-notify
-    # shape for dispatch and combine ("payload-arrival notify folded into the
-    # push"), and the design doc kills ring for the same underlying gap.
-    #
-    # Numerics are bit-identical to the previous full-mesh form: every shard is
-    # still summed in canonical peer order 0..P-1 through a single FP32
-    # accumulator with exactly one BF16 cast/store per element.  A shard is now
-    # reduced by exactly one rank and broadcast, which additionally removes any
-    # chance of rank-dependent rounding.
-    #
-    # Barrier protocol: three waves on the same per-rank signal cell via
-    # AtomicAdd, thresholds Ge 1 / 2 / 3 (the runtime clears every retained
-    # window before each request, so thresholds restart at 1).  Wave 3 keeps the
-    # pre-existing completion-barrier contract: no rank returns before every
-    # peer is done with this window.
+    # program 的 method，所以必须在这里定义。协议使用 two-wave completion
+    # barrier（expected=1/2 Ge）。
     @pl.function(type=pl.FunctionType.InCore)
     def tp_all_reduce(
         self,
@@ -272,126 +250,92 @@ class WholeDecodeStep3p5:
         my_rank: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         group_size = tp_size
-        # Shard width is algorithmic: rank r owns columns [r*shard, (r+1)*shard).
-        shard = HIDDEN // group_size
 
-        # Phase 1: stage-in — publish the shards OTHER ranks own into my
-        # tmp_window slot; peer p reads my columns [p*shard, (p+1)*shard).  My own
-        # shard is deliberately NOT staged, which gives each column a single
-        # writer for the whole call: column p*shard is written here, read by peer
-        # p in its Phase 3, and afterwards overwritten only by peer p's own
-        # Phase-3 push; column my_rank*shard is never written in my window at all
-        # (Phase 3 lands my reduced shard straight into `local`, Phase 5 skips it).
-        for s in pl.parallel(group_size):
-            stage_off = s * shard
-            if s != my_rank:
-                stage_tile = pl.load(local, [0, stage_off], [BATCH, shard])
-                pl.store(stage_tile, [0, stage_off], tmp_window)
+        # Keep the existing full-size communication window ABI.  The local
+        # transfer grain is configurable, while reduce-scatter ownership is
+        # defined by the TP rank count rather than a fixed core count.
+        ar_chunk = TP_ALL_REDUCE_CHUNK
+        for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+            stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
+            pl.store(stage_tile, [0, k0], tmp_window)
 
-        # Phase 2: reduce-scatter barrier (wave 1) — every peer's full staged
-        # tensor is readable once this returns.
-        for peer in pl.parallel(group_size):
+        # Wave 1 publishes all source partials.
+        for peer in pl.range(group_size):
             if peer != my_rank:
                 pld.system.notify(
                     target=signal_window, peer=peer,
                     offsets=[my_rank, 0], value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
-        for src in pl.parallel(group_size):
+        for src in pl.range(group_size):
             if src != my_rank:
                 pld.system.wait(
                     signal=signal_window, offsets=[src, 0],
                     expected=1, cmp=pld.WaitCmp.Ge,
                 )
 
-        # Phase 3: reduce-scatter — sum ONLY the shard this rank owns, land it in
-        # `local`, and push it to every peer.  The owner is selected by iterating
-        # ranks under an ``owner == my_rank`` guard, matching the V4-Flash
-        # collectives (``lm_head_tp`` / ``load_all_owner_hidden_decoupled``);
-        # note ``pl.range`` does NOT unroll (only ``pl.unroll`` does), so this is
-        # a plain runtime loop and ``base`` stays a runtime scalar -- that is
-        # fine, the full-mesh predecessor addressed the same window with a
-        # runtime column offset too.
-        # Serial: the FP32 accumulator is a carried reduction, and keeping one
-        # heavy remote read in flight per rank avoids saturating the cross-die
-        # link.
-        for owner in pl.range(group_size):
-            if owner == my_rank:
-                base = owner * shard
-                own_tile = pl.load(local, [0, base], [BATCH, shard])
-                acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
-                # Canonical peer order 0..P-1 keeps the FP32 summation order equal
-                # to the previous full-mesh form, hence a bit-identical BF16
-                # result.
-                for peer in pl.range(group_size):
-                    if peer == my_rank:
-                        acc = pl.add(acc, pl.cast(own_tile, target_type=pl.FP32))
-                    else:
-                        remote_tile = pld.tile.remote_load(
-                            tmp_window, peer=peer,
-                            offsets=[0, base], shape=[BATCH, shard],
-                        )
-                        acc = pl.add(
-                            acc, pl.cast(remote_tile, target_type=pl.FP32),
-                        )
-                reduced_tile = pl.cast(acc, target_type=pl.BF16)
-                # Land my own shard directly in `local`.
-                pl.store(reduced_tile, [0, base], local)
-                # PUSH my reduced shard into every peer's window slot at my own
-                # column.  Push + notify travel the SAME direction, so a peer that
-                # observes the arrival count already has the payload in its own
-                # HBM.  The pull form (store locally -> notify remotely -> peer
-                # remote-loads) crosses two directions: a local V->MTE3 fence
-                # cannot order my store against the peer's read, which is what
-                # made this collective rank-dependent.  V4-Flash uses the same
-                # push-then-notify shape for dispatch and combine.
-                for dst in pl.range(group_size):
-                    if dst != my_rank:
-                        pld.tile.remote_store(
-                            reduced_tile, tmp_window, dst, [0, base],
-                        )
+        # Reduce-scatter: rank r uniquely owns chunk r.  Preserve the
+        # canonical peer order 0..N-1, one FP32 accumulator, and one final
+        # BF16 cast to retain the numerical contract of the pull mesh.
+        owned_chunk = HIDDEN // group_size
+        owned_base = my_rank * owned_chunk
+        own_tile = pl.load(
+            tmp_window, [0, owned_base], [BATCH, owned_chunk],
+        )
+        acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
+        for peer in pl.range(group_size):
+            if peer == my_rank:
+                acc = pl.add(
+                    acc,
+                    pl.cast(own_tile, target_type=pl.FP32),
+                )
+            else:
+                remote_tile = pld.tile.remote_load(
+                    tmp_window, peer=peer,
+                    offsets=[0, owned_base],
+                    shape=[BATCH, owned_chunk],
+                )
+                acc = pl.add(
+                    acc,
+                    pl.cast(remote_tile, target_type=pl.FP32),
+                )
+        reduced_tile = pl.cast(acc, target_type=pl.BF16)
 
-        # Phase 4: all-gather barrier (wave 2) — every owner has pushed its
-        # reduced shard into my window, so after this wave the whole reduced
-        # vector is readable LOCALLY.
-        for peer in pl.parallel(group_size):
+        # All-gather by push into write-disjoint offsets of the same window.
+        # Chunk r has one writer (rank r); after rank r has read all source
+        # copies of that chunk, overwriting it cannot race another reducer.
+        pl.store(reduced_tile, [0, owned_base], tmp_window)
+        for dst in pl.range(group_size):
+            if dst != my_rank:
+                pld.tile.remote_store(
+                    reduced_tile,
+                    target=tmp_window,
+                    peer=dst,
+                    offsets=[0, owned_base],
+                )
+
+        # Wave 2 publishes all pushed result chunks and closes the existing
+        # two-wave signal/window lifetime without an extra orchestration task.
+        for peer in pl.range(group_size):
             if peer != my_rank:
                 pld.system.notify(
                     target=signal_window, peer=peer,
                     offsets=[my_rank, 0], value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
-        for src in pl.parallel(group_size):
+        for src in pl.range(group_size):
             if src != my_rank:
                 pld.system.wait(
                     signal=signal_window, offsets=[src, 0],
                     expected=2, cmp=pld.WaitCmp.Ge,
                 )
 
-        # Phase 5: all-gather — purely LOCAL reads now; there is no remote access
-        # after the barrier at all.  The own shard was stored back in Phase 3.
-        for r in pl.parallel(group_size):
-            off = r * shard
-            if r != my_rank:
-                peer_shard = pl.load(tmp_window, [0, off], [BATCH, shard])
-                pl.store(peer_shard, [0, off], local)
-
-        # Phase 6: completion barrier (wave 3). Ensures every rank finished its
-        # all-gather reads before returning, so the next collective cannot race
-        # this one's reads. threshold 2 -> 3.
-        for peer in pl.parallel(group_size):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=signal_window, peer=peer,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.parallel(group_size):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=signal_window, offsets=[src, 0],
-                    expected=3, cmp=pld.WaitCmp.Ge,
-                )
+        # The completed temporary window contains the complete reduced vector.
+        for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+            result_tile = pl.load(
+                tmp_window, [0, k0], [BATCH, ar_chunk],
+            )
+            pl.store(result_tile, [0, k0], local)
         return local
 
     @pl.function(

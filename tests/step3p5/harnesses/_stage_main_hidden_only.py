@@ -23,6 +23,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -92,6 +93,50 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--itl-iters", type=int, default=20, help="measured decode iters per context")
     parser.add_argument("--itl-warmup", type=int, default=3, help="warmup decode iters per context (not recorded)")
     parser.add_argument(
+        "--itl-save-hidden",
+        action="store_true",
+        help=(
+            "diagnostic-only: save the first measured next_hidden tensor for "
+            "each --itl-context-lens point, enabling bitwise/tolerance A/B "
+            "between different task-grain configurations"
+        ),
+    )
+    parser.add_argument(
+        "--full-attn-online-softmax-blocks-per-task",
+        type=int,
+        default=0,
+        help=(
+            "override full-attention SV+segment-recurrence grain before "
+            "config import; zero keeps the release/config value"
+        ),
+    )
+    parser.add_argument(
+        "--full-attn-online-softmax-partials-per-reduce-task",
+        type=int,
+        default=0,
+        help=(
+            "override the number of segment partials merged by each parallel "
+            "full-attention online-softmax reduction task before config import; "
+            "zero keeps the release/config value"
+        ),
+    )
+    parser.add_argument(
+        "--full-attn-out-proj-fuse-cast",
+        action="store_true",
+        help=(
+            "diagnostic-only: fuse the full-attention out-proj FP32-to-BF16 "
+            "cast into each out-proj matmul task before config import"
+        ),
+    )
+    parser.add_argument(
+        "--swa-out-proj-fuse-cast",
+        action="store_true",
+        help=(
+            "diagnostic-only: fuse the SWA out-proj FP32-to-BF16 cast into "
+            "each out-proj matmul task before config import"
+        ),
+    )
+    parser.add_argument(
         "--dfx",
         default="",
         help=(
@@ -99,6 +144,16 @@ def _parse_args() -> argparse.Namespace:
             "(e.g. 'swim' for l2_swimlane, 'pmu' for AICore PMU, 'scope'/'dep'). "
             "Artifacts land under {compiled.output_dir}/dfx_outputs/. Run swim and "
             "pmu in SEPARATE invocations (each perturbs timing)."
+        ),
+    )
+    parser.add_argument(
+        "--dfx-after-itl",
+        action="store_true",
+        help=(
+            "perf-only: keep the ITL loop clean, then capture one warm dep_gen "
+            "iteration and one warm l2_swimlane iteration at the largest "
+            "requested context. Requires --itl-context-lens and is mutually "
+            "exclusive with --dfx."
         ),
     )
     parser.add_argument("--pmu", type=int, default=1, help="AICore PMU event type when --dfx contains 'pmu' (1=CYCLE..4=MEMORY)")
@@ -602,10 +657,8 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
     """
     import statistics
 
-    # ITL honours --active-batch: `valid_rows` active decode rows, each with its
-    # own scheduler-owned paged sequence.  Row r owns blocks r, r+R, r+2R, ...
-    # (see _step_metadata), so the block table needs R * ceil(L/BLOCK_SIZE)
-    # scheduler blocks -- R times more than a single-row run at the same context.
+    # The formal BATCH=16 is storage capacity. ITL must drive the requested
+    # runtime active-row count, with one disjoint paged sequence per row.
     active = int(getattr(args, "active_batch", 1) or 1)
     if not 1 <= active <= BATCH:
         raise ValueError(f"--active-batch must be in [1,{BATCH}], got {active}")
@@ -622,13 +675,10 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
         if need > args.num_blocks:
             raise ValueError(
                 f"itl context {length} with --active-batch {active} needs "
-                f">= {need} scheduler blocks (each of the {active} active rows "
-                f"owns its own paged sequence), got --num-blocks "
-                f"{args.num_blocks}"
+                f">= {need} scheduler blocks, got {args.num_blocks}"
             )
 
-    # Fixed dummy embedding — content is irrelevant to decode-step timing.  One
-    # row per active decode slot.
+    # Content is irrelevant to timing; shape must still match active rows.
     embedding = (
         _load_embedding_row(args.ckpt, args.seed_token)
         .unsqueeze(0)
@@ -645,27 +695,29 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
         set_kwargs = dict(
             seq_lens=seq, positions=pos, block_table=table, slot_mapping=slot
         )
-        # Warmup runs must NOT emit DFX artifacts: the first cold run absorbs
-        # cross-rank startup skew (the first tp_all_reduce barrier waits for
-        # the slowest rank to finish init), and the holder merges every run's
-        # trace, so capturing warmup pollutes the swimlane with a one-time
-        # ~300ms skew bar that is not steady-state. Suppress N1_DFX/N1_PMU
-        # during warmup, restore for the measured iters (mirrors serving warmup).
-        _dfx_env = os.environ.pop("N1_DFX", None)
-        _pmu_env = os.environ.pop("N1_PMU", None)
+        # Keep cold-start skew and profiling artifacts out of warmup.
+        dfx_env = os.environ.pop("N1_DFX", None)
+        pmu_env = os.environ.pop("N1_PMU", None)
         for _ in range(max(0, args.itl_warmup)):
             holder.set_live_step(embedding, **set_kwargs)
             holder.run()
-        if _dfx_env is not None:
-            os.environ["N1_DFX"] = _dfx_env
-        if _pmu_env is not None:
-            os.environ["N1_PMU"] = _pmu_env
+        if dfx_env is not None:
+            os.environ["N1_DFX"] = dfx_env
+        if pmu_env is not None:
+            os.environ["N1_PMU"] = pmu_env
         samples: list[float] = []
-        for _ in range(max(1, args.itl_iters)):
+        hidden_path: Path | None = None
+        for sample_idx in range(max(1, args.itl_iters)):
             holder.set_live_step(embedding, **set_kwargs)
             started = time.time()
-            holder.run()
+            result = holder.run()
             samples.append(time.time() - started)
+            if args.itl_save_hidden and sample_idx == 0:
+                hidden_path = out / f"itl_ctx{length}_hidden.pt"
+                torch.save(
+                    result["next_hidden"].to(torch.bfloat16).cpu(),
+                    hidden_path,
+                )
         ms = sorted(s * 1000.0 for s in samples)
         n = len(ms)
         res = {
@@ -677,6 +729,8 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
             "itl_ms_p99": round(ms[min(n - 1, int(n * 0.99))], 3),
             "itl_ms_max": round(ms[-1], 3),
         }
+        if hidden_path is not None:
+            res["hidden_path"] = str(hidden_path)
         results.append(res)
         print(json.dumps(res, sort_keys=True), flush=True)
 
@@ -684,8 +738,6 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
         "kind": "decode_itl",
         "num_blocks": args.num_blocks,
         "block_size": BLOCK_SIZE,
-        # ``batch_capacity`` is the fixed storage upper bound (the BATCH formal);
-        # ``active_batch`` is how many decode rows this run actually drove.
         "batch_capacity": BATCH,
         "active_batch": active,
         "warmup": args.itl_warmup,
@@ -693,10 +745,59 @@ def _run_itl(holder, args: argparse.Namespace, out: Path) -> int:
     }
     (out / "itl_report.json").write_text(json.dumps(report, indent=2))
     print(f"ITL_REPORT={out / 'itl_report.json'}", flush=True)
+
+    if args.dfx_after_itl:
+        dfx_context = max(ctx_lens)
+        seq, pos, table, slot = _step_metadata(
+            step=dfx_context - 1,
+            scheduler_num_blocks=args.num_blocks,
+            valid_rows=active,
+        )
+        set_kwargs = dict(
+            seq_lens=seq,
+            positions=pos,
+            block_table=table,
+            slot_mapping=slot,
+        )
+
+        # Keep the measured loop completely clean.  The two unprofiled
+        # submissions below warm the resident graph before either profiling
+        # mode is enabled; dep_gen and swimlane are intentionally separate.
+        for _ in range(2):
+            holder.set_live_step(embedding, **set_kwargs)
+            holder.run()
+
+        print(
+            f"[canonical] DFX dep_gen iter (warm, ctx={dfx_context})",
+            flush=True,
+        )
+        holder.set_live_step(embedding, **set_kwargs)
+        os.environ["N1_DFX"] = "dep"
+        try:
+            holder.run()
+        finally:
+            os.environ.pop("N1_DFX", None)
+
+        print(
+            f"[canonical] DFX l2_swimlane iter (warm, ctx={dfx_context})",
+            flush=True,
+        )
+        holder.set_live_step(embedding, **set_kwargs)
+        os.environ["N1_DFX"] = "swim"
+        try:
+            holder.run()
+        finally:
+            os.environ.pop("N1_DFX", None)
+
     return 0
 
 
 def _run_worker(args: argparse.Namespace) -> int:
+    if args.dfx and args.dfx_after_itl:
+        raise ValueError("--dfx and --dfx-after-itl are mutually exclusive")
+    if args.dfx_after_itl and not args.itl_context_lens:
+        raise ValueError("--dfx-after-itl requires --itl-context-lens")
+
     devices = _devices(args.device)
     if not 1 <= args.active_batch <= BATCH:
         raise ValueError(f"--active-batch must be in [1,{BATCH}]")
@@ -723,8 +824,29 @@ def _run_worker(args: argparse.Namespace) -> int:
         45 * physical_blocks * BLOCK_SIZE
     )
     os.environ["PYPTO_STEP3P5_ROPE_SEQ"] = str(int(args.num_blocks) * BLOCK_SIZE)
+    if args.full_attn_online_softmax_blocks_per_task < 0:
+        raise ValueError(
+            "--full-attn-online-softmax-blocks-per-task must be non-negative"
+        )
+    if args.full_attn_online_softmax_blocks_per_task:
+        os.environ[
+            "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK"
+        ] = str(args.full_attn_online_softmax_blocks_per_task)
+    if args.full_attn_online_softmax_partials_per_reduce_task < 0:
+        raise ValueError(
+            "--full-attn-online-softmax-partials-per-reduce-task must be "
+            "non-negative"
+        )
+    if args.full_attn_online_softmax_partials_per_reduce_task:
+        os.environ[
+            "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK"
+        ] = str(args.full_attn_online_softmax_partials_per_reduce_task)
+    if args.full_attn_out_proj_fuse_cast:
+        os.environ["PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_FUSE_CAST"] = "1"
+    if args.swa_out_proj_fuse_cast:
+        os.environ["PYPTO_STEP3P5_SWA_OUT_PROJ_FUSE_CAST"] = "1"
     os.environ.setdefault("PYPTO_PROG_BUILD_DIR", str(out / "build_output"))
-    if args.dfx:
+    if args.dfx and not args.dfx_after_itl:
         # PERF-A1: forward DFX tokens to WholeDecodeHolder.run() via env.
         os.environ["N1_DFX"] = args.dfx
         os.environ["N1_PMU"] = str(args.pmu)

@@ -335,7 +335,7 @@ def test_c3_expert_lane_fanout_uses_spmd_and_no_incore_parallel() -> None:
     source, tree = _parse(_CANONICAL)
     # This is a C3 expert-lane contract, not a blanket restriction on every
     # InCore helper in the canonical program.  In particular, tp_all_reduce
-    # legitimately uses write-disjoint pl.parallel copies for local staging.
+    # uses write-disjoint pl.parallel copies for the final local copy.
     for name in ("dispatch_step", "combine_step"):
         function = _method(tree, name)
         assert not any(
@@ -365,6 +365,22 @@ def test_two_layer_tp_all_reduce_matches_canonical() -> None:
         two_layer,
         include_attributes=False,
     )
+
+
+def test_tp_all_reduce_uses_tput_source_and_existing_push_gather() -> None:
+    source, tree = _parse(_CANONICAL)
+    body = _segment(source, _method(tree, "tp_all_reduce"))
+    assert body.count("pld.tensor.put(") == 1
+    assert "peer=my_rank" in body
+    assert "dst=tmp_window,\n            peer=my_rank,\n            src=local" in body
+    assert "for dst in pl.range(group_size):" in body
+    assert "pld.tile.remote_store(" in body
+    assert "pl.store(reduced_tile, [0, owned_base], tmp_window)" in body
+    assert "pl.store(reduced_tile, [0, owned_base], local)" not in body
+    assert "chunk_rows=BATCH" in body
+    assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
+    for expected in (1, 2, 3):
+        assert f"expected={expected}" in body
 
 
 def test_g1_threads_runtime_active_tokens_through_moe_and_holder() -> None:

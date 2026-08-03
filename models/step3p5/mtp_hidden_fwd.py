@@ -6,6 +6,8 @@ The vLLM proposer invokes one compile-time layer variant at a time.  PyPTO
 owns token embedding plus the selected MTP decoder body and writes only the
 raw hidden state.  vLLM owns every operation after that boundary.
 """
+# ruff: noqa: F401,F821
+
 from __future__ import annotations
 
 import pypto.language as pl
@@ -44,6 +46,11 @@ from .config import (
     ROPE_SEQ_DYN,
     ROTARY_HALF_SWA,
     SLIDING_WINDOW,
+    SWA_OUT_PROJ_FUSE_CAST,
+    SWA_OUT_PROJ_MATMUL_N_CHUNK,
+    SWA_OUT_PROJ_MATMUL_TILES_PER_TASK,
+    SWA_OUT_PROJ_VEC_N_CHUNK,
+    TP_ALL_REDUCE_CHUNK,
     TP_WORLD_SIZE,
     USER_BATCH_DYN,
     VOCAB,
@@ -275,7 +282,7 @@ def _mtp_input_proj_body(
             )
 
     if TP_WORLD_SIZE > 1:
-        self.tp_all_reduce(
+        partial = self.tp_all_reduce(
             partial,
             eh_tmp_window,
             eh_signal_window,
@@ -326,13 +333,21 @@ def _build_mtp_layer_hidden_program(
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-            """Released two-wave barrier all-reduce, with fresh call windows."""
-            ar_chunk = HIDDEN // 8
-            for k0 in pl.range(0, HIDDEN, ar_chunk):
-                stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
-                pl.store(stage_tile, [0, k0], tmp_window)
+            """Three-wave reduce-scatter/all-gather on fresh call windows."""
+            group_size = tp_size
+            ar_chunk = TP_ALL_REDUCE_CHUNK
 
-            for peer in pl.range(tp_size):
+            # Self-target TPUT drains before the following notify (PTOAS#872).
+            pld.tensor.put(
+                dst=tmp_window,
+                peer=my_rank,
+                src=local,
+                chunk_rows=BATCH,
+                chunk_cols=TP_ALL_REDUCE_CHUNK,
+            )
+
+            # Wave 1 publishes every rank's source partial.
+            for peer in pl.range(group_size):
                 if peer != my_rank:
                     pld.system.notify(
                         target=signal_window,
@@ -341,7 +356,7 @@ def _build_mtp_layer_hidden_program(
                         value=1,
                         op=pld.NotifyOp.AtomicAdd,
                     )
-            for src in pl.range(tp_size):
+            for src in pl.range(group_size):
                 if src != my_rank:
                     pld.system.wait(
                         signal=signal_window,
@@ -350,25 +365,49 @@ def _build_mtp_layer_hidden_program(
                         cmp=pld.WaitCmp.Ge,
                     )
 
-            for k0 in pl.range(0, HIDDEN, ar_chunk):
-                own_tile = pl.load(tmp_window, [0, k0], [BATCH, ar_chunk])
-                acc = pl.cast(own_tile, target_type=pl.FP32)
-                for peer in pl.range(tp_size):
-                    if peer != my_rank:
-                        recv = pld.tile.remote_load(
-                            tmp_window,
-                            peer=peer,
-                            offsets=[0, k0],
-                            shape=[BATCH, ar_chunk],
-                        )
-                        acc = pl.add(acc, pl.cast(recv, target_type=pl.FP32))
-                pl.store(
-                    pl.cast(acc, target_type=pl.BF16),
-                    [0, k0],
-                    local,
-                )
+            # Reduce-scatter: rank r owns one HIDDEN / TP shard. Preserve the
+            # fixed peer order, one FP32 accumulator, and one final BF16 cast.
+            owned_chunk = HIDDEN // group_size
+            owned_base = my_rank * owned_chunk
+            own_tile = pl.load(
+                tmp_window,
+                [0, owned_base],
+                [BATCH, owned_chunk],
+            )
+            acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
+            for peer in pl.range(group_size):
+                if peer == my_rank:
+                    acc = pl.add(
+                        acc,
+                        pl.cast(own_tile, target_type=pl.FP32),
+                    )
+                else:
+                    recv = pld.tile.remote_load(
+                        tmp_window,
+                        peer=peer,
+                        offsets=[0, owned_base],
+                        shape=[BATCH, owned_chunk],
+                    )
+                    acc = pl.add(
+                        acc,
+                        pl.cast(recv, target_type=pl.FP32),
+                    )
+            reduced_tile = pl.cast(acc, target_type=pl.BF16)
 
-            for peer in pl.range(tp_size):
+            # Publish the write-disjoint reduced shard with the existing
+            # all-gather push path.
+            pl.store(reduced_tile, [0, owned_base], tmp_window)
+            for dst in pl.range(group_size):
+                if dst != my_rank:
+                    pld.tile.remote_store(
+                        reduced_tile,
+                        target=tmp_window,
+                        peer=dst,
+                        offsets=[0, owned_base],
+                    )
+
+            # Wave 2 publishes all reduced shards.
+            for peer in pl.range(group_size):
                 if peer != my_rank:
                     pld.system.notify(
                         target=signal_window,
@@ -377,12 +416,39 @@ def _build_mtp_layer_hidden_program(
                         value=1,
                         op=pld.NotifyOp.AtomicAdd,
                     )
-            for src in pl.range(tp_size):
+            for src in pl.range(group_size):
                 if src != my_rank:
                     pld.system.wait(
                         signal=signal_window,
                         offsets=[src, 0],
                         expected=2,
+                        cmp=pld.WaitCmp.Ge,
+                    )
+
+            for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+                result_tile = pl.load(
+                    tmp_window,
+                    [0, k0],
+                    [BATCH, ar_chunk],
+                )
+                pl.store(result_tile, [0, k0], local)
+
+            # Wave 3 closes the final-read/reuse lifetime of tmp_window.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window,
+                        offsets=[src, 0],
+                        expected=3,
                         cmp=pld.WaitCmp.Ge,
                     )
             return local

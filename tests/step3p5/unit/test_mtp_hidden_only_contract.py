@@ -77,6 +77,55 @@ def test_each_call_owns_fresh_collective_windows():
     assert "run_gen" not in source
 
 
+def test_mtp_all_reduce_uses_tput_source_and_existing_push_gather():
+    source = _source()
+    tree = ast.parse(source)
+    methods = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "tp_all_reduce"
+    ]
+    assert len(methods) == 1
+    body = ast.get_source_segment(source, methods[0])
+    assert body is not None
+    assert body.count("pld.tensor.put(") == 1
+    assert "peer=my_rank" in body
+    assert "pld.tile.remote_store(" in body
+    assert "pl.store(reduced_tile, [0, owned_base], tmp_window)" in body
+    assert "pl.store(reduced_tile, [0, owned_base], local)" not in body
+    assert "owned_chunk = HIDDEN // group_size" in body
+    assert "chunk_rows=BATCH" in body
+    assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
+    for expected in (1, 2, 3):
+        assert f"expected={expected}" in body
+
+
+def test_mtp_input_projection_keeps_all_reduce_return_lineage():
+    source = _source()
+    tree = ast.parse(source)
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_mtp_input_proj_body"
+    ]
+    assert len(functions) == 1
+    body = ast.get_source_segment(source, functions[0])
+    assert body is not None
+    assert "partial = self.tp_all_reduce(" in body
+
+
+def test_mtp_lifts_current_swa_out_proj_closure_constants():
+    source = _source()
+    for name in (
+        "SWA_OUT_PROJ_FUSE_CAST",
+        "SWA_OUT_PROJ_MATMUL_N_CHUNK",
+        "SWA_OUT_PROJ_MATMUL_TILES_PER_TASK",
+        "SWA_OUT_PROJ_VEC_N_CHUNK",
+    ):
+        assert f"    {name}," in source
+
+
 def test_selected_mtp_declares_persistent_kv_inout():
     tree = ast.parse(_source())
     layer_orch = None

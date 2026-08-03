@@ -110,13 +110,19 @@ class TwoLayerAttnPerf:
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         group_size = tp_size
 
-        # Keep the existing full-size communication window ABI.  The local
-        # transfer grain is configurable, while reduce-scatter ownership is
-        # defined by the TP rank count rather than a fixed core count.
+        # Keep the existing full-size communication window ABI.  The transfer
+        # grain is configurable, while reduce-scatter ownership is defined by
+        # the TP rank count rather than a fixed core count.
         ar_chunk = TP_ALL_REDUCE_CHUNK
-        for k0 in pl.parallel(0, HIDDEN, ar_chunk):
-            stage_tile = pl.load(local, [0, k0], [BATCH, ar_chunk])
-            pl.store(stage_tile, [0, k0], tmp_window)
+
+        # Self-target TPUT drains before the following notify (PTOAS#872).
+        pld.tensor.put(
+            dst=tmp_window,
+            peer=my_rank,
+            src=local,
+            chunk_rows=BATCH,
+            chunk_cols=TP_ALL_REDUCE_CHUNK,
+        )
 
         # Wave 1 publishes all source partials.
         for peer in pl.range(group_size):
@@ -160,9 +166,7 @@ class TwoLayerAttnPerf:
                 )
         reduced_tile = pl.cast(acc, target_type=pl.BF16)
 
-        # All-gather by push into write-disjoint offsets of the same window.
-        # Chunk r has one writer (rank r); after rank r has read all source
-        # copies of that chunk, overwriting it cannot race another reducer.
+        # Publish the write-disjoint reduced shard with the existing push path.
         pl.store(reduced_tile, [0, owned_base], tmp_window)
         for dst in pl.range(group_size):
             if dst != my_rank:

@@ -386,6 +386,22 @@ def test_tp_all_reduce_uses_tput_source_and_existing_push_gather() -> None:
         assert f"expected={expected}" in body
 
 
+def test_tp_all_reduce_keeps_reduce_scatter_accumulate_serial() -> None:
+    # The reduce-scatter accumulate carries an FP32 accumulator across peers in
+    # a fixed order and casts to BF16 exactly once.  hidden_tp_spread == 0
+    # depends on that shape, so the loop must never become pl.parallel/pl.spmd.
+    # Switching it is also pointless: swapping pl.range for pl.parallel in this
+    # InCore body produced byte-identical AIV codegen (measured 2026-08-05, the
+    # loop kind is not consumed here), and the onephase_par microbenchmark
+    # measured parallel re-reduction as slower.
+    source, tree = _parse(_CANONICAL)
+    body = _segment(source, _method(tree, "tp_all_reduce"))
+    assert "for peer in pl.range(group_size):" in body
+    assert "acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)" in body
+    assert body.count("reduced_tile = pl.cast(acc, target_type=pl.BF16)") == 1
+    assert "pl.parallel(group_size)" not in body
+
+
 def test_g1_threads_runtime_active_tokens_through_moe_and_holder() -> None:
     source, tree = _parse(_CANONICAL)
     whole = _method(tree, "whole_chip_orch")

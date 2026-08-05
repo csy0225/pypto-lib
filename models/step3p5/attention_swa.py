@@ -248,8 +248,21 @@ def attention_swa(
     # Runtime-loop lowering must not recover current_hidden through a stale
     # pre-call SSA version after the TP collective; the caller-owned output
     # formal provides an explicit producer/consumer lineage.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_residual_hold"):
-        resid1_out[:, :] = current_hidden[:, :]
+    for resid_hold_task in pl.spmd(
+        BATCH // BATCH_TILE,
+        name_hint="attn_residual_hold",
+        allow_early_resolve=True,
+    ):
+        resid_hold_b0 = resid_hold_task * BATCH_TILE
+        resid1_out = pl.assemble(
+            resid1_out,
+            pl.slice(
+                current_hidden,
+                [BATCH_TILE, HIDDEN],
+                [resid_hold_b0, 0],
+            ),
+            [resid_hold_b0, 0],
+        )
 
     layer_hidden_base = attn_layer_idx * HIDDEN
     layer_qhidden_base = attn_layer_idx * HIDDEN_Q_SWA_LOCAL
@@ -359,18 +372,32 @@ def attention_swa(
             )
         hg_score = pl.recip(pl.add(pl.exp(pl.neg(hg_logits)), 1.0))
         gate_score_t[:, :] = pl.cast(hg_score, target_type=pl.BF16)
-    for hg_n0 in pl.spmd(
-        HIDDEN_Q_SWA_LOCAL // K_CHUNK,
+    swa_head_gate_chunks = HIDDEN_Q_SWA_LOCAL // K_CHUNK
+    for hg_task in pl.spmd(
+        (BATCH // BATCH_TILE) * swa_head_gate_chunks,
         name_hint="swa_head_gate_expand",
         allow_early_resolve=True,
     ):
-        hg_n0 = hg_n0 * K_CHUNK
+        hg_b_idx = hg_task // swa_head_gate_chunks
+        hg_n_idx = hg_task % swa_head_gate_chunks
+        hg_b0 = hg_b_idx * BATCH_TILE
+        hg_n0 = hg_n_idx * K_CHUNK
         hg_r = pl.slice(
             gate_r, [NUM_HEADS_SWA_LOCAL_PAD, K_CHUNK], [0, hg_n0],
         )
-        hg_ge = pl.matmul(gate_score_t, hg_r, out_dtype=pl.FP32)
-        gate_exp[:, hg_n0:hg_n0 + K_CHUNK] = pl.cast(
-            hg_ge, target_type=pl.BF16,
+        hg_ge = pl.matmul(
+            pl.slice(
+                gate_score_t,
+                [BATCH_TILE, NUM_HEADS_SWA_LOCAL_PAD],
+                [hg_b0, 0],
+            ),
+            hg_r,
+            out_dtype=pl.FP32,
+        )
+        gate_exp = pl.assemble(
+            gate_exp,
+            pl.cast(hg_ge, target_type=pl.BF16),
+            [hg_b0, hg_n0],
         )
 
     # ----- Scope 1.b — Q projection. -----
@@ -641,11 +668,12 @@ def attention_swa(
     for swa_count_b in pl.range(active_tokens):
         swa_active_tasks = swa_active_tasks + 1
     # Stage 1: QK matmul (cube). One core per active batch row.
-    for fa_b in pl.spmd(
+    with pl.spmd(
         swa_active_tasks,
         name_hint="swa_qk_matmul",
         allow_early_resolve=True,
-    ):
+    ) as swa_qk_tid:
+        fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
@@ -671,11 +699,13 @@ def attention_swa(
 
     # Stage 2: softmax (vec). pl.slice(valid_shape=) marks Q_HEAD_BATCH_SWA real
     # rows + valid_len columns; fillpad pushes -inf into the masked tail.
-    for fa_b in pl.spmd(
+    with pl.spmd(
         swa_active_tasks,
         name_hint="swa_softmax",
+        deps=[swa_qk_tid],
         allow_early_resolve=True,
-    ):
+    ) as swa_softmax_tid:
+        fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
@@ -715,11 +745,13 @@ def attention_swa(
     # Stage 3: SV matmul (cube). exp_tile uses the full SWA_Q_PAD_ALIGNED row
     # stride; matmul output's bottom (SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA)
     # rows are garbage from un-initialised GM but are never read by Stage 4.
-    for fa_b in pl.spmd(
+    with pl.spmd(
         swa_active_tasks,
         name_hint="swa_sv_matmul",
+        deps=[swa_softmax_tid],
         allow_early_resolve=True,
-    ):
+    ) as swa_sv_tid:
+        fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
@@ -749,11 +781,13 @@ def attention_swa(
     # the stage-4 slices because pypto's frontend rejects re-assigning a
     # valid_shape-tagged tile back through arithmetic ops that drop the
     # valid_shape attribute (e.g., `li = pl.add(pl.mul(alpha, li), ...)`).
-    for fa_b in pl.spmd(
+    with pl.spmd(
         swa_active_tasks,
         name_hint="swa_online_softmax",
+        deps=[swa_sv_tid],
         allow_early_resolve=True,
-    ):
+    ) as _swa_online_softmax_tid:
+        fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
             fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)

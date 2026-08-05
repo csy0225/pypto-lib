@@ -20,6 +20,7 @@ import pypto.language.distributed as pld
 
 from .config import (
     BATCH,
+    BATCH_TILE,
     EPS,
     HIDDEN,
     HIDDEN_INV,
@@ -182,14 +183,17 @@ def dense_mlp_body_tp(
     partial_hidden = pl.create_tensor(
         [BATCH, HIDDEN], dtype=pl.BF16,
     )
-    for dob in pl.spmd(
-        hidden_blocks,
+    for down_task in pl.spmd(
+        (BATCH // BATCH_TILE) * hidden_blocks,
         name_hint="dense_down_matmul_tp",
         optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
     ):
+        down_b_idx = down_task // hidden_blocks
+        dob = down_task % hidden_blocks
+        down_b0 = down_b_idx * BATCH_TILE
         d0 = dob * K_CHUNK
         mlp_chunk_0 = pl.slice(
-            mlp_tile, [BATCH, MLP_OUT_CHUNK], [0, 0],
+            mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [down_b0, 0],
         )
         w_down_chunk_0 = pl.slice(
             w_down,
@@ -203,8 +207,8 @@ def dense_mlp_body_tp(
             down_o0 = ob * MLP_OUT_CHUNK
             down_mlp_chunk_bf16 = pl.slice(
                 mlp_tile,
-                [BATCH, MLP_OUT_CHUNK],
-                [0, down_o0],
+                [BATCH_TILE, MLP_OUT_CHUNK],
+                [down_b0, down_o0],
             )
             w_down_chunk = pl.slice(
                 w_down,
@@ -217,7 +221,7 @@ def dense_mlp_body_tp(
         partial_hidden = pl.assemble(
             partial_hidden,
             pl.cast(down_acc, target_type=pl.BF16),
-            [0, d0],
+            [down_b0, d0],
         )
 
     if TP_WORLD_SIZE > 1:

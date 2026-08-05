@@ -185,12 +185,41 @@ def test_standalone_tp_wrapper_forwards_runtime_num_tokens() -> None:
     assert "num_tokens" in [ast.unparse(arg) for arg in chip_call.args]
 
 
+def test_full_attention_core_stages_capture_task_ids_and_chain_dependencies() -> None:
+    """Dynamic launch extents and scratch consumers must use captured tasks."""
+    fn_source = ast.unparse(_function("attention_full"))
+    assert "with pl.spmd(full_qk_active_tasks" in fn_source
+    assert "as full_qk_tid" in fn_source
+    assert "with pl.spmd(full_softmax_active_tasks" in fn_source
+    assert "deps=[full_qk_tid]" in fn_source
+    assert "as full_softmax_tid" in fn_source
+    assert "deps=[full_softmax_tid]" in fn_source
+
+
 def test_full_online_softmax_writeback_casts_after_flatten() -> None:
     """Finalize separately so out-proj consumes attn_out, not partial scratch."""
-    fn_source = ast.unparse(_function("attention_full"))
+    fn = _function("attention_full")
+    fn_source = ast.unparse(fn)
     assert "name_hint='full_sv_matmul'" in fn_source
     assert "pl.system.syncall(core_type='mix')" not in fn_source
     assert "pl.split_aiv(2, mode=pl.SplitMode.NONE)" not in fn_source
+    full_sv_spmd = next(
+        node.items[0].context_expr
+        for node in ast.walk(fn)
+        if isinstance(node, ast.With)
+        and len(node.items) == 1
+        and _call_name(node.items[0].context_expr) == "pl.spmd"
+        and any(
+            keyword.arg == "name_hint"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "full_sv_matmul"
+            for keyword in node.items[0].context_expr.keywords
+        )
+    )
+    assert all(
+        keyword.arg != "optimizations"
+        for keyword in full_sv_spmd.keywords
+    ), "recurrent M/L state must have one AIV owner, not two split subblocks"
     assert "name_hint='full_online_softmax_pass_a'" not in fn_source
     assert "name_hint='full_online_softmax_pass_b'" not in fn_source
     assert "name_hint='full_online_softmax_pass_c'" not in fn_source
@@ -206,6 +235,17 @@ def test_full_online_softmax_writeback_casts_after_flatten() -> None:
     )
     assert "online_partial_mi" not in fn_source
     assert "online_partial_li" not in fn_source
+    assert (
+        "fa_sm_exp_zero_heads = pl.full([Q_HEAD_PAD_FULL - "
+        "Q_HEAD_BATCH_FULL, BLOCK_SIZE], dtype=pl.BF16, value=0.0)"
+        in fn_source
+    )
+    assert (
+        "all_exp_padded = pl.assemble(all_exp_padded, "
+        "fa_sm_exp_zero_heads, [fa_sm_scratch_row + "
+        "Q_HEAD_BATCH_FULL, 0])"
+        in fn_source
+    )
     assert "fa_sv_ml = pl.concat(fa_sv_mi_real, fa_sv_li_real)" in fn_source
     assert (
         "fa_acc_ml_new_row = pl.concat(fa_acc_mi_new_row, "
@@ -224,15 +264,127 @@ def test_full_online_softmax_writeback_casts_after_flatten() -> None:
     assert "ctx_bf16 = pl.cast(ctx, target_type=pl.BF16)" not in fn_source
 
 
-def test_full_online_softmax_default_grain_matches_a2a3_profile() -> None:
-    """The release default is calibrated, while remaining env-overridable."""
-    config_source = (_ROOT / "models" / "step3p5" / "config.py").read_text()
+def test_full_attention_task_profiles_are_explicit_and_portable_by_default() -> None:
+    """A2A3 tuning must not silently become a cross-architecture default."""
+    config_path = _ROOT / "models" / "step3p5" / "config.py"
+    config_tree = ast.parse(config_path.read_text(encoding="utf-8"))
+    profiles_node = next(
+        node.value
+        for node in config_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_ATTN_TASK_PROFILES"
+            for target in node.targets
+        )
+    )
+    profiles = ast.literal_eval(profiles_node)
+    assert profiles["portable"]["online_blocks_per_task"] == 16
+    assert profiles["portable"]["qk_uniform_o1"] == 0
+    assert profiles["portable"]["softmax_uniform_o1"] == 0
+    assert profiles["portable"]["online_uniform_o1"] == 0
+    assert profiles["portable"]["online_reduce_uniform_o1"] == 0
+    assert profiles["a2a3"] == {
+        "qk_blocks_per_task": 22,
+        "softmax_blocks_per_task": 12,
+        "online_blocks_per_task": 22,
+        "online_reduce_fan_in": 8,
+        "qk_uniform_o1": 1,
+        "softmax_uniform_o1": 1,
+        "online_uniform_o1": 1,
+        "online_reduce_uniform_o1": 1,
+    }
+
+    profile_default = next(
+        node.value
+        for node in config_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "ATTN_TASK_PROFILE"
+            for target in node.targets
+        )
+    )
+    assert isinstance(profile_default, ast.Call)
+    assert ast.unparse(profile_default.func) == "os.environ.get"
+    assert [
+        ast.literal_eval(argument)
+        for argument in profile_default.args
+    ] == [
+        "PYPTO_STEP3P5_ATTN_TASK_PROFILE",
+        "portable",
+    ]
+    assert not profile_default.keywords
+
+    config_source = config_path.read_text(encoding="utf-8")
+    for env_name in (
+        "PYPTO_STEP3P5_FULL_ATTN_QK_BLOCKS_PER_TASK",
+        "PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK",
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",
+        "PYPTO_STEP3P5_FULL_ATTN_QK_UNIFORM_O1",
+        "PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_UNIFORM_O1",
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1",
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
+    ):
+        assert env_name in config_source
+
+
+def test_full_qk_uniform_rows_use_task_major_constant_work_mapping() -> None:
+    """Uniform rows avoid scans and queue full groups before row tails."""
+    fn_source = ast.unparse(_function("attention_full"))
     assert (
-        '"PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",\n'
-        '        "16",'
-    ) in config_source
-    assert '"FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK"' in config_source
+        "full_qk_uniform_tasks_per_row = pl.cast(0, pl.INDEX)"
+        in fn_source
+    )
     assert (
-        '"PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",\n'
-        '        "8",'
-    ) in config_source
+        "full_qk_tasks_uniform = pl.cast(FULL_ATTN_QK_UNIFORM_O1, "
+        "pl.INDEX)"
+        in fn_source
+    )
+    assert "+ 1 - FULL_ATTN_QK_UNIFORM_O1" not in fn_source
+    assert (
+        "fa_count_qk_tasks != full_qk_uniform_tasks_per_row"
+        in fn_source
+    )
+    assert "if active_tokens != 1:" in fn_source
+    assert (
+        "fa_qk_task_in_b = fa_task // active_tokens"
+        in fn_source
+    )
+    assert (
+        "fa_qk_b = fa_task - fa_qk_task_in_b * active_tokens"
+        in fn_source
+    )
+    assert "fa_task // full_qk_uniform_tasks_per_row" not in fn_source
+    assert "for fa_qk_scan_b in pl.range(active_tokens):" in fn_source
+
+
+def test_every_uniform_o1_mapping_has_an_independent_compile_time_guard() -> None:
+    fn_source = ast.unparse(_function("attention_full"))
+    for guard in (
+        "FULL_ATTN_QK_UNIFORM_O1",
+        "FULL_ATTN_SOFTMAX_UNIFORM_O1",
+        "FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1",
+        "FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
+    ):
+        assert f"pl.cast({guard}, pl.INDEX)" in fn_source
+        assert f"- {guard}" not in fn_source
+    assert "full_softmax_uniform_tasks_per_row" in fn_source
+    assert "full_online_uniform_tasks_per_row" in fn_source
+    assert "full_online_reduce_uniform_tasks_per_row" in fn_source
+    for task, local_task, row in (
+        ("fa_task", "fa_qk_task_in_b", "fa_qk_b"),
+        ("fa_task", "fa_sm_task_in_b", "fa_sm_b"),
+        ("fa_task", "fa_sv_task_in_b", "fa_sv_b"),
+        (
+            "fa_reduce_task",
+            "fa_reduce_task_in_b",
+            "fa_reduce_b",
+        ),
+    ):
+        assert f"{local_task} = {task} // active_tokens" in fn_source
+        assert (
+            f"{row} = {task} - {local_task} * active_tokens"
+            in fn_source
+        )

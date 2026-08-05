@@ -45,9 +45,13 @@ from models.step3p5.config import (
     FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK,
     FULL_ATTN_OUT_PROJ_VEC_N_CHUNK,
     FULL_ATTN_QK_BLOCKS_PER_TASK,
+    FULL_ATTN_QK_UNIFORM_O1,
     FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK,
+    FULL_ATTN_SOFTMAX_UNIFORM_O1,
     FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK,
     FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK,
+    FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1,
+    FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1,
     HEAD_DIM,
     HEAD_DIM_INV,
     HIDDEN,
@@ -261,7 +265,7 @@ class WholeDecodeStep3p5:
             dst=tmp_window,
             peer=my_rank,
             src=local,
-            chunk_rows=BATCH,
+            chunk_rows=BATCH_TILE,
             chunk_cols=TP_ALL_REDUCE_CHUNK,
         )
 
@@ -285,38 +289,43 @@ class WholeDecodeStep3p5:
         # BF16 cast to retain the numerical contract of the pull mesh.
         owned_chunk = HIDDEN // group_size
         owned_base = my_rank * owned_chunk
-        own_tile = pl.load(
-            tmp_window, [0, owned_base], [BATCH, owned_chunk],
-        )
-        acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
-        for peer in pl.range(group_size):
-            if peer == my_rank:
-                acc = pl.add(
-                    acc,
-                    pl.cast(own_tile, target_type=pl.FP32),
-                )
-            else:
-                remote_tile = pld.tile.remote_load(
-                    tmp_window, peer=peer,
-                    offsets=[0, owned_base],
-                    shape=[BATCH, owned_chunk],
-                )
-                acc = pl.add(
-                    acc,
-                    pl.cast(remote_tile, target_type=pl.FP32),
-                )
-        reduced_tile = pl.cast(acc, target_type=pl.BF16)
+        for ar_b0 in pl.range(0, BATCH, BATCH_TILE):
+            own_tile = pl.load(
+                tmp_window,
+                [ar_b0, owned_base],
+                [BATCH_TILE, owned_chunk],
+            )
+            acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
+            for peer in pl.range(group_size):
+                if peer == my_rank:
+                    acc = pl.add(
+                        acc,
+                        pl.cast(own_tile, target_type=pl.FP32),
+                    )
+                else:
+                    remote_tile = pld.tile.remote_load(
+                        tmp_window,
+                        peer=peer,
+                        offsets=[ar_b0, owned_base],
+                        shape=[BATCH_TILE, owned_chunk],
+                    )
+                    acc = pl.add(
+                        acc,
+                        pl.cast(remote_tile, target_type=pl.FP32),
+                    )
+            reduced_tile = pl.cast(acc, target_type=pl.BF16)
 
-        # Publish the write-disjoint reduced shard with the existing push path.
-        pl.store(reduced_tile, [0, owned_base], tmp_window)
-        for dst in pl.range(group_size):
-            if dst != my_rank:
-                pld.tile.remote_store(
-                    reduced_tile,
-                    target=tmp_window,
-                    peer=dst,
-                    offsets=[0, owned_base],
-                )
+            # Publish the write-disjoint reduced shard with the existing push
+            # path. Batch tiling changes only the transfer tile, not ownership.
+            pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)
+            for dst in pl.range(group_size):
+                if dst != my_rank:
+                    pld.tile.remote_store(
+                        reduced_tile,
+                        target=tmp_window,
+                        peer=dst,
+                        offsets=[ar_b0, owned_base],
+                    )
 
         # Wave 2 publishes all pushed result chunks.
         for peer in pl.range(group_size):
@@ -334,11 +343,18 @@ class WholeDecodeStep3p5:
                 )
 
         # The completed temporary window contains the complete reduced vector.
-        for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+        ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)
+        for ar_copy in pl.parallel(ar_copy_tiles):
+            ar_b_idx = ar_copy // (HIDDEN // ar_chunk)
+            ar_k_idx = ar_copy % (HIDDEN // ar_chunk)
+            ar_b0 = ar_b_idx * BATCH_TILE
+            k0 = ar_k_idx * ar_chunk
             result_tile = pl.load(
-                tmp_window, [0, k0], [BATCH, ar_chunk],
+                tmp_window,
+                [ar_b0, k0],
+                [BATCH_TILE, ar_chunk],
             )
-            pl.store(result_tile, [0, k0], local)
+            pl.store(result_tile, [ar_b0, k0], local)
 
         # Wave 3 closes the communication-window read lifetime.  Every rank
         # finishes its final local reads before the window can be reused.

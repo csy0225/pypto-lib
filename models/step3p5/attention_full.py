@@ -100,9 +100,13 @@ from .config import (
     BLOCK_TABLE_FLAT_DYN,
     EPS,
     FULL_ATTN_QK_BLOCKS_PER_TASK,
+    FULL_ATTN_QK_UNIFORM_O1,
     FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK,
+    FULL_ATTN_SOFTMAX_UNIFORM_O1,
     FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK,
     FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK,
+    FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1,
+    FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1,
     HEAD_DIM,
     HEAD_DIM_INV,
     HIDDEN,
@@ -248,8 +252,21 @@ def attention_full(
     # Runtime-loop lowering must not recover current_hidden through a stale
     # pre-call SSA version after the TP collective; the caller-owned output
     # formal provides an explicit producer/consumer lineage.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_residual_hold"):
-        resid1_out[:, :] = current_hidden[:, :]
+    for resid_hold_task in pl.spmd(
+        BATCH // BATCH_TILE,
+        name_hint="attn_residual_hold",
+        allow_early_resolve=True,
+    ):
+        resid_hold_b0 = resid_hold_task * BATCH_TILE
+        resid1_out = pl.assemble(
+            resid1_out,
+            pl.slice(
+                current_hidden,
+                [BATCH_TILE, HIDDEN],
+                [resid_hold_b0, 0],
+            ),
+            [resid_hold_b0, 0],
+        )
 
     layer_hidden_base = attn_layer_idx * HIDDEN
     layer_qhidden_base = attn_layer_idx * HIDDEN_Q_FULL_LOCAL
@@ -370,18 +387,32 @@ def attention_full(
             )
         hg_score = pl.recip(pl.add(pl.exp(pl.neg(hg_logits)), 1.0))
         gate_score_t[:, :] = pl.cast(hg_score, target_type=pl.BF16)
-    for hg_n0 in pl.spmd(
-        HIDDEN_Q_FULL_LOCAL // K_CHUNK,
+    full_head_gate_chunks = HIDDEN_Q_FULL_LOCAL // K_CHUNK
+    for hg_task in pl.spmd(
+        (BATCH // BATCH_TILE) * full_head_gate_chunks,
         name_hint="full_head_gate_expand",
         allow_early_resolve=True,
     ):
-        hg_n0 = hg_n0 * K_CHUNK
+        hg_b_idx = hg_task // full_head_gate_chunks
+        hg_n_idx = hg_task % full_head_gate_chunks
+        hg_b0 = hg_b_idx * BATCH_TILE
+        hg_n0 = hg_n_idx * K_CHUNK
         hg_r = pl.slice(
             gate_r, [NUM_HEADS_FULL_LOCAL_PAD, K_CHUNK], [0, hg_n0],
         )
-        hg_ge = pl.matmul(gate_score_t, hg_r, out_dtype=pl.FP32)
-        gate_exp[:, hg_n0:hg_n0 + K_CHUNK] = pl.cast(
-            hg_ge, target_type=pl.BF16,
+        hg_ge = pl.matmul(
+            pl.slice(
+                gate_score_t,
+                [BATCH_TILE, NUM_HEADS_FULL_LOCAL_PAD],
+                [hg_b0, 0],
+            ),
+            hg_r,
+            out_dtype=pl.FP32,
+        )
+        gate_exp = pl.assemble(
+            gate_exp,
+            pl.cast(hg_ge, target_type=pl.BF16),
+            [hg_b0, hg_n0],
         )
 
     # ----- Scope 1.b — Q projection. -----
@@ -639,8 +670,20 @@ def attention_full(
     # See docs/step3p5/phases/15-singlerank-npu.md "Phase A route decision".
     MAX_CTX_BLOCKS = MAX_SEQ_DEFAULT // BLOCK_SIZE
     full_qk_active_tasks = pl.cast(0, pl.INDEX)
+    full_qk_uniform_tasks_per_row = pl.cast(0, pl.INDEX)
+    full_qk_tasks_uniform = pl.cast(
+        FULL_ATTN_QK_UNIFORM_O1, pl.INDEX,
+    )
     full_softmax_active_tasks = pl.cast(0, pl.INDEX)
+    full_softmax_uniform_tasks_per_row = pl.cast(0, pl.INDEX)
+    full_softmax_tasks_uniform = pl.cast(
+        FULL_ATTN_SOFTMAX_UNIFORM_O1, pl.INDEX,
+    )
     full_online_softmax_active_tasks = pl.cast(0, pl.INDEX)
+    full_online_uniform_tasks_per_row = pl.cast(0, pl.INDEX)
+    full_online_tasks_uniform = pl.cast(
+        FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1, pl.INDEX,
+    )
     # Launch exactly the logical tasks implied by active request rows.  A
     # zero-token request is a graph-level no-op/reject contract: adding a
     # dummy attention task here penalizes every non-empty request and does not
@@ -661,6 +704,27 @@ def attention_full(
             + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
             - 1
         ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
+        if fa_count_b == 0:
+            full_qk_uniform_tasks_per_row = fa_count_qk_tasks
+            full_softmax_uniform_tasks_per_row = fa_count_softmax_tasks
+            full_online_uniform_tasks_per_row = fa_count_online_tasks
+        else:
+            # Each switch initializes its route predicate fail-closed.  A
+            # mismatch can only clear the predicate; it can never re-enable a
+            # disabled route.  This matters when a later row has exactly one
+            # more task than row zero.
+            if fa_count_qk_tasks != full_qk_uniform_tasks_per_row:
+                full_qk_tasks_uniform = pl.cast(0, pl.INDEX)
+            if (
+                fa_count_softmax_tasks
+                != full_softmax_uniform_tasks_per_row
+            ):
+                full_softmax_tasks_uniform = pl.cast(0, pl.INDEX)
+            if (
+                fa_count_online_tasks
+                != full_online_uniform_tasks_per_row
+            ):
+                full_online_tasks_uniform = pl.cast(0, pl.INDEX)
         full_qk_active_tasks = full_qk_active_tasks + fa_count_qk_tasks
         full_softmax_active_tasks = (
             full_softmax_active_tasks + fa_count_softmax_tasks
@@ -695,31 +759,50 @@ def attention_full(
     online_partial_ml = pl.create_tensor(
         [BATCH * MAX_CTX_BLOCKS, 2 * Q_HEAD_BATCH_FULL], dtype=pl.FP32,
     )
-    for fa_task in pl.spmd(
+    with pl.spmd(
         full_qk_active_tasks,
         name_hint="full_qk_matmul",
         allow_early_resolve=True,
-    ):
+    ) as full_qk_tid:
+        fa_task = pl.tile.get_block_idx()
         if fa_task < full_qk_active_tasks:
             fa_qk_b = pl.cast(0, pl.INDEX)
-            fa_qk_task_in_b = pl.cast(0, pl.INDEX)
-            fa_qk_task_base = pl.cast(0, pl.INDEX)
-            for fa_qk_scan_b in pl.range(active_tokens):
-                fa_qk_scan_ctx_len = pl.tensor.read(
-                    seq_lens, [fa_qk_scan_b],
-                )
-                fa_qk_scan_ctx_blocks = (
-                    fa_qk_scan_ctx_len + BLOCK_SIZE - 1
-                ) // BLOCK_SIZE
-                fa_qk_scan_tasks = (
-                    fa_qk_scan_ctx_blocks
-                    + FULL_ATTN_QK_BLOCKS_PER_TASK - 1
-                ) // FULL_ATTN_QK_BLOCKS_PER_TASK
-                if fa_task >= fa_qk_task_base:
-                    if fa_task < fa_qk_task_base + fa_qk_scan_tasks:
-                        fa_qk_b = fa_qk_scan_b
-                        fa_qk_task_in_b = fa_task - fa_qk_task_base
-                fa_qk_task_base = fa_qk_task_base + fa_qk_scan_tasks
+            fa_qk_task_in_b = fa_task
+            if active_tokens != 1:
+                if full_qk_tasks_uniform != 0:
+                    # Traverse uniform rows task-major rather than row-major:
+                    # complete block groups are queued before the shorter tail
+                    # groups.  The runtime can then pull balanced work in the
+                    # first wave and leave only tails for a partial next wave.
+                    fa_qk_task_in_b = fa_task // active_tokens
+                    fa_qk_b = (
+                        fa_task - fa_qk_task_in_b * active_tokens
+                    )
+                else:
+                    fa_qk_task_base = pl.cast(0, pl.INDEX)
+                    for fa_qk_scan_b in pl.range(active_tokens):
+                        fa_qk_scan_ctx_len = pl.tensor.read(
+                            seq_lens, [fa_qk_scan_b],
+                        )
+                        fa_qk_scan_ctx_blocks = (
+                            fa_qk_scan_ctx_len + BLOCK_SIZE - 1
+                        ) // BLOCK_SIZE
+                        fa_qk_scan_tasks = (
+                            fa_qk_scan_ctx_blocks
+                            + FULL_ATTN_QK_BLOCKS_PER_TASK - 1
+                        ) // FULL_ATTN_QK_BLOCKS_PER_TASK
+                        if fa_task >= fa_qk_task_base:
+                            if (
+                                fa_task
+                                < fa_qk_task_base + fa_qk_scan_tasks
+                            ):
+                                fa_qk_b = fa_qk_scan_b
+                                fa_qk_task_in_b = (
+                                    fa_task - fa_qk_task_base
+                                )
+                        fa_qk_task_base = (
+                            fa_qk_task_base + fa_qk_scan_tasks
+                        )
             fa_qk_sb0 = (
                 fa_qk_task_in_b * FULL_ATTN_QK_BLOCKS_PER_TASK
             )
@@ -767,31 +850,45 @@ def attention_full(
                         [fa_qk_scratch_row, 0],
                     )
 
-    for fa_task in pl.spmd(
+    with pl.spmd(
         full_softmax_active_tasks,
         name_hint="full_softmax",
+        deps=[full_qk_tid],
         allow_early_resolve=True,
-    ):
+    ) as full_softmax_tid:
+        fa_task = pl.tile.get_block_idx()
         if fa_task < full_softmax_active_tasks:
             fa_sm_b = pl.cast(0, pl.INDEX)
-            fa_sm_task_in_b = pl.cast(0, pl.INDEX)
-            fa_sm_task_base = pl.cast(0, pl.INDEX)
-            for fa_sm_scan_b in pl.range(active_tokens):
-                fa_sm_scan_ctx_len = pl.tensor.read(
-                    seq_lens, [fa_sm_scan_b],
-                )
-                fa_sm_scan_ctx_blocks = (
-                    fa_sm_scan_ctx_len + BLOCK_SIZE - 1
-                ) // BLOCK_SIZE
-                fa_sm_scan_tasks = (
-                    fa_sm_scan_ctx_blocks
-                    + FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK - 1
-                ) // FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK
-                if fa_task >= fa_sm_task_base:
-                    if fa_task < fa_sm_task_base + fa_sm_scan_tasks:
-                        fa_sm_b = fa_sm_scan_b
-                        fa_sm_task_in_b = fa_task - fa_sm_task_base
-                fa_sm_task_base = fa_sm_task_base + fa_sm_scan_tasks
+            fa_sm_task_in_b = fa_task
+            if active_tokens != 1:
+                if full_softmax_tasks_uniform != 0:
+                    fa_sm_task_in_b = fa_task // active_tokens
+                    fa_sm_b = fa_task - fa_sm_task_in_b * active_tokens
+                else:
+                    fa_sm_task_base = pl.cast(0, pl.INDEX)
+                    for fa_sm_scan_b in pl.range(active_tokens):
+                        fa_sm_scan_ctx_len = pl.tensor.read(
+                            seq_lens, [fa_sm_scan_b],
+                        )
+                        fa_sm_scan_ctx_blocks = (
+                            fa_sm_scan_ctx_len + BLOCK_SIZE - 1
+                        ) // BLOCK_SIZE
+                        fa_sm_scan_tasks = (
+                            fa_sm_scan_ctx_blocks
+                            + FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK - 1
+                        ) // FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK
+                        if fa_task >= fa_sm_task_base:
+                            if (
+                                fa_task
+                                < fa_sm_task_base + fa_sm_scan_tasks
+                            ):
+                                fa_sm_b = fa_sm_scan_b
+                                fa_sm_task_in_b = (
+                                    fa_task - fa_sm_task_base
+                                )
+                        fa_sm_task_base = (
+                            fa_sm_task_base + fa_sm_scan_tasks
+                        )
             fa_sm_sb0 = (
                 fa_sm_task_in_b * FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK
             )
@@ -836,10 +933,26 @@ def attention_full(
                         fa_sm_exp_scores_bf16, target_type=pl.FP32,
                     )
                     fa_sm_cur_li = pl.row_sum(fa_sm_exp_scores_fp32)
+                    # SV uses the cube-legal padded head tile. Define every
+                    # row explicitly instead of letting the padded half read
+                    # uninitialized GM.
                     all_exp_padded = pl.assemble(
                         all_exp_padded,
                         fa_sm_exp_scores_bf16,
                         [fa_sm_scratch_row, 0],
+                    )
+                    fa_sm_exp_zero_heads = pl.full(
+                        [
+                            Q_HEAD_PAD_FULL - Q_HEAD_BATCH_FULL,
+                            BLOCK_SIZE,
+                        ],
+                        dtype=pl.BF16,
+                        value=0.0,
+                    )
+                    all_exp_padded = pl.assemble(
+                        all_exp_padded,
+                        fa_sm_exp_zero_heads,
+                        [fa_sm_scratch_row + Q_HEAD_BATCH_FULL, 0],
                     )
                     fa_sm_lm_row = (
                         fa_sm_b * MAX_CTX_BLOCKS + fa_sm_sb
@@ -865,38 +978,46 @@ def attention_full(
     # and immediately performs the segment-local online recurrence on the vector
     # lane. The SPMD grid is workload-derived; no fixed resident-worker count
     # or independent first-pass recurrence kernel is introduced.
+    # Keep one AIV owner per mixed task. UP_DOWN would split O into disjoint
+    # head rows but duplicate the unsplit M/L recurrence on both subblocks,
+    # creating a cross-subblock GM read-after-write race between KV blocks.
     with pl.spmd(
         full_online_softmax_active_tasks,
         name_hint="full_sv_matmul",
-        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
+        deps=[full_softmax_tid],
         allow_early_resolve=True,
     ) as full_sv_online_tid:
         fa_task = pl.tile.get_block_idx()
         if fa_task < full_online_softmax_active_tasks:
             fa_sv_b = pl.cast(0, pl.INDEX)
-            # Map the flat logical task id to an active row using a countdown.
-            # Keeping the selected row/task local once a task is found avoids
-            # the 0162 lowering bug where a cumulative task-base scan can
-            # overwrite row 0 with the next row's base.
-            fa_sv_task_in_b = fa_task
-            for fa_sv_scan_b in pl.range(active_tokens):
-                fa_sv_scan_ctx_len = pl.tensor.read(
-                    seq_lens, [fa_sv_scan_b],
-                )
-                fa_sv_scan_ctx_blocks = (
-                    fa_sv_scan_ctx_len + BLOCK_SIZE - 1
-                ) // BLOCK_SIZE
-                fa_sv_scan_tasks = (
-                    fa_sv_scan_ctx_blocks
-                    + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
-                    - 1
-                ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
-                if fa_sv_scan_b == fa_sv_b:
-                    if fa_sv_task_in_b >= fa_sv_scan_tasks:
-                        fa_sv_task_in_b = (
-                            fa_sv_task_in_b - fa_sv_scan_tasks
+            if active_tokens == 1:
+                fa_sv_task_in_b = fa_task
+            else:
+                if full_online_tasks_uniform != 0:
+                    fa_sv_task_in_b = fa_task // active_tokens
+                    fa_sv_b = fa_task - fa_sv_task_in_b * active_tokens
+                else:
+                    # Keep countdown as the heterogeneous fallback; cumulative
+                    # task-base lowering previously overwrote row 0.
+                    fa_sv_task_in_b = fa_task
+                    for fa_sv_scan_b in pl.range(active_tokens):
+                        fa_sv_scan_ctx_len = pl.tensor.read(
+                            seq_lens, [fa_sv_scan_b],
                         )
-                        fa_sv_b = fa_sv_b + 1
+                        fa_sv_scan_ctx_blocks = (
+                            fa_sv_scan_ctx_len + BLOCK_SIZE - 1
+                        ) // BLOCK_SIZE
+                        fa_sv_scan_tasks = (
+                            fa_sv_scan_ctx_blocks
+                            + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
+                            - 1
+                        ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
+                        if fa_sv_scan_b == fa_sv_b:
+                            if fa_sv_task_in_b >= fa_sv_scan_tasks:
+                                fa_sv_task_in_b = (
+                                    fa_sv_task_in_b - fa_sv_scan_tasks
+                                )
+                                fa_sv_b = fa_sv_b + 1
 
             fa_sv_ctx_len = pl.tensor.read(seq_lens, [fa_sv_b])
             fa_sv_ctx_blocks = (
@@ -1063,6 +1184,10 @@ def attention_full(
     # (0, fan-in, 2*fan-in, ...). Those destinations are outside every other
     # group's source range, so concurrent tasks remain read/write disjoint.
     full_online_softmax_reduce_tasks = pl.cast(0, pl.INDEX)
+    full_online_reduce_uniform_tasks_per_row = pl.cast(0, pl.INDEX)
+    full_online_reduce_tasks_uniform = pl.cast(
+        FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1, pl.INDEX,
+    )
     for fa_reduce_count_b in pl.range(active_tokens):
         fa_reduce_count_ctx_len = pl.tensor.read(
             seq_lens, [fa_reduce_count_b],
@@ -1080,6 +1205,16 @@ def attention_full(
             + FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
             - 1
         ) // FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
+        if fa_reduce_count_b == 0:
+            full_online_reduce_uniform_tasks_per_row = (
+                fa_reduce_count_tasks
+            )
+        else:
+            if (
+                fa_reduce_count_tasks
+                != full_online_reduce_uniform_tasks_per_row
+            ):
+                full_online_reduce_tasks_uniform = pl.cast(0, pl.INDEX)
         full_online_softmax_reduce_tasks = (
             full_online_softmax_reduce_tasks + fa_reduce_count_tasks
         )
@@ -1091,34 +1226,46 @@ def attention_full(
         fa_reduce_task = pl.tile.get_block_idx()
         if fa_reduce_task < full_online_softmax_reduce_tasks:
             fa_reduce_b = pl.cast(0, pl.INDEX)
-            # Use the same countdown mapping as full_sv_matmul.  The explicit
-            # row guard is important for heterogeneous active rows: after the
-            # task crosses a row boundary, later rows must not consume it a
-            # second time in the same scan.
             fa_reduce_task_in_b = fa_reduce_task
-            for fa_reduce_scan_b in pl.range(active_tokens):
-                fa_reduce_scan_ctx_len = pl.tensor.read(
-                    seq_lens, [fa_reduce_scan_b],
-                )
-                fa_reduce_scan_ctx_blocks = (
-                    fa_reduce_scan_ctx_len + BLOCK_SIZE - 1
-                ) // BLOCK_SIZE
-                fa_reduce_scan_segments = (
-                    fa_reduce_scan_ctx_blocks
-                    + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
-                    - 1
-                ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
-                fa_reduce_scan_tasks = (
-                    fa_reduce_scan_segments
-                    + FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
-                    - 1
-                ) // FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
-                if fa_reduce_scan_b == fa_reduce_b:
-                    if fa_reduce_task_in_b >= fa_reduce_scan_tasks:
-                        fa_reduce_task_in_b = (
-                            fa_reduce_task_in_b - fa_reduce_scan_tasks
+            if active_tokens != 1:
+                if full_online_reduce_tasks_uniform != 0:
+                    fa_reduce_task_in_b = (
+                        fa_reduce_task // active_tokens
+                    )
+                    fa_reduce_b = (
+                        fa_reduce_task
+                        - fa_reduce_task_in_b * active_tokens
+                    )
+                else:
+                    for fa_reduce_scan_b in pl.range(active_tokens):
+                        fa_reduce_scan_ctx_len = pl.tensor.read(
+                            seq_lens, [fa_reduce_scan_b],
                         )
-                        fa_reduce_b = fa_reduce_b + 1
+                        fa_reduce_scan_ctx_blocks = (
+                            fa_reduce_scan_ctx_len + BLOCK_SIZE - 1
+                        ) // BLOCK_SIZE
+                        fa_reduce_scan_segments = (
+                            fa_reduce_scan_ctx_blocks
+                            + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
+                            - 1
+                        ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
+                        fa_reduce_scan_tasks = (
+                            fa_reduce_scan_segments
+                            + FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
+                            - 1
+                        ) // (
+                            FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
+                        )
+                        if fa_reduce_scan_b == fa_reduce_b:
+                            if (
+                                fa_reduce_task_in_b
+                                >= fa_reduce_scan_tasks
+                            ):
+                                fa_reduce_task_in_b = (
+                                    fa_reduce_task_in_b
+                                    - fa_reduce_scan_tasks
+                                )
+                                fa_reduce_b = fa_reduce_b + 1
 
             fa_reduce_ctx_len = pl.tensor.read(seq_lens, [fa_reduce_b])
             fa_reduce_ctx_blocks = (

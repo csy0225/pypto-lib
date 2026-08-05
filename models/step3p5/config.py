@@ -532,29 +532,91 @@ MAX_BLOCKS_PER_SEQ = (MAX_SEQ_DEFAULT + BLOCK_SIZE - 1) // BLOCK_SIZE
 # this many paged-cache blocks; the runtime maps logical blocks onto the
 # architecture's available physical cores and dispatches extra blocks in waves.
 #
-# The online-softmax default is calibrated independently from QK/softmax/SV.
-# On 0162/A2A3 at bs=1/ctx=64k, grain=16 balances the parallel
-# SV+segment-recurrence span against the hierarchical reduce/finalize tail.
-# It is an architecture
-# profile, not a semantic constant; other targets should override it from their
-# own sweep.
+# A profile names a set of compile-time tuning defaults; it never names or
+# fixes a physical core count. The runtime maps workload-derived logical tasks
+# onto the target's available resources. ``portable`` preserves the proven
+# release fallback. ``a2a3`` records the fixed-workload, all-rank profile
+# validated on the 0162 A2A3 stack; launchers must select it explicitly.
+# Environment overrides remain highest priority for single-variable sweeps.
 PTO2_LOGICAL_BLOCK_LIMIT = 2**15 - 1
+ATTN_TASK_PROFILE = os.environ.get(
+    "PYPTO_STEP3P5_ATTN_TASK_PROFILE",
+    "portable",
+)
+_ATTN_TASK_PROFILES = {
+    "portable": {
+        "qk_blocks_per_task": 22,
+        "softmax_blocks_per_task": 12,
+        "online_blocks_per_task": 16,
+        "online_reduce_fan_in": 8,
+        "qk_uniform_o1": 0,
+        "softmax_uniform_o1": 0,
+        "online_uniform_o1": 0,
+        "online_reduce_uniform_o1": 0,
+    },
+    "a2a3": {
+        "qk_blocks_per_task": 22,
+        "softmax_blocks_per_task": 12,
+        "online_blocks_per_task": 22,
+        "online_reduce_fan_in": 8,
+        "qk_uniform_o1": 1,
+        "softmax_uniform_o1": 1,
+        "online_uniform_o1": 1,
+        "online_reduce_uniform_o1": 1,
+    },
+}
+if ATTN_TASK_PROFILE not in _ATTN_TASK_PROFILES:
+    raise ValueError(
+        "PYPTO_STEP3P5_ATTN_TASK_PROFILE must be one of "
+        f"{sorted(_ATTN_TASK_PROFILES)}, got {ATTN_TASK_PROFILE!r}",
+    )
+_attn_task_profile = _ATTN_TASK_PROFILES[ATTN_TASK_PROFILE]
 FULL_ATTN_QK_BLOCKS_PER_TASK = int(
-    os.environ.get("PYPTO_STEP3P5_FULL_ATTN_QK_BLOCKS_PER_TASK", "22"),
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_QK_BLOCKS_PER_TASK",
+        str(_attn_task_profile["qk_blocks_per_task"]),
+    ),
 )
 FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK = int(
-    os.environ.get("PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK", "12"),
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK",
+        str(_attn_task_profile["softmax_blocks_per_task"]),
+    ),
 )
 FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK = int(
     os.environ.get(
         "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",
-        "16",
+        str(_attn_task_profile["online_blocks_per_task"]),
     ),
 )
 FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK = int(
     os.environ.get(
         "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",
-        "8",
+        str(_attn_task_profile["online_reduce_fan_in"]),
+    ),
+)
+FULL_ATTN_QK_UNIFORM_O1 = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_QK_UNIFORM_O1",
+        str(_attn_task_profile["qk_uniform_o1"]),
+    ),
+)
+FULL_ATTN_SOFTMAX_UNIFORM_O1 = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_UNIFORM_O1",
+        str(_attn_task_profile["softmax_uniform_o1"]),
+    ),
+)
+FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1 = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1",
+        str(_attn_task_profile["online_uniform_o1"]),
+    ),
+)
+FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1 = int(
+    os.environ.get(
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
+        str(_attn_task_profile["online_reduce_uniform_o1"]),
     ),
 )
 for _name, _value in (
@@ -586,6 +648,23 @@ if FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK <= 0:
         "must be positive, got "
         f"{FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK}",
     )
+for _name, _value in (
+    ("PYPTO_STEP3P5_FULL_ATTN_QK_UNIFORM_O1", FULL_ATTN_QK_UNIFORM_O1),
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_UNIFORM_O1",
+        FULL_ATTN_SOFTMAX_UNIFORM_O1,
+    ),
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1",
+        FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1,
+    ),
+    (
+        "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
+        FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1,
+    ),
+):
+    if _value not in (0, 1):
+        raise ValueError(f"{_name} must be 0 or 1, got {_value}")
 
 
 # -----------------------------------------------------------------------------
@@ -843,10 +922,15 @@ __all__ = [
     "Q_HEAD_PAD_SWA",
     "MAX_BLOCKS_PER_SEQ",
     "PTO2_LOGICAL_BLOCK_LIMIT",
+    "ATTN_TASK_PROFILE",
     "FULL_ATTN_QK_BLOCKS_PER_TASK",
     "FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK",
     "FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK",
     "FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",
+    "FULL_ATTN_QK_UNIFORM_O1",
+    "FULL_ATTN_SOFTMAX_UNIFORM_O1",
+    "FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1",
+    "FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
     # distributed topology
     "TP_WORLD_SIZE",
     "EP_WORLD_SIZE",

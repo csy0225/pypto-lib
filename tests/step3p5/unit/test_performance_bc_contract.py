@@ -375,10 +375,13 @@ def test_tp_all_reduce_uses_tput_source_and_existing_push_gather() -> None:
     assert "dst=tmp_window,\n            peer=my_rank,\n            src=local" in body
     assert "for dst in pl.range(group_size):" in body
     assert "pld.tile.remote_store(" in body
-    assert "pl.store(reduced_tile, [0, owned_base], tmp_window)" in body
-    assert "pl.store(reduced_tile, [0, owned_base], local)" not in body
-    assert "chunk_rows=BATCH" in body
+    assert "for ar_b0 in pl.range(0, BATCH, BATCH_TILE):" in body
+    assert "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)" in body
+    assert "pl.store(reduced_tile, [ar_b0, owned_base], local)" not in body
+    assert "chunk_rows=BATCH_TILE" in body
     assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
+    assert "shape=[BATCH_TILE, owned_chunk]" in body
+    assert "ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)" in body
     for expected in (1, 2, 3):
         assert f"expected={expected}" in body
 

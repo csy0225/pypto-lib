@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import os
 import re
@@ -73,10 +74,16 @@ from pathlib import Path
 import torch
 
 BLOCK_SIZE = 128
-# config.STORAGE_BATCH_CAPACITY, duplicated because the block-table size env
-# must be set BEFORE models.step3p5.config is first imported (it computes
-# BLOCK_TABLE_FLAT_DYN at module level). main() asserts the two agree.
-STORAGE_BATCH = 16
+# The storage capacity must be selected before models.step3p5.config is first
+# imported because BLOCK_TABLE_FLAT_DYN is computed at module load. Keep the
+# environment as the single source of truth so the same harness can compile
+# capacity-16 and capacity-32 profiles without editing source.
+STORAGE_BATCH = int(os.environ.get("PYPTO_STEP3P5_STORAGE_BATCH_CAPACITY", "16"))
+if STORAGE_BATCH <= 0 or STORAGE_BATCH % 16 != 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_STORAGE_BATCH_CAPACITY must be a positive multiple "
+        f"of 16, got {STORAGE_BATCH}",
+    )
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 _I32 = torch.int32
@@ -140,6 +147,26 @@ def _parse_args() -> argparse.Namespace:
         help="segment partials merged by each parallel full-attention "
         "online-softmax reduce task (default: config/env value)",
     )
+    p.add_argument(
+        "--attn-task-profile",
+        default="",
+        help="compile-time attention task profile "
+        "(portable or a2a3; default: config portable profile)",
+    )
+    for stage in (
+        "qk",
+        "softmax",
+        "online-softmax",
+        "online-softmax-reduce",
+    ):
+        p.add_argument(
+            f"--full-attn-{stage}-uniform-o1",
+            type=int,
+            choices=(0, 1),
+            default=-1,
+            help=f"override uniform-row O(1) mapping for {stage}; "
+            "-1 keeps the profile default",
+        )
     p.add_argument(
         "--full-attn-out-proj-n-chunk",
         type=int,
@@ -223,7 +250,243 @@ def _parse_args() -> argparse.Namespace:
                    help="context length for the DFX iters (default: largest --context-lens)")
     p.add_argument("--compile-only", action="store_true",
                    help="compile and exit (card-free preflight)")
+    p.add_argument(
+        "--reference-output-dir",
+        default="",
+        help="optional output directory from a baseline run; compare each "
+        "captured active output against its matching tensor",
+    )
+    p.add_argument(
+        "--replacement-atol",
+        type=float,
+        default=0.02,
+        help="absolute tolerance for --reference-output-dir comparison",
+    )
+    p.add_argument(
+        "--replacement-rtol",
+        type=float,
+        default=0.02,
+        help="relative tolerance for --reference-output-dir comparison",
+    )
+    p.add_argument(
+        "--replacement-max-bad-ratio",
+        type=float,
+        default=0.02,
+        help="maximum fraction outside replacement atol/rtol",
+    )
+    p.add_argument(
+        "--audit-iteration-outputs",
+        action="store_true",
+        help="hash the active output after every measured iteration and fail "
+        "if one prepared program produces more than one result",
+    )
     return p.parse_args()
+
+
+_ATTENTION_CODEGEN_STAGES = (
+    {
+        "description": "full QK",
+        "marker": "full_qk_matmul",
+        "bound_prefix": "full_qk_active_tasks__rv_",
+        "bound_is_scalar": True,
+        "producer": "full_qk_tid",
+        "dependency": None,
+    },
+    {
+        "description": "full softmax",
+        "marker": "full_softmax",
+        "bound_prefix": "full_softmax_active_tasks__rv_",
+        "bound_is_scalar": True,
+        "producer": "full_softmax_tid",
+        "dependency": "full_qk_tid",
+    },
+    {
+        "description": "full SV",
+        "marker": "full_sv_matmul",
+        "bound_prefix": "full_online_softmax_active_tasks__rv_",
+        "bound_is_scalar": True,
+        "producer": "full_sv_online_tid",
+        "dependency": "full_softmax_tid",
+    },
+    {
+        "description": "full reduce",
+        "marker": "full_online_softmax_reduce",
+        "bound_prefix": "full_online_softmax_reduce_tasks__rv_",
+        "bound_is_scalar": True,
+        "producer": "full_online_softmax_reduce_tid",
+        "dependency": "full_sv_online_tid",
+    },
+    {
+        "description": "full finalize",
+        "marker": "full_online_softmax_finalize",
+        "bound_prefix": "full_online_softmax_active_rows__rv_",
+        "bound_is_scalar": False,
+        "producer": None,
+        "dependency": "full_online_softmax_reduce_tid",
+    },
+    {
+        "description": "SWA QK",
+        "marker": "swa_qk_matmul",
+        "bound_prefix": "swa_active_tasks__rv_",
+        "bound_is_scalar": False,
+        "producer": "swa_qk_tid",
+        "dependency": None,
+    },
+    {
+        "description": "SWA softmax",
+        "marker": "swa_softmax",
+        "bound_prefix": "swa_active_tasks__rv_",
+        "bound_is_scalar": False,
+        "producer": "swa_softmax_tid",
+        "dependency": "swa_qk_tid",
+    },
+    {
+        "description": "SWA SV",
+        "marker": "swa_sv_matmul",
+        "bound_prefix": "swa_active_tasks__rv_",
+        "bound_is_scalar": False,
+        "producer": "swa_sv_tid",
+        "dependency": "swa_softmax_tid",
+    },
+    {
+        "description": "SWA online softmax",
+        "marker": "swa_online_softmax",
+        "bound_prefix": "swa_active_tasks__rv_",
+        "bound_is_scalar": False,
+        "producer": None,
+        "dependency": "swa_sv_tid",
+    },
+)
+_CODEGEN_STAGE_COMMENT = re.compile(
+    r"^[ \t]*// (?:Spmd|Group) [^\n]+$",
+    flags=re.MULTILINE,
+)
+
+
+def _attention_codegen_stage_blocks(source: str) -> tuple[dict[str, str], list[str]]:
+    comments = list(_CODEGEN_STAGE_COMMENT.finditer(source))
+    blocks = {}
+    errors = []
+    for stage in _ATTENTION_CODEGEN_STAGES:
+        matches = [
+            (index, comment)
+            for index, comment in enumerate(comments)
+            if stage["marker"] in comment.group(0)
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{stage['description']} stage marker count={len(matches)}",
+            )
+            continue
+        index, comment = matches[0]
+        end = (
+            comments[index + 1].start()
+            if index + 1 < len(comments)
+            else len(source)
+        )
+        blocks[stage["marker"]] = source[comment.start():end]
+    return blocks, errors
+
+
+def _attention_codegen_contract_errors(source: str) -> list[str]:
+    blocks, errors = _attention_codegen_stage_blocks(source)
+    for stage in _ATTENTION_CODEGEN_STAGES:
+        block = blocks.get(stage["marker"])
+        if block is None:
+            continue
+        description = stage["description"]
+        params_matches = re.findall(
+            r"\bL0TaskArgs\s+(params_t\d+)\s*;",
+            block,
+        )
+        if len(params_matches) != 1:
+            errors.append(
+                f"{description} task-argument declaration count="
+                f"{len(params_matches)}",
+            )
+            continue
+        params = params_matches[0]
+        launch = re.search(
+            rf"\b{re.escape(params)}\.launch_spec\.set_block_num\(\s*"
+            rf"({re.escape(stage['bound_prefix'])}\w*)\s*\);",
+            block,
+        )
+        if launch is None:
+            errors.append(f"{description} dynamic launch")
+            bound = None
+        else:
+            bound = launch.group(1)
+        if stage["bound_is_scalar"] and (
+            bound is None
+            or re.search(
+                rf"\b{re.escape(params)}\.add_scalar\(\s*"
+                rf"{re.escape(bound)}\s*\);",
+                block,
+            )
+            is None
+        ):
+            errors.append(f"{description} launch/scalar SSA agreement")
+
+        dependency = stage["dependency"]
+        if dependency is not None:
+            deps = f"{params}_deps"
+            deps_count = f"{params}_deps_count"
+            dependency_patterns = (
+                rf"\bPTO2TaskId\s+{re.escape(deps)}\[1\]\s*;",
+                rf"\buint32_t\s+{re.escape(deps_count)}\s*=\s*0\s*;",
+                rf"\b{re.escape(deps)}\[\s*{re.escape(deps_count)}"
+                rf"\+\+\s*\]\s*=\s*{re.escape(dependency)}\s*;",
+                rf"\b{re.escape(params)}\.set_dependencies\(\s*"
+                rf"{re.escape(deps)}\s*,\s*{re.escape(deps_count)}\s*\);",
+            )
+            if any(
+                re.search(pattern, block) is None
+                for pattern in dependency_patterns
+            ):
+                errors.append(
+                    f"{description} dependency from {dependency}",
+                )
+
+        producer = stage["producer"]
+        if producer is not None:
+            submit = re.search(
+                rf"\bTaskOutputTensors\s+(\w+)\s*=\s*"
+                rf"rt_submit_\w+\([^;]*\b{re.escape(params)}\s*\)\s*;",
+                block,
+            )
+            if (
+                submit is None
+                or re.search(
+                    rf"\bPTO2TaskId\s+{re.escape(producer)}\s*=\s*"
+                    rf"{re.escape(submit.group(1))}\.task_id\(\)\s*;",
+                    block,
+                )
+                is None
+            ):
+                errors.append(f"{description} task publication")
+    return errors
+
+
+def _verify_attention_codegen_contract(build_dir: Path) -> Path:
+    candidates = [
+        path
+        for path in build_dir.rglob("orchestration/chip_orch.cpp")
+        if "full_qk_matmul" in path.read_text(encoding="utf-8")
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "expected exactly one attention chip orchestration source below "
+            f"{build_dir}, found {len(candidates)}",
+        )
+    source_path = candidates[0]
+    errors = _attention_codegen_contract_errors(
+        source_path.read_text(encoding="utf-8"),
+    )
+    if errors:
+        raise RuntimeError(
+            "attention lowering contract failed: " + ", ".join(errors),
+        )
+    return source_path
 
 
 def _devices(text: str) -> list[int]:
@@ -243,8 +506,9 @@ def _step_metadata(
     num_blocks: int,
     batch: int,
     active_rows: int = 1,
+    physical_blocks: int | None = None,
 ):
-    """Decode metadata with active rows and disjoint paged sequences."""
+    """Decode metadata with active rows and compact disjoint physical pages."""
     if not 0 <= int(active_rows) <= int(batch):
         raise ValueError(
             f"active_rows must be in [0,{batch}], got {active_rows}",
@@ -276,17 +540,153 @@ def _step_metadata(
     pos = torch.zeros(batch, dtype=_I32)
     table = torch.zeros(batch, num_blocks, dtype=_I32)
     slot = torch.zeros(batch, dtype=_I32)
+    next_physical_block = 0
     for row, row_context_len in enumerate(row_context_lens):
         step = row_context_len - 1
         row_blocks = (row_context_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         table[row, :row_blocks] = (
-            row * num_blocks
+            next_physical_block
             + torch.arange(row_blocks, dtype=_I32)
         )
         seq[row] = row_context_len
         pos[row] = step
-        slot[row] = row * num_blocks * BLOCK_SIZE + step
+        slot[row] = (
+            (next_physical_block + step // BLOCK_SIZE) * BLOCK_SIZE
+            + step % BLOCK_SIZE
+        )
+        next_physical_block += row_blocks
+    if (
+        physical_blocks is not None
+        and next_physical_block > int(physical_blocks)
+    ):
+        raise ValueError(
+            f"compact metadata needs {next_physical_block} physical blocks, "
+            f"but the KV slab only has {physical_blocks}",
+        )
     return seq, pos, table.reshape(-1), slot
+
+
+def _linear_percentile(values: list[float], q: float) -> float:
+    """Linearly interpolated percentile shared by wall and DFX reports."""
+    if not values:
+        return 0.0
+    if not 0.0 <= q <= 1.0:
+        raise ValueError(f"percentile q must be in [0,1], got {q}")
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * q
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    """Hash a tensor's dtype, shape and raw CPU bytes deterministically."""
+    cpu = tensor.detach().contiguous().cpu()
+    digest = hashlib.sha256()
+    digest.update(str(cpu.dtype).encode("ascii"))
+    digest.update(str(tuple(cpu.shape)).encode("ascii"))
+    digest.update(cpu.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _tensor_probe(tensor: torch.Tensor, edge_elements: int = 4096) -> dict:
+    """Fingerprint bounded tensor edges without hashing multi-GB fixtures."""
+    flat = tensor.detach().reshape(-1)
+    edge = min(int(edge_elements), flat.numel())
+    if edge == 0:
+        sample = flat
+    elif flat.numel() <= 2 * edge:
+        sample = flat
+    else:
+        sample = torch.cat((flat[:edge], flat[-edge:]))
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "numel": tensor.numel(),
+        "sample_numel": sample.numel(),
+        "sample_sha256": _tensor_sha256(sample),
+    }
+
+
+def _context_workload(
+    label: int,
+    *,
+    active_rows: int,
+    active_context_lens: list[int],
+) -> list[int]:
+    """Resolve a benchmark label into the actual per-row context lengths."""
+    return (
+        list(active_context_lens)
+        if active_context_lens
+        else [int(label)] * int(active_rows)
+    )
+
+
+def _context_summary(label: int, context_lens: list[int]) -> dict:
+    blocks = [
+        (int(context_len) + BLOCK_SIZE - 1) // BLOCK_SIZE
+        for context_len in context_lens
+    ]
+    return {
+        "context_label": int(label),
+        "per_row_context_lens": [int(value) for value in context_lens],
+        "total_context_tokens": sum(int(value) for value in context_lens),
+        "per_row_context_blocks": blocks,
+        "total_context_blocks": sum(blocks),
+    }
+
+
+def _make_kv_fixture(
+    *,
+    total_rows: int,
+    layer_cache_rows: int,
+    head_dim: int,
+    initialized_layers: int,
+    cache_kind: int,
+    seed: int,
+) -> torch.Tensor:
+    """Create a full provenance-safe KV upload with deterministic active slabs."""
+    if total_rows <= 0 or layer_cache_rows <= 0 or head_dim <= 0:
+        raise ValueError("KV fixture dimensions must be positive")
+    if total_rows % layer_cache_rows != 0:
+        raise ValueError(
+            f"KV fixture rows {total_rows} are not divisible by slab rows "
+            f"{layer_cache_rows}",
+        )
+    layer_count = total_rows // layer_cache_rows
+    if not 0 <= initialized_layers <= layer_count:
+        raise ValueError(
+            f"initialized_layers must be in [0,{layer_count}], got "
+            f"{initialized_layers}",
+        )
+
+    fixture = torch.empty(total_rows, head_dim, dtype=_BF16).share_memory_()
+    fixture.zero_()
+    chunk_rows = min(8192, layer_cache_rows)
+    col_ids = torch.arange(head_dim, dtype=torch.int64).reshape(1, -1)
+    for layer in range(initialized_layers):
+        layer_row0 = layer * layer_cache_rows
+        for row0 in range(0, layer_cache_rows, chunk_rows):
+            rows = min(chunk_rows, layer_cache_rows - row0)
+            row_ids = torch.arange(
+                row0,
+                row0 + rows,
+                dtype=torch.int64,
+            ).reshape(-1, 1)
+            values = (
+                row_ids * 131
+                + col_ids * 17
+                + layer * 43
+                + cache_kind * 71
+                + seed * 97
+            ) % 255
+            fixture[
+                layer_row0 + row0:layer_row0 + row0 + rows
+            ].copy_(((values.to(torch.float32) + 1.0) / 4096.0).to(_BF16))
+    return fixture
 
 
 def _logical_task_count(
@@ -381,7 +781,10 @@ def analyze_uniformity(
     busy_excl: collections.Counter = collections.Counter()
     fam_cores: dict[str, set] = collections.defaultdict(set)
     fam_busy: collections.Counter = collections.Counter()
-    fam_intervals: dict[str, list[tuple[int, int, int]]] = collections.defaultdict(list)
+    fam_intervals: dict[
+        str,
+        list[tuple[str, int, int, int]],
+    ] = collections.defaultdict(list)
     fam_tasks: dict[str, set[str]] = collections.defaultdict(set)
     t0, t1 = None, None
     for core, tid, _seq, st, en, _recv in rows:
@@ -393,7 +796,7 @@ def analyze_uniformity(
         t1 = en if t1 is None else max(t1, en)
         fam_cores[fam].add(core)
         fam_busy[fam] += en - st
-        fam_intervals[fam].append((st, en, core))
+        fam_intervals[fam].append((str(tid), st, en, core))
         fam_tasks[fam].add(str(tid))
     makespan = t1 - t0
     core_types = sw["metadata"].get("core_types", [])
@@ -414,7 +817,7 @@ def analyze_uniformity(
         fam = _resource_family(names.get(str(tid), "unknown"), resource)
         fam_cores[fam].add(core)
         fam_busy[fam] += en - st
-        fam_intervals[fam].append((st, en, core))
+        fam_intervals[fam].append((str(tid), st, en, core))
         fam_tasks[fam].add(str(tid))
 
     def occupancy(busy: collections.Counter, core_ids: list[int]) -> dict:
@@ -423,7 +826,7 @@ def analyze_uniformity(
         cores = len(core_ids)
         return {
             "occupancy_min": round(vals[0], 4),
-            "occupancy_p50": round(vals[len(vals) // 2], 4),
+            "occupancy_p50": round(_linear_percentile(vals, 0.50), 4),
             "occupancy_mean": round(statistics.fmean(vals), 4),
             "occupancy_max": round(vals[-1], 4),
             "occupancy_stdev": round(statistics.pstdev(vals), 4),
@@ -438,20 +841,11 @@ def analyze_uniformity(
         for resource in sorted(resource_core_counts)
     }
 
-    def percentile(vals: list[float], q: float) -> float:
-        if not vals:
-            return 0.0
-        ordered = sorted(vals)
-        idx = min(len(ordered) - 1, int((len(ordered) - 1) * q))
-        return ordered[idx]
-
     def family_stats(fam: str) -> dict:
         intervals = fam_intervals[fam]
-        starts = [st for st, _en, _core in intervals]
-        ends = [en for _st, en, _core in intervals]
-        durations_us = [us(en - st) for st, en, _core in intervals]
+        durations_us = [us(en - st) for _tid, st, en, _core in intervals]
         events = []
-        for st, en, _core in intervals:
+        for _tid, st, en, _core in intervals:
             events.append((st, 1))
             events.append((en, -1))
         active = 0
@@ -475,14 +869,50 @@ def analyze_uniformity(
         resource_types = sorted(
             {
                 core_types[core]
-                for _st, _en, core in intervals
+                for _tid, _st, _en, core in intervals
                 if 0 <= core < len(core_types)
             }
         )
         available_cores = sum(resource_core_counts[t] for t in resource_types)
-        span_ticks = max(ends) - min(starts)
-        average_concurrency = fam_busy[fam] / span_ticks
-        schedulable_concurrency = min(available_cores, logical_blocks)
+        intervals_by_task: dict[
+            str,
+            list[tuple[int, int, int]],
+        ] = collections.defaultdict(list)
+        for task_id, st, en, core in intervals:
+            intervals_by_task[task_id].append((st, en, core))
+
+        invocation_spans: list[int] = []
+        invocation_waves: list[int] = []
+        invocation_pack_denominator = 0
+        invocation_full_resource_denominator = 0
+        resource_slices = 0
+        for task_intervals in intervals_by_task.values():
+            task_start = min(st for st, _en, _core in task_intervals)
+            task_end = max(en for _st, en, _core in task_intervals)
+            task_span = task_end - task_start
+            task_slices = len(task_intervals)
+            invocation_spans.append(task_span)
+            resource_slices += task_slices
+            if available_cores:
+                invocation_waves.append(
+                    (task_slices + available_cores - 1) // available_cores,
+                )
+                invocation_full_resource_denominator += (
+                    task_span * available_cores
+                )
+                invocation_pack_denominator += (
+                    task_span * min(available_cores, task_slices)
+                )
+
+        # Sum per-invocation spans instead of taking the first start and last end
+        # across a family. The latter incorrectly counts gaps between distinct
+        # collectives (and can make a short all-reduce family look millisecond
+        # long).
+        span_ticks = sum(invocation_spans)
+        average_concurrency = (
+            fam_busy[fam] / span_ticks if span_ticks else 0.0
+        )
+        invocation_spans_us = [us(value) for value in invocation_spans]
         return {
             "busy_us": round(us(fam_busy[fam]), 1),
             "distinct_cores": len(fam_cores[fam]),
@@ -490,26 +920,42 @@ def analyze_uniformity(
             "available_cores": available_cores,
             "logical_blocks": logical_blocks,
             "expected_logical_blocks": expected,
-            "waves_at_full_resource": (
-                (logical_blocks + available_cores - 1) // available_cores
-                if logical_blocks and available_cores
-                else 0
+            "resource_slices": resource_slices,
+            "waves_at_full_resource": sum(invocation_waves),
+            "observed_slices": resource_slices,
+            "invocation_count": len(invocation_spans),
+            "invocation_span_us_p50": round(
+                _linear_percentile(invocation_spans_us, 0.50),
+                3,
             ),
-            "observed_slices": len(intervals),
-            "slice_duration_us_p50": round(percentile(durations_us, 0.50), 3),
-            "slice_duration_us_p99": round(percentile(durations_us, 0.99), 3),
+            "invocation_span_us_p99": round(
+                _linear_percentile(invocation_spans_us, 0.99),
+                3,
+            ),
+            "invocation_span_us_max": round(max(invocation_spans_us), 3),
+            "slice_duration_us_p50": round(
+                _linear_percentile(durations_us, 0.50),
+                3,
+            ),
+            "slice_duration_us_p99": round(
+                _linear_percentile(durations_us, 0.99),
+                3,
+            ),
             "slice_duration_us_max": round(max(durations_us), 3),
             "stage_span_us": round(us(span_ticks), 3),
             "peak_concurrency": peak,
             "average_concurrency": round(average_concurrency, 3),
             "full_resource_utilization": (
-                round(fam_busy[fam] / (span_ticks * available_cores), 4)
-                if available_cores
+                round(
+                    fam_busy[fam] / invocation_full_resource_denominator,
+                    4,
+                )
+                if invocation_full_resource_denominator
                 else 0.0
             ),
             "packing_efficiency": (
-                round(average_concurrency / schedulable_concurrency, 4)
-                if schedulable_concurrency
+                round(fam_busy[fam] / invocation_pack_denominator, 4)
+                if invocation_pack_denominator
                 else 0.0
             ),
         }
@@ -547,10 +993,9 @@ def analyze_uniformity(
     }
 
 
-def print_uniformity(tag: str, u: dict, *, reference: bool = False) -> None:
-    mark = "  <== LOW-WAIT REFERENCE (minimum rank makespan)" if reference else ""
+def print_uniformity(tag: str, u: dict) -> None:
     print(f"\n[uniformity {tag}] makespan={u['makespan_us'] / 1000:.3f}ms "
-          f"cores={u['n_cores']}{mark}")
+          f"cores={u['n_cores']}")
     for label, key in (("all", "all"), ("excl tp_all_reduce", "excl_tp_all_reduce")):
         o = u[key]
         print(f"  {label:<20} busy={o['busy_us_total']:.0f}µs bubble={o['bubble_ratio'] * 100:.1f}% "
@@ -564,13 +1009,14 @@ def print_uniformity(tag: str, u: dict, *, reference: bool = False) -> None:
             f"occ p50={o['occupancy_p50']:.3f} mean={o['occupancy_mean']:.3f} "
             f"max={o['occupancy_max']:.3f}"
         )
-    print("  | kernel family | busy µs | cores | blocks | span µs | "
+    print("  | kernel family | busy µs | cores | invokes | slices | span-sum µs | "
           "slice p50/p99/max µs | peak/avg | waves | pack |")
-    print("  |---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for fam, info in list(u["families"].items())[:18]:
         print(
             f"  | {fam} | {info['busy_us']:.1f} | {info['distinct_cores']} | "
-            f"{info['logical_blocks']} | {info['stage_span_us']:.1f} | "
+            f"{info['invocation_count']} | {info['resource_slices']} | "
+            f"{info['stage_span_us']:.1f} | "
             f"{info['slice_duration_us_p50']:.2f}/"
             f"{info['slice_duration_us_p99']:.2f}/"
             f"{info['slice_duration_us_max']:.2f} | "
@@ -605,6 +1051,42 @@ def main() -> int:
             "--active-context-lens must contain exactly one value per active "
             f"row ({args.active_rows}), got {active_context_lens}",
         )
+    ctx_lens = [
+        int(value)
+        for value in str(args.context_lens).split(",")
+        if value.strip()
+    ]
+    if active_context_lens and len(ctx_lens) != 1:
+        raise ValueError(
+            "--active-context-lens requires exactly one benchmark "
+            "--context-lens label",
+        )
+    if not ctx_lens:
+        raise ValueError("--context-lens must contain at least one value")
+    if args.replacement_atol < 0.0 or args.replacement_rtol < 0.0:
+        raise ValueError("replacement atol/rtol must be non-negative")
+    if not 0.0 <= args.replacement_max_bad_ratio <= 1.0:
+        raise ValueError("--replacement-max-bad-ratio must be in [0,1]")
+
+    allocation_context_labels = list(ctx_lens)
+    if (
+        args.dfx
+        and args.dfx_context
+        and args.dfx_context not in allocation_context_labels
+    ):
+        allocation_context_labels.append(int(args.dfx_context))
+    context_workloads = {
+        int(label): _context_workload(
+            int(label),
+            active_rows=args.active_rows,
+            active_context_lens=active_context_lens,
+        )
+        for label in allocation_context_labels
+    }
+    workload_summaries = {
+        label: _context_summary(label, row_context_lens)
+        for label, row_context_lens in context_workloads.items()
+    }
 
     # Config env MUST be set before models.step3p5.config is first imported:
     # KV_CACHE_ROWS_DYN / BLOCK_TABLE_FLAT_DYN / ROPE_SEQ_DYN are module-level.
@@ -615,13 +1097,32 @@ def main() -> int:
     # canonical stride matters for perf: the DDR distance between a layer's KV
     # rows is part of what we are measuring.
     max_seq = int(args.num_blocks) * BLOCK_SIZE
+    for summary in workload_summaries.values():
+        for row, context_len in enumerate(summary["per_row_context_lens"]):
+            if not 0 < context_len <= max_seq:
+                raise ValueError(
+                    f"context length {context_len} for active row {row} must "
+                    f"be in [1,{max_seq}]",
+                )
     os.environ["PYPTO_STEP3P5_MAX_SEQ"] = str(max_seq)
-    physical_blocks = int(args.num_blocks) * max(1, int(args.active_rows)) + 15
+    max_workload_blocks = max(
+        summary["total_context_blocks"]
+        for summary in workload_summaries.values()
+    )
+    # Pages are compact across active rows. Keep the canonical capacity-1
+    # reserve so tail/current-token writes never force a sparse
+    # ``row * max_blocks`` allocation. A fixed-total-64K sweep therefore uses
+    # the same 512+15 physical pages at bs1, bs4, ..., bs16.
+    physical_blocks = max(1, int(max_workload_blocks)) + STORAGE_BATCH - 1
     os.environ["PYPTO_STEP3P5_KV_CACHE_ROWS"] = str(45 * physical_blocks * BLOCK_SIZE)
     os.environ["PYPTO_STEP3P5_ROPE_SEQ"] = str(max_seq)
     os.environ["PYPTO_STEP3P5_BLOCK_TABLE_FLAT"] = str(
         STORAGE_BATCH * int(args.num_blocks)
     )
+    if args.attn_task_profile:
+        os.environ["PYPTO_STEP3P5_ATTN_TASK_PROFILE"] = (
+            args.attn_task_profile
+        )
     for arg_name, env_name in (
         (
             "tp_all_reduce_chunk",
@@ -681,6 +1182,27 @@ def main() -> int:
             raise ValueError(f"--{arg_name.replace('_', '-')} must be non-negative")
         if value:
             os.environ[env_name] = str(value)
+    for arg_name, env_name in (
+        (
+            "full_attn_qk_uniform_o1",
+            "PYPTO_STEP3P5_FULL_ATTN_QK_UNIFORM_O1",
+        ),
+        (
+            "full_attn_softmax_uniform_o1",
+            "PYPTO_STEP3P5_FULL_ATTN_SOFTMAX_UNIFORM_O1",
+        ),
+        (
+            "full_attn_online_softmax_uniform_o1",
+            "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1",
+        ),
+        (
+            "full_attn_online_softmax_reduce_uniform_o1",
+            "PYPTO_STEP3P5_FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
+        ),
+    ):
+        value = int(getattr(args, arg_name))
+        if value >= 0:
+            os.environ[env_name] = str(value)
     if args.full_attn_out_proj_fuse_cast:
         os.environ["PYPTO_STEP3P5_FULL_ATTN_OUT_PROJ_FUSE_CAST"] = "1"
     if args.swa_out_proj_fuse_cast:
@@ -693,8 +1215,8 @@ def main() -> int:
     import models.step3p5.config as cfg
     if cfg.BATCH != STORAGE_BATCH:
         raise ValueError(
-            f"harness assumes STORAGE_BATCH={STORAGE_BATCH} to size the block "
-            f"table before config import, but config.BATCH is {cfg.BATCH}"
+            f"harness storage capacity {STORAGE_BATCH} does not match "
+            f"config.BATCH {cfg.BATCH}",
         )
     if cfg.MAX_SEQ_DEFAULT != max_seq:
         raise ValueError(
@@ -715,6 +1237,22 @@ def main() -> int:
         "FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK",
         None,
     )
+    uniform_o1_mapping = {
+        "qk": int(getattr(cfg, "FULL_ATTN_QK_UNIFORM_O1", 0)),
+        "softmax": int(
+            getattr(cfg, "FULL_ATTN_SOFTMAX_UNIFORM_O1", 0),
+        ),
+        "online_softmax": int(
+            getattr(cfg, "FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1", 0),
+        ),
+        "online_softmax_reduce": int(
+            getattr(
+                cfg,
+                "FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
+                0,
+            ),
+        ),
+    }
     out_proj_grains = {
         "full": {
             "matmul": getattr(
@@ -771,7 +1309,7 @@ def main() -> int:
     else:
         task_layout = "logical_tasks_by_work_grain"
         logical_tasks_at_capacity = {
-            stage: args.active_rows
+            stage: int(cfg.BATCH)
             * ((args.num_blocks + int(grain) - 1) // int(grain))
             for stage, grain in task_grains.items()
         }
@@ -798,6 +1336,13 @@ def main() -> int:
     tp = 8
     if int(args.num_blocks) * BLOCK_SIZE > RSD:
         raise ValueError(f"ROPE_SEQ_DYN {RSD} < num_blocks*128")
+    layer_cache_rows = KVC // LAYER_DYN
+    expected_layer_cache_rows = physical_blocks * BLOCK_SIZE
+    if layer_cache_rows != expected_layer_cache_rows:
+        raise RuntimeError(
+            f"KV slab rows {layer_cache_rows} != compact layout rows "
+            f"{expected_layer_cache_rows}",
+        )
 
     from pypto import ir
     from pypto.ir.distributed_compiled_program import DistributedConfig
@@ -812,16 +1357,33 @@ def main() -> int:
     )
     print(f"[two-layer] compile OK in {time.time() - t_compile:.1f}s "
           f"=> {compiled.output_dir}", flush=True)
+    codegen_contract_path = _verify_attention_codegen_contract(
+        Path(compiled.output_dir),
+    )
+    print(
+        "[two-layer] attention codegen contract OK: "
+        f"{codegen_contract_path}",
+        flush=True,
+    )
     if args.compile_only:
         return 0
 
     # ---- host tensors: only what mutates per step. Must be share_memory_ and
     # allocated BEFORE prepare() so the forked chip children inherit them.
+    fixture_generator = torch.Generator(device="cpu")
+    fixture_generator.manual_seed(args.seed)
+
     def zsh(*shape, dtype=_BF16):
         return torch.zeros(shape, dtype=dtype).share_memory_()
 
     current_hidden = zsh(tp, BATCH, HIDDEN)
-    current_hidden.normal_(0.0, 0.02)
+    current_hidden[0].normal_(
+        0.0,
+        0.02,
+        generator=fixture_generator,
+    )
+    for rank in range(1, tp):
+        current_hidden[rank].copy_(current_hidden[0])
     next_hidden_out = zsh(tp, BATCH, HIDDEN)
     seq_lens_h = torch.ones(tp, UBD, dtype=_I32).share_memory_()
     block_table_h = torch.zeros(tp, BTF, dtype=_I32).share_memory_()
@@ -833,8 +1395,18 @@ def main() -> int:
     # forked chip child, which can only read memory it inherited at fork, so
     # every init buffer must be shared-memory AND allocated before prepare().
     def h_rand(*shape, dtype=_BF16, scale=0.02):
-        return ((torch.randn(shape, dtype=torch.float32) * scale)
-                .to(dtype).share_memory_())
+        return (
+            (
+                torch.randn(
+                    shape,
+                    dtype=torch.float32,
+                    generator=fixture_generator,
+                )
+                * scale
+            )
+            .to(dtype)
+            .share_memory_()
+        )
 
     def h_ones(*shape, dtype=_F32):
         return torch.ones(shape, dtype=dtype).share_memory_()
@@ -876,23 +1448,55 @@ def main() -> int:
         "rope_cos_swa": h_ones(tp, RSD, ROTS),
         "rope_sin_swa": torch.zeros(tp, RSD, ROTS, dtype=_F32).share_memory_(),
     }
+    k_cache_fixture = _make_kv_fixture(
+        total_rows=KVC,
+        layer_cache_rows=layer_cache_rows,
+        head_dim=HEAD_DIM,
+        initialized_layers=2,
+        cache_kind=0,
+        seed=args.seed,
+    )
+    v_cache_fixture = _make_kv_fixture(
+        total_rows=KVC,
+        layer_cache_rows=layer_cache_rows,
+        head_dim=HEAD_DIM,
+        initialized_layers=2,
+        cache_kind=1,
+        seed=args.seed,
+    )
+    fixture_probe = {
+        "seed": args.seed,
+        "current_hidden": _tensor_probe(current_hidden),
+        "init_h": {
+            key: _tensor_probe(value)
+            for key, value in sorted(init_h.items())
+        },
+        "k_cache": _tensor_probe(k_cache_fixture),
+        "v_cache": _tensor_probe(v_cache_fixture),
+    }
+    (out / "fixture_probe.json").write_text(
+        json.dumps(fixture_probe, indent=2),
+    )
 
     prepare_cm = compiled.prepare(persistent=True)
     rt = prepare_cm.__enter__()
     owned = []
 
-    def dev(shape, dtype, *, key=None):
+    def dev(shape, dtype, *, key=None, shared_init=None):
         """[tp, *tail] device-resident stacked tensor, one shard per rank.
 
-        ``key`` names an ``init_h`` upload source; omit it to leave the buffer
-        uninitialised (used for the KV pool, whose content cannot affect timing
-        and which is far too large to stage through host memory).
+        ``key`` names a per-rank ``init_h`` source. ``shared_init`` reuses one
+        full-shape source for every rank, as required by the large KV fixtures.
         """
         from pypto.runtime.device_tensor import StackedDeviceTensor
+        if key is not None and shared_init is not None:
+            raise ValueError("dev accepts either key or shared_init, not both")
         src = init_h[key] if key else None
         shards = []
         for r in range(tp):
-            init = src[r] if src is not None else None
+            init = shared_init if shared_init is not None else (
+                src[r] if src is not None else None
+            )
             shards.append(rt.alloc_tensor(tuple(shape[1:]), dtype, init=init, worker_id=r))
         st = StackedDeviceTensor(shards, tuple(shape), tuple(range(tp)))
         owned.append(st)
@@ -922,10 +1526,18 @@ def main() -> int:
         rope_sf = dev((tp, RSD, ROTF), _F32, key="rope_sin_full")
         rope_cs = dev((tp, RSD, ROTS), _F32, key="rope_cos_swa")
         rope_ss = dev((tp, RSD, ROTS), _F32, key="rope_sin_swa")
-        # KV pool: 45 slabs x num_blocks x 128 rows per rank (~755 MB each),
-        # left uninitialised on purpose.
-        k_cache = dev((tp, KVC, HEAD_DIM), _BF16)
-        v_cache = dev((tp, KVC, HEAD_DIM), _BF16)
+        # KV pool keeps the canonical 45-slab stride, but pages inside each slab
+        # are compact across active rows.
+        k_cache = dev(
+            (tp, KVC, HEAD_DIM),
+            _BF16,
+            shared_init=k_cache_fixture,
+        )
+        v_cache = dev(
+            (tp, KVC, HEAD_DIM),
+            _BF16,
+            shared_init=v_cache_fixture,
+        )
 
         # Arg order MUST match TwoLayerAttnPerf.host_orch exactly.
         arglist = [
@@ -939,66 +1551,199 @@ def main() -> int:
         ]
 
         def set_step(context_len: int) -> None:
-            row_context_lens = (
-                active_context_lens
-                if active_context_lens
-                else [context_len] * args.active_rows
-            )
+            row_context_lens = context_workloads[int(context_len)]
             seq, _pos, table, slot = _step_metadata(
                 context_lens=row_context_lens,
                 num_blocks=args.num_blocks,
                 batch=BATCH,
                 active_rows=args.active_rows,
+                physical_blocks=physical_blocks,
             )
             seq_lens_h.copy_(seq.unsqueeze(0).expand(tp, -1))
             block_table_h.copy_(table.reshape(1, -1).expand(tp, -1))
             slot_mapping_h.copy_(slot.unsqueeze(0).expand(tp, -1))
 
-        ctx_lens = [int(x) for x in str(args.context_lens).split(",") if x.strip()]
-        if active_context_lens and len(ctx_lens) != 1:
-            raise ValueError(
-                "--active-context-lens requires exactly one benchmark "
-                "--context-lens label",
-            )
-        if not ctx_lens:
-            raise ValueError("--context-lens must contain at least one value")
+        outputs_dir = out / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        reference_root = (
+            Path(args.reference_output_dir)
+            if args.reference_output_dir
+            else None
+        )
+        if reference_root is not None and (reference_root / "outputs").is_dir():
+            reference_root = reference_root / "outputs"
         results = []
         for length in ctx_lens:
             set_step(length)
             for _ in range(max(0, args.warmup)):
                 rt.run(compiled, *arglist)
             samples = []
+            measured_output_sha256 = []
             for _ in range(max(1, args.iters)):
                 t = time.time()
                 rt.run(compiled, *arglist)
                 samples.append((time.time() - t) * 1000.0)
+                if args.audit_iteration_outputs:
+                    measured_output_sha256.append(
+                        _tensor_sha256(
+                            next_hidden_out[
+                                0,
+                                :args.active_rows,
+                            ],
+                        ),
+                    )
             ms = sorted(samples)
             n = len(ms)
+            if args.active_rows:
+                active_output = next_hidden_out[:, :args.active_rows].float()
+                active_output_finite = bool(
+                    torch.isfinite(active_output).all().item(),
+                )
+                hidden_tp_spread = float(
+                    (active_output - active_output[0:1]).abs().max().item(),
+                )
+            else:
+                active_output_finite = True
+                hidden_tp_spread = 0.0
+            if not active_output_finite:
+                raise RuntimeError(
+                    f"non-finite active output at context_len={length}",
+                )
+            if hidden_tp_spread != 0.0:
+                raise RuntimeError(
+                    "TP-replicated output diverged at "
+                    f"context_len={length}: max_abs_spread={hidden_tp_spread}",
+                )
+            workload = workload_summaries[int(length)]
+            output_name = f"context_{int(length)}.pt"
+            output_path = outputs_dir / output_name
+            captured_output = (
+                next_hidden_out[0, :args.active_rows]
+                .detach()
+                .clone()
+                .contiguous()
+            )
+            torch.save(captured_output, output_path)
+            output_sha256 = _tensor_sha256(captured_output)
+            replacement = None
+            if reference_root is not None:
+                reference_path = reference_root / output_name
+                if not reference_path.is_file():
+                    raise FileNotFoundError(
+                        f"missing replacement reference {reference_path}",
+                    )
+                reference = torch.load(
+                    reference_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                if (
+                    reference.dtype != captured_output.dtype
+                    or tuple(reference.shape) != tuple(captured_output.shape)
+                ):
+                    raise ValueError(
+                        f"replacement reference {reference_path} has "
+                        f"shape={tuple(reference.shape)} dtype={reference.dtype}; "
+                        f"expected shape={tuple(captured_output.shape)} "
+                        f"dtype={captured_output.dtype}",
+                    )
+                got_f = captured_output.float()
+                ref_f = reference.float()
+                diff = (got_f - ref_f).abs()
+                bad = diff > (
+                    args.replacement_atol
+                    + args.replacement_rtol * ref_f.abs()
+                )
+                bad_ratio = float(bad.float().mean().item())
+                replacement = {
+                    "reference_path": str(reference_path),
+                    "reference_sha256": _tensor_sha256(reference),
+                    "exact": bool(torch.equal(captured_output, reference)),
+                    "max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
+                    "mean_abs_diff": float(diff.mean().item()) if diff.numel() else 0.0,
+                    "bad_ratio": bad_ratio,
+                    "atol": args.replacement_atol,
+                    "rtol": args.replacement_rtol,
+                    "max_bad_ratio": args.replacement_max_bad_ratio,
+                    "passed": bad_ratio <= args.replacement_max_bad_ratio,
+                }
             res = {
-                "context_len": length,
+                **workload,
                 "iters": n,
                 "two_layer_ms_min": round(ms[0], 4),
                 "two_layer_ms_mean": round(statistics.fmean(ms), 4),
-                "two_layer_ms_p50": round(ms[n // 2], 4),
-                "two_layer_ms_p99": round(ms[min(n - 1, int(n * 0.99))], 4),
+                "two_layer_ms_p50": round(statistics.median(ms), 4),
+                "two_layer_ms_p99": round(
+                    _linear_percentile(ms, 0.99),
+                    4,
+                ),
                 "two_layer_ms_max": round(ms[-1], 4),
+                "active_output_finite": active_output_finite,
+                "hidden_tp_spread": hidden_tp_spread,
+                "active_output_path": str(output_path),
+                "active_output_sha256": output_sha256,
+                "measured_output_sha256": (
+                    measured_output_sha256
+                    if args.audit_iteration_outputs
+                    else None
+                ),
+                "measured_output_unique_count": (
+                    len(set(measured_output_sha256))
+                    if args.audit_iteration_outputs
+                    else None
+                ),
+                "replacement_comparison": replacement,
             }
             results.append(res)
             print(json.dumps(res, sort_keys=True), flush=True)
+            if (
+                args.audit_iteration_outputs
+                and len(set(measured_output_sha256)) != 1
+            ):
+                raise RuntimeError(
+                    "prepared-program output changed across measured "
+                    f"iterations at context label {length}: "
+                    f"{measured_output_sha256}",
+                )
+            if replacement is not None and not replacement["passed"]:
+                raise RuntimeError(
+                    "replacement comparison failed at context label "
+                    f"{length}: {replacement}",
+                )
 
         report = {
             "kind": "two_layer_attn_perf",
             "layers": ["L0_full_dense", "L1_swa_dense"],
             "seed": args.seed,
             "num_blocks": args.num_blocks,
+            "block_table_blocks_per_row_capacity": args.num_blocks,
             "block_size": BLOCK_SIZE,
             "max_seq": cfg.MAX_SEQ_DEFAULT,
             "batch_capacity": BATCH,
             "active_rows": args.active_rows,
             "active_context_lens": active_context_lens or None,
+            "context_workloads": {
+                str(label): summary
+                for label, summary in workload_summaries.items()
+            },
+            "kv_layout": {
+                "kind": "compact_active_row_pages",
+                "physical_blocks_per_layer": physical_blocks,
+                "workload_blocks_per_layer_max": max_workload_blocks,
+                "tail_reserve_blocks": STORAGE_BATCH - 1,
+                "layer_cache_rows": layer_cache_rows,
+                "initialized_layers": [0, 1],
+                "initializer": "full_upload_deterministic_nonzero_mod255",
+            },
             "warmup": args.warmup,
             "full_attn_task_layout": task_layout,
+            "attention_task_profile": getattr(
+                cfg,
+                "ATTN_TASK_PROFILE",
+                "legacy",
+            ),
             "full_attn_blocks_per_task": task_grains,
+            "full_attn_uniform_o1_mapping": uniform_o1_mapping,
             "full_attn_online_softmax_reduce_fan_in": (
                 online_softmax_reduce_fan_in
             ),
@@ -1026,11 +1771,7 @@ def main() -> int:
             "full_attn_logical_tasks_by_context": {
                 str(length): {
                     stage: _logical_task_count(
-                        (
-                            active_context_lens
-                            if active_context_lens
-                            else [length] * args.active_rows
-                        ),
+                        context_workloads[int(length)],
                         int(grain),
                     )
                     for stage, grain in task_grains.items()
@@ -1039,11 +1780,7 @@ def main() -> int:
             },
             "full_attn_sv_online_logical_tasks_by_context": {
                 str(length): _sv_online_logical_task_count(
-                    (
-                        active_context_lens
-                        if active_context_lens
-                        else [length] * args.active_rows
-                    ),
+                    context_workloads[int(length)],
                     online_blocks_per_task=int(task_grains["online_softmax"]),
                 )
                 for length in ctx_lens
@@ -1068,8 +1805,17 @@ def main() -> int:
                    config=RunConfig(platform=args.platform, enable_dep_gen=True))
             rt.run(compiled, *arglist)
             print(f"[two-layer] DFX l2_swimlane iter (ctx={dfx_ctx})", flush=True)
-            rt.run(compiled, *arglist,
-                   config=RunConfig(platform=args.platform, enable_l2_swimlane=True))
+            rt.run(
+                compiled,
+                *arglist,
+                config=RunConfig(
+                    platform=args.platform,
+                    enable_l2_swimlane=True,
+                    l2_swimlane_reuse_dep_gen=(
+                        not args.platform.endswith("sim")
+                    ),
+                ),
+            )
     finally:
         for st in owned:
             try:
@@ -1080,11 +1826,7 @@ def main() -> int:
 
     if args.dfx:
         dfx_ctx = args.dfx_context or max(ctx_lens)
-        dfx_context_lens = (
-            active_context_lens
-            if active_context_lens
-            else [dfx_ctx] * args.active_rows
-        )
+        dfx_context_lens = context_workloads[int(dfx_ctx)]
         full_sv_online_logical_tasks = _sv_online_logical_task_count(
             dfx_context_lens,
             online_blocks_per_task=int(task_grains["online_softmax"]),
@@ -1115,24 +1857,38 @@ def main() -> int:
                 for context_len in dfx_context_lens
             ),
             "full_online_softmax_finalize": args.active_rows,
-            "full_out_proj_matmul_aic": (
-                HIDDEN // int(out_proj_grains["full"]["matmul"])
-                + int(out_proj_grains["full"]["matmul_tiles_per_task"]) - 1
-            ) // int(out_proj_grains["full"]["matmul_tiles_per_task"]),
-            "swa_out_proj_matmul_aic": (
-                HIDDEN // int(out_proj_grains["swa"]["matmul"])
-                + int(out_proj_grains["swa"]["matmul_tiles_per_task"]) - 1
-            ) // int(out_proj_grains["swa"]["matmul_tiles_per_task"]),
-            "full_out_resid_add": HIDDEN // int(out_proj_grains["full"]["vec"]),
-            "swa_out_resid_add": HIDDEN // int(out_proj_grains["swa"]["vec"]),
+            "full_out_proj_matmul_aic": (BATCH // cfg.BATCH_TILE)
+            * (
+                (
+                    HIDDEN // int(out_proj_grains["full"]["matmul"])
+                    + int(out_proj_grains["full"]["matmul_tiles_per_task"])
+                    - 1
+                )
+                // int(out_proj_grains["full"]["matmul_tiles_per_task"])
+            ),
+            "swa_out_proj_matmul_aic": (BATCH // cfg.BATCH_TILE)
+            * (
+                (
+                    HIDDEN // int(out_proj_grains["swa"]["matmul"])
+                    + int(out_proj_grains["swa"]["matmul_tiles_per_task"])
+                    - 1
+                )
+                // int(out_proj_grains["swa"]["matmul_tiles_per_task"])
+            ),
+            "full_out_resid_add": (BATCH // cfg.BATCH_TILE)
+            * (HIDDEN // int(out_proj_grains["full"]["vec"])),
+            "swa_out_resid_add": (BATCH // cfg.BATCH_TILE)
+            * (HIDDEN // int(out_proj_grains["swa"]["vec"])),
         }
         if not getattr(cfg, "FULL_ATTN_OUT_PROJ_FUSE_CAST", 0):
             expected_logical_blocks["full_out_proj_cast"] = (
-                HIDDEN // int(out_proj_grains["full"]["vec"])
+                (BATCH // cfg.BATCH_TILE)
+                * (HIDDEN // int(out_proj_grains["full"]["vec"]))
             )
         if not getattr(cfg, "SWA_OUT_PROJ_FUSE_CAST", 0):
             expected_logical_blocks["swa_out_proj_cast"] = (
-                HIDDEN // int(out_proj_grains["swa"]["vec"])
+                (BATCH // cfg.BATCH_TILE)
+                * (HIDDEN // int(out_proj_grains["swa"]["vec"]))
             )
         _postprocess_dfx(
             Path(compiled.output_dir),
@@ -1140,6 +1896,106 @@ def main() -> int:
             expected_logical_blocks=expected_logical_blocks,
         )
     return 0
+
+
+def _numeric_min_median_max(values: list[float]) -> dict[str, float]:
+    return {
+        "min": round(min(values), 4),
+        "median": round(statistics.median(values), 4),
+        "max": round(max(values), 4),
+    }
+
+
+def _aggregate_rank_uniformity(rank_reports: dict[str, dict]) -> dict:
+    """Aggregate every rank instead of selecting a minimum-makespan rank."""
+    reports = list(rank_reports.values())
+    family_names = sorted(
+        {
+            family
+            for report in reports
+            for family in report["families"]
+        },
+    )
+    family_metrics = (
+        "busy_us",
+        "logical_blocks",
+        "resource_slices",
+        "waves_at_full_resource",
+        "invocation_count",
+        "invocation_span_us_p50",
+        "invocation_span_us_p99",
+        "invocation_span_us_max",
+        "slice_duration_us_p50",
+        "slice_duration_us_p99",
+        "slice_duration_us_max",
+        "stage_span_us",
+        "peak_concurrency",
+        "average_concurrency",
+        "full_resource_utilization",
+        "packing_efficiency",
+    )
+    families = {}
+    for family in family_names:
+        present = [
+            report["families"][family]
+            for report in reports
+            if family in report["families"]
+        ]
+        families[family] = {
+            "present_rank_count": len(present),
+            **{
+                metric: _numeric_min_median_max(
+                    [float(info[metric]) for info in present],
+                )
+                for metric in family_metrics
+            },
+        }
+    return {
+        "rank_count": len(rank_reports),
+        "rank_tags": sorted(rank_reports),
+        "makespan_us": _numeric_min_median_max(
+            [float(report["makespan_us"]) for report in reports],
+        ),
+        "families": families,
+    }
+
+
+def _collective_low_wait_reference(
+    rank_reports: dict[str, dict],
+) -> dict | None:
+    """Select a diagnostic rank with the least in-kernel collective wait.
+
+    ``tp_all_reduce`` includes peer-arrival spin time, so the all-rank
+    makespan median can be orders of magnitude larger than device compute
+    during DFX capture.  This reference is only a low-wait heuristic; retain
+    the all-rank aggregate alongside it.
+    """
+    candidates = []
+    for tag, report in rank_reports.items():
+        collective = report["families"].get("tp_all_reduce")
+        if collective is None:
+            continue
+        candidates.append(
+            (
+                float(collective["stage_span_us"]),
+                float(report["makespan_us"]),
+                tag,
+                report,
+            ),
+        )
+    if not candidates:
+        return None
+    collective_us, makespan_us, tag, report = min(candidates)
+    return {
+        "rank_tag": tag,
+        "tp_all_reduce_stage_span_us": round(collective_us, 4),
+        "makespan_us": round(makespan_us, 4),
+        "families": report["families"],
+        "interpretation": (
+            "diagnostic low-wait heuristic; not a replacement for all-rank "
+            "correctness or wall-clock timing"
+        ),
+    }
 
 
 def _postprocess_dfx(
@@ -1162,7 +2018,7 @@ def _postprocess_dfx(
     (out / "critical_path_stdout.txt").write_text(proc.stdout + proc.stderr)
     print(proc.stdout[-4000:] if proc.stdout else proc.stderr[-2000:], flush=True)
 
-    summary = {}
+    rank_summary = {}
     for rank_dir in sorted(dfx_root.rglob("l2_swimlane_records.json")):
         d = rank_dir.parent
         u = analyze_uniformity(
@@ -1171,22 +2027,35 @@ def _postprocess_dfx(
         )
         if u is None:
             continue
-        summary[str(d.relative_to(dfx_root))] = u
-    if not summary:
+        rank_summary[str(d.relative_to(dfx_root))] = u
+    if not rank_summary:
         return
-    # Minimum makespan is a useful low-wait heuristic, but this program has
-    # multiple collectives and one rank need not be the last arrival at every
-    # barrier. Keep the selected rank for convenient A/B reporting without
-    # treating it as a uniquely wait-free measurement.
-    ref = min(summary, key=lambda k: summary[k]["makespan_us"])
-    for tag, u in summary.items():
-        print_uniformity(tag, u, reference=(tag == ref))
-    summary["_reference_rank"] = ref
-    print(f"\n[two-layer] LOW-WAIT REFERENCE rank = {ref} "
-          f"(device makespan {summary[ref]['makespan_us'] / 1000:.3f} ms). "
-          f"Read {dfx_root / ref / 'critical_path_report.md'} for its chain; "
-          f"compare per-collective minima when attributing all-reduce time.")
-    (out / "uniformity_report.json").write_text(json.dumps(summary, indent=2))
+    for tag, u in rank_summary.items():
+        print_uniformity(tag, u)
+    aggregate = _aggregate_rank_uniformity(rank_summary)
+    low_wait = _collective_low_wait_reference(rank_summary)
+    makespan = aggregate["makespan_us"]
+    print(
+        "\n[two-layer] ALL-RANK makespan "
+        f"min/median/max={makespan['min'] / 1000:.3f}/"
+        f"{makespan['median'] / 1000:.3f}/"
+        f"{makespan['max'] / 1000:.3f} ms",
+    )
+    if low_wait is not None:
+        print(
+            "[two-layer] COLLECTIVE LOW-WAIT REFERENCE "
+            f"{low_wait['rank_tag']}: makespan="
+            f"{low_wait['makespan_us'] / 1000:.3f} ms, "
+            "tp_all_reduce span-sum="
+            f"{low_wait['tp_all_reduce_stage_span_us']:.3f} us "
+            "(diagnostic heuristic)",
+        )
+    report = {
+        "ranks": rank_summary,
+        "all_rank_aggregate": aggregate,
+        "collective_low_wait_reference": low_wait,
+    }
+    (out / "uniformity_report.json").write_text(json.dumps(report, indent=2))
     print(f"UNIFORMITY_REPORT={out / 'uniformity_report.json'}", flush=True)
 
 

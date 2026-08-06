@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import time
 import urllib.request
@@ -18,11 +19,22 @@ from typing import Any
 
 DEFAULT_MODEL = "step3.5-flash-w8a8"
 DEFAULT_PORT = 8001
-DEFAULT_LOG_ROOT = Path("/mnt/nvme1/chensiyu/logs/step3p5_910b_w8a8_prefill_v001")
+# Log/golden roots are operator-specific; resolve from env with a neutral
+# default so no username path is baked into the source (CLAUDE.md: no private
+# info). Set STEP3P5_W8A8_PREFILL_LOG_ROOT / STEP3P5_W8A8_PREFILL_LIVE_DUMP in
+# the run environment.
+DEFAULT_LOG_ROOT = Path(
+    os.environ.get(
+        "STEP3P5_W8A8_PREFILL_LOG_ROOT",
+        "/tmp/step3p5_w8a8_prefill_logs",
+    )
+)
 DEFAULT_GOLDEN_ROOT = DEFAULT_LOG_ROOT / "golden_step3p5_w8a8_prefill_vllm_sampled"
 DEFAULT_LIVE_DUMP = Path(
-    "/mnt/nvme1/chensiyu/logs/step3p5_910b_w8a8_v001/"
-    "vllm_tensor_dump_w8a8_prefill_sampled"
+    os.environ.get(
+        "STEP3P5_W8A8_PREFILL_LIVE_DUMP",
+        "/tmp/step3p5_w8a8_prefill_logs/vllm_tensor_dump_w8a8_prefill_sampled",
+    )
 )
 DEFAULT_SEQ_LENS = (1024, 4096, 8192, 32768, 65536, 131072)
 

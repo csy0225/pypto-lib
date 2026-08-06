@@ -24,6 +24,7 @@ class PatchState:
     original_model_forward: Callable[..., Any]
     original_causal_forward: Callable[..., Any]
     original_compute_logits: Callable[..., Any]
+    prefill_dispatch: bool = False
 
 
 class PyPTOBackendUnavailable(RuntimeError):
@@ -62,6 +63,66 @@ def classify_decode_gate(
     if sidecar_available and eligible:
         return GATE_PROCEED
     return GATE_FAIL_CLOSED
+
+
+# --- Fail-closed prefill-gate decision (pure; unit-tested card-free) --------
+# Three-way dispatch on a Step3p5 forward's num_prefills, broadcast as an
+# INT32 code from rank 0 so all TP ranks take the same branch. Prefill and
+# decode share one CPU/Gloo control plane; the codes are deliberately
+# disjoint from the decode GATE_* codes so a combined dispatch can route a
+# batch to the right resident sidecar without ambiguity.
+GATE_PREFILL_PROCEED = 10  # num_prefills>0 and the prefill ABI holds
+GATE_DECODE_PROCEED = 11   # num_prefills==0: defer to the decode path
+GATE_REJECT = 12           # any eligibility violation / sidecar down
+
+
+def classify_prefill_gate(
+    forward_context,
+    vllm_config,
+    *,
+    num_prefills: int,
+    T: int = 128,
+    chunked_prefill: bool = False,
+    context_parallel: int = 1,
+    pipeline_parallel: int = 1,
+    num_kv_groups: int = 1,
+    sidecar_available: bool = True,
+) -> int:
+    """Decide how a Step3p5 forward with prefills proceeds (fail-closed).
+
+    A pure decision function: ``forward_context`` / ``vllm_config`` are passed
+    through for signature symmetry with the live caller but are not dereferenced
+    here (the caller resolves the scalar eligibility inputs first), so the
+    card-free unit tests can exercise every branch with ``None``.
+
+    Args:
+      forward_context: the vLLM ``ForwardContext`` (unused by the decision).
+      vllm_config: the vLLM config (unused by the decision).
+      num_prefills: scheduler prefill request count for this step.
+      T: active prefill token count (``num_actual_tokens``).
+      chunked_prefill: vLLM chunked-prefill scheduling is active.
+      context_parallel: ``prefill_context_parallel_size`` (1 => no CP/PCP).
+      pipeline_parallel: ``pipeline_parallel_size`` (1 => no PP).
+      num_kv_groups: resolved KV cache group count (1 => single group).
+      sidecar_available: the resident whole-prefill sidecar socket is present.
+    Returns one of ``GATE_PREFILL_PROCEED`` / ``GATE_DECODE_PROCEED`` /
+    ``GATE_REJECT``.
+    """
+    # A pure-decode step is not a prefill request; defer to the decode path so
+    # the existing decode sidecar / monkey-patch handles it unchanged.
+    if num_prefills == 0:
+        return GATE_DECODE_PROCEED
+    if (
+        not sidecar_available
+        or chunked_prefill
+        or context_parallel != 1
+        or pipeline_parallel != 1
+        or num_kv_groups != 1
+        or T <= 0
+        or T > 128
+    ):
+        return GATE_REJECT
+    return GATE_PREFILL_PROCEED
 
 
 def _repo_root() -> Path:
@@ -453,31 +514,399 @@ def _pypto_full_forward(self, input_ids, positions, intermediate_tensors=None, i
     return next_hidden
 
 
+# ---------------------------------------------------------------------------
+# Prefill hidden-only whole-net path (dual of the decode path above).
+#
+# The prefill sidecar owns the resident single-chip ``whole_prefill_step3p5``
+# program.  A forward with ``num_prefills > 0`` is routed here by
+# ``_pypto_causal_forward_dispatch`` (installed on ``Step3p5ForCausalLM.forward``
+# when ``PYPTO_STEP3P5_PREFILL_PATCH=1``).  A pure-decode forward
+# (``num_prefills == 0``) is left on the decode path, which the decode
+# monkey-patch already owns on ``Step3p5Model.forward`` — so the two paths are
+# disjoint and never both active for one step.
+# ---------------------------------------------------------------------------
+
+
+def _wd_prefill_sock_path() -> str:
+    return os.environ.get(
+        "PYPTO_WHOLE_PREFILL_SOCK", "/logs/pypto_whole_prefill.sock"
+    )
+
+
+# Lazily-created, process-global whole-prefill sidecar client.  Rank 0 is the
+# only socket peer; the CPU/Gloo-only TP coordination mirrors the decode path
+# (a vLLM device-group broadcast would form a cross-runtime collective cycle
+# against PyPTO on the same eight NPUs).
+_WD_PREFILL_CLIENT = None
+
+
+def _wd_prefill_client():
+    global _WD_PREFILL_CLIENT
+    if _WD_PREFILL_CLIENT is None:
+        from tools.step3p5.whole_prefill_sidecar import (  # noqa: PLC0415
+            WholePrefillClient,
+        )
+        _WD_PREFILL_CLIENT = WholePrefillClient(_wd_prefill_sock_path()).connect()
+    return _WD_PREFILL_CLIENT
+
+
+def _run_prefill_plan(client, hidden_cpu, prefill_plan):
+    """Execute one prefill whole-net round and restore the active token rows.
+
+    A normal prefill is a single whole-net round (no speculative target
+    decomposition, unlike decode).  ``prefill_plan`` is the validated
+    ``PrefillPlan`` from ``vllm_prefill_metadata.extract_pypto_prefill_meta``;
+    its ``protocol_tensors`` / ``protocol_meta`` are exactly the sidecar ABI.
+
+    The returned hidden uses vLLM's original flattened token order so the
+    unchanged final RMSNorm, LM head and sampler consume exactly the rows they
+    expect.  A sidecar failure is terminal, not a fallback request: PyPTO may
+    already have written paged KV for this prefill.
+    """
+    import torch  # noqa: PLC0415
+
+    if (
+        hidden_cpu.dtype != torch.bfloat16
+        or hidden_cpu.ndim != 2
+        or int(hidden_cpu.shape[0]) != int(prefill_plan.valid_tokens)
+        or int(hidden_cpu.shape[1]) != 4096
+    ):
+        raise PyPTOBackendUnavailable(
+            "prefill-plan hidden ABI mismatch: "
+            f"dtype={hidden_cpu.dtype}, shape={tuple(hidden_cpu.shape)}, "
+            f"valid_tokens={prefill_plan.valid_tokens}"
+        )
+
+    out_meta, output = client.prefill(
+        dict({"hidden": hidden_cpu}, **prefill_plan.protocol_tensors()),
+        prefill_plan.protocol_meta(),
+    )
+    next_hidden = output.get("next_hidden")
+    if (
+        not isinstance(next_hidden, torch.Tensor)
+        or next_hidden.dtype != torch.bfloat16
+        or tuple(next_hidden.shape) != tuple(hidden_cpu.shape)
+    ):
+        raise PyPTOBackendUnavailable(
+            "prefill sidecar next_hidden ABI mismatch; got "
+            f"{getattr(next_hidden, 'dtype', None)}/"
+            f"{getattr(next_hidden, 'shape', None)}, expected "
+            f"{hidden_cpu.dtype}/{tuple(hidden_cpu.shape)}"
+        )
+    if not torch.isfinite(next_hidden.float()).all():
+        raise PyPTOBackendUnavailable("prefill sidecar returned NaN/Inf next_hidden")
+    return (
+        {
+            "op": "prefill_plan",
+            "round_count": 1,
+            "query_lengths": list(prefill_plan.query_lengths),
+            "out_meta": dict(out_meta),
+        },
+        next_hidden,
+    )
+
+
+def _pypto_prefill_forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+    """Prefill hidden-only whole-net runner via the resident sidecar.
+
+    Data flow (live single-handoff, N=1 whole-net; prefill dual of the decode
+    ``_pypto_full_forward`` path):
+      1. vLLM embeds locally (embed_tokens) -> hidden [num_tokens, HIDDEN],
+         replicated across the 8 TP ranks.
+      2. every rank copies its embedding hidden to CPU before PyPTO takes the
+         shared device partition.
+      3. rank-0 extracts the vLLM-Ascend prefill attention metadata
+         (``extract_pypto_prefill_meta``) and resolves the scalar eligibility
+         inputs (T, chunked-prefill, CP/PCP, PP, KV-group count, sidecar up).
+         A single prefill request (``num_prefills == 1``, ``num_decodes == 0``)
+         with ``1 <= T <= PREFILL_T`` is the only served shape.  The decision
+         is broadcast on the TP CPU/Gloo group before any rank branches.
+      4. all ranks rendezvous on the CPU group.  Rank-0 drives the sidecar
+         while ranks 1..7 wait only on the CPU control plane.
+      5. rank-0 broadcasts a CPU result object containing status and replicated
+         hidden.  Each rank independently copies the hidden back to its NPU.
+      6. return next_hidden; vLLM's (patched) compute_logits applies the
+         validated final norm + lm_head tail.
+    """
+    import torch  # noqa: PLC0415
+    step3p5 = _load_step3p5_module()
+    state = _patch_state(step3p5)
+    original_forward = state.original_model_forward if state is not None else None
+
+    # embed locally (mirror vLLM Step3p5Model.forward preamble)
+    if inputs_embeds is None:
+        hidden = self.embed_tokens(input_ids)
+    else:
+        hidden = inputs_embeds
+
+    from vllm.distributed import (  # noqa: PLC0415
+        get_pp_group,
+        get_tensor_model_parallel_rank,
+        get_tp_group,
+    )
+    rank = get_tensor_model_parallel_rank()
+    tp = get_tp_group()
+
+    # Required on every rank: completes rank-local embedding before non-rank0
+    # workers enter a CPU-only wait.  No vLLM NPU collective is allowed between
+    # here and sidecar completion.
+    hidden_cpu = hidden.detach().to("cpu", dtype=torch.bfloat16).contiguous()
+
+    prefill_plan = None
+    local_error = None
+    decision = GATE_REJECT
+    if rank == 0:
+        sidecar_available = os.path.exists(_wd_prefill_sock_path())
+        num_prefills = 0
+        T = 0
+        chunked_prefill = False
+        context_parallel = 1
+        pipeline_parallel = 1
+        num_kv_groups = 1
+        try:
+            if not sidecar_available:
+                raise PyPTOBackendUnavailable("prefill sidecar socket is absent")
+            pp = get_pp_group()
+            if int(getattr(pp, "world_size", 1)) != 1:
+                raise PyPTOBackendUnavailable(
+                    "pipeline parallel live path is unsupported"
+                )
+            if hidden.ndim != 2 or hidden.shape[1] != 4096:
+                raise PyPTOBackendUnavailable(
+                    f"hidden must be [T,4096], got {tuple(hidden.shape)}"
+                )
+            if hidden.dtype != torch.bfloat16:
+                raise PyPTOBackendUnavailable(
+                    f"hidden must be BF16, got {hidden.dtype}"
+                )
+            from vllm.forward_context import get_forward_context  # noqa: PLC0415
+            from tools.step3p5.vllm_prefill_metadata import (  # noqa: PLC0415
+                PREFILL_T,
+                extract_pypto_prefill_meta,
+            )
+
+            forward_context = get_forward_context()
+            prefill_plan = extract_pypto_prefill_meta(
+                forward_context,
+                vllm_config=self.vllm_config,
+                positions=positions,
+            )
+            if int(hidden.shape[0]) != prefill_plan.valid_tokens:
+                raise PyPTOBackendUnavailable(
+                    "graph/token padding is not supported by the first live "
+                    f"prefill ABI: hidden rows={hidden.shape[0]}, "
+                    f"valid={prefill_plan.valid_tokens}"
+                )
+            # Resolve the scalar eligibility inputs the pure gate consumes.
+            num_prefills = len(prefill_plan.query_lengths)
+            T = prefill_plan.valid_tokens
+            parallel = getattr(self.vllm_config, "parallel_config", None)
+            pipeline_parallel = int(getattr(parallel, "pipeline_parallel_size", 1))
+            context_parallel = int(
+                getattr(parallel, "prefill_context_parallel_size", 1)
+            )
+            scheduler = getattr(self.vllm_config, "scheduler_config", None)
+            for flag in ("chunked_prefill_enabled", "enable_chunked_prefill"):
+                if bool(getattr(scheduler, flag, False)):
+                    chunked_prefill = True
+                    break
+            groups = getattr(
+                getattr(self.vllm_config, "kv_cache_config", None),
+                "kv_cache_groups",
+                None,
+            )
+            num_kv_groups = len(groups) if groups else 1
+            # extract_pypto_prefill_meta already rejects multi-group, but keep
+            # the gate self-contained: a future single-pass metadata path must
+            # still fail closed here.
+            _ = PREFILL_T  # guard against accidental drift of the constant
+        except Exception as exc:  # noqa: BLE001
+            local_error = exc
+            T = 0
+        decision = classify_prefill_gate(
+            forward_context,
+            self.vllm_config,
+            num_prefills=num_prefills,
+            T=T,
+            chunked_prefill=chunked_prefill,
+            context_parallel=context_parallel,
+            pipeline_parallel=pipeline_parallel,
+            num_kv_groups=num_kv_groups,
+            sidecar_available=sidecar_available,
+        )
+
+    # CPU/Gloo broadcast (never the NPU device group — see decode path note).
+    decision = int(tp.broadcast_object(decision if rank == 0 else None, src=0))
+
+    # Pure decode => defer to the decode path (the decode monkey-patch owns
+    # Step3p5Model.forward).  This branch is reached only when the causal
+    # dispatcher could not pre-classify, e.g. a metadata-less profile call.
+    if decision == GATE_DECODE_PROCEED:
+        if original_forward is None:
+            raise PyPTOBackendUnavailable(
+                f"decode path unavailable and no fallback exists: {local_error!r}"
+            )
+        return original_forward(self, input_ids, positions, intermediate_tensors, inputs_embeds)
+
+    if decision == GATE_REJECT:
+        if rank == 0:
+            reason = (
+                repr(local_error)
+                if local_error is not None
+                else (
+                    "real prefill request is not PyPTO-eligible and no correct "
+                    "fallback exists (tail-only instance)"
+                )
+            )
+            setattr(self, "_pypto_prefill_last_error", reason)
+        setattr(
+            self,
+            "_pypto_prefill_fail_closed",
+            int(getattr(self, "_pypto_prefill_fail_closed", 0)) + 1,
+        )
+        raise PyPTOBackendUnavailable(
+            "PyPTO real prefill request failed closed"
+            + (f": {local_error!r}" if rank == 0 and local_error is not None else "")
+        )
+
+    # decision == GATE_PREFILL_PROCEED.  CPU-group rendezvous: every rank has
+    # completed the embedding->CPU copy and no rank is still submitting vLLM
+    # NPU work when rank 0 enters the resident PyPTO runtime.
+    tp.barrier()
+
+    payload = None
+    if rank == 0:
+        assert prefill_plan is not None
+
+        def _run_sidecar():
+            cli = _wd_prefill_client()
+            return _run_prefill_plan(cli, hidden_cpu, prefill_plan)
+
+        payload = _sidecar_result_payload(
+            _run_sidecar, output_key="next_hidden"
+        )
+
+    payload = tp.broadcast_object(payload, src=0)
+    if not bool(payload.get("ok")):
+        if rank == 0:
+            setattr(self, "_pypto_prefill_last_error", payload.get("error"))
+        raise PyPTOBackendUnavailable(
+            "PyPTO sidecar prefill failed on rank0: "
+            f"{payload.get('error_type')}: {payload.get('error')}"
+            if rank == 0
+            else "PyPTO sidecar prefill failed on rank0"
+        )
+
+    next_hidden_cpu = payload["next_hidden"]
+    if (
+        next_hidden_cpu.dtype != torch.bfloat16
+        or tuple(next_hidden_cpu.shape) != tuple(hidden_cpu.shape)
+    ):
+        raise PyPTOBackendUnavailable(
+            "CPU control-plane next_hidden ABI mismatch after broadcast"
+        )
+    next_hidden = next_hidden_cpu.to(
+        device=hidden.device,
+        dtype=hidden.dtype,
+    )
+    if rank == 0:
+        setattr(self, "_pypto_prefill_last_meta", dict(payload["out_meta"]))
+    setattr(
+        self,
+        "_pypto_prefill_calls",
+        int(getattr(self, "_pypto_prefill_calls", 0)) + 1,
+    )
+    return next_hidden
+
+
+def _pypto_causal_forward_dispatch(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+    """Route a Step3p5ForCausalLM.forward by prefill presence.
+
+    A step with ``num_prefills > 0`` runs the resident whole-prefill sidecar
+    via ``_pypto_prefill_forward`` (which itself embeds locally and returns
+    pre-final-norm hidden).  A pure-decode step defers to the original
+    ``Step3p5ForCausalLM.forward`` so the decode monkey-patch on
+    ``Step3p5Model.forward`` handles it unchanged.  Profile/dummy/warmup calls
+    with no live attention metadata are treated as decode (deferred), matching
+    the decode gate's metadata-only no-op allowance.
+    """
+    step3p5 = _load_step3p5_module()
+    state = _patch_state(step3p5)
+    original_causal_forward = state.original_causal_forward if state is not None else None
+
+    num_prefills = 0
+    try:
+        from vllm.forward_context import get_forward_context  # noqa: PLC0415
+        attn_md = getattr(get_forward_context(), "attn_metadata", None)
+        if attn_md:
+            representative = next(iter(attn_md.values()))
+            num_prefills = int(getattr(representative, "num_prefills", 0))
+    except Exception:  # noqa: BLE001
+        # No live forward context => profile/dummy/warmup => defer (decode path).
+        num_prefills = 0
+
+    if num_prefills > 0:
+        return _pypto_prefill_forward(
+            self, input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+    if original_causal_forward is None:
+        raise PyPTOBackendUnavailable(
+            "decode path unavailable: causal forward has no original to defer to"
+        )
+    return original_causal_forward(self, input_ids, positions, intermediate_tensors, inputs_embeds)
+
+
 def install(mode: str | None = None) -> dict[str, Any]:
-    """Install the only production mode: full hidden-only whole-net."""
+    """Install the only production mode: full hidden-only whole-net.
+
+    The decode path is always installed on ``Step3p5Model.forward``.  When
+    ``PYPTO_STEP3P5_PREFILL_PATCH=1`` is set, the prefill causal dispatcher is
+    additionally installed on ``Step3p5ForCausalLM.forward`` so a forward with
+    ``num_prefills > 0`` routes to the resident whole-prefill sidecar; a
+    pure-decode forward still falls through to the decode path.  The two paths
+    are disjoint: the dispatcher only intercepts prefill steps.
+    """
     mode = (mode or os.environ.get("PYPTO_STEP3P5_PATCH_MODE") or "full").lower()
     if mode != "full":
         raise ValueError(
             "only PYPTO_STEP3P5_PATCH_MODE=full is supported; "
             f"got {mode!r}"
         )
+    prefill_dispatch = os.environ.get("PYPTO_STEP3P5_PREFILL_PATCH", "") == "1"
 
     step3p5 = _load_step3p5_module()
-    if _patch_state(step3p5) is not None:
-        return {"ok": True, "already_installed": True, "mode": _patch_state(step3p5).mode}
+    existing = _patch_state(step3p5)
+    if existing is not None:
+        # If the caller toggled the prefill flag on an already-installed patch,
+        # re-apply just the causal forward so the dispatch matches the env.
+        if existing.prefill_dispatch != prefill_dispatch:
+            if prefill_dispatch:
+                step3p5.Step3p5ForCausalLM.forward = _pypto_causal_forward_dispatch
+            else:
+                step3p5.Step3p5ForCausalLM.forward = existing.original_causal_forward
+            existing.prefill_dispatch = prefill_dispatch
+        return {
+            "ok": True,
+            "already_installed": True,
+            "mode": existing.mode,
+            "prefill_dispatch": existing.prefill_dispatch,
+        }
 
     state = PatchState(
         mode=mode,
         original_model_forward=step3p5.Step3p5Model.forward,
         original_causal_forward=step3p5.Step3p5ForCausalLM.forward,
         original_compute_logits=step3p5.Step3p5ForCausalLM.compute_logits,
+        prefill_dispatch=prefill_dispatch,
     )
 
     step3p5.Step3p5Model.forward = _pypto_full_forward
     step3p5.Step3p5ForCausalLM.compute_logits = _pypto_tail_compute_logits
+    if prefill_dispatch:
+        step3p5.Step3p5ForCausalLM.forward = _pypto_causal_forward_dispatch
 
     _set_patch_state(step3p5, state)
-    return {"ok": True, "installed": True, "mode": mode}
+    return {"ok": True, "installed": True, "mode": mode, "prefill_dispatch": prefill_dispatch}
 
 
 def uninstall() -> dict[str, Any]:
@@ -498,6 +927,7 @@ def status() -> dict[str, Any]:
     return {
         "installed": state is not None,
         "mode": None if state is None else state.mode,
+        "prefill_dispatch": bool(state.prefill_dispatch) if state else False,
         "module": getattr(step3p5, "__file__", None),
     }
 

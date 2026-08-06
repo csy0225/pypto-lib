@@ -87,9 +87,48 @@ tools/step3p5/
   mtp_kv_exporter.py
 ```
 
-安装器只接受 `PYPTO_STEP3P5_PATCH_MODE=full`。real decode 请求若不满足
-canonical ABI 必须 fail-closed；禁止 vanilla、per-layer 或 silent fallback。
-只有明确识别的 profile/dummy/warmup call 可以执行 harmless no-op。
+### 2.1 Prefill 轨道（canonical，与 decode 对偶）
+
+prefill 整网融合镜像 decode 的 single-chip hidden-only 边界，新增一条
+prefill 轨道。prefill 与 decode 共享同一 weight pool、同一 KV pool、同一
+IPC 契约、同一 fail-closed 纪律；唯一 program 为
+`models.step3p5.prefill_layer_single_chip_hidden:whole_prefill_step3p5`。
+
+```text
+models/step3p5/
+  prefill_layer_single_chip_hidden.py     # whole_prefill_step3p5 (hidden-only)
+  prefill_fwd.py                          # per-layer prefill kernels + diag LM-head
+  prefill_attention_full.py
+  prefill_attention_swa.py
+  prefill_qkv_proj_rope.py                # PREFILL_T=128, TOK_TILE=32
+  prefill_moe.py
+
+tools/step3p5/
+  whole_prefill_holder.py                 # WholePrefillHolder (set_live_prompt)
+  whole_prefill_sidecar.py                # AF_UNIX pypto_prefill.sock
+  vllm_prefill_metadata.py                # extract_pypto_prefill_meta
+  pypto_whole_prefill_backend.py          # thin compat wrapper
+  vllm_monkey_patch.py                    # classify_prefill_gate + _pypto_prefill_forward
+```
+
+prefill 与 decode 的差异：token 维度 `PREFILL_T=128`（decode `BATCH=16`）；
+`positions`/`slot_mapping` 为 per-token `[PREFILL_T]`（decode 为 paged
+`[UBD]`）；新增 resident `position_ids [tp, PREFILL_T] INT32`（decode 无）；
+prefill attention **写** paged cache（decode 读），把整段 prompt 的 K/V 写入
+vLLM paged blocks 供后续 decode 读取。
+
+安装器在 `PYPTO_STEP3P5_PREFILL_PATCH=1` 时额外在
+`Step3p5ForCausalLM.forward` 装 `_pypto_causal_forward_dispatch`，按
+`num_prefills>0` 分流 prefill/原 forward（decode 路径不变）。real prefill
+请求若不满足 canonical ABI（chunked-prefill / CP/PCP / PP>1 / T>PREFILL_T /
+multi KV group / sidecar down）必须 fail-closed；禁止 vanilla、per-layer 或
+silent fallback。
+
+> **状态（2026-08-05）**：prefill 桥接层（holder/sidecar/metadata/monkey_patch
+> /backend）+ 整网 program 契约 scaffold 已落地并 card-free 验证通过；整网
+> program 的真实 45 层 body 与 P1 内核 codegen 改造（token-tiling / W8A8 /
+> attention 修复 / 双索引）仍在推进（`IS_SCAFFOLD=True` 期间 holder.build
+> 拒绝编译）。详见 `/data/jhj/pypto_step3p5/RECOVERY_PROGRESS.md`。
 
 ## 3. 设计不变量
 
@@ -357,6 +396,22 @@ TP spread: 0.0
 `240/256 = 93.75%`；这低于历史 `>=95%` vanilla raw gate，不能把 raw
 结果标记为无条件 PASS。详细数据见
 `tests/step3p5/ci/LIVE_PRECISION_AB.md`。
+
+### 7.2 Prefill canonical 轨道（与 decode 对偶）
+
+prefill 整网融合的 canonical symbol 为：
+
+```text
+models.step3p5.prefill_layer_single_chip_hidden:whole_prefill_step3p5
+```
+
+holder/sidecar/harness/CI 只允许该 canonical symbol，禁止历史 unroll /
+per-layer / silent fallback。prefill 轨道复用 decode 的 IPC 生命周期契约、
+ACL IPC 传输、weight 池、KV allocator overlay 与 sitecustomize 第 1/2 段；
+桥接层骨架镜像 decode，差异仅在 program 名、per-rank arg 签名（55-arg =
+decode 54-arg + `position_ids`）、prefill 专属 metadata 与 KV 写入语义。
+prefill KV 写入语义：prefill attention 写 paged cache（decode 读），
+prefill→decode 交接时 KV ownership 契约延续同一 paged pool。
 
 ### 7.1 canonical rename 回归
 

@@ -171,9 +171,19 @@ def attention_full_prefill(
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_FULL_LOCAL_PAD], pl.BF16],
+    # Head-wise gate block-diag constant R (R[h, h*HEAD_DIM+d]=1), mirroring
+    # decode attention_full.py:211. Holder constructs it once (layer-independent).
+    gate_r: pl.Tensor[[NUM_HEADS_FULL_LOCAL_PAD, HIDDEN_Q_FULL_LOCAL], pl.BF16],
     positions: pl.Tensor[[PREFILL_T], pl.INT32],
     resid1_out: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
-    layer_idx: pl.Scalar[pl.INT32],
+    # Dual-index (PROGRESS Session 21-22, mirror decode attention_full.py:213-214):
+    # norm_layer_idx is the PHYSICAL layer number for norm weights + KV cache
+    # (layer_cache_base = norm_layer_idx * layer_cache_rows); attn_layer_idx is
+    # the within-bucket weight offset (layer_hidden_base = attn_layer_idx * HIDDEN,
+    # =0 once whole-net pre-slices weights). Single-layer programs pass
+    # norm=attn=physical so behaviour is unchanged.
+    norm_layer_idx: pl.Scalar[pl.INT32],
+    attn_layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[
         [PREFILL_T, HIDDEN // TP_WORLD_SIZE], pl.BF16
     ],
@@ -196,10 +206,10 @@ def attention_full_prefill(
     ``PrefillLayerMoE.chip_orch``. Literals make every shape /
     arithmetic argument an unambiguous compile-time integer.
     """
-    layer_qhidden_base = layer_idx * HIDDEN_Q_FULL_LOCAL
+    layer_qhidden_base = attn_layer_idx * HIDDEN_Q_FULL_LOCAL
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
-    layer_cache_base = layer_idx * layer_cache_rows
+    layer_cache_base = norm_layer_idx * layer_cache_rows
 
     # ── Scope 1 — inlined prefill QKV+RoPE body (full, Phase X.9). ───────
     # The factory ``select_prefill_qkv(full=True)`` body is materialised
@@ -215,7 +225,7 @@ def attention_full_prefill(
 
     qkv_d_blocks = HIDDEN // 256
     qkv_q_blocks = HIDDEN_Q_FULL_LOCAL // 128
-    layer_hidden_base = layer_idx * HIDDEN
+    layer_hidden_base = attn_layer_idx * HIDDEN
 
     # ── Stage 1.a — replicated zero-centred input RMSNorm. ───────────
     for tg_idx in pl.spmd(
@@ -257,7 +267,7 @@ def attention_full_prefill(
             )
             gamma = pl.slice(
                 input_rms_weight,
-                [1, 256], [layer_idx, k0],
+                [1, 256], [norm_layer_idx, k0],
             )
             scaled_rms = pl.row_expand_mul(chunk, inv_rms)
             normed_rms = pl.col_expand_mul(scaled_rms, pl.add(gamma, 1.0))
@@ -410,7 +420,7 @@ def attention_full_prefill(
             ),
             [QK_NORM_T_TILE * 8, HEAD_DIM],
         )
-        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
         # Phase X.7: per_head_qk_norm body inlined.
         q_sq = pl.row_sum(pl.mul(q_chunk, q_chunk))
         q_inv = pl.rsqrt(pl.add(pl.mul(q_sq, 0.0078125), EPS))
@@ -425,7 +435,7 @@ def attention_full_prefill(
 
         k_col = kh * HEAD_DIM
         k_chunk = pl.slice(k_proj, [QK_NORM_T_TILE, HEAD_DIM], [tg, k_col])
-        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
         k_sq = pl.row_sum(pl.mul(k_chunk, k_chunk))
         k_inv = pl.rsqrt(pl.add(pl.mul(k_sq, 0.0078125), EPS))
         k_scaled = pl.row_expand_mul(k_chunk, k_inv)
@@ -754,34 +764,70 @@ def attention_full_prefill(
 
     attn_out = pl.reshape(attn_out_flat, [PREFILL_T, HIDDEN_Q_FULL_LOCAL])
 
-    # ── Scope 2.5 — head-wise sigmoid gate on attn_out. ──────────────────
-    # DEBUG BYPASS (revert): the per-head [TOK_TILE,1] gate_col TLOAD hits the
-    # pto-isa ND2ND [N,1] VEC layout wall (same class as decode; solved there via
-    # the gate_r block-diagonal matmul). Bypassed to verify the causal cross-token
-    # attention in isolation; port the gate_r fix next. Golden must use
-    # w_g_full=None while this bypass is active.
+    # ── Scope 2.5 — head-wise sigmoid gate on attn_out (gate_r block-diag). ──
+    # Mirror decode attention_full.py:329-416 (full_head_gate_expand, PROGRESS
+    # Session 3 A). The per-head [TOK_TILE,1] gate_col TLOAD hit the pto-isa
+    # ND2ND [N,1] VEC layout wall; solved via the gate_r block-diagonal matmul:
+    #   gate_score[t, h] = sigmoid(gate_logits[t, h])
+    #   attn_out[t, h*HEAD_DIM + d] *= gate_score[t, h]
+    # realised as gate_score @ gate_r (R[h, h*HEAD_DIM+d]=1 block-diag) spmd,
+    # each task [GATE_T_TILE, NH_PAD] x [NH_PAD, K_CHUNK] -> [GATE_T_TILE, K_CHUNK],
+    # hadamarded with the attn_out slab and assembled IN-PLACE back into attn_out
+    # (no separate [PREFILL_T, HIDDEN_Q] BF16 buffer; 128*1024*2=256KB > 188KB UB).
+    # GATE_T_TILE=16 matches the cube fractal M>=16 minimum (decode BATCH=16).
+    GATE_T_TILE = 16
+    gate_score_t = pl.create_tensor(
+        [PREFILL_T, NUM_HEADS_FULL_LOCAL_PAD], dtype=pl.BF16,
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_full_head_gate_sigmoid",
+        allow_early_resolve=True,
+    ):
+        hg_logits = pl.slice(
+            gate_logits, [PREFILL_T, NUM_HEADS_FULL_LOCAL_PAD], [0, 0],
+        )
+        hg_score = pl.recip(pl.add(pl.exp(pl.neg(hg_logits)), 1.0))
+        gate_score_t[:, :] = pl.cast(hg_score, target_type=pl.BF16)
+
+    full_head_gate_chunks = HIDDEN_Q_FULL_LOCAL // K_CHUNK
+    for hg_task in pl.spmd(
+        (PREFILL_T // GATE_T_TILE) * full_head_gate_chunks,
+        name_hint="prefill_full_head_gate_expand",
+        allow_early_resolve=True,
+    ):
+        hg_b_idx = hg_task // full_head_gate_chunks
+        hg_n_idx = hg_task % full_head_gate_chunks
+        hg_b0 = hg_b_idx * GATE_T_TILE
+        hg_n0 = hg_n_idx * K_CHUNK
+        # Block-diag R constant slice for this output chunk.
+        hg_r = pl.slice(
+            gate_r, [NUM_HEADS_FULL_LOCAL_PAD, K_CHUNK], [0, hg_n0],
+        )
+        hg_ge = pl.matmul(
+            pl.slice(
+                gate_score_t,
+                [GATE_T_TILE, NUM_HEADS_FULL_LOCAL_PAD],
+                [hg_b0, 0],
+            ),
+            hg_r,
+            out_dtype=pl.FP32,
+        )
+        # Hadamard the expanded gate with attn_out and write back in-place.
+        a_slab = pl.slice(
+            attn_out, [GATE_T_TILE, K_CHUNK], [hg_b0, hg_n0],
+        )
+        gated_fp32 = pl.mul(
+            pl.cast(a_slab, target_type=pl.FP32),
+            hg_ge,
+        )
+        attn_out = pl.assemble(
+            attn_out,
+            pl.cast(gated_fp32, target_type=pl.BF16),
+            [hg_b0, hg_n0],
+        )
+
     attn_out_gated = attn_out
-    if False:
-        attn_out_gated = pl.create_tensor([PREFILL_T, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16)
-        for hg_idx in pl.spmd(
-            (PREFILL_T // TOK_TILE) * NUM_HEADS_FULL_LOCAL,
-            name_hint="prefill_full_head_gate",
-        ):
-            tg_idx = hg_idx // NUM_HEADS_FULL_LOCAL
-            h = hg_idx % NUM_HEADS_FULL_LOCAL
-            tg = tg_idx * TOK_TILE
-            h_col = h * HEAD_DIM
-            head_slab = pl.slice(
-                attn_out, [TOK_TILE, HEAD_DIM], [tg, h_col],
-            )
-            gate_col = pl.slice(gate_logits, [TOK_TILE, 1], [tg, h])
-            # Phase X.7: head_wise_gate_apply body inlined.
-            hg_gate = pl.recip(pl.add(pl.exp(pl.neg(gate_col)), 1.0))
-            hg_gated_fp32 = pl.row_expand_mul(
-                pl.cast(head_slab, target_type=pl.FP32), hg_gate,
-            )
-            gated = pl.cast(hg_gated_fp32, target_type=pl.BF16)
-            attn_out_gated = pl.assemble(attn_out_gated, gated, [tg, h_col])
 
     # ── Scope 3.a — local o_proj (per-rank partial). ─────────────────────
     qhidden_blocks = HIDDEN_Q_FULL_LOCAL // K_CHUNK
@@ -1018,6 +1064,9 @@ def _build_tp_prefill_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             w_g: pl.Tensor[
                 [LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_FULL_LOCAL_PAD], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [NUM_HEADS_FULL_LOCAL_PAD, HIDDEN_Q], pl.BF16
+            ],
             positions: pl.Tensor[[PREFILL_T], pl.INT32],
             resid1_out: pl.Out[
                 pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16]
@@ -1028,7 +1077,8 @@ def _build_tp_prefill_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             signal_window: pld.DistributedTensor[
                 [tp_size, 1], pl.INT32
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
             resid1_out = body_inline(
@@ -1040,9 +1090,11 @@ def _build_tp_prefill_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                 rope_cos, rope_sin,
                 k_cache, v_cache,
                 wo, w_g,
+                gate_r,
                 positions,
                 resid1_out,
-                layer_idx,
+                norm_layer_idx,
+                attn_layer_idx,
                 tmp_window,
                 signal_window,
                 my_rank,
@@ -1095,11 +1147,15 @@ def _build_tp_prefill_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             w_g: pl.Tensor[
                 [tp_size, LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_FULL_LOCAL_PAD], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [tp_size, NUM_HEADS_FULL_LOCAL_PAD, HIDDEN_Q], pl.BF16
+            ],
             positions: pl.Tensor[[tp_size, PREFILL_T], pl.INT32],
             resid1_out: pl.Out[
                 pl.Tensor[[tp_size, PREFILL_T, HIDDEN], pl.BF16]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
         ):
             tmp_buf = pld.alloc_window_buffer(PREFILL_T * tp_chunk * 2)
             sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -1119,10 +1175,12 @@ def _build_tp_prefill_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                     rope_cos[r], rope_sin[r],
                     k_cache[r], v_cache[r],
                     wo[r], w_g[r],
+                    gate_r[r],
                     positions[r],
                     resid1_out[r],
                     tmp_window, signal_window,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     r,
                     device=r,
                 )

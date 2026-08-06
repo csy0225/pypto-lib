@@ -148,9 +148,19 @@ def attention_swa_prefill(
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_QHIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     w_g: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16],
+    # Head-wise gate block-diag constant R (R[h, h*HEAD_DIM+d]=1), mirroring
+    # decode attention_full.py:211. Holder constructs it once (layer-independent).
+    gate_r: pl.Tensor[[NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q_SWA_LOCAL], pl.BF16],
     positions: pl.Tensor[[PREFILL_T], pl.INT32],
     resid1_out: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
-    layer_idx: pl.Scalar[pl.INT32],
+    # Dual-index (PROGRESS Session 21-22, mirror decode attention_full.py:213-214):
+    # norm_layer_idx is the PHYSICAL layer number for norm weights + KV cache
+    # (layer_cache_base = norm_layer_idx * layer_cache_rows); attn_layer_idx is
+    # the within-bucket weight offset (layer_hidden_base = attn_layer_idx * HIDDEN,
+    # =0 once whole-net pre-slices weights). Single-layer programs pass
+    # norm=attn=physical so behaviour is unchanged.
+    norm_layer_idx: pl.Scalar[pl.INT32],
+    attn_layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[
         [PREFILL_T, HIDDEN // TP_WORLD_SIZE], pl.BF16
     ],
@@ -168,10 +178,10 @@ def attention_swa_prefill(
     ``PrefillLayerMoE.chip_orch``. Literals make every shape /
     arithmetic argument an unambiguous compile-time integer.
     """
-    layer_qhidden_base = layer_idx * HIDDEN_Q_SWA_LOCAL
+    layer_qhidden_base = attn_layer_idx * HIDDEN_Q_SWA_LOCAL
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
-    layer_cache_base = layer_idx * layer_cache_rows
+    layer_cache_base = norm_layer_idx * layer_cache_rows
 
     # ── Scope 1 — inlined prefill QKV+RoPE body (swa, Phase X.9). ────────
     # SWA variant: NUM_HEADS=12, HIDDEN_Q=1536, Q_PER_KV=12, KV_HEADS=1,
@@ -186,7 +196,7 @@ def attention_swa_prefill(
 
     qkv_d_blocks = HIDDEN // 256
     qkv_q_blocks = HIDDEN_Q_SWA_LOCAL // 128
-    layer_hidden_base = layer_idx * HIDDEN
+    layer_hidden_base = attn_layer_idx * HIDDEN
 
     # ── Stage 1.a — replicated zero-centred input RMSNorm. ───────────
     for tg_idx in pl.spmd(
@@ -228,7 +238,7 @@ def attention_swa_prefill(
             )
             gamma = pl.slice(
                 input_rms_weight,
-                [1, 256], [layer_idx, k0],
+                [1, 256], [norm_layer_idx, k0],
             )
             scaled_rms = pl.row_expand_mul(chunk, inv_rms)
             normed_rms = pl.col_expand_mul(scaled_rms, pl.add(gamma, 1.0))
@@ -357,6 +367,16 @@ def attention_swa_prefill(
         )
 
     # ── Stage 1.f — per-head zero-centred q_norm / k_norm. ───────────
+    # qk_norm folds 12 heads into the row dim ([T_TILE*12, HEAD_DIM]), so its
+    # Vec UB footprint is 3x the folded q_chunk (q_chunk/q_scaled/q_normed
+    # alive together).  With TOK_TILE=32 that is 3 * [384,128] FP32 = 591872 B,
+    # 3.14x the 188416 B Vec UB.  Sub-tile the qk_norm scope to
+    # QK_NORM_T_TILE = TOK_TILE // 4 = 8 (mirrors the full-attention sibling
+    # prefill_attention_full.py:398), giving 3 * [96,128] FP32 ~ 149504 B with
+    # ~39 KB headroom.  PREFILL_T=128 % 8 == 0.  Only the qk_norm scope is
+    # sub-tiled; rmsnorm/q_proj/k_proj/v_proj/gate_proj still use TOK_TILE=32
+    # (cube Mat/L1 budget, not Vec UB).  See PROGRESS.md Session 20续2.
+    QK_NORM_T_TILE = TOK_TILE // 4
     q_proj_norm = pl.create_tensor(
         [PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32,
     )
@@ -364,35 +384,35 @@ def attention_swa_prefill(
         [PREFILL_T, KV_HIDDEN_LOCAL], dtype=pl.FP32,
     )
     for qkn_idx in pl.spmd(
-        (PREFILL_T // TOK_TILE) * 1,
+        (PREFILL_T // QK_NORM_T_TILE) * 1,
         name_hint="prefill_swa_qk_norm_zc",
     ):
         tg_idx2 = qkn_idx // 1
         kh = qkn_idx % 1
-        tg = tg_idx2 * TOK_TILE
+        tg = tg_idx2 * QK_NORM_T_TILE
         q_col = kh * 12 * HEAD_DIM
         q_chunk = pl.reshape(
             pl.slice(
-                q_proj, [TOK_TILE, 12 * HEAD_DIM], [tg, q_col],
+                q_proj, [QK_NORM_T_TILE, 12 * HEAD_DIM], [tg, q_col],
             ),
-            [TOK_TILE * 12, HEAD_DIM],
+            [QK_NORM_T_TILE * 12, HEAD_DIM],
         )
-        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
         # Phase X.7: per_head_qk_norm body inlined.
         q_sq = pl.row_sum(pl.mul(q_chunk, q_chunk))
         q_inv = pl.rsqrt(pl.add(pl.mul(q_sq, 0.0078125), EPS))
         q_scaled = pl.row_expand_mul(q_chunk, q_inv)
         q_normed = pl.col_expand_mul(q_scaled, pl.add(q_gamma, 1.0))
         q_normed_flat = pl.reshape(
-            q_normed, [TOK_TILE, 12 * HEAD_DIM],
+            q_normed, [QK_NORM_T_TILE, 12 * HEAD_DIM],
         )
         q_proj_norm = pl.assemble(
             q_proj_norm, q_normed_flat, [tg, q_col],
         )
 
         k_col = kh * HEAD_DIM
-        k_chunk = pl.slice(k_proj, [TOK_TILE, HEAD_DIM], [tg, k_col])
-        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
+        k_chunk = pl.slice(k_proj, [QK_NORM_T_TILE, HEAD_DIM], [tg, k_col])
+        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
         k_sq = pl.row_sum(pl.mul(k_chunk, k_chunk))
         k_inv = pl.rsqrt(pl.add(pl.mul(k_sq, 0.0078125), EPS))
         k_scaled = pl.row_expand_mul(k_chunk, k_inv)
@@ -678,27 +698,73 @@ def attention_swa_prefill(
                     attn_out, ctx_flat, [t, q_base * HEAD_DIM],
                 )
 
-    # ── Scope 2.5 — head-wise gate. ──────────────────────────────────────
-    attn_out_gated = pl.create_tensor([PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
-    for hg_idx in pl.spmd(
-        (PREFILL_T // TOK_TILE) * NUM_HEADS_SWA_LOCAL,
-        name_hint="prefill_swa_head_gate",
+    # ── Scope 2.5 — head-wise sigmoid gate on attn_out (gate_r block-diag). ──
+    # Mirror decode attention_full.py:329-416 (full_head_gate_expand, PROGRESS
+    # Session 3 A, swa symmetric). The per-head [TOK_TILE,1] gate_col TLOAD hit
+    # the pto-isa ND2ND [N,1] VEC layout wall; solved via the gate_r block-diagonal
+    # matmul:
+    #   gate_score[t, h] = sigmoid(gate_logits[t, h])
+    #   attn_out[t, h*HEAD_DIM + d] *= gate_score[t, h]
+    # realised as gate_score @ gate_r (R[h, h*HEAD_DIM+d]=1 block-diag) spmd,
+    # each task [GATE_T_TILE, NH_PAD] x [NH_PAD, 256] -> [GATE_T_TILE, 256],
+    # hadamarded with the attn_out slab and assembled IN-PLACE back into attn_out
+    # (no separate [PREFILL_T, HIDDEN_Q] BF16 buffer; 128*1536*2=384KB > 188KB UB).
+    # GATE_T_TILE=16 matches the cube fractal M>=16 minimum (decode BATCH=16).
+    # Chunk uses literal 256 (pypto inline closure does not resolve swa module
+    # globals; matches the swa o_proj K-chunk literal below).
+    GATE_T_TILE = 16
+    gate_score_t = pl.create_tensor(
+        [PREFILL_T, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.BF16,
+    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_swa_head_gate_sigmoid",
+        allow_early_resolve=True,
     ):
-        tg_idx = hg_idx // NUM_HEADS_SWA_LOCAL
-        h = hg_idx % NUM_HEADS_SWA_LOCAL
-        tg = tg_idx * TOK_TILE
-        h_col = h * HEAD_DIM
-        head_slab = pl.slice(
-            attn_out, [TOK_TILE, HEAD_DIM], [tg, h_col],
+        hg_logits = pl.slice(
+            gate_logits, [PREFILL_T, NUM_HEADS_SWA_LOCAL_PAD], [0, 0],
         )
-        gate_col = pl.slice(gate_logits, [TOK_TILE, 1], [tg, h])
-        # Phase X.7: head_wise_gate_apply body inlined.
-        hg_gate = pl.recip(pl.add(pl.exp(pl.neg(gate_col)), 1.0))
-        hg_gated_fp32 = pl.row_expand_mul(
-            pl.cast(head_slab, target_type=pl.FP32), hg_gate,
+        hg_score = pl.recip(pl.add(pl.exp(pl.neg(hg_logits)), 1.0))
+        gate_score_t[:, :] = pl.cast(hg_score, target_type=pl.BF16)
+
+    swa_head_gate_chunks = HIDDEN_Q_SWA_LOCAL // 256
+    for hg_task in pl.spmd(
+        (PREFILL_T // GATE_T_TILE) * swa_head_gate_chunks,
+        name_hint="prefill_swa_head_gate_expand",
+        allow_early_resolve=True,
+    ):
+        hg_b_idx = hg_task // swa_head_gate_chunks
+        hg_n_idx = hg_task % swa_head_gate_chunks
+        hg_b0 = hg_b_idx * GATE_T_TILE
+        hg_n0 = hg_n_idx * 256
+        # Block-diag R constant slice for this output chunk.
+        hg_r = pl.slice(
+            gate_r, [NUM_HEADS_SWA_LOCAL_PAD, 256], [0, hg_n0],
         )
-        gated = pl.cast(hg_gated_fp32, target_type=pl.BF16)
-        attn_out_gated = pl.assemble(attn_out_gated, gated, [tg, h_col])
+        hg_ge = pl.matmul(
+            pl.slice(
+                gate_score_t,
+                [GATE_T_TILE, NUM_HEADS_SWA_LOCAL_PAD],
+                [hg_b0, 0],
+            ),
+            hg_r,
+            out_dtype=pl.FP32,
+        )
+        # Hadamard the expanded gate with attn_out and write back in-place.
+        a_slab = pl.slice(
+            attn_out, [GATE_T_TILE, 256], [hg_b0, hg_n0],
+        )
+        gated_fp32 = pl.mul(
+            pl.cast(a_slab, target_type=pl.FP32),
+            hg_ge,
+        )
+        attn_out = pl.assemble(
+            attn_out,
+            pl.cast(gated_fp32, target_type=pl.BF16),
+            [hg_b0, hg_n0],
+        )
+
+    attn_out_gated = attn_out
 
     # ── Scope 3.a — local o_proj. ────────────────────────────────────────
     out_proj_k_blocks = HIDDEN_Q_SWA_LOCAL // 256
@@ -929,6 +995,9 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             w_g: pl.Tensor[
                 [LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q], pl.BF16
+            ],
             positions: pl.Tensor[[PREFILL_T], pl.INT32],
             resid1_out: pl.Out[
                 pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16]
@@ -939,7 +1008,8 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             signal_window: pld.DistributedTensor[
                 [tp_size, 1], pl.INT32
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
             resid1_out = body_inline(
@@ -951,9 +1021,11 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                 rope_cos, rope_sin,
                 k_cache, v_cache,
                 wo, w_g,
+                gate_r,
                 positions,
                 resid1_out,
-                layer_idx,
+                norm_layer_idx,
+                attn_layer_idx,
                 tmp_window,
                 signal_window,
                 my_rank,
@@ -1006,11 +1078,15 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
             w_g: pl.Tensor[
                 [tp_size, LAYER_HIDDEN_ROWS_DYN, NUM_HEADS_SWA_LOCAL_PAD], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [tp_size, NUM_HEADS_SWA_LOCAL_PAD, HIDDEN_Q], pl.BF16
+            ],
             positions: pl.Tensor[[tp_size, PREFILL_T], pl.INT32],
             resid1_out: pl.Out[
                 pl.Tensor[[tp_size, PREFILL_T, HIDDEN], pl.BF16]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
+            attn_layer_idx: pl.Scalar[pl.INT32],
         ):
             tmp_buf = pld.alloc_window_buffer(PREFILL_T * tp_chunk * 2)
             sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -1030,10 +1106,12 @@ def _build_tp_prefill_attention_swa_program(tp_size: int = TP_WORLD_SIZE):
                     rope_cos[r], rope_sin[r],
                     k_cache[r], v_cache[r],
                     wo[r], w_g[r],
+                    gate_r[r],
                     positions[r],
                     resid1_out[r],
                     tmp_window, signal_window,
-                    layer_idx,
+                    norm_layer_idx,
+                    attn_layer_idx,
                     r,
                     device=r,
                 )

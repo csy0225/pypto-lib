@@ -233,20 +233,38 @@ ROUTER_SCORE_PAD = 512
 ROUTER_TOPK_PAD = 16
 ROUTER_SORT_PAD = ROUTER_TOPK_PAD * 2
 ROUTER_GATE_K_CHUNK = 512
+# Expert-column chunk for the router gate SPMD fan-out (mirrors decode
+# ``ROUTER_GATE_N_CHUNK = 32`` decode_fwd.py:152, PROGRESS Session 4 step 3).
+# The monolithic ``[ROUTER_GATE_K_CHUNK, N_EXPERTS] FP32`` weight slice
+# (512*288*4 = 576 KiB) exceeds the 512 KiB L1/Mat wall; fanning the expert
+# dimension out keeps each task's weight tile at ``[512, 32] = 64 KiB``.
+ROUTER_GATE_N_CHUNK = 32
 ROUTER_FP32_NEG_INF = -3.4028235e38
 ROUTER_SCALE = 3.0  # MOE_ROUTER_SCALING_FACTOR
 assert TOPK <= ROUTER_TOPK_PAD
 assert HIDDEN % ROUTER_GATE_K_CHUNK == 0
+assert N_EXPERTS % ROUTER_GATE_N_CHUNK == 0
 
 # Routed-expert kernel constants — mirrors expert_routed.py / moe.ROUTED_*.
-ROUTED_GATE_K_CHUNK = 256
-ROUTED_GATE_N_CHUNK = 256
-ROUTED_DOWN_K_CHUNK = 256
-ROUTED_DOWN_N_CHUNK = 256
+ROUTED_GATE_K_CHUNK = 64
+ROUTED_GATE_N_CHUNK = 64
+ROUTED_DOWN_K_CHUNK = 64
+ROUTED_DOWN_N_CHUNK = 128
 ROUTED_MAX_TILE = LOCAL_RECV_MAX
+# Row tiling for the routed-expert gate_up/down bodies (mirrors decode
+# ``RECV_TILE`` / ``N_RECV_TILES`` in decode_fwd.py:161,181).  The monolithic
+# ``h_tile [ROUTED_MAX_TILE=1024, inter=1280] FP32 = 5 MiB`` overflows the
+# 188 KiB Vec UB; tiling the 1024 routed rows into 32-row tiles keeps the
+# per-tile ``h_tile [32, 1280] FP32 = 160 KiB`` under the limit.  See
+# PROGRESS.md Session 4-7 (RECV_TILE row tiling) and RECOVERY_PROGRESS.md §6.
+RECV_TILE = 32
+N_RECV_TILES = LOCAL_RECV_MAX // RECV_TILE
 assert HIDDEN % ROUTED_GATE_K_CHUNK == 0
 assert HIDDEN % ROUTED_DOWN_N_CHUNK == 0
 assert MOE_INTERMEDIATE % ROUTED_GATE_N_CHUNK == 0
+assert LOCAL_RECV_MAX % RECV_TILE == 0, (
+    f"LOCAL_RECV_MAX={LOCAL_RECV_MAX} must be a multiple of RECV_TILE={RECV_TILE}"
+)
 assert MOE_INTERMEDIATE % ROUTED_DOWN_K_CHUNK == 0
 
 # Shared-expert kernel constants — mirrors expert_shared.py / moe.SHARED_*.
@@ -274,7 +292,13 @@ def _prefill_dense_mlp_body_tp(
     w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE_LOCAL], pl.BF16],
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     next_hidden: pl.Tensor[[PREFILL_T, HIDDEN], pl.BF16],
-    layer_idx: pl.Scalar[pl.INT32],
+    # Dual-index (PROGRESS Session 21-22, mirror decode dense_mlp_body_tp):
+    # norm_layer_idx is the PHYSICAL layer number for post_rms_weight slice;
+    # mlp_layer_idx is the within-bucket weight offset for w_gate/w_up/w_down
+    # (=0 once whole-net pre-slices weights). Single-layer programs pass
+    # norm=mlp=physical so behaviour is unchanged.
+    norm_layer_idx: pl.Scalar[pl.INT32],
+    mlp_layer_idx: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[[PREFILL_T, HIDDEN // TP_WORLD_SIZE], pl.BF16],
     signal_window: pld.DistributedTensor[[TP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -282,8 +306,8 @@ def _prefill_dense_mlp_body_tp(
     """Post-attention zero-centred RMSNorm + TP-sliced SwiGLU MLP + residual."""
     hidden_blocks = HIDDEN // K_CHUNK
     mlp_out_blocks = INTERMEDIATE_LOCAL // MLP_OUT_CHUNK
-    layer_hidden_base = layer_idx * HIDDEN
-    layer_inter_base = layer_idx * INTERMEDIATE_LOCAL
+    layer_hidden_base = mlp_layer_idx * HIDDEN
+    layer_inter_base = mlp_layer_idx * INTERMEDIATE_LOCAL
 
     # ── Step 1: post-attention zero-centred RMSNorm. ──────────────────
     # Token-tiled (DeepSeek-V4 style, cf. decode_rmsnorm.attn_norm): process
@@ -319,7 +343,7 @@ def _prefill_dense_mlp_body_tp(
                     resid1_fp32, [BATCH, K_CHUNK], [t0, k0],
                 )
                 gamma = pl.slice(
-                    post_rms_weight, [1, K_CHUNK], [layer_idx, k0],
+                    post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
                 )
                 scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
                 normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
@@ -593,6 +617,9 @@ def _build_prefill_layer_dense_program(
             w_g: pl.Tensor[
                 [LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [num_heads_local_pad, hidden_q_local], pl.BF16
+            ],
             positions: pl.Tensor[[PREFILL_T], pl.INT32],
             post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
             w_gate: pl.Tensor[
@@ -619,7 +646,10 @@ def _build_prefill_layer_dense_program(
             mlp_signal_window: pld.DistributedTensor[
                 [tp_size, 1], pl.INT32
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            # Single-layer programs pass norm=attn=mlp=physical (PROGRESS
+            # Session 21-22) so behaviour is unchanged; the whole-net caller
+            # pre-slices weights and passes attn/mlp=0 separately.
+            norm_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
             resid1 = pl.create_tensor(
@@ -634,9 +664,11 @@ def _build_prefill_layer_dense_program(
                 rope_cos, rope_sin,
                 k_cache, v_cache,
                 wo, w_g,
+                gate_r,
                 positions,
                 resid1,
-                layer_idx,
+                norm_layer_idx,
+                norm_layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
@@ -644,7 +676,9 @@ def _build_prefill_layer_dense_program(
             next_hidden_out = dense_inline(
                 resid1, post_rms_weight,
                 w_gate, w_up, w_down,
-                next_hidden_out, layer_idx,
+                next_hidden_out,
+                norm_layer_idx,
+                norm_layer_idx,
                 mlp_tmp_window, mlp_signal_window, my_rank,
             )
             return next_hidden_out
@@ -695,6 +729,9 @@ def _build_prefill_layer_dense_program(
             w_g: pl.Tensor[
                 [tp_size, LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [tp_size, num_heads_local_pad, hidden_q_local], pl.BF16
+            ],
             positions: pl.Tensor[[tp_size, PREFILL_T], pl.INT32],
             post_rms_weight: pl.Tensor[
                 [tp_size, LAYER_DYN, HIDDEN], pl.FP32
@@ -711,7 +748,7 @@ def _build_prefill_layer_dense_program(
             next_hidden_out: pl.Out[
                 pl.Tensor[[tp_size, PREFILL_T, HIDDEN], pl.BF16]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
         ):
             attn_tmp_buf = pld.alloc_window_buffer(PREFILL_T * tp_chunk * 2)
             attn_sig_buf = pld.alloc_window_buffer(tp_size * 4)
@@ -739,13 +776,14 @@ def _build_prefill_layer_dense_program(
                     rope_cos[r], rope_sin[r],
                     k_cache[r], v_cache[r],
                     wo[r], w_g[r],
+                    gate_r[r],
                     positions[r],
                     post_rms_weight[r],
                     w_gate[r], w_up[r], w_down[r],
                     next_hidden_out[r],
                     attn_tmp_window, attn_signal_window,
                     mlp_tmp_window, mlp_signal_window,
-                    layer_idx,
+                    norm_layer_idx,
                     r,
                     device=r,
                 )
@@ -1009,7 +1047,7 @@ def _build_prefill_layer_moe_program(
             return local
 
         # ---------- Collective: EP all_to_all ----------
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.Inline)
         def ep_all_to_all(
             self,
             send: pld.DistributedTensor[[local_recv_max, HIDDEN], pl.BF16],
@@ -1025,50 +1063,60 @@ def _build_prefill_layer_moe_program(
             group_size = n_ranks
             d_cols = HIDDEN
 
-            n_self = pl.cast(pl.read(send_counts, [my_rank]), pl.INDEX)
-            s_off_self = pl.cast(pl.read(send_offsets, [my_rank]), pl.INDEX)
-            r_off_self = pl.cast(pl.read(recv_offsets, [my_rank]), pl.INDEX)
-            for r in pl.range(n_self):
-                self_tile = pl.load(
-                    send, [s_off_self + r, 0], [1, d_cols],
-                )
-                pl.store(self_tile, [r_off_self + r, 0], recv)
+            # All body ops are cross-core (load/store on DistributedTensor,
+            # notify/wait, remote_load).  Wrap in CORE_GROUP scopes
+            # (PROGRESS.md Session 20: bare cross-core ops inlined into the
+            # caller become Misplaced / unregistered).  Self-copy and the
+            # notify/wait/remote-load phases are separate scopes so the
+            # OutlineIncoreScopes pass can outline each phase cleanly.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="ep_a2a_self_copy"):
+                n_self = pl.cast(pl.read(send_counts, [my_rank]), pl.INDEX)
+                s_off_self = pl.cast(pl.read(send_offsets, [my_rank]), pl.INDEX)
+                r_off_self = pl.cast(pl.read(recv_offsets, [my_rank]), pl.INDEX)
+                for r in pl.range(n_self):
+                    self_tile = pl.load(
+                        send, [s_off_self + r, 0], [1, d_cols],
+                    )
+                    pl.store(self_tile, [r_off_self + r, 0], recv)
 
-            for peer in pl.range(group_size):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=signal_window,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=1,
-                        op=pld.NotifyOp.Set,
-                    )
-
-            for src in pl.range(group_size):
-                if src != my_rank:
-                    pld.system.wait(
-                        signal=signal_window,
-                        offsets=[src, 0],
-                        expected=1,
-                        cmp=pld.WaitCmp.Ge,
-                    )
-
-            for peer in pl.range(group_size):
-                if peer != my_rank:
-                    n_recv = pl.cast(
-                        pl.read(recv_counts, [peer]), pl.INDEX,
-                    )
-                    r_off = pl.cast(
-                        pl.read(recv_offsets, [peer]), pl.INDEX,
-                    )
-                    for r in pl.range(n_recv):
-                        peer_tile = pld.tile.remote_load(
-                            send,
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="ep_a2a_notify"):
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=signal_window,
                             peer=peer,
-                            offsets=[r_off + r, 0],
-                            shape=[1, d_cols],
+                            offsets=[my_rank, 0],
+                            value=1,
+                            op=pld.NotifyOp.Set,
                         )
-                        pl.store(peer_tile, [r_off + r, 0], recv)
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="ep_a2a_wait"):
+                for src in pl.range(group_size):
+                    if src != my_rank:
+                        pld.system.wait(
+                            signal=signal_window,
+                            offsets=[src, 0],
+                            expected=1,
+                            cmp=pld.WaitCmp.Ge,
+                        )
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="ep_a2a_remote_gather"):
+                for peer in pl.range(group_size):
+                    if peer != my_rank:
+                        n_recv = pl.cast(
+                            pl.read(recv_counts, [peer]), pl.INDEX,
+                        )
+                        r_off = pl.cast(
+                            pl.read(recv_offsets, [peer]), pl.INDEX,
+                        )
+                        for r in pl.range(n_recv):
+                            peer_tile = pld.tile.remote_load(
+                                send,
+                                peer=peer,
+                                offsets=[r_off + r, 0],
+                                shape=[1, d_cols],
+                            )
+                            pl.store(peer_tile, [r_off + r, 0], recv)
 
             return recv
 
@@ -1089,35 +1137,13 @@ def _build_prefill_layer_moe_program(
                 [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
             )
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_matmul"):
-                x_fp32 = pl.cast(x, target_type=pl.FP32)
-                x0 = pl.slice(x_fp32, [BATCH, ROUTER_GATE_K_CHUNK], [0, 0])
-                w0 = pl.slice(
-                    gate_w, [ROUTER_GATE_K_CHUNK, N_EXPERTS], [0, 0],
-                )
-                logits = pl.matmul(x0, w0, out_dtype=pl.FP32)
-                for kb in pl.range(1, HIDDEN // ROUTER_GATE_K_CHUNK):
-                    k0 = kb * ROUTER_GATE_K_CHUNK
-                    xk = pl.slice(
-                        x_fp32, [BATCH, ROUTER_GATE_K_CHUNK], [0, k0],
-                    )
-                    wk = pl.slice(
-                        gate_w, [ROUTER_GATE_K_CHUNK, N_EXPERTS], [k0, 0],
-                    )
-                    logits = pl.matmul_acc(logits, xk, wk)
-
-                score_n = pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0))
-                bias_row = pl.reshape(router_bias, [1, N_EXPERTS])
-                biased_n = pl.add(
-                    score_n,
-                    pl.col_expand_mul(
-                        pl.full(
-                            [BATCH, N_EXPERTS], dtype=pl.FP32, value=1.0,
-                        ),
-                        bias_row,
-                    ),
-                )
-
+            # Gate N-chunk SPMD fan-out (mirrors decode_fwd.py:516-608,
+            # PROGRESS Session 4 step 3 + Session 6 step 7).  The full
+            # ``x_fp32`` cast is dropped in favour of per-K-chunk casts so the
+            # ``[BATCH, HIDDEN] FP32`` tile never lives alongside the matmul
+            # intermediates; the expert dimension is fanned out via SPMD so
+            # each task's weight tile is ``[K_CHUNK, N_CHUNK] = 64 KiB``.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_init"):
                 score_buf[:, :] = pl.full(
                     [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32, value=0.0,
                 )
@@ -1125,8 +1151,63 @@ def _build_prefill_layer_moe_program(
                     [BATCH, ROUTER_SCORE_PAD],
                     dtype=pl.FP32, value=ROUTER_FP32_NEG_INF,
                 )
-                score_buf[:, 0:N_EXPERTS] = score_n
-                biased_buf[:, 0:N_EXPERTS] = biased_n
+
+            # Sigmoid is applied per N-chunk on the matmul output (the vec op
+            # needs a TileType), NOT on the assembled full logits — assembling
+            # first would force a ``[BATCH, N_EXPERTS] FP32`` tile back into
+            # Vec UB.  PyPTO does not accept an SPMD region nested inside an
+            # AT scope, so the fan-out lives at function scope (decode comment
+            # decode_fwd.py:513-515).
+            for nb in pl.spmd(
+                N_EXPERTS // ROUTER_GATE_N_CHUNK,
+                name_hint="gate_expert_fanout",
+            ):
+                n0 = nb * ROUTER_GATE_N_CHUNK
+                raw0 = pl.cast(
+                    pl.slice(x, [BATCH, ROUTER_GATE_K_CHUNK], [0, 0]),
+                    target_type=pl.FP32,
+                )
+                w0 = pl.slice(
+                    gate_w,
+                    [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
+                    [0, n0],
+                )
+                logits_n = pl.matmul(raw0, w0, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // ROUTER_GATE_K_CHUNK):
+                    k0 = kb * ROUTER_GATE_K_CHUNK
+                    rawk = pl.cast(
+                        pl.slice(
+                            x, [BATCH, ROUTER_GATE_K_CHUNK], [0, k0],
+                        ),
+                        target_type=pl.FP32,
+                    )
+                    wk = pl.slice(
+                        gate_w,
+                        [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
+                        [k0, n0],
+                    )
+                    logits_n = pl.matmul_acc(logits_n, rawk, wk)
+                score_n_chunk = pl.recip(
+                    pl.add(pl.exp(pl.neg(logits_n)), 1.0),
+                )
+                bias_chunk = pl.slice(
+                    router_bias, [ROUTER_GATE_N_CHUNK], [n0],
+                )
+                bias_row_chunk = pl.reshape(
+                    bias_chunk, [1, ROUTER_GATE_N_CHUNK],
+                )
+                biased_n_chunk = pl.add(
+                    score_n_chunk,
+                    pl.col_expand_mul(
+                        pl.full(
+                            [BATCH, ROUTER_GATE_N_CHUNK],
+                            dtype=pl.FP32, value=1.0,
+                        ),
+                        bias_row_chunk,
+                    ),
+                )
+                score_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = score_n_chunk
+                biased_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = biased_n_chunk
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_topk"):
                 topk_idx_tile = pl.create_tensor(
@@ -1242,58 +1323,81 @@ def _build_prefill_layer_moe_program(
             indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
             send_counts_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
             send_offsets_per_rank: pl.Tensor[[n_ranks], pl.INT32],
-            send_buf: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
+            # GM send buffer (DistributedTensor): written in place so the
+            # original parameter SSA value reaches ep_all_to_all with its
+            # materialized CommCtx intact.  pl.assemble re-assignment produced
+            # a derived SSA value whose CommCtx get_comm_ctx could not resolve
+            # (PROGRESS.md Session 20续).  pl.store(pl.load(...)) writes the GM
+            # tile in place without re-assigning send_buf.
+            send_buf: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
             cursor_per_bucket: pl.Tensor[[per_rank_buckets], pl.INT32],
             bucket_offset: pl.Tensor[[per_rank_buckets], pl.INT32],
         ):
-            for r in pl.range(n_ranks):
-                rank_off = pl.read(send_offsets_per_rank, [r])
-                pl.write(
-                    bucket_offset, [r * n_local_experts],
-                    pl.cast(rank_off, pl.INT32),
-                )
-                pl.write(
-                    cursor_per_bucket, [r * n_local_experts],
-                    pl.cast(rank_off, pl.INT32),
-                )
-                for e in pl.range(1, n_local_experts):
-                    prev_off = pl.read(
-                        bucket_offset, [r * n_local_experts + e - 1],
-                    )
-                    prev_cnt = pl.read(
-                        send_counts_per_bucket,
-                        [r * n_local_experts + e - 1],
-                    )
-                    new_off = pl.cast(prev_off + prev_cnt, pl.INT32)
+            # Wrap the pack body in an InCore scope (PROGRESS.md Session 20续
+            # item 9, mirrors decode dispatch_push in decode_fwd.py:927).  The
+            # pl.load(x, ..., target_memory=Vec) tile op would otherwise inline
+            # into chip_orch (Orchestration) and InitMemRef would materialize it
+            # as a misplaced tile.alloc at the Orchestration body top.
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="dispatch_pack",
+            ):
+                for r in pl.range(n_ranks):
+                    rank_off = pl.read(send_offsets_per_rank, [r])
                     pl.write(
-                        bucket_offset, [r * n_local_experts + e], new_off,
+                        bucket_offset, [r * n_local_experts],
+                        pl.cast(rank_off, pl.INT32),
                     )
                     pl.write(
-                        cursor_per_bucket, [r * n_local_experts + e],
-                        new_off,
+                        cursor_per_bucket, [r * n_local_experts],
+                        pl.cast(rank_off, pl.INT32),
                     )
+                    for e in pl.range(1, n_local_experts):
+                        prev_off = pl.read(
+                            bucket_offset, [r * n_local_experts + e - 1],
+                        )
+                        prev_cnt = pl.read(
+                            send_counts_per_bucket,
+                            [r * n_local_experts + e - 1],
+                        )
+                        new_off = pl.cast(prev_off + prev_cnt, pl.INT32)
+                        pl.write(
+                            bucket_offset, [r * n_local_experts + e], new_off,
+                        )
+                        pl.write(
+                            cursor_per_bucket, [r * n_local_experts + e],
+                            new_off,
+                        )
 
-            for t in pl.range(BATCH):
-                for k in pl.range(TOPK):
-                    eid = pl.read(indices, [t, k])
-                    dst = eid // n_local_experts
-                    loc_e = eid - dst * n_local_experts
-                    bkt = dst * n_local_experts + loc_e
-                    slot_i32 = pl.read(cursor_per_bucket, [bkt])
-                    slot = pl.cast(slot_i32, pl.INDEX)
-                    send_buf = pl.assemble(
-                        send_buf,
-                        pl.slice(x, [1, HIDDEN], [t, 0]),
-                        [slot, 0],
-                    )
-                    pl.write(
-                        cursor_per_bucket, [bkt],
-                        pl.cast(slot_i32 + 1, pl.INT32),
-                    )
+                for t in pl.range(BATCH):
+                    for k in pl.range(TOPK):
+                        eid = pl.read(indices, [t, k])
+                        dst = eid // n_local_experts
+                        loc_e = eid - dst * n_local_experts
+                        bkt = dst * n_local_experts + loc_e
+                        slot_i32 = pl.read(cursor_per_bucket, [bkt])
+                        slot = pl.cast(slot_i32, pl.INDEX)
+                        # In-place GM write: load the source row as a tile and
+                        # store it into send_buf at [slot, 0].  No re-assignment
+                        # of send_buf, so ep_all_to_all receives the original
+                        # CommCtx.
+                        pl.store(
+                            pl.load(x, [t, 0], [1, HIDDEN]),
+                            [slot, 0],
+                            send_buf,
+                        )
+                        pl.write(
+                            cursor_per_bucket, [bkt],
+                            pl.cast(slot_i32 + 1, pl.INT32),
+                        )
 
-            return send_buf
-
-        @pl.function(type=pl.FunctionType.Inline)
+        # InCore (PROGRESS.md Session 20 item 7): pure scalar compute that reads
+        # pub_counts (DistributedTensor) with no pl.at.  As an Inline function
+        # the bare pl.read on a DistributedTensor inlines into chip_orch
+        # (Orchestration) and materializes as a misplaced op; InCore keeps the
+        # read inside an InCore body (mirrors decode _norm_quant_moe_input).
+        @pl.function(type=pl.FunctionType.InCore)
         def _build_local_expert_csr(
             self,
             pub_counts: pld.DistributedTensor[
@@ -1320,7 +1424,10 @@ def _build_prefill_layer_moe_program(
                     pl.cast(prev_off + prev_cnt, pl.INT32),
                 )
 
-        @pl.function(type=pl.FunctionType.Inline)
+        # InCore (PROGRESS.md Session 20 item 8): pure scalar compute that reads
+        # pub_counts (DistributedTensor); cursor is a small local DDR scratch.
+        # Inline would inline the bare pl.read into chip_orch (Orchestration).
+        @pl.function(type=pl.FunctionType.InCore)
         def _build_inverse_map(
             self,
             indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
@@ -1370,7 +1477,7 @@ def _build_prefill_layer_moe_program(
                         pl.cast(my_cursor_val + 1, pl.INT32),
                     )
 
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.Inline)
         def dispatch_step(  # noqa: PLR0913
             self,
             x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
@@ -1393,6 +1500,13 @@ def _build_prefill_layer_moe_program(
                 [local_recv_max, HIDDEN], pl.BF16
             ],
             data_done_sig: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            # GM send buffer (mirrors decode moe.py): the InCore create_tensor
+            # of [local_recv_max, HIDDEN] BF16 = 8 MiB overflows the 188 KiB
+            # Vec UB, so the buffer is allocated on GM by host_orch and passed
+            # in as a DistributedTensor.  See PROGRESS.md Session 4.
+            send_buf: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
             my_rank: pl.Scalar[pl.INT32],
         ) -> tuple[
             pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
@@ -1410,76 +1524,99 @@ def _build_prefill_layer_moe_program(
                 send_counts_bkt, send_counts_rank, send_offsets_rank,
             )
 
-            for peer in pl.range(n_ranks):
-                for e in pl.range(n_local_experts):
-                    v = pl.read(
-                        send_counts_bkt, [peer * n_local_experts + e],
-                    )
-                    if peer == my_rank:
-                        pl.write(
-                            pub_counts,
-                            [my_rank * n_ranks + my_rank, e],
-                            v,
+            # Publish per-bucket counts to peers and signal count_done in one
+            # InCore scope (PROGRESS.md Session 20 item 4, mirrors decode
+            # dispatch_meta in decode_fwd.py:863).  Bare pl.write on a
+            # DistributedTensor and bare pld.system.notify inline into chip_orch
+            # (Orchestration) and materialize as misplaced ops; the count_done
+            # notify is kept inside the same scope so it fires after publishes.
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="dispatch_pub_counts",
+            ):
+                for peer in pl.range(n_ranks):
+                    for e in pl.range(n_local_experts):
+                        v = pl.read(
+                            send_counts_bkt, [peer * n_local_experts + e],
                         )
-                    else:
+                        if peer == my_rank:
+                            pl.write(
+                                pub_counts,
+                                [my_rank * n_ranks + my_rank, e],
+                                v,
+                            )
+                        else:
+                            pld.system.notify(
+                                target=pub_counts,
+                                peer=peer,
+                                offsets=[my_rank * n_ranks + peer, e],
+                                value=v,
+                                op=pld.NotifyOp.Set,
+                            )
+
+                for peer in pl.range(n_ranks):
+                    if peer != my_rank:
                         pld.system.notify(
-                            target=pub_counts,
+                            target=count_done_sig,
                             peer=peer,
-                            offsets=[my_rank * n_ranks + peer, e],
-                            value=v,
+                            offsets=[my_rank, 0],
+                            value=1,
                             op=pld.NotifyOp.Set,
                         )
+            # Wait for all peers' count_done signals in an InCore scope
+            # (PROGRESS.md Session 20 item 5).  Bare pld.system.wait inlines
+            # into chip_orch (Orchestration) and materializes as a misplaced op.
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="dispatch_wait_counts",
+            ):
+                for src in pl.range(n_ranks):
+                    if src != my_rank:
+                        pld.system.wait(
+                            signal=count_done_sig,
+                            offsets=[src, 0],
+                            expected=1,
+                            cmp=pld.WaitCmp.Ge,
+                        )
 
-            for peer in pl.range(n_ranks):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=count_done_sig,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=1,
-                        op=pld.NotifyOp.Set,
-                    )
-            for src in pl.range(n_ranks):
-                if src != my_rank:
-                    pld.system.wait(
-                        signal=count_done_sig,
-                        offsets=[src, 0],
-                        expected=1,
-                        cmp=pld.WaitCmp.Ge,
-                    )
-
-            send_buf = pl.create_tensor(
-                [local_recv_max, HIDDEN], dtype=pl.BF16,
-            )
+            # send_buf is now a GM DistributedTensor parameter (allocated by
+            # host_orch); the InCore create_tensor of 8 MiB overflowed the Vec
+            # UB.  cursor_bkt / bucket_offset stay on-chip (small INT32).
             cursor_bkt = pl.create_tensor(
                 [per_rank_buckets], dtype=pl.INT32,
             )
             bucket_offset = pl.create_tensor(
                 [per_rank_buckets], dtype=pl.INT32,
             )
-            send_buf = self._pack_send_payload(
+            self._pack_send_payload(
                 x, expert_indices,
                 send_counts_bkt, send_offsets_rank,
                 send_buf, cursor_bkt, bucket_offset,
             )
 
+            # Reduce peer-published counts into per-src recv_counts and prefix
+            # into recv_offsets (PROGRESS.md Session 20 item 6).  pl.read on the
+            # DistributedTensor pub_counts would inline into chip_orch
+            # (Orchestration) as a misplaced op; create_tensor stays outside
+            # (DDR scratch) and the read/write go inside the scope.
             recv_counts = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
-            for src in pl.range(n_ranks):
-                acc = pl.cast(0, pl.INT32)
-                for e in pl.range(n_local_experts):
-                    acc = acc + pl.read(
-                        pub_counts, [src * n_ranks + my_rank, e],
-                    )
-                pl.write(recv_counts, [src], pl.cast(acc, pl.INT32))
             recv_offsets = pl.create_tensor([n_ranks_pad], dtype=pl.INT32)
-            pl.write(recv_offsets, [0], pl.cast(0, pl.INT32))
-            for r in pl.range(1, n_ranks):
-                prev_off = pl.read(recv_offsets, [r - 1])
-                prev_cnt = pl.read(recv_counts, [r - 1])
-                pl.write(
-                    recv_offsets, [r],
-                    pl.cast(prev_off + prev_cnt, pl.INT32),
-                )
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="dispatch_recv_counts",
+            ):
+                for src in pl.range(n_ranks):
+                    acc = pl.cast(0, pl.INT32)
+                    for e in pl.range(n_local_experts):
+                        acc = acc + pl.read(
+                            pub_counts, [src * n_ranks + my_rank, e],
+                        )
+                    pl.write(recv_counts, [src], pl.cast(acc, pl.INT32))
+                pl.write(recv_offsets, [0], pl.cast(0, pl.INT32))
+                for r in pl.range(1, n_ranks):
+                    prev_off = pl.read(recv_offsets, [r - 1])
+                    prev_cnt = pl.read(recv_counts, [r - 1])
+                    pl.write(
+                        recv_offsets, [r],
+                        pl.cast(prev_off + prev_cnt, pl.INT32),
+                    )
 
             self.ep_all_to_all(
                 send_buf, recv_x,
@@ -1493,30 +1630,42 @@ def _build_prefill_layer_moe_program(
                 local_expert_offset, local_expert_count,
                 my_rank,
             )
-            running = pl.cast(0, pl.INT32)
-            for e in pl.range(n_local_experts):
-                for src in pl.range(n_ranks):
-                    n = pl.cast(
-                        pl.read(pub_counts, [src * n_ranks + my_rank, e]),
-                        pl.INDEX,
-                    )
-                    src_base = pl.cast(pl.read(recv_offsets, [src]), pl.INDEX)
-                    src_e_off = pl.cast(0, pl.INT32)
-                    for prev_e in pl.range(n_local_experts):
-                        if prev_e < e:
-                            src_e_off = src_e_off + pl.read(
-                                pub_counts,
-                                [src * n_ranks + my_rank, prev_e],
-                            )
-                    for row in pl.range(n):
-                        src_row = (
-                            src_base
-                            + pl.cast(src_e_off, pl.INDEX) + row
+            # Gather routed rows from recv_x into the expert-contiguous
+            # local_routed_x_out (PROGRESS.md Session 20 item 1, mirrors decode
+            # dispatch_gather in decode_fwd.py:1012).  pl.load(recv_x, ...,
+            # target_memory=Vec) is the tile op InitMemRef materializes as a Vec
+            # tile.alloc; wrapping it in an InCore scope lets
+            # OutlineIncoreScopes outline it so the alloc lands in the InCore
+            # body instead of chip_orch (Orchestration).
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="dispatch_gather",
+            ):
+                running = pl.cast(0, pl.INT32)
+                for e in pl.range(n_local_experts):
+                    for src in pl.range(n_ranks):
+                        n = pl.cast(
+                            pl.read(pub_counts, [src * n_ranks + my_rank, e]),
+                            pl.INDEX,
                         )
-                        dst_row = pl.cast(running, pl.INDEX) + row
-                        tile = pl.load(recv_x, [src_row, 0], [1, HIDDEN])
-                        pl.store(tile, [dst_row, 0], local_routed_x_out)
-                    running = running + pl.cast(n, pl.INT32)
+                        src_base = pl.cast(
+                            pl.read(recv_offsets, [src]), pl.INDEX,
+                        )
+                        src_e_off = pl.cast(0, pl.INT32)
+                        for prev_e in pl.range(n_local_experts):
+                            if prev_e < e:
+                                src_e_off = src_e_off + pl.read(
+                                    pub_counts,
+                                    [src * n_ranks + my_rank, prev_e],
+                                )
+                        for row in pl.range(n):
+                            src_row = (
+                                src_base
+                                + pl.cast(src_e_off, pl.INDEX) + row
+                            )
+                            dst_row = pl.cast(running, pl.INDEX) + row
+                            tile = pl.load(recv_x, [src_row, 0], [1, HIDDEN])
+                            pl.store(tile, [dst_row, 0], local_routed_x_out)
+                        running = running + pl.cast(n, pl.INT32)
 
             self._build_inverse_map(
                 expert_indices, pub_counts, inverse_map, my_rank,
@@ -1530,7 +1679,7 @@ def _build_prefill_layer_moe_program(
             )
 
         # ---------- Stage 3a: expert_routed (local 36 experts) ----------
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.Inline)
         def _expert_routed(  # noqa: PLR0913, PLR0915
             self,
             local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
@@ -1549,147 +1698,138 @@ def _build_prefill_layer_moe_program(
                 [local_recv_max, HIDDEN], pl.BF16
             ],
         ):
-            for e in pl.parallel(n_local_experts):
+            for e in pl.range(n_local_experts):
                 n_rows = pl.read(local_expert_count, [e])
                 offset_i32 = pl.read(local_expert_offset, [e])
                 offset = pl.cast(offset_i32, pl.INDEX)
 
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_gate_up"):
-                    h_tile = pl.create_tensor(
-                        [ROUTED_MAX_TILE, inter], dtype=pl.FP32,
-                    )
-                    h_tile[:, :] = pl.full(
-                        [ROUTED_MAX_TILE, inter], dtype=pl.FP32,
-                        value=0.0,
-                    )
-                    valid_rows = pl.cast(n_rows, pl.INDEX)
+                # Row tiling (mirrors decode RECV_TILE / N_RECV_TILES,
+                # decode_fwd.py:1083): the 1024 routed rows are processed in
+                # 32-row tiles so the per-tile h_tile [32, inter] FP32 = 160 KiB
+                # stays under the 188 KiB Vec UB (the monolithic [1024, inter]
+                # FP32 = 5 MiB overflows).  gate_up and down are both inside
+                # the per-tile loop; h_bf16 is a per-tile bridge tensor.
+                for tile_idx in pl.range(N_RECV_TILES):
+                    tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
+                    tile_rem = n_rows - tile_row0_i32
+                    if tile_rem > 0:
+                        tile_offset = offset + pl.cast(tile_row0_i32, pl.INDEX)
+                        tile_valid = pl.cast(
+                            pl.min(pl.cast(RECV_TILE, pl.INT32), tile_rem),
+                            pl.INDEX,
+                        )
 
-                    for nb in pl.range(inter // ROUTED_GATE_N_CHUNK):
-                        n0 = nb * ROUTED_GATE_N_CHUNK
-
-                        x0 = pl.slice(
-                            local_routed_x,
-                            [ROUTED_MAX_TILE, ROUTED_GATE_K_CHUNK],
-                            [offset, 0],
-                            valid_shape=[valid_rows, ROUTED_GATE_K_CHUNK],
+                        # Bridge-tensor h_bf16 at loop level (PROGRESS Session 5
+                        # step 4, mirrors decode_fwd.py:1094): shared between
+                        # the gate_up / down SPMD fans.  No FP32 h_tile
+                        # accumulator — gated is written directly per N-chunk.
+                        h_bf16 = pl.create_tensor(
+                            [RECV_TILE, inter], dtype=pl.BF16,
                         )
-                        wg0 = pl.slice(
-                            w_gate,
-                            [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                            [e, 0, n0],
-                        )
-                        wu0 = pl.slice(
-                            w_up,
-                            [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                            [e, 0, n0],
-                        )
-                        wg0_2d = pl.reshape(
-                            wg0,
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                        )
-                        wu0_2d = pl.reshape(
-                            wu0,
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                        )
-                        gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
-                        up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
-                            k0 = kb * ROUTED_GATE_K_CHUNK
-                            xk = pl.slice(
+                        for nb in pl.spmd(
+                            inter // ROUTED_GATE_N_CHUNK,
+                            name_hint="expert_gate_up",
+                        ):
+                            n0 = nb * ROUTED_GATE_N_CHUNK
+                            x0 = pl.slice(
                                 local_routed_x,
-                                [ROUTED_MAX_TILE, ROUTED_GATE_K_CHUNK],
-                                [offset, k0],
-                                valid_shape=[
-                                    valid_rows, ROUTED_GATE_K_CHUNK,
-                                ],
+                                [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                [tile_offset, 0],
+                                valid_shape=[tile_valid, ROUTED_GATE_K_CHUNK],
                             )
-                            wgk = pl.reshape(
-                                pl.slice(
-                                    w_gate,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
-                                ),
+                            wg0 = pl.slice(
+                                w_gate,
+                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                [e, 0, n0],
+                            )
+                            wu0 = pl.slice(
+                                w_up,
+                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                [e, 0, n0],
+                            )
+                            wg0_2d = pl.reshape(
+                                wg0,
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            wuk = pl.reshape(
-                                pl.slice(
-                                    w_up,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
-                                ),
+                            wu0_2d = pl.reshape(
+                                wu0,
                                 [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
                             )
-                            gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
-                            up_acc = pl.matmul_acc(up_acc, xk, wuk)
-
-                        sigmoid = pl.recip(
-                            pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
-                        )
-                        silu = pl.mul(gate_acc, sigmoid)
-                        if _routed_swiglu_step:
-                            silu_c = pl.minimum(silu, _routed_swiglu_limit)
-                            up_c = pl.maximum(
-                                pl.minimum(up_acc, _routed_swiglu_limit),
-                                -_routed_swiglu_limit,
+                            gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.FP32)
+                            up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.FP32)
+                            for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
+                                k0 = kb * ROUTED_GATE_K_CHUNK
+                                xk = pl.slice(
+                                    local_routed_x,
+                                    [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                    [tile_offset, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_GATE_K_CHUNK,
+                                    ],
+                                )
+                                wgk = pl.reshape(
+                                    pl.slice(
+                                        w_gate,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                wuk = pl.reshape(
+                                    pl.slice(
+                                        w_up,
+                                        [
+                                            1,
+                                            ROUTED_GATE_K_CHUNK,
+                                            ROUTED_GATE_N_CHUNK,
+                                        ],
+                                        [e, k0, n0],
+                                    ),
+                                    [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                                )
+                                gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                                up_acc = pl.matmul_acc(up_acc, xk, wuk)
+                            sigmoid = pl.recip(
+                                pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
                             )
-                            gated = pl.mul(silu_c, up_c)
-                        else:
-                            gated = pl.mul(silu, up_acc)
+                            silu = pl.mul(gate_acc, sigmoid)
+                            if _routed_swiglu_step:
+                                silu_c = pl.minimum(silu, _routed_swiglu_limit)
+                                up_c = pl.maximum(
+                                    pl.minimum(up_acc, _routed_swiglu_limit),
+                                    -_routed_swiglu_limit,
+                                )
+                                gated = pl.mul(silu_c, up_c)
+                            else:
+                                gated = pl.mul(silu, up_acc)
+                            gated_v = pl.set_validshape(
+                                gated, tile_valid, ROUTED_GATE_N_CHUNK,
+                            )
+                            gated_m = pl.fillpad(
+                                gated_v, pad_value=pl.PadValue.zero,
+                            )
+                            h_bf16[
+                                :, n0 : n0 + ROUTED_GATE_N_CHUNK
+                            ] = pl.cast(gated_m, target_type=pl.BF16)
 
-                        gated_v = pl.set_validshape(
-                            gated, valid_rows, ROUTED_GATE_N_CHUNK,
-                        )
-                        gated_m = pl.fillpad(
-                            gated_v, pad_value=pl.PadValue.zero,
-                        )
-                        h_tile[
-                            :, n0 : n0 + ROUTED_GATE_N_CHUNK
-                        ] = gated_m
-
-                    h_bf16 = pl.cast(h_tile, target_type=pl.BF16)
-
-                    for db in pl.range(HIDDEN // ROUTED_DOWN_N_CHUNK):
-                        d0 = db * ROUTED_DOWN_N_CHUNK
-                        h0 = pl.slice(
-                            h_bf16,
-                            [ROUTED_MAX_TILE, ROUTED_DOWN_K_CHUNK],
-                            [0, 0],
-                            valid_shape=[
-                                valid_rows, ROUTED_DOWN_K_CHUNK,
-                            ],
-                        )
-                        wd0 = pl.reshape(
-                            pl.slice(
-                                w_down,
-                                [
-                                    1,
-                                    ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
-                                ],
-                                [e, 0, d0],
-                            ),
-                            [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
-                        )
-                        y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
-                        for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
-                            k0 = kb2 * ROUTED_DOWN_K_CHUNK
-                            hk = pl.slice(
+                        for db in pl.spmd(
+                            HIDDEN // ROUTED_DOWN_N_CHUNK,
+                            name_hint="expert_down",
+                        ):
+                            d0 = db * ROUTED_DOWN_N_CHUNK
+                            h0 = pl.slice(
                                 h_bf16,
-                                [ROUTED_MAX_TILE, ROUTED_DOWN_K_CHUNK],
-                                [0, k0],
+                                [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                [0, 0],
                                 valid_shape=[
-                                    valid_rows, ROUTED_DOWN_K_CHUNK,
+                                    tile_valid, ROUTED_DOWN_K_CHUNK,
                                 ],
                             )
-                            wdk = pl.reshape(
+                            wd0 = pl.reshape(
                                 pl.slice(
                                     w_down,
                                     [
@@ -1697,30 +1837,53 @@ def _build_prefill_layer_moe_program(
                                         ROUTED_DOWN_K_CHUNK,
                                         ROUTED_DOWN_N_CHUNK,
                                     ],
-                                    [e, k0, d0],
+                                    [e, 0, d0],
                                 ),
-                                [
-                                    ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
-                                ],
+                                [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
                             )
-                            y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                            y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                            for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
+                                k0 = kb2 * ROUTED_DOWN_K_CHUNK
+                                hk = pl.slice(
+                                    h_bf16,
+                                    [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                    [0, k0],
+                                    valid_shape=[
+                                        tile_valid, ROUTED_DOWN_K_CHUNK,
+                                    ],
+                                )
+                                wdk = pl.reshape(
+                                    pl.slice(
+                                        w_down,
+                                        [
+                                            1,
+                                            ROUTED_DOWN_K_CHUNK,
+                                            ROUTED_DOWN_N_CHUNK,
+                                        ],
+                                        [e, k0, d0],
+                                    ),
+                                    [
+                                        ROUTED_DOWN_K_CHUNK,
+                                        ROUTED_DOWN_N_CHUNK,
+                                    ],
+                                )
+                                y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
-                        y_v = pl.set_validshape(
-                            y_acc, valid_rows, ROUTED_DOWN_N_CHUNK,
-                        )
-                        y_m = pl.fillpad(
-                            y_v, pad_value=pl.PadValue.zero,
-                        )
-                        local_routed_y = pl.assemble(
-                            local_routed_y,
-                            pl.cast(y_m, target_type=pl.BF16),
-                            [offset, d0],
-                        )
+                            y_v = pl.set_validshape(
+                                y_acc, tile_valid, ROUTED_DOWN_N_CHUNK,
+                            )
+                            y_m = pl.fillpad(
+                                y_v, pad_value=pl.PadValue.zero,
+                            )
+                            local_routed_y = pl.assemble(
+                                local_routed_y,
+                                pl.cast(y_m, target_type=pl.BF16),
+                                [tile_offset, d0],
+                            )
 
             return local_routed_y
 
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.Inline)
         def expert_routed_step(
             self,
             local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.BF16],
@@ -1829,7 +1992,7 @@ def _build_prefill_layer_moe_program(
 
             return sh_y_shard
 
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.Inline)
         def expert_shared_step(  # noqa: PLR0913
             self,
             x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
@@ -1879,13 +2042,15 @@ def _build_prefill_layer_moe_program(
                     r_route = pl.cast(t * TOPK + k, pl.INT32)
 
                     if dst == my_rank:
-                        tmp = pl.create_tensor([1], dtype=pl.INT32)
-                        pl.write(tmp, [0], r_route)
-                        tile = pl.load(tmp, [0], [1])
-                        pl.store(
-                            tile,
-                            [my_rank, loc_e, pl.cast(idx, pl.INDEX)],
+                        # Direct write to the GM DistributedTensor (mirrors
+                        # decode combine_step): the tmp create_tensor + write +
+                        # load + store round-trip produced a TileType that
+                        # tile.store rejected, and the tmp scratch is unneeded.
+                        # See PROGRESS.md Session 4 (combine pl.write fix).
+                        pl.write(
                             src_route_table,
+                            [my_rank, loc_e, pl.cast(idx, pl.INDEX)],
+                            r_route,
                         )
                     else:
                         pld.system.notify(
@@ -1938,22 +2103,22 @@ def _build_prefill_layer_moe_program(
                             pl.cast(e_cursor, pl.INDEX)
                             + pl.cast(src_off, pl.INDEX) + row
                         )
-                        tile = pl.load(
-                            local_routed_y,
-                            [local_row, 0], [1, HIDDEN],
+                        # Per-row put (mirrors decode combine_step:1778-1785,
+                        # PROGRESS.md Session 5 step 6): put only one
+                        # [1, HIDDEN] = 8 KiB row from local_routed_y into the
+                        # peer's routed_y_buf at [r_route, 0].  The previous
+                        # X.4 minimal rewrite put the entire
+                        # [n_routes_per_rank, HIDDEN] BF16 = 1 MiB buf, which
+                        # overflowed the 188 KiB Vec UB.  A single put serves
+                        # both local (peer==my_rank) and remote peers.
+                        pld.tensor.put(
+                            dst=routed_y_buf,
+                            peer=src,
+                            src=local_routed_y,
+                            dst_offsets=[r_route, 0],
+                            src_offsets=[local_row, 0],
+                            shape=[1, HIDDEN],
                         )
-                        if src == my_rank:
-                            pl.store(tile, [r_route, 0], routed_y_buf)
-                        else:
-                            # Phase X.4 minimal rewrite — see decode_layer.py
-                            # for the FIXME(X.5) on per-row staging windows.
-                            pl.store(tile, [r_route, 0], routed_y_buf)
-                            pld.tensor.put(
-                                routed_y_buf,
-                                peer=src,
-                                src=routed_y_buf,
-                                atomic=pld.AtomicType.None_,
-                            )
                     src_off = src_off + pl.cast(n, pl.INT32)
                 total_e = pl.cast(0, pl.INT32)
                 for src2 in pl.range(n_ranks):
@@ -2017,7 +2182,7 @@ def _build_prefill_layer_moe_program(
 
             return moe_out
 
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.Inline)
         def combine_step(  # noqa: PLR0913
             self,
             local_routed_y: pl.Tensor[
@@ -2045,23 +2210,30 @@ def _build_prefill_layer_moe_program(
             self._publish_src_route_table(
                 expert_indices, src_route_table, my_rank,
             )
-            for peer in pl.range(n_ranks):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=route_pub_sig,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=1,
-                        op=pld.NotifyOp.Set,
-                    )
-            for src in pl.range(n_ranks):
-                if src != my_rank:
-                    pld.system.wait(
-                        signal=route_pub_sig,
-                        offsets=[src, 0],
-                        expected=1,
-                        cmp=pld.WaitCmp.Ge,
-                    )
+            # Wrap cross-core notify/wait in CORE_GROUP scopes (PROGRESS.md
+            # Session 20: bare pld.system.notify/wait inlined into chip_orch
+            # (Orchestration) become Misplaced builtin op).  Each scope holds
+            # one control-plane phase so the OutlineIncoreScopes pass can
+            # outline them correctly.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_route_notify"):
+                for peer in pl.range(n_ranks):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=route_pub_sig,
+                            peer=peer,
+                            offsets=[my_rank, 0],
+                            value=1,
+                            op=pld.NotifyOp.Set,
+                        )
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_route_wait"):
+                for src in pl.range(n_ranks):
+                    if src != my_rank:
+                        pld.system.wait(
+                            signal=route_pub_sig,
+                            offsets=[src, 0],
+                            expected=1,
+                            cmp=pld.WaitCmp.Ge,
+                        )
 
             self._push_routed_y_to_sources(
                 local_routed_y,
@@ -2103,6 +2275,11 @@ def _build_prefill_layer_moe_program(
             w_g: pl.Tensor[
                 [LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16
             ],
+            # Attention head-wise gate block-diag constant R (NOT w_gate_r,
+            # which is the MoE routed expert weight). Holder constructs it once.
+            gate_r: pl.Tensor[
+                [num_heads_local_pad, hidden_q_local], pl.BF16
+            ],
             positions: pl.Tensor[[PREFILL_T], pl.INT32],
             post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
             gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
@@ -2140,6 +2317,11 @@ def _build_prefill_layer_moe_program(
             data_done_sig: pld.DistributedTensor[
                 [n_ranks, 1], pl.INT32
             ],
+            # GM send buffer for dispatch (mirrors recv_x: allocated by
+            # host_orch, passed through chip_orch to dispatch_step).
+            send_buf: pld.DistributedTensor[
+                [local_recv_max, HIDDEN], pl.BF16
+            ],
             sh_tmp_window: pld.DistributedTensor[
                 [BATCH, sh_tp_chunk], pl.BF16
             ],
@@ -2158,7 +2340,10 @@ def _build_prefill_layer_moe_program(
             combine_done_sig: pld.DistributedTensor[
                 [n_ranks, 1], pl.INT32
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            # MoE body special case (PROGRESS Session 22): MoE weights have no
+            # layer dim (pre-sliced), so only norm_layer_idx (physical, for
+            # post_rms + KV cache) is needed; attention passes norm=attn=physical.
+            norm_layer_idx: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ):
             # ── A: prefill attention + tp_all_reduce -> resid1. ────────
@@ -2172,99 +2357,89 @@ def _build_prefill_layer_moe_program(
                 rope_cos, rope_sin,
                 k_cache, v_cache,
                 wo, w_g,
+                gate_r,
                 positions,
                 resid1,
-                layer_idx,
+                norm_layer_idx,
+                norm_layer_idx,
                 attn_tmp_window,
                 attn_signal_window,
                 my_rank,
             )
 
-            # ── B: post-attention zero-centred RMSNorm. ────────────────
+            # ── B: post-attention RMSNorm + residual add fused per-tile
+            # (PROGRESS Session 6 step 8+9, mirrors decode BATCH=16).  The full
+            # [PREFILL_T, HIDDEN] post_norm / resid1_fp32 / moe_out buffers and
+            # their CORE_GROUP scopes are removed; each MoE tile runs a
+            # two-pass chunked RMSNorm over resid1[t_lo:t_lo+BATCH] producing
+            # tile_x (stage C) and a per-tile residual add producing
+            # next_hidden_out[t_lo] (stage D).  inv_rms is per-token (over
+            # HIDDEN features) so per-tile is bit-equivalent to the full pass.
             hidden_blocks = HIDDEN // K_CHUNK
-            post_norm = pl.create_tensor(
-                [PREFILL_T, HIDDEN], dtype=pl.BF16,
-            )
-            resid1_fp32 = pl.create_tensor(
-                [PREFILL_T, HIDDEN], dtype=pl.FP32,
-            )
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="prefill_moe_post_rmsnorm_zc",
-            ):
-                for kb in pl.range(hidden_blocks):
-                    k0 = kb * K_CHUNK
-                    rchunk = pl.cast(
-                        pl.slice(
-                            resid1, [PREFILL_T, K_CHUNK], [0, k0],
-                        ),
-                        target_type=pl.FP32,
-                    )
-                    resid1_fp32 = pl.assemble(
-                        resid1_fp32, rchunk, [0, k0],
-                    )
-
-                sq_sum = pl.full(
-                    [1, PREFILL_T], dtype=pl.FP32, value=0.0,
-                )
-                for kb2 in pl.range(hidden_blocks):
-                    k0 = kb2 * K_CHUNK
-                    ck = pl.slice(
-                        resid1_fp32, [PREFILL_T, K_CHUNK], [0, k0],
-                    )
-                    sq_sum = pl.add(
-                        sq_sum,
-                        pl.reshape(
-                            pl.row_sum(pl.mul(ck, ck)), [1, PREFILL_T],
-                        ),
-                    )
-                inv_rms_moe = pl.recip(
-                    pl.sqrt(
-                        pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS),
-                    ),
-                )
-                inv_rms_col = pl.reshape(inv_rms_moe, [PREFILL_T, 1])
-                for kb3 in pl.range(hidden_blocks):
-                    k0 = kb3 * K_CHUNK
-                    norm_chunk = pl.slice(
-                        resid1_fp32, [PREFILL_T, K_CHUNK], [0, k0],
-                    )
-                    gamma = pl.slice(
-                        post_rms_weight, [1, K_CHUNK], [layer_idx, k0],
-                    )
-                    scaled = pl.row_expand_mul(norm_chunk, inv_rms_col)
-                    normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
-                    post_norm = pl.assemble(
-                        post_norm,
-                        pl.cast(normed, target_type=pl.BF16),
-                        [0, k0],
-                    )
 
             # ── C: prefill MoE adapter — Phase X.10 inlined per-tile loop.
-            # Body copied from ``prefill_moe.PrefillMoE.chip_orch`` (which in
-            # turn mirrors ``moe.EpTpMoE.chip_orch`` per-tile invocation): we
-            # slice the [PREFILL_T, HIDDEN] post_norm into PREFILL_TILE_COUNT
-            # independent [BATCH, HIDDEN] tiles and run the inlined gate /
-            # dispatch / expert_routed / expert_shared / combine pipeline once
-            # per tile. Routing is per-token, so this is bit-equivalent to a
-            # single T=PREFILL_T pass. The window pool shared across tiles is
-            # safe because each tile flushes (signal-wait pairs) before the
-            # next reads.
-            moe_out = pl.create_tensor(
-                [PREFILL_T, HIDDEN], dtype=pl.BF16,
-            )
+            # Each tile runs a two-pass chunked RMSNorm on resid1[t_lo] ->
+            # tile_x, then the inlined gate / dispatch / expert_routed /
+            # expert_shared / combine pipeline -> tile_y, then a per-tile
+            # residual add -> next_hidden_out[t_lo].  Routing is per-token, so
+            # this is bit-equivalent to a single T=PREFILL_T pass.  The window
+            # pool shared across tiles is safe because each tile flushes
+            # (signal-wait pairs) before the next reads.
             for tile_idx in pl.unroll(PREFILL_TILE_COUNT):
                 t_lo = tile_idx * BATCH
                 tile_x = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+                # Per-tile zero-centred RMSNorm on resid1[t_lo:t_lo+BATCH]
+                # (PROGRESS Session 6 step 8, mirrors decode BATCH=16).
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_in",
+                    name_hint="prefill_moe_post_rmsnorm_tile",
                 ):
-                    tile_x = pl.assemble(
-                        tile_x,
-                        pl.slice(post_norm, [BATCH, HIDDEN], [t_lo, 0]),
-                        [0, 0],
+                    sq_sum = pl.full(
+                        [1, BATCH], dtype=pl.FP32, value=0.0,
                     )
+                    for kb in pl.range(hidden_blocks):
+                        k0 = kb * K_CHUNK
+                        rchunk_tile = pl.cast(
+                            pl.slice(
+                                resid1, [BATCH, K_CHUNK], [t_lo, k0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        sq_sum = pl.add(
+                            sq_sum,
+                            pl.reshape(
+                                pl.row_sum(
+                                    pl.mul(rchunk_tile, rchunk_tile),
+                                ),
+                                [1, BATCH],
+                            ),
+                        )
+                    inv_rms_tile = pl.recip(
+                        pl.sqrt(
+                            pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS),
+                        ),
+                    )
+                    inv_rms_col = pl.reshape(inv_rms_tile, [BATCH, 1])
+                    for kb2 in pl.range(hidden_blocks):
+                        k0 = kb2 * K_CHUNK
+                        norm_chunk_tile = pl.cast(
+                            pl.slice(
+                                resid1, [BATCH, K_CHUNK], [t_lo, k0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        gamma = pl.slice(
+                            post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
+                        )
+                        scaled = pl.row_expand_mul(norm_chunk_tile, inv_rms_col)
+                        normed = pl.col_expand_mul(
+                            scaled, pl.add(gamma, 1.0),
+                        )
+                        tile_x = pl.assemble(
+                            tile_x,
+                            pl.cast(normed, target_type=pl.BF16),
+                            [0, k0],
+                        )
 
                 # 1) Gate (local, replicated).
                 expert_indices = pl.create_tensor(
@@ -2306,6 +2481,7 @@ def _build_prefill_layer_moe_program(
                     local_routed_x,
                     local_expert_offset, local_expert_count, inverse_map,
                     pub_counts, count_done_sig, recv_x, data_done_sig,
+                    send_buf,
                     my_rank,
                 )
 
@@ -2331,37 +2507,37 @@ def _build_prefill_layer_moe_program(
                     my_rank,
                 )
 
+                # Per-tile residual add (PROGRESS Session 6 step 9, mirrors
+                # decode): next_hidden_out[t_lo] = resid1[t_lo] + tile_y,
+                # removing the full [PREFILL_T, HIDDEN] moe_out / resid1_fp32
+                # buffers.  Chunked over K_CHUNK to keep Vec tiles at
+                # [BATCH, K_CHUNK] FP32 = 16 KiB.
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
-                    name_hint="prefill_moe_tile_out",
+                    name_hint="prefill_moe_residual_add_tile",
                 ):
-                    moe_out = pl.assemble(
-                        moe_out,
-                        pl.slice(tile_y, [BATCH, HIDDEN], [0, 0]),
-                        [t_lo, 0],
-                    )
-
-            # ── D: residual add. ───────────────────────────────────────
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="prefill_moe_residual_add",
-            ):
-                for kb4 in pl.range(hidden_blocks):
-                    k0 = kb4 * K_CHUNK
-                    m = pl.cast(
-                        pl.slice(
-                            moe_out, [PREFILL_T, K_CHUNK], [0, k0],
-                        ),
-                        target_type=pl.FP32,
-                    )
-                    r = pl.slice(
-                        resid1_fp32, [PREFILL_T, K_CHUNK], [0, k0],
-                    )
-                    next_hidden_out = pl.assemble(
-                        next_hidden_out,
-                        pl.cast(pl.add(r, m), target_type=pl.BF16),
-                        [0, k0],
-                    )
+                    for kb4 in pl.range(hidden_blocks):
+                        k0 = kb4 * K_CHUNK
+                        res_chunk = pl.cast(
+                            pl.slice(
+                                resid1, [BATCH, K_CHUNK], [t_lo, k0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        y_chunk = pl.cast(
+                            pl.slice(
+                                tile_y, [BATCH, K_CHUNK], [0, k0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        next_hidden_out = pl.assemble(
+                            next_hidden_out,
+                            pl.cast(
+                                pl.add(res_chunk, y_chunk),
+                                target_type=pl.BF16,
+                            ),
+                            [t_lo, k0],
+                        )
             return next_hidden_out
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
@@ -2410,6 +2586,9 @@ def _build_prefill_layer_moe_program(
             w_g: pl.Tensor[
                 [tp_size, LAYER_HIDDEN_ROWS_DYN, num_heads_local_pad], pl.BF16
             ],
+            gate_r: pl.Tensor[
+                [tp_size, num_heads_local_pad, hidden_q_local], pl.BF16
+            ],
             positions: pl.Tensor[[tp_size, PREFILL_T], pl.INT32],
             post_rms_weight: pl.Tensor[
                 [tp_size, LAYER_DYN, HIDDEN], pl.FP32
@@ -2439,7 +2618,7 @@ def _build_prefill_layer_moe_program(
             next_hidden_out: pl.Out[
                 pl.Tensor[[tp_size, PREFILL_T, HIDDEN], pl.BF16]
             ],
-            layer_idx: pl.Scalar[pl.INT32],
+            norm_layer_idx: pl.Scalar[pl.INT32],
         ):
             attn_tmp_buf = pld.alloc_window_buffer(
                 PREFILL_T * tp_chunk * 2,
@@ -2450,6 +2629,12 @@ def _build_prefill_layer_moe_program(
             )
             count_done_buf = pld.alloc_window_buffer(n_ranks * 4)
             recv_x_buf = pld.alloc_window_buffer(
+                local_recv_max * HIDDEN * 2,
+            )
+            # GM send buffer for dispatch (same size as recv_x: [local_recv_max,
+            # HIDDEN] BF16).  Allocated on GM so the InCore dispatch_step does
+            # not create an 8 MiB on-chip tensor.  Mirrors decode moe.py.
+            send_buf_buf = pld.alloc_window_buffer(
                 local_recv_max * HIDDEN * 2,
             )
             data_done_buf = pld.alloc_window_buffer(n_ranks * 4)
@@ -2481,6 +2666,10 @@ def _build_prefill_layer_moe_program(
                 )
                 recv_x = pld.window(
                     recv_x_buf,
+                    [local_recv_max, HIDDEN], dtype=pl.BF16,
+                )
+                send_buf = pld.window(
+                    send_buf_buf,
                     [local_recv_max, HIDDEN], dtype=pl.BF16,
                 )
                 data_done_sig = pld.window(
@@ -2516,6 +2705,7 @@ def _build_prefill_layer_moe_program(
                     rope_cos[r], rope_sin[r],
                     k_cache[r], v_cache[r],
                     wo[r], w_g[r],
+                    gate_r[r],
                     positions[r],
                     post_rms_weight[r],
                     gate_w[r], router_bias[r],
@@ -2525,10 +2715,11 @@ def _build_prefill_layer_moe_program(
                     attn_tmp_window, attn_signal_window,
                     pub_counts, count_done_sig,
                     recv_x, data_done_sig,
+                    send_buf,
                     sh_tmp_window, sh_signal_window,
                     src_route_table, route_pub_sig,
                     routed_y_buf, combine_done_sig,
-                    layer_idx,
+                    norm_layer_idx,
                     r,
                     device=r,
                 )

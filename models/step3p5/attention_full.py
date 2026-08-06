@@ -543,11 +543,76 @@ def attention_full(
         [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL, HEAD_DIM], dtype=pl.BF16,
     )
 
-    # Keep a static parallel bound for the current tiling/codegen profile, but
-    # guard the complete per-row body with the runtime active bound.  Inactive
-    # rows must not read a substituted ``b_safe`` request and must not perform
-    # RoPE or assemble into K/V cache.
-    for b in pl.parallel(BATCH):
+    # Separate active-row tasks write Q and update the resident K/V cache.
+    with pl.spmd(
+        active_tokens,
+        name_hint="full_rope_q",
+        allow_early_resolve=True,
+    ) as full_rope_q_tid:
+        b = pl.tile.get_block_idx()
+        if b < active_tokens:
+            ctx_len = pl.tensor.read(seq_lens, [b])
+            pos = ctx_len - 1
+            cos_lo = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, 0])
+            cos_hi = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
+            sin_lo = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, 0])
+            sin_hi = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
+
+            for ki in pl.range(KV_HEADS_LOCAL):
+                # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_FULL] slices of
+                # q_proj_norm, mirroring the K path above. This replaces the
+                # earlier reshape(q_proj_norm -> [Q_HEAD_BATCH_FULL, HEAD_DIM])
+                # + [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL] col-offset slice, which
+                # miscompiled the rot_q_hi (cols ROTARY_HALF_FULL..ROTARY_DIM)
+                # write into all_q_padded -> wrong q.k scores for ctx>1 (invisible
+                # at ctx=1 since output=V). Verified via _stage_scope12_qk.py:
+                # per-rank crossrow scores bad_ratio 0.25/0.90 -> ~0.
+                q_base = ki * Q_PER_KV_FULL
+                pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL + ki * Q_HEAD_PAD_FULL
+                for qh in pl.range(Q_HEAD_BATCH_FULL):
+                    qh_col = (q_base + qh) * HEAD_DIM
+                    q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col])
+                    q_hi_h = pl.slice(
+                        q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col + ROTARY_HALF_FULL],
+                    )
+                    rot_q_lo_h = pl.sub(
+                        pl.col_expand_mul(q_lo_h, cos_lo),
+                        pl.col_expand_mul(q_hi_h, sin_lo),
+                    )
+                    rot_q_hi_h = pl.add(
+                        pl.col_expand_mul(q_hi_h, cos_hi),
+                        pl.col_expand_mul(q_lo_h, sin_hi),
+                    )
+                    q_row = pad_row_base + qh
+                    all_q_padded = pl.assemble(
+                        all_q_padded,
+                        pl.cast(pl.slice(q_proj_norm, [1, HEAD_DIM], [b, qh_col]),
+                                target_type=pl.BF16),
+                        [q_row, 0],
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
+                        [q_row, ROTARY_HALF_FULL],
+                    )
+                all_q_padded = pl.assemble(
+                    all_q_padded,
+                    pl.cast(
+                        pl.full([Q_HEAD_PAD_FULL - Q_HEAD_BATCH_FULL, HEAD_DIM],
+                                dtype=pl.FP32, value=0.0),
+                        target_type=pl.BF16,
+                    ),
+                    [pad_row_base + Q_HEAD_BATCH_FULL, 0],
+                )
+
+    with pl.spmd(
+        active_tokens,
+        name_hint="full_rope_kv_cache",
+        allow_early_resolve=True,
+    ) as full_rope_kv_tid:
+        b = pl.tile.get_block_idx()
         if b < active_tokens:
             ctx_len = pl.tensor.read(seq_lens, [b])
             pos = ctx_len - 1
@@ -559,103 +624,55 @@ def attention_full(
             sin_lo = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, 0])
             sin_hi = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="full_rope_kv_cache"):
-                for ki in pl.range(KV_HEADS_LOCAL):
-                    kv_col = ki * HEAD_DIM
-                    cache_row = (
-                        layer_cache_base
-                        + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
-                        + slot_offset
-                    )
-                    k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col])
-                    k_hi = pl.slice(
-                        k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col + ROTARY_HALF_FULL],
-                    )
-                    rot_k_lo = pl.sub(
-                        pl.col_expand_mul(k_lo, cos_lo),
-                        pl.col_expand_mul(k_hi, sin_lo),
-                    )
-                    rot_k_hi = pl.add(
-                        pl.col_expand_mul(k_hi, cos_hi),
-                        pl.col_expand_mul(k_lo, sin_hi),
-                    )
-                    # Phase A (2026-06-11): use qwen3/32b's full-row-cast-then-
-                    # overwrite idiom instead of the (compile-required, runtime-
-                    # broken) `pl.add(k_pass, 0.0)` workaround. Cast the entire
-                    # [1, HEAD_DIM] k_proj_norm row to BF16 once (which is the
-                    # exact pattern qwen3/32b's v_cache write uses and which
-                    # AICore lowers cleanly), then overwrite cols 0..2*HALF with
-                    # the RoPE'd halves. The pass-through tail (cols 2*HALF..)
-                    # is left as the initial full-row cast.
-                    k_cache = pl.assemble(
-                        k_cache,
-                        pl.cast(
-                            pl.slice(k_proj_norm, [1, HEAD_DIM], [b, kv_col]),
-                            target_type=pl.BF16,
-                        ),
-                        [cache_row, 0],
-                    )
-                    k_cache = pl.assemble(
-                        k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
-                    )
-                    k_cache = pl.assemble(
-                        k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
-                        [cache_row, ROTARY_HALF_FULL],
-                    )
-                    v_cache = pl.assemble(
-                        v_cache,
-                        pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
-                                target_type=pl.BF16),
-                        [cache_row, 0],
-                    )
+            for ki in pl.range(KV_HEADS_LOCAL):
+                kv_col = ki * HEAD_DIM
+                cache_row = (
+                    layer_cache_base
+                    + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
+                    + slot_offset
+                )
+                k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col])
+                k_hi = pl.slice(
+                    k_proj_norm, [1, ROTARY_HALF_FULL], [b, kv_col + ROTARY_HALF_FULL],
+                )
+                rot_k_lo = pl.sub(
+                    pl.col_expand_mul(k_lo, cos_lo),
+                    pl.col_expand_mul(k_hi, sin_lo),
+                )
+                rot_k_hi = pl.add(
+                    pl.col_expand_mul(k_hi, cos_hi),
+                    pl.col_expand_mul(k_lo, sin_hi),
+                )
+                # Phase A (2026-06-11): use qwen3/32b's full-row-cast-then-
+                # overwrite idiom instead of the (compile-required, runtime-
+                # broken) `pl.add(k_pass, 0.0)` workaround. Cast the entire
+                # [1, HEAD_DIM] k_proj_norm row to BF16 once (which is the
+                # exact pattern qwen3/32b's v_cache write uses and which
+                # AICore lowers cleanly), then overwrite cols 0..2*HALF with
+                # the RoPE'd halves. The pass-through tail (cols 2*HALF..)
+                # is left as the initial full-row cast.
+                k_cache = pl.assemble(
+                    k_cache,
+                    pl.cast(
+                        pl.slice(k_proj_norm, [1, HEAD_DIM], [b, kv_col]),
+                        target_type=pl.BF16,
+                    ),
+                    [cache_row, 0],
+                )
+                k_cache = pl.assemble(
+                    k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
+                )
+                k_cache = pl.assemble(
+                    k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
+                    [cache_row, ROTARY_HALF_FULL],
+                )
+                v_cache = pl.assemble(
+                    v_cache,
+                    pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
+                            target_type=pl.BF16),
+                    [cache_row, 0],
+                )
 
-                    # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_FULL] slices of
-                    # q_proj_norm, mirroring the K path above. This replaces the
-                    # earlier reshape(q_proj_norm -> [Q_HEAD_BATCH_FULL, HEAD_DIM])
-                    # + [Q_HEAD_BATCH_FULL, ROTARY_HALF_FULL] col-offset slice, which
-                    # miscompiled the rot_q_hi (cols ROTARY_HALF_FULL..ROTARY_DIM)
-                    # write into all_q_padded -> wrong q.k scores for ctx>1 (invisible
-                    # at ctx=1 since output=V). Verified via _stage_scope12_qk.py:
-                    # per-rank crossrow scores bad_ratio 0.25/0.90 -> ~0.
-                    q_base = ki * Q_PER_KV_FULL
-                    pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL + ki * Q_HEAD_PAD_FULL
-                    for qh in pl.range(Q_HEAD_BATCH_FULL):
-                        qh_col = (q_base + qh) * HEAD_DIM
-                        q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col])
-                        q_hi_h = pl.slice(
-                            q_proj_norm, [1, ROTARY_HALF_FULL], [b, qh_col + ROTARY_HALF_FULL],
-                        )
-                        rot_q_lo_h = pl.sub(
-                            pl.col_expand_mul(q_lo_h, cos_lo),
-                            pl.col_expand_mul(q_hi_h, sin_lo),
-                        )
-                        rot_q_hi_h = pl.add(
-                            pl.col_expand_mul(q_hi_h, cos_hi),
-                            pl.col_expand_mul(q_lo_h, sin_hi),
-                        )
-                        q_row = pad_row_base + qh
-                        all_q_padded = pl.assemble(
-                            all_q_padded,
-                            pl.cast(pl.slice(q_proj_norm, [1, HEAD_DIM], [b, qh_col]),
-                                    target_type=pl.BF16),
-                            [q_row, 0],
-                        )
-                        all_q_padded = pl.assemble(
-                            all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
-                        )
-                        all_q_padded = pl.assemble(
-                            all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
-                            [q_row, ROTARY_HALF_FULL],
-                        )
-                    all_q_padded = pl.assemble(
-                        all_q_padded,
-                        pl.cast(
-                            pl.full([Q_HEAD_PAD_FULL - Q_HEAD_BATCH_FULL, HEAD_DIM],
-                                    dtype=pl.FP32, value=0.0),
-                            target_type=pl.BF16,
-                        ),
-                        [pad_row_base + Q_HEAD_BATCH_FULL, 0],
-                    )
 
     # ----- fa_fused — Phase A (2026-06-11): qwen3/32b-style 4-spmd split. -----
     # The previous fused mixed AIC+AIV single root tripped 507018 / VEC UB
@@ -762,6 +779,7 @@ def attention_full(
     with pl.spmd(
         full_qk_active_tasks,
         name_hint="full_qk_matmul",
+        deps=[full_rope_q_tid, full_rope_kv_tid],
         allow_early_resolve=True,
     ) as full_qk_tid:
         fa_task = pl.tile.get_block_idx()
@@ -1493,10 +1511,14 @@ def attention_full(
         + FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK - 1
     ) // FULL_ATTN_OUT_PROJ_MATMUL_TILES_PER_TASK
     for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
+        # Keep the fused mixed task unsplit across batch rows.  UP_DOWN creates
+        # two AIV subblocks; with grouped N tiles, the lower subblock can
+        # intermittently publish only a suffix of the first tile.  The
+        # unsplit [BATCH_TILE, N] accumulator stays within the tile budget and
+        # preserves the workload-derived logical-task count.
         for out_task in pl.spmd(
             full_out_proj_tasks,
             name_hint="full_out_proj_matmul",
-            optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
         ):
             # Keep the legal cube tile at N=64, but let one logical task
             # sequentially consume multiple output tiles.  This separates
@@ -1992,7 +2014,11 @@ def _torch_single_card_attention_full(
             ] = ctx.reshape(1, -1).to(torch.bfloat16)
         attn_out[b : b + 1, :] = attn_row
 
-    gate = torch.sigmoid(hidden_states.float() @ w_g_full.float())
+    gate = (
+        torch.sigmoid(normed_bf16.float() @ w_g_full.float())
+        .bfloat16()
+        .float()
+    )
     attn_view = attn_out.view(batch, num_heads_full, head_dim).float()
     attn_gated = (attn_view * gate.unsqueeze(-1)).to(torch.bfloat16)
     attn_gated_flat = attn_gated.view(batch, hidden_q)
@@ -2191,7 +2217,11 @@ def _torch_per_rank_partial_full(
             ] = ctx.reshape(1, -1).to(torch.bfloat16)
         attn_out_local[b : b + 1, :] = attn_row
 
-    gate_local = torch.sigmoid(hidden_states.float() @ w_g_local.float())
+    gate_local = (
+        torch.sigmoid(normed_bf16.float() @ w_g_local.float())
+        .bfloat16()
+        .float()
+    )
     attn_view = attn_out_local.view(batch, heads_local, head_dim).float()
     attn_gated = (attn_view * gate_local.unsqueeze(-1)).to(torch.bfloat16)
     attn_gated_flat = attn_gated.view(batch, hidden_q_local)

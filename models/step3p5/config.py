@@ -546,8 +546,9 @@ MAX_BLOCKS_PER_SEQ = (MAX_SEQ_DEFAULT + BLOCK_SIZE - 1) // BLOCK_SIZE
 # A profile names a set of compile-time tuning defaults; it never names or
 # fixes a physical core count. The runtime maps workload-derived logical tasks
 # onto the target's available resources. ``portable`` preserves the proven
-# release fallback. ``a2a3`` records the fixed-workload, all-rank profile
-# validated on the 0162 A2A3 stack; launchers must select it explicitly.
+# release fallback. ``a2a3`` records the all-rank profile validated across
+# per-request 64K batch sizes on the 0162 A2A3 stack; launchers must select it
+# explicitly.
 # Environment overrides remain highest priority for single-variable sweeps.
 PTO2_LOGICAL_BLOCK_LIMIT = 2**15 - 1
 ATTN_TASK_PROFILE = os.environ.get(
@@ -567,7 +568,7 @@ _ATTN_TASK_PROFILES = {
     },
     "a2a3": {
         "qk_blocks_per_task": 22,
-        "softmax_blocks_per_task": 12,
+        "softmax_blocks_per_task": 16,
         "online_blocks_per_task": 22,
         "online_reduce_fan_in": 8,
         "qk_uniform_o1": 1,

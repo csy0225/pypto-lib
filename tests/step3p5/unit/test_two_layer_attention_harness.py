@@ -13,25 +13,56 @@ import itertools
 import json
 
 import pytest
+import torch
 
 from tests.step3p5.harnesses._stage_two_layer_attn import (
     _attention_codegen_contract_errors,
     _aggregate_rank_uniformity,
     _collective_low_wait_reference,
+    _full_kv_slot_oracle,
+    _kv_slot_audit_layout,
     _linear_percentile,
     _make_kv_fixture,
+    _run_alternating_input_audit,
+    _runtime_active_row_counts,
     _step_metadata,
     _tensor_probe,
+    _tilewise_numerical_report,
+    _torch_swa_local_partial_oracle,
     analyze_uniformity,
 )
 
 
 def _valid_attention_codegen_source() -> str:
     return """
+// Spmd full_rope_q_spmd: full_rope_q
+L0TaskArgs params_t7;
+params_t7.add_output(all_q_padded_v1);
+params_t7.add_scalar(active_tokens__rv_v2_inline1);
+params_t7.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
+params_t7.set_allow_early_resolve(true);
+TaskOutputTensors task_7_outs = rt_submit_aiv_task(8, params_t7);
+PTO2TaskId full_rope_q_tid = task_7_outs.task_id();
+// Spmd full_rope_kv_cache_spmd: full_rope_kv_cache
+L0TaskArgs params_t8;
+params_t8.add_inout(ext_k_cache);
+params_t8.add_inout(ext_v_cache);
+params_t8.add_scalar(active_tokens__rv_v2_inline1);
+params_t8.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
+params_t8.set_allow_early_resolve(true);
+TaskOutputTensors task_8_outs = rt_submit_aiv_task(9, params_t8);
+PTO2TaskId full_rope_kv_tid = task_8_outs.task_id();
 // Spmd full_qk_matmul_spmd: full_qk_matmul
 L0TaskArgs params_t10;
+params_t10.add_input(all_q_padded_v1);
+params_t10.add_input(ext_k_cache);
 params_t10.add_scalar(full_qk_active_tasks__rv_v2_inline153);
 params_t10.launch_spec.set_block_num(full_qk_active_tasks__rv_v2_inline153);
+PTO2TaskId params_t10_deps[2];
+uint32_t params_t10_deps_count = 0;
+params_t10_deps[params_t10_deps_count++] = full_rope_q_tid;
+params_t10_deps[params_t10_deps_count++] = full_rope_kv_tid;
+params_t10.set_dependencies(params_t10_deps, params_t10_deps_count);
 TaskOutputTensors task_10_outs = rt_submit_aic_task(11, params_t10);
 PTO2TaskId full_qk_tid = task_10_outs.task_id();
 // Spmd full_softmax_spmd: full_softmax
@@ -47,6 +78,7 @@ TaskOutputTensors task_11_outs = rt_submit_aiv_task(12, params_t11);
 PTO2TaskId full_softmax_tid = task_11_outs.task_id();
 // Group full_sv_matmul: MixedKernels (AIC + AIV lanes)
 L0TaskArgs params_t12;
+params_t12.add_input(ext_v_cache);
 params_t12.add_scalar(full_online_softmax_active_tasks__rv_v2_inline149);
 params_t12.launch_spec.set_block_num(
     full_online_softmax_active_tasks__rv_v2_inline149);
@@ -78,9 +110,33 @@ params_t14_deps[params_t14_deps_count++] =
     full_online_softmax_reduce_tid;
 params_t14.set_dependencies(params_t14_deps, params_t14_deps_count);
 TaskOutputTensors task_14_outs = rt_submit_aiv_task(16, params_t14);
+// Spmd swa_rope_q_spmd: swa_rope_q
+L0TaskArgs params_t31;
+params_t31.add_output(all_q_padded_swa_v1);
+params_t31.add_scalar(active_tokens__rv_v2_inline1);
+params_t31.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
+params_t31.set_allow_early_resolve(true);
+TaskOutputTensors task_31_outs = rt_submit_aiv_task(35, params_t31);
+PTO2TaskId swa_rope_q_tid = task_31_outs.task_id();
+// Spmd swa_rope_kv_cache_spmd: swa_rope_kv_cache
+L0TaskArgs params_t32;
+params_t32.add_inout(ext_k_cache_swa);
+params_t32.add_inout(ext_v_cache_swa);
+params_t32.add_scalar(active_tokens__rv_v2_inline1);
+params_t32.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
+params_t32.set_allow_early_resolve(true);
+TaskOutputTensors task_32_outs = rt_submit_aiv_task(36, params_t32);
+PTO2TaskId swa_rope_kv_tid = task_32_outs.task_id();
 // Spmd swa_qk_matmul_spmd: swa_qk_matmul
 L0TaskArgs params_t34;
+params_t34.add_input(all_q_padded_swa_v1);
+params_t34.add_input(ext_k_cache_swa);
 params_t34.launch_spec.set_block_num(swa_active_tasks__rv_v2_inline207);
+PTO2TaskId params_t34_deps[2];
+uint32_t params_t34_deps_count = 0;
+params_t34_deps[params_t34_deps_count++] = swa_rope_q_tid;
+params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;
+params_t34.set_dependencies(params_t34_deps, params_t34_deps_count);
 TaskOutputTensors task_34_outs = rt_submit_aic_task(38, params_t34);
 PTO2TaskId swa_qk_tid = task_34_outs.task_id();
 // Spmd swa_softmax_spmd: swa_softmax
@@ -94,6 +150,7 @@ TaskOutputTensors task_35_outs = rt_submit_aiv_task(39, params_t35);
 PTO2TaskId swa_softmax_tid = task_35_outs.task_id();
 // Spmd swa_sv_matmul_spmd: swa_sv_matmul
 L0TaskArgs params_t36;
+params_t36.add_input(ext_v_cache_swa);
 params_t36.launch_spec.set_block_num(swa_active_tasks__rv_v2_inline207);
 PTO2TaskId params_t36_deps[1];
 uint32_t params_t36_deps_count = 0;
@@ -143,6 +200,56 @@ def test_attention_codegen_contract_rejects_incomplete_dependency_wiring() -> No
     )
 
 
+@pytest.mark.parametrize(
+    ("needle", "expected_error"),
+    [
+        (
+            "params_t10_deps[params_t10_deps_count++] = full_rope_q_tid;",
+            "full QK dependency from full_rope_q_tid, full_rope_kv_tid",
+        ),
+        (
+            "params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;",
+            "SWA QK dependency from swa_rope_q_tid, swa_rope_kv_tid",
+        ),
+    ],
+)
+def test_attention_codegen_contract_requires_both_rope_producers(
+    needle: str,
+    expected_error: str,
+) -> None:
+    source = _valid_attention_codegen_source().replace(needle, "")
+    assert expected_error in _attention_codegen_contract_errors(source)
+
+
+@pytest.mark.parametrize(
+    ("needle", "expected_error"),
+    [
+        (
+            "params_t7.set_allow_early_resolve(true);",
+            "full Q RoPE early-resolve hint",
+        ),
+        (
+            "params_t8.set_allow_early_resolve(true);",
+            "full KV RoPE/cache early-resolve hint",
+        ),
+        (
+            "params_t31.set_allow_early_resolve(true);",
+            "SWA Q RoPE early-resolve hint",
+        ),
+        (
+            "params_t32.set_allow_early_resolve(true);",
+            "SWA KV RoPE/cache early-resolve hint",
+        ),
+    ],
+)
+def test_attention_codegen_contract_requires_rope_early_resolve(
+    needle: str,
+    expected_error: str,
+) -> None:
+    source = _valid_attention_codegen_source().replace(needle, "")
+    assert expected_error in _attention_codegen_contract_errors(source)
+
+
 def test_attention_codegen_contract_checks_every_swa_stage_bound() -> None:
     source = _valid_attention_codegen_source().replace(
         "params_t36.launch_spec.set_block_num("
@@ -165,6 +272,53 @@ def test_attention_codegen_contract_checks_launch_scalar_ssa_identity() -> None:
     )
     assert (
         "full SV launch/scalar SSA agreement"
+        in _attention_codegen_contract_errors(source)
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "needle", "replacement"),
+    [
+        (
+            "full",
+            "params_t10.add_input(all_q_padded_v1);",
+            "params_t10.add_input(all_q_padded_v2);",
+        ),
+        (
+            "full",
+            "params_t10.add_input(ext_k_cache);",
+            "params_t10.add_input(ext_k_cache_v2);",
+        ),
+        (
+            "full",
+            "params_t12.add_input(ext_v_cache);",
+            "params_t12.add_input(ext_v_cache_v2);",
+        ),
+        (
+            "swa",
+            "params_t34.add_input(all_q_padded_swa_v1);",
+            "params_t34.add_input(all_q_padded_swa_v2);",
+        ),
+        (
+            "swa",
+            "params_t34.add_input(ext_k_cache_swa);",
+            "params_t34.add_input(ext_k_cache_swa_v2);",
+        ),
+        (
+            "swa",
+            "params_t36.add_input(ext_v_cache_swa);",
+            "params_t36.add_input(ext_v_cache_swa_v2);",
+        ),
+    ],
+)
+def test_attention_codegen_contract_rejects_rope_cache_lineage_version_mismatch(
+    prefix: str,
+    needle: str,
+    replacement: str,
+) -> None:
+    source = _valid_attention_codegen_source().replace(needle, replacement)
+    assert (
+        f"{prefix} split RoPE tensor lineage"
         in _attention_codegen_contract_errors(source)
     )
 
@@ -270,43 +424,400 @@ def test_grain_plus_one_heterogeneous_rows_always_fall_back(grain: int) -> None:
     ) == expected
 
 
-def test_compact_metadata_uses_fixed_total_pages_for_bs4() -> None:
-    contexts = [16384] * 4
+@pytest.mark.parametrize("active_rows", [1, 2, 4, 7, 8, 16])
+def test_compact_metadata_gives_every_request_its_own_64k_pages(
+    active_rows: int,
+) -> None:
+    contexts = [65536] * active_rows
+    physical_blocks = active_rows * 512 + 15
     _seq, _pos, table, slot = _step_metadata(
         context_lens=contexts,
         num_blocks=512,
         batch=16,
-        active_rows=4,
-        physical_blocks=527,
+        active_rows=active_rows,
+        physical_blocks=physical_blocks,
     )
     table = table.reshape(16, 512)
-    assert table[0, :128].tolist() == list(range(0, 128))
-    assert table[1, :128].tolist() == list(range(128, 256))
-    assert table[2, :128].tolist() == list(range(256, 384))
-    assert table[3, :128].tolist() == list(range(384, 512))
-    assert slot[:4].tolist() == [
-        16383,
-        32767,
-        49151,
-        65535,
+    for row in range(active_rows):
+        block0 = row * 512
+        assert table[row].tolist() == list(range(block0, block0 + 512))
+        assert int(slot[row]) == (block0 + 512) * 128 - 1
+    assert table[active_rows:].count_nonzero().item() == 0
+
+
+def test_compact_metadata_can_reverse_chronological_page_order() -> None:
+    _seq, _pos, table, slot = _step_metadata(
+        context_lens=[384],
+        num_blocks=4,
+        batch=2,
+        active_rows=1,
+        physical_blocks=4,
+        block_table_order="reverse",
+    )
+    table = table.reshape(2, 4)
+    assert table[0].tolist() == [2, 1, 0, 0]
+    assert int(slot[0]) == 127
+    assert table[1].count_nonzero().item() == 0
+
+
+def test_compact_metadata_rejects_unknown_page_order() -> None:
+    with pytest.raises(ValueError, match="block_table_order"):
+        _step_metadata(
+            context_lens=[128],
+            num_blocks=1,
+            batch=1,
+            active_rows=1,
+            block_table_order="random",
+        )
+
+
+def test_runtime_batch_matrix_preserves_requested_non_power_of_two_order() -> None:
+    assert _runtime_active_row_counts(
+        "1,2,4,7,8,16",
+        default=1,
+        capacity=16,
+    ) == [1, 2, 4, 7, 8, 16]
+    assert _runtime_active_row_counts(
+        "",
+        default=7,
+        capacity=16,
+    ) == [7]
+    with pytest.raises(ValueError, match="distinct"):
+        _runtime_active_row_counts("1,1", default=1, capacity=16)
+    with pytest.raises(ValueError, match=r"in \[0,16\]"):
+        _runtime_active_row_counts("17", default=1, capacity=16)
+
+
+def test_alternating_input_audit_is_cold_discriminating_and_restores_a() -> None:
+    current = torch.zeros(2, 2, 3, dtype=torch.bfloat16)
+    output = torch.empty_like(current)
+    input_a = (
+        torch.arange(6, dtype=torch.float32)
+        .reshape(1, 2, 3)
+        .expand(2, -1, -1)
+        .clone()
+        .bfloat16()
+    )
+    input_b = (input_a.float() * -2.0 + 0.5).bfloat16()
+    calls = []
+
+    def run_once() -> None:
+        calls.append(current.clone())
+        output.copy_((current.float() * 3.0 + 1.0).bfloat16())
+
+    report = _run_alternating_input_audit(
+        run_once=run_once,
+        current_hidden=current,
+        next_hidden_out=output,
+        input_a=input_a,
+        input_b=input_b,
+        active_rows=2,
+        iterations=6,
+    )
+
+    assert report["passed"]
+    assert report["zero_warmup"]
+    assert report["reference_sha256"]["A"] != report["reference_sha256"]["B"]
+    assert [entry["variant"] for entry in report["iteration_hashes"]] == [
+        "A", "B", "A", "B", "A", "B",
     ]
+    assert torch.equal(calls[0], input_a)
+    assert torch.equal(calls[1], input_b)
+    assert torch.equal(current, input_a)
 
 
-def test_compact_metadata_bs12_64k_uses_512_pages() -> None:
-    contexts = [5504] * 8 + [5376] * 4
-    _seq, _pos, table, _slot = _step_metadata(
-        context_lens=contexts,
-        num_blocks=512,
-        batch=16,
-        active_rows=12,
-        physical_blocks=527,
+def test_alternating_input_audit_rejects_partially_unwritten_output() -> None:
+    current = torch.zeros(2, 2, 3, dtype=torch.bfloat16)
+    output = torch.empty_like(current)
+    input_a = torch.ones_like(current)
+    input_b = torch.full_like(current, 2.0)
+
+    def run_once() -> None:
+        output[:, :, 1:].copy_(current[:, :, 1:])
+
+    with pytest.raises(RuntimeError, match="unwritten/poisoned"):
+        _run_alternating_input_audit(
+            run_once=run_once,
+            current_hidden=current,
+            next_hidden_out=output,
+            input_a=input_a,
+            input_b=input_b,
+            active_rows=2,
+            iterations=4,
+        )
+    assert torch.equal(current, input_a)
+
+
+def test_alternating_input_audit_rejects_stale_variant_publication() -> None:
+    current = torch.zeros(2, 2, 3, dtype=torch.bfloat16)
+    output = torch.empty_like(current)
+    input_a = torch.ones_like(current)
+    input_b = torch.full_like(current, 2.0)
+    invocation = 0
+
+    def run_once() -> None:
+        nonlocal invocation
+        invocation += 1
+        published = input_b if invocation == 3 else current
+        output.copy_(published)
+
+    with pytest.raises(RuntimeError, match="stale/intermittent publication"):
+        _run_alternating_input_audit(
+            run_once=run_once,
+            current_hidden=current,
+            next_hidden_out=output,
+            input_a=input_a,
+            input_b=input_b,
+            active_rows=2,
+            iterations=4,
+        )
+    assert torch.equal(current, input_a)
+
+
+def test_inactive_row_audit_requires_identical_active_output() -> None:
+    current = torch.zeros(2, 3, 4, dtype=torch.bfloat16)
+    output = torch.empty_like(current)
+    input_a = torch.ones_like(current)
+    input_b = input_a.clone()
+    input_b[:, 2].fill_(99.0)
+
+    def run_once() -> None:
+        output.copy_(current)
+
+    report = _run_alternating_input_audit(
+        run_once=run_once,
+        current_hidden=current,
+        next_hidden_out=output,
+        input_a=input_a,
+        input_b=input_b,
+        active_rows=2,
+        iterations=4,
+        expected_output_relation="same",
+        zero_warmup=False,
     )
-    table = table.reshape(16, 512)
-    used = []
-    for row, context_len in enumerate(contexts):
-        blocks = (context_len + 127) // 128
-        used.extend(table[row, :blocks].tolist())
-    assert used == list(range(512))
+
+    assert report["passed"]
+    assert not report["zero_warmup"]
+    assert report["expected_output_relation"] == "same"
+    assert report["reference_sha256"]["A"] == report["reference_sha256"]["B"]
+
+
+def test_alternating_input_audit_rejects_unchanged_output_tile() -> None:
+    current = torch.zeros(2, 2, 128, dtype=torch.bfloat16)
+    output = torch.empty_like(current)
+    input_a = torch.ones_like(current)
+    input_b = torch.full_like(current, 2.0)
+
+    def run_once() -> None:
+        output.copy_(current)
+        output[:, :, 64:].fill_(7.0)
+
+    with pytest.raises(RuntimeError, match="non-discriminating row/column"):
+        _run_alternating_input_audit(
+            run_once=run_once,
+            current_hidden=current,
+            next_hidden_out=output,
+            input_a=input_a,
+            input_b=input_b,
+            active_rows=2,
+            iterations=4,
+        )
+
+
+def test_alternating_audit_can_discriminate_external_variant_source() -> None:
+    current = torch.ones(2, 1, 128, dtype=torch.bfloat16)
+    output = torch.empty_like(current)
+    invocation = 0
+
+    def run_once() -> None:
+        nonlocal invocation
+        scale = 1.0 if invocation % 2 == 0 else 2.0
+        invocation += 1
+        output.copy_((current.float() * scale).bfloat16())
+
+    report = _run_alternating_input_audit(
+        run_once=run_once,
+        current_hidden=current,
+        next_hidden_out=output,
+        input_a=current.clone(),
+        input_b=current.clone(),
+        active_rows=1,
+        iterations=4,
+        require_distinct_active_inputs=False,
+    )
+
+    assert report["passed"]
+    assert report["active_inputs_equal"]
+    assert not report["require_distinct_active_inputs"]
+    assert report["reference_sha256"]["A"] != report["reference_sha256"]["B"]
+
+
+def test_full_kv_slot_oracle_applies_bf16_norm_and_rope() -> None:
+    hidden = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0]]],
+        dtype=torch.bfloat16,
+    )
+    identity = (
+        torch.eye(4, dtype=torch.float32)
+        .reshape(1, 4, 4)
+        .bfloat16()
+    )
+    k_row, v_row = _full_kv_slot_oracle(
+        hidden=hidden,
+        input_rms_weight=torch.zeros(1, 4),
+        k_norm_weight=torch.zeros(1, 4),
+        wk=identity,
+        wv=identity,
+        rope_cos=torch.tensor([[0.0, 0.0]]),
+        rope_sin=torch.tensor([[1.0, 1.0]]),
+        eps=1.0e-5,
+    )
+
+    normed = (
+        hidden.float()
+        * torch.rsqrt(
+            hidden.float().pow(2).mean(dim=-1, keepdim=True) + 1.0e-5,
+        )
+    ).bfloat16()
+    k_normed = (
+        normed.float()
+        * torch.rsqrt(
+            normed.float().pow(2).mean(dim=-1, keepdim=True) + 1.0e-5,
+        )
+    )
+    expected_k = torch.cat(
+        (
+            -k_normed[..., 1:2],
+            k_normed[..., 0:1],
+            k_normed[..., 2:],
+        ),
+        dim=-1,
+    ).bfloat16()
+
+    assert torch.equal(v_row, normed)
+    assert torch.equal(k_row, expected_k)
+
+
+def test_swa_local_partial_oracle_matches_reverse_table_reference() -> None:
+    hidden = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0]],
+        dtype=torch.bfloat16,
+    )
+    wq = torch.zeros(4, 4, dtype=torch.bfloat16)
+    wk = torch.zeros(4, 2, dtype=torch.bfloat16)
+    wv = torch.eye(4).bfloat16()[:, :2].contiguous()
+    wo = torch.eye(4).bfloat16()
+    w_g = torch.zeros(4, 2, dtype=torch.bfloat16)
+    gate_r = torch.tensor(
+        [[1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0]],
+        dtype=torch.bfloat16,
+    )
+    seq_lens = torch.tensor([3], dtype=torch.int32)
+    block_table = torch.zeros(1, 2, dtype=torch.int32)
+    block_table[0, 0] = 1
+    block_table[0, 1] = 0
+    slot_mapping = torch.tensor([0], dtype=torch.int32)
+    rope_cos = torch.ones(3, 2)
+    rope_sin = torch.zeros(3, 2)
+    k_cache = torch.tensor(
+        [[0.25, 0.5], [0.75, 1.0], [1.25, 1.5], [1.75, 2.0]],
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.tensor(
+        [[2.0, 1.75], [1.5, 1.25], [1.0, 0.75], [0.5, 0.25]],
+        dtype=torch.bfloat16,
+    )
+
+    partial = _torch_swa_local_partial_oracle(
+        hidden=hidden,
+        input_rms_weight=torch.zeros(4),
+        q_norm_weight=torch.zeros(2),
+        k_norm_weight=torch.zeros(2),
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wo=wo,
+        w_g=w_g,
+        gate_r=gate_r,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+        rope_cos=rope_cos,
+        rope_sin=rope_sin,
+        k_cache_layer=k_cache,
+        v_cache_layer=v_cache,
+        eps=1.0e-5,
+        block_size=2,
+        sliding_window=3,
+        out_proj_k_chunk=2,
+        out_proj_n_chunk=2,
+    )
+    normed = (
+        hidden.float()
+        * torch.rsqrt(
+            hidden.float().pow(2).mean(dim=-1, keepdim=True) + 1.0e-5,
+        )
+    ).bfloat16()
+    current_v = (normed.float() @ wv.float()).bfloat16()[0]
+    context = (
+        (
+            v_cache[2].float()
+            + v_cache[3].float()
+            + current_v.float()
+        )
+        / 3.0
+    ).bfloat16()
+    expected = (
+        torch.cat((context, context)).float() * 0.5
+    ).bfloat16().reshape(1, 4)
+
+    assert torch.equal(partial, expected)
+
+
+def test_kv_slot_audit_layout_separates_layers_targets_and_canaries() -> None:
+    layout = _kv_slot_audit_layout(
+        page_base=512,
+        active_rows=2,
+        layer_cache_rows=1024 * 128,
+    )
+    assert len(layout) == 12
+    assert [slot["attention_kind"] for slot in layout[:6]] == ["full"] * 6
+    assert [slot["attention_kind"] for slot in layout[6:]] == ["swa"] * 6
+    assert [slot["role"] for slot in layout[:3]] == [
+        "target",
+        "left_canary",
+        "right_canary",
+    ]
+    target = layout[0]["cache_row"]
+    assert layout[1]["cache_row"] == target - 1
+    assert layout[2]["cache_row"] == target + 1
+    assert layout[6]["cache_row"] - target == 1024 * 128
+
+
+def test_tilewise_numerical_report_catches_one_bad_64_column_tile() -> None:
+    expected = torch.zeros(8, 7, 128)
+    actual = expected.clone()
+    actual[0, 0, 0] = 1.0
+    aggregate = _tilewise_numerical_report(
+        actual=actual,
+        expected=expected,
+        tile_width=64,
+        atol=0.05,
+        rtol=0.05,
+        max_bad_ratio=0.01,
+    )
+    assert aggregate["passed"]
+
+    per_rank_row = _tilewise_numerical_report(
+        actual=actual[0, 0],
+        expected=expected[0, 0],
+        tile_width=64,
+        atol=0.05,
+        rtol=0.05,
+        max_bad_ratio=0.01,
+    )
+    assert not per_rank_row["passed"]
+    assert per_rank_row["tiles"][0]["bad_ratio"] == pytest.approx(1.0 / 64.0)
 
 
 def test_compact_metadata_rejects_small_physical_pool() -> None:

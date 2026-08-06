@@ -17,7 +17,15 @@ _SOURCE = (
 
 
 def test_swa_attention_stages_capture_and_chain_runtime_tasks() -> None:
+    assert "name_hint=\"swa_rope_q\"" in _SOURCE
+    assert ") as swa_rope_q_tid:" in _SOURCE
+    assert "name_hint=\"swa_rope_kv_cache\"" in _SOURCE
+    assert ") as swa_rope_kv_tid:" in _SOURCE
     assert "with pl.spmd(\n        swa_active_tasks,\n        name_hint=\"swa_qk_matmul\"" in _SOURCE
+    assert (
+        "name_hint=\"swa_qk_matmul\",\n"
+        "        deps=[swa_rope_q_tid, swa_rope_kv_tid],"
+    ) in _SOURCE
     assert ") as swa_qk_tid:" in _SOURCE
     assert "name_hint=\"swa_softmax\",\n        deps=[swa_qk_tid]," in _SOURCE
     assert ") as swa_softmax_tid:" in _SOURCE

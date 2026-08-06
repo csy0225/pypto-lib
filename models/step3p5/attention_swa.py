@@ -74,10 +74,9 @@ re-stated here for symmetry:
 
 Per-layer ``rope_theta = 1e4`` (no yarn scaling on SWA layers per
 ``yarn_only_types = ["full_attention"]``). The sliding-window mask
-(``eff_ctx_len = min(seq_len, SLIDING_WINDOW)``, BLOCK_SIZE=128 →
-4 paged blocks per KV head) applies to the local-head slice the same
-way it applies to the global heads: per-rank q rows attend only to
-window-local k/v rows that the rank's KV cache shard already holds.
+selects ``[max(0, seq_len - SLIDING_WINDOW), seq_len)`` from the
+chronological paged block table. An unaligned 512-token window spans
+five physical blocks; aligned windows span four.
 
 TODO(phase-3 SWA cache layout): linear layout retained for Wave 2; the
 rotating-slot variant ``((start_pos + s) % WIN)`` is deferred until the
@@ -534,14 +533,68 @@ def attention_swa(
         [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.BF16,
     )
 
-    # Scope-2 runtime bound: BATCH is storage capacity, not logical batch.
-    # Keep the static extent for the compiler/tiling ABI, but predicate the
-    # complete per-row RoPE/KV producer by ``active_tokens``.  Inactive rows
-    # must not read clamped metadata and must never write a padding slot: the
-    # reserve is storage/allocator metadata, not an attention output sink.
-    # This also keeps the formal seq_lens/slot_mapping capacity independent of
-    # the runtime active-token count.
-    for b in pl.parallel(BATCH):
+    # Separate active-row tasks write Q and update the resident K/V cache.
+    with pl.spmd(
+        active_tokens,
+        name_hint="swa_rope_q",
+        allow_early_resolve=True,
+    ) as swa_rope_q_tid:
+        b = pl.tile.get_block_idx()
+        if b < active_tokens:
+            ctx_len = pl.tensor.read(seq_lens, [b])
+            pos = ctx_len - 1
+            cos_row = pl.slice(rope_cos, [1, ROTARY_HALF_SWA * 2], [pos, 0])
+            sin_row = pl.slice(rope_sin, [1, ROTARY_HALF_SWA * 2], [pos, 0])
+            cos_lo = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, 0])
+            cos_hi = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
+            sin_lo = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, 0])
+            sin_hi = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
+
+            for ki in pl.range(KV_HEADS_LOCAL):
+                # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_SWA] slices of
+                # q_proj_norm (mirrors the K path), replacing reshape([.,HEAD_DIM])
+                # + col-offset slice which miscompiled the rot_q_hi write into
+                # all_q_padded. See attention_full.py Scope 2 / _stage_scope12_qk.py.
+                q_base = ki * Q_PER_KV_SWA
+                pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED + ki * SWA_Q_PAD_ALIGNED
+                for qh in pl.range(Q_HEAD_BATCH_SWA):
+                    qh_col = (q_base + qh) * HEAD_DIM
+                    q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col])
+                    q_hi_h = pl.slice(
+                        q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col + ROTARY_HALF_SWA],
+                    )
+                    rot_q_lo_h = pl.sub(
+                        pl.col_expand_mul(q_lo_h, cos_lo),
+                        pl.col_expand_mul(q_hi_h, sin_lo),
+                    )
+                    rot_q_hi_h = pl.add(
+                        pl.col_expand_mul(q_hi_h, cos_hi),
+                        pl.col_expand_mul(q_lo_h, sin_hi),
+                    )
+                    q_row = pad_row_base + qh
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
+                        [q_row, ROTARY_HALF_SWA],
+                    )
+                all_q_padded = pl.assemble(
+                    all_q_padded,
+                    pl.cast(
+                        pl.full([SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA, HEAD_DIM],
+                                dtype=pl.FP32, value=0.0),
+                        target_type=pl.BF16,
+                    ),
+                    [pad_row_base + Q_HEAD_BATCH_SWA, 0],
+                )
+
+    with pl.spmd(
+        active_tokens,
+        name_hint="swa_rope_kv_cache",
+        allow_early_resolve=True,
+    ) as swa_rope_kv_tid:
+        b = pl.tile.get_block_idx()
         if b < active_tokens:
             ctx_len = pl.tensor.read(seq_lens, [b])
             pos = ctx_len - 1
@@ -555,108 +608,70 @@ def attention_swa(
             sin_lo = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, 0])
             sin_hi = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_kv_cache"):
-                for ki in pl.range(KV_HEADS_LOCAL):
-                    kv_col = ki * HEAD_DIM
-                    cache_row = (
-                        layer_cache_base
-                        + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
-                        + slot_offset
-                    )
-                    k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col])
-                    k_hi = pl.slice(
-                        k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col + ROTARY_HALF_SWA],
-                    )
-                    rot_k_lo = pl.sub(
-                        pl.col_expand_mul(k_lo, cos_lo),
-                        pl.col_expand_mul(k_hi, sin_lo),
-                    )
-                    rot_k_hi = pl.add(
-                        pl.col_expand_mul(k_hi, cos_hi),
-                        pl.col_expand_mul(k_lo, sin_hi),
-                    )
-                    k_cache = pl.assemble(
-                        k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
-                    )
-                    k_cache = pl.assemble(
-                        k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
-                        [cache_row, ROTARY_HALF_SWA],
-                    )
-                    v_cache = pl.assemble(
-                        v_cache,
-                        pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
-                                target_type=pl.BF16),
-                        [cache_row, 0],
-                    )
+            for ki in pl.range(KV_HEADS_LOCAL):
+                kv_col = ki * HEAD_DIM
+                cache_row = (
+                    layer_cache_base
+                    + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
+                    + slot_offset
+                )
+                k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col])
+                k_hi = pl.slice(
+                    k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col + ROTARY_HALF_SWA],
+                )
+                rot_k_lo = pl.sub(
+                    pl.col_expand_mul(k_lo, cos_lo),
+                    pl.col_expand_mul(k_hi, sin_lo),
+                )
+                rot_k_hi = pl.add(
+                    pl.col_expand_mul(k_hi, cos_hi),
+                    pl.col_expand_mul(k_lo, sin_hi),
+                )
+                k_cache = pl.assemble(
+                    k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
+                )
+                k_cache = pl.assemble(
+                    k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
+                    [cache_row, ROTARY_HALF_SWA],
+                )
+                v_cache = pl.assemble(
+                    v_cache,
+                    pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
+                            target_type=pl.BF16),
+                    [cache_row, 0],
+                )
 
-                    # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_SWA] slices of
-                    # q_proj_norm (mirrors the K path), replacing reshape([.,HEAD_DIM])
-                    # + col-offset slice which miscompiled the rot_q_hi write into
-                    # all_q_padded. See attention_full.py Scope 2 / _stage_scope12_qk.py.
-                    q_base = ki * Q_PER_KV_SWA
-                    pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED + ki * SWA_Q_PAD_ALIGNED
-                    for qh in pl.range(Q_HEAD_BATCH_SWA):
-                        qh_col = (q_base + qh) * HEAD_DIM
-                        q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col])
-                        q_hi_h = pl.slice(
-                            q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col + ROTARY_HALF_SWA],
-                        )
-                        rot_q_lo_h = pl.sub(
-                            pl.col_expand_mul(q_lo_h, cos_lo),
-                            pl.col_expand_mul(q_hi_h, sin_lo),
-                        )
-                        rot_q_hi_h = pl.add(
-                            pl.col_expand_mul(q_hi_h, cos_hi),
-                            pl.col_expand_mul(q_lo_h, sin_hi),
-                        )
-                        q_row = pad_row_base + qh
-                        all_q_padded = pl.assemble(
-                            all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
-                        )
-                        all_q_padded = pl.assemble(
-                            all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
-                            [q_row, ROTARY_HALF_SWA],
-                        )
-                    all_q_padded = pl.assemble(
-                        all_q_padded,
-                        pl.cast(
-                            pl.full([SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA, HEAD_DIM],
-                                    dtype=pl.FP32, value=0.0),
-                            target_type=pl.BF16,
-                        ),
-                        [pad_row_base + Q_HEAD_BATCH_SWA, 0],
-                    )
 
     # ----- fa_fused (SWA) — Phase A (2026-06-11): qwen3/32b-style 4-spmd. -----
     # Mirror of attention_full.py's Phase A rewrite. SWA differs only in:
     #   * Q_HEAD_BATCH_SWA=12 / Q_HEAD_PAD_SWA=24 / SWA_Q_PAD_ALIGNED=32
     #     (instead of full's 8/16/16)
-    #   * fa_eff_ctx_len = min(fa_ctx_len, SLIDING_WINDOW) — window clamp on
-    #     the iteration count; KV-tile addressing is unchanged (the cache
-    #     still spans the full ctx, the window clamp just caps how many
-    #     tiles we iterate). At SLIDING_WINDOW=512 and BLOCK_SIZE=128,
-    #     SWA_WIN_BLOCKS=4 caps the GM scratch size 8x below the full path.
+    #   * the block-table range covers the trailing token window.
     # See docs/step3p5/phases/15-singlerank-npu.md "Phase A route decision".
     # Localise the module-level WIN_BLOCKS constant: pypto IR's frontend does
     # not lift bare module globals computed inside the file (only ``from
     # .config import`` names round-trip through the trace).
     SWA_WIN_BLOCKS = (SLIDING_WINDOW + BLOCK_SIZE - 1) // BLOCK_SIZE
+    SWA_STORAGE_BLOCKS = SWA_WIN_BLOCKS + 1
     all_raw_scores = pl.create_tensor(
-        [BATCH * SWA_WIN_BLOCKS * SWA_Q_PAD_ALIGNED, BLOCK_SIZE], dtype=pl.FP32,
+        [BATCH * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
+        dtype=pl.FP32,
     )
     all_exp_padded = pl.create_tensor(
-        [BATCH * SWA_WIN_BLOCKS * SWA_Q_PAD_ALIGNED, BLOCK_SIZE], dtype=pl.BF16,
+        [BATCH * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
+        dtype=pl.BF16,
     )
     # mi/li 以 [1, SWA_Q_PAD_ALIGNED] 宽行落盘，避免从 GM 直接 slice
     # 出 FP32 [N,1] 窄列 tile。Padded heads 只参与中间计算，最终会裁掉。
     all_cur_mi = pl.create_tensor(
-        [BATCH * SWA_WIN_BLOCKS, SWA_Q_PAD_ALIGNED], dtype=pl.FP32,
+        [BATCH * SWA_STORAGE_BLOCKS, SWA_Q_PAD_ALIGNED], dtype=pl.FP32,
     )
     all_cur_li = pl.create_tensor(
-        [BATCH * SWA_WIN_BLOCKS, SWA_Q_PAD_ALIGNED], dtype=pl.FP32,
+        [BATCH * SWA_STORAGE_BLOCKS, SWA_Q_PAD_ALIGNED], dtype=pl.FP32,
     )
     all_oi_tmp = pl.create_tensor(
-        [BATCH * SWA_WIN_BLOCKS * SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.FP32,
+        [BATCH * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED, HEAD_DIM],
+        dtype=pl.FP32,
     )
     # Launch exactly one logical task per active row. Keep the launch extent
     # as a loop-carried SSA value: older codegen can leave a direct
@@ -671,13 +686,18 @@ def attention_swa(
     with pl.spmd(
         swa_active_tasks,
         name_hint="swa_qk_matmul",
+        deps=[swa_rope_q_tid, swa_rope_kv_tid],
         allow_early_resolve=True,
     ) as swa_qk_tid:
         fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
-            fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
-            fa_ctx_blocks = (fa_eff_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)
+            fa_first_block = fa_window_start // BLOCK_SIZE
+            fa_end_block = (
+                fa_ctx_len + BLOCK_SIZE - 1
+            ) // BLOCK_SIZE
+            fa_ctx_blocks = fa_end_block - fa_first_block
             fa_block_table_base = fa_b * bt_stride
             q_padded_row = fa_b * SWA_Q_PAD_ALIGNED  # KV_HEADS_LOCAL=1, Q_GROUPS=1
             q_padded = pl.slice(
@@ -685,20 +705,27 @@ def attention_swa(
             )
             for sb in pl.range(fa_ctx_blocks):
                 fa_pbid = pl.cast(
-                    pl.tensor.read(block_table, [fa_block_table_base + sb]), pl.INDEX,
+                    pl.tensor.read(
+                        block_table,
+                        [fa_block_table_base + fa_first_block + sb],
+                    ),
+                    pl.INDEX,
                 )
                 fa_cache_row = layer_cache_base + fa_pbid * BLOCK_SIZE
                 k_tile = pl.slice(
-                    k_cache, [BLOCK_SIZE, HEAD_DIM], [fa_cache_row, 0],
+                    k_cache,
+                    [BLOCK_SIZE, HEAD_DIM],
+                    [fa_cache_row, 0],
                 )
                 raw_scores = pl.matmul(
                     q_padded, k_tile, b_trans=True, out_dtype=pl.FP32,
                 )
-                scratch_row = (fa_b * SWA_WIN_BLOCKS + sb) * SWA_Q_PAD_ALIGNED
+                scratch_row = (
+                    fa_b * SWA_STORAGE_BLOCKS + sb
+                ) * SWA_Q_PAD_ALIGNED
                 all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [scratch_row, 0])
 
-    # Stage 2: softmax (vec). pl.slice(valid_shape=) marks Q_HEAD_BATCH_SWA real
-    # rows + valid_len columns; fillpad pushes -inf into the masked tail.
+    # Stage 2: softmax (vec).
     with pl.spmd(
         swa_active_tasks,
         name_hint="swa_softmax",
@@ -708,20 +735,58 @@ def attention_swa(
         fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
-            fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
-            fa_ctx_blocks = (fa_eff_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)
+            fa_first_block = fa_window_start // BLOCK_SIZE
+            fa_end_block = (
+                fa_ctx_len + BLOCK_SIZE - 1
+            ) // BLOCK_SIZE
+            fa_ctx_blocks = fa_end_block - fa_first_block
             for sb in pl.range(fa_ctx_blocks):
-                s0 = sb * BLOCK_SIZE
-                valid_len = pl.min(BLOCK_SIZE, fa_eff_ctx_len - s0)
-                scratch_row = (fa_b * SWA_WIN_BLOCKS + sb) * SWA_Q_PAD_ALIGNED
-                scores_valid = pl.slice(
+                fa_block = fa_first_block + sb
+                fa_block_token0 = fa_block * BLOCK_SIZE
+                valid_lo = pl.max(
+                    0,
+                    fa_window_start - fa_block_token0,
+                )
+                valid_hi = pl.min(
+                    BLOCK_SIZE,
+                    fa_ctx_len - fa_block_token0,
+                )
+                valid_len = valid_hi - valid_lo
+                scratch_row = (
+                    fa_b * SWA_STORAGE_BLOCKS + sb
+                ) * SWA_Q_PAD_ALIGNED
+                raw_scores = pl.slice(
                     all_raw_scores,
                     [SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
                     [scratch_row, 0],
-                    valid_shape=[Q_HEAD_BATCH_SWA, valid_len],
                 )
-                scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-                scores = pl.mul(scores_padded, decode_attn_scale)
+                scores = pl.mul(raw_scores, decode_attn_scale)
+                if valid_len < BLOCK_SIZE:
+                    score_cols = pl.arange(
+                        0,
+                        [1, BLOCK_SIZE],
+                        dtype=pl.INT32,
+                    )
+                    valid_from_i32 = pl.cmp(
+                        score_cols,
+                        pl.cast(valid_lo, pl.INT32),
+                        cmp_type=5,
+                    )
+                    valid_to_i32 = pl.cmp(
+                        score_cols,
+                        pl.cast(valid_hi, pl.INT32),
+                        cmp_type=2,
+                    )
+                    valid_mask = pl.cast(
+                        pl.mul(valid_from_i32, valid_to_i32),
+                        target_type=pl.FP32,
+                    )
+                    invalid_bias = pl.mul(
+                        pl.sub(valid_mask, 1.0),
+                        1.0e20,
+                    )
+                    scores = pl.col_expand_add(scores, invalid_bias)
                 cur_mi = pl.row_max(scores)
                 exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
                 exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
@@ -730,7 +795,7 @@ def attention_swa(
                 all_exp_padded = pl.assemble(
                     all_exp_padded, exp_scores_bf16, [scratch_row, 0],
                 )
-                lm_row = fa_b * SWA_WIN_BLOCKS + sb
+                lm_row = fa_b * SWA_STORAGE_BLOCKS + sb
                 all_cur_mi = pl.assemble(
                     all_cur_mi,
                     pl.reshape(cur_mi, [1, SWA_Q_PAD_ALIGNED]),
@@ -754,18 +819,30 @@ def attention_swa(
         fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
-            fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
-            fa_ctx_blocks = (fa_eff_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+            fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)
+            fa_first_block = fa_window_start // BLOCK_SIZE
+            fa_end_block = (
+                fa_ctx_len + BLOCK_SIZE - 1
+            ) // BLOCK_SIZE
+            fa_ctx_blocks = fa_end_block - fa_first_block
             fa_block_table_base = fa_b * bt_stride
             for sb in pl.range(fa_ctx_blocks):
                 fa_pbid = pl.cast(
-                    pl.tensor.read(block_table, [fa_block_table_base + sb]), pl.INDEX,
+                    pl.tensor.read(
+                        block_table,
+                        [fa_block_table_base + fa_first_block + sb],
+                    ),
+                    pl.INDEX,
                 )
                 fa_cache_row = layer_cache_base + fa_pbid * BLOCK_SIZE
                 v_tile = pl.slice(
-                    v_cache, [BLOCK_SIZE, HEAD_DIM], [fa_cache_row, 0],
+                    v_cache,
+                    [BLOCK_SIZE, HEAD_DIM],
+                    [fa_cache_row, 0],
                 )
-                scratch_row = (fa_b * SWA_WIN_BLOCKS + sb) * SWA_Q_PAD_ALIGNED
+                scratch_row = (
+                    fa_b * SWA_STORAGE_BLOCKS + sb
+                ) * SWA_Q_PAD_ALIGNED
                 exp_tile = pl.slice(
                     all_exp_padded,
                     [SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
@@ -790,10 +867,16 @@ def attention_swa(
         fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
-            fa_eff_ctx_len = pl.min(fa_ctx_len, SLIDING_WINDOW)
-            fa_ctx_blocks = (fa_eff_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-            oi_row0 = fa_b * SWA_WIN_BLOCKS * SWA_Q_PAD_ALIGNED
-            lm_row0 = fa_b * SWA_WIN_BLOCKS
+            fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)
+            fa_first_block = fa_window_start // BLOCK_SIZE
+            fa_end_block = (
+                fa_ctx_len + BLOCK_SIZE - 1
+            ) // BLOCK_SIZE
+            fa_ctx_blocks = fa_end_block - fa_first_block
+            oi_row0 = (
+                fa_b * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED
+            )
+            lm_row0 = fa_b * SWA_STORAGE_BLOCKS
             oi = pl.slice(
                 all_oi_tmp, [SWA_Q_PAD_ALIGNED, HEAD_DIM], [oi_row0, 0],
             )
@@ -1246,8 +1329,8 @@ def _torch_single_card_attention_swa(
 ):
     """Pure-torch single-card oracle for the SWA path.
 
-    SWA variant: ``rotary_dim == head_dim`` (no pass-through tail), and
-    ``eff_ctx_len = min(seq_len, sliding_window)``.
+    SWA variant: ``rotary_dim == head_dim`` (no pass-through tail), and the
+    visible range is ``[max(0, seq_len - sliding_window), seq_len)``.
     """
     import math
 
@@ -1278,7 +1361,7 @@ def _torch_single_card_attention_swa(
     q_proj_norm = per_head(q_proj, num_heads_full, q_norm_weight[0:1, :])
     k_proj_norm = per_head(k_proj, num_kv_heads_full, k_norm_weight[0:1, :])
 
-    gate_logits = hidden_states.float() @ w_g_full.float()
+    gate_logits = normed_bf16.float() @ w_g_full.float()
     k_cache = k_cache_full.clone()
     v_cache = v_cache_full.clone()
     max_ctx_blocks = MAX_BLOCKS_PER_SEQ
@@ -1286,8 +1369,9 @@ def _torch_single_card_attention_swa(
 
     for b in range(batch):
         ctx_len = int(seq_lens[b].item())
-        eff_ctx_len = min(ctx_len, sliding_window)
-        eff_ctx_blocks = (eff_ctx_len + block_size - 1) // block_size
+        window_start = max(0, ctx_len - sliding_window)
+        first_block = window_start // block_size
+        end_block = (ctx_len + block_size - 1) // block_size
         pos = ctx_len - 1
 
         cr = rope_cos[pos : pos + 1, :]
@@ -1323,22 +1407,24 @@ def _torch_single_card_attention_swa(
             oi = torch.zeros(q_per_kv, head_dim)
             li = torch.zeros(q_per_kv, 1)
             mi = torch.zeros(q_per_kv, 1)
-            for sb in range(eff_ctx_blocks):
-                valid_len = min(block_size, eff_ctx_len - sb * block_size)
-                pbid = int(block_table[b * max_ctx_blocks + sb].item())
+            for block in range(first_block, end_block):
+                block_token0 = block * block_size
+                valid_lo = max(window_start, block_token0) - block_token0
+                valid_hi = min(ctx_len, block_token0 + block_size) - block_token0
+                pbid = int(block_table[b * max_ctx_blocks + block].item())
                 cr0 = (pbid * num_kv_heads_full + kvh) * block_size
                 kt = k_cache[cr0 : cr0 + block_size, :]
                 vt = v_cache[cr0 : cr0 + block_size, :]
                 rs = q_grp.float() @ kt.float().T
-                if valid_len < block_size:
-                    rs[:, valid_len:] = torch.finfo(torch.float32).min
+                rs[:, :valid_lo] = torch.finfo(torch.float32).min
+                rs[:, valid_hi:] = torch.finfo(torch.float32).min
                 scores = rs * scale
                 cm = scores.max(dim=-1, keepdim=True).values
                 es = torch.exp(scores - cm)
                 es_b = es.to(torch.bfloat16)
                 cl = es_b.float().sum(dim=-1, keepdim=True)
                 ot = es_b.float() @ vt.float()
-                if sb == 0:
+                if block == first_block:
                     oi, li, mi = ot, cl, cm
                 else:
                     mn = torch.maximum(mi, cm)
@@ -1353,7 +1439,7 @@ def _torch_single_card_attention_swa(
             ] = ctx.reshape(1, -1).to(torch.bfloat16)
         attn_out[b : b + 1, :] = attn_row
 
-    gate = torch.sigmoid(gate_logits).unsqueeze(-1)
+    gate = torch.sigmoid(gate_logits).bfloat16().float().unsqueeze(-1)
     gated = (
         attn_out.view(batch, num_heads_full, head_dim).float() * gate
     ).view(batch, num_heads_full * head_dim).to(torch.bfloat16)
@@ -1452,8 +1538,9 @@ def _torch_per_rank_partial_swa(
     attn_out_local = torch.zeros(batch, hidden_q_local, dtype=torch.bfloat16)
     for b in range(batch):
         ctx_len = int(seq_lens[b].item())
-        eff_ctx_len = min(ctx_len, sliding_window)
-        eff_ctx_blocks = (eff_ctx_len + block_size - 1) // block_size
+        window_start = max(0, ctx_len - sliding_window)
+        first_block = window_start // block_size
+        end_block = (ctx_len + block_size - 1) // block_size
         pos = ctx_len - 1
         cr = rope_cos[pos : pos + 1, :]
         sr = rope_sin[pos : pos + 1, :]
@@ -1488,22 +1575,24 @@ def _torch_per_rank_partial_swa(
             oi = torch.zeros(q_per_kv, head_dim)
             li = torch.zeros(q_per_kv, 1)
             mi = torch.zeros(q_per_kv, 1)
-            for sb in range(eff_ctx_blocks):
-                valid_len = min(block_size, eff_ctx_len - sb * block_size)
-                pbid = int(block_table[b * max_ctx_blocks + sb].item())
+            for block in range(first_block, end_block):
+                block_token0 = block * block_size
+                valid_lo = max(window_start, block_token0) - block_token0
+                valid_hi = min(ctx_len, block_token0 + block_size) - block_token0
+                pbid = int(block_table[b * max_ctx_blocks + block].item())
                 cr0 = (pbid * kv_heads_local + kvh) * block_size
                 kt = k_cache[cr0 : cr0 + block_size, :]
                 vt = v_cache[cr0 : cr0 + block_size, :]
                 rs = q_grp.float() @ kt.float().T
-                if valid_len < block_size:
-                    rs[:, valid_len:] = torch.finfo(torch.float32).min
+                rs[:, :valid_lo] = torch.finfo(torch.float32).min
+                rs[:, valid_hi:] = torch.finfo(torch.float32).min
                 scores = rs * scale
                 cm = scores.max(dim=-1, keepdim=True).values
                 es = torch.exp(scores - cm)
                 es_b = es.to(torch.bfloat16)
                 cl = es_b.float().sum(dim=-1, keepdim=True)
                 ot = es_b.float() @ vt.float()
-                if sb == 0:
+                if block == first_block:
                     oi, li, mi = ot, cl, cm
                 else:
                     mn = torch.maximum(mi, cm)
@@ -1518,7 +1607,11 @@ def _torch_per_rank_partial_swa(
             ] = ctx.reshape(1, -1).to(torch.bfloat16)
         attn_out_local[b : b + 1, :] = attn_row
 
-    gate_local = torch.sigmoid(hidden_states.float() @ w_g_local.float())
+    gate_local = (
+        torch.sigmoid(normed_bf16.float() @ w_g_local.float())
+        .bfloat16()
+        .float()
+    )
     attn_view = attn_out_local.view(batch, heads_local, head_dim).float()
     attn_gated = (attn_view * gate_local.unsqueeze(-1)).to(torch.bfloat16)
     attn_gated_flat = attn_gated.view(batch, hidden_q_local)
@@ -1591,8 +1684,7 @@ def _run_distributed_mock(
     slot_mapping = torch.empty(batch, dtype=torch.int32)
     for b in range(batch):
         ctx_len = int(seq_lens[b].item())
-        eff_ctx_len = min(ctx_len, SLIDING_WINDOW)
-        slot_pos = eff_ctx_len - 1
+        slot_pos = ctx_len - 1
         logical_block = slot_pos // BLOCK_SIZE
         page_offset = slot_pos % BLOCK_SIZE
         phys_block = b * MAX_BLOCKS_PER_SEQ + logical_block

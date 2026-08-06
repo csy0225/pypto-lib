@@ -155,20 +155,29 @@ def test_b3_canonical_kv_is_resident_inout_and_holder_never_copies_pool() -> Non
 
 
 def test_b3_attention_only_writes_slot_addressed_head_rows() -> None:
-    for path, name_hint in (
-        (_FULL_ATTN, "full_rope_kv_cache"),
-        (_SWA_ATTN, "swa_rope_kv_cache"),
+    for path, prefix in (
+        (_FULL_ATTN, "full"),
+        (_SWA_ATTN, "swa"),
     ):
         source = path.read_text(encoding="utf-8")
-        assert "for b in pl.parallel(BATCH):" in source
+        assert f'name_hint="{prefix}_rope_q"' in source
+        assert f'name_hint="{prefix}_rope_kv_cache"' in source
+        assert f"{prefix}_rope_stage = pl.create_tensor(" not in source
+        assert f"{prefix}_k_rope_stage = pl.create_tensor(" not in source
+        assert f"{prefix}_v_stage = pl.create_tensor(" not in source
+        assert source.count("        active_tokens,") >= 1
         assert "if b < active_tokens:" in source
         assert "slot = pl.tensor.read(slot_mapping, [b])" in source
         assert "slot_mapping, [b_safe]" not in source
         assert "layer_cache_base" in source
         assert "cache_row = (" in source
-        assert name_hint in source
-        assert "[cache_row, 0]" in source
+        assert (
+            f"deps=[{prefix}_rope_q_tid, {prefix}_rope_kv_tid]"
+            in source
+        )
+        assert "k_cache = pl.assemble(" in source
         assert "v_cache = pl.assemble(" in source
+        assert "[cache_row, 0]" in source
         assert "pl.slice(v_proj, [1, HEAD_DIM]" in source
         # The only cache-row address is layer base + slot-derived block/offset
         # (+ local KV-head lane); slot_mapping never embeds a layer base.

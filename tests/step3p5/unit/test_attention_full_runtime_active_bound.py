@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Source contracts for full-attention runtime active-row isolation.
 
-These checks intentionally target only the full-attention implementation.  The
-static ``BATCH`` dimension remains the storage/tiling capacity, while
-``num_tokens`` controls which request rows may read request metadata, execute
-RoPE, or update the resident KV cache.
+These checks intentionally target only the full-attention implementation. The
+static ``BATCH`` dimension remains the storage capacity, while ``num_tokens``
+controls the fused RoPE/KV logical task grid.
 """
 from __future__ import annotations
 
@@ -60,34 +59,95 @@ def _contains_name(node: ast.AST, name: str) -> bool:
     )
 
 
-def test_full_attention_rope_and_kv_writes_are_runtime_guarded() -> None:
+def _spmd_scope(function: ast.FunctionDef, hint: str) -> ast.With:
+    matches = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.With)
+        and len(node.items) == 1
+        and _call_name(node.items[0].context_expr) == "pl.spmd"
+        and any(
+            keyword.arg == "name_hint"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == hint
+            for keyword in node.items[0].context_expr.keywords
+        )
+    ]
+    assert len(matches) == 1, f"expected one {hint!r} SPMD scope"
+    return matches[0]
+
+
+def _guarded_body(scope: ast.With, row_name: str) -> ast.If:
+    guards = [
+        node
+        for node in scope.body
+        if isinstance(node, ast.If) and _is_active_guard(node, row_name)
+    ]
+    assert len(guards) == 1
+    return guards[0]
+
+
+def test_full_attention_rope_and_kv_writes_use_active_task_grids() -> None:
     fn = _function("attention_full")
     assert "num_tokens" in {arg.arg for arg in fn.args.args}
     assert "b_safe" not in ast.unparse(fn)
 
-    row_loop = None
-    for node in ast.walk(fn):
-        if not isinstance(node, (ast.For, ast.AsyncFor)):
-            continue
-        if not isinstance(node.target, ast.Name) or node.target.id != "b":
-            continue
-        if _call_name(node.iter) != "pl.parallel":
-            continue
-        if ast.unparse(node.iter) == "pl.parallel(BATCH)":
-            row_loop = node
-            break
-    assert row_loop is not None, "full-attention must retain static-capacity tiling"
-    assert len(row_loop.body) == 1 and isinstance(row_loop.body[0], ast.If)
-    guard = row_loop.body[0]
-    assert _is_active_guard(guard, "b")
+    q_rope_scope = _spmd_scope(fn, "full_rope_q")
+    q_rope_call = q_rope_scope.items[0].context_expr
+    assert ast.unparse(q_rope_call.args[0]) == "active_tokens"
+    assert any(
+        keyword.arg == "allow_early_resolve"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in q_rope_call.keywords
+    )
+    assert (
+        isinstance(q_rope_scope.items[0].optional_vars, ast.Name)
+        and q_rope_scope.items[0].optional_vars.id == "full_rope_q_tid"
+    )
+    q_rope_source = ast.unparse(_guarded_body(q_rope_scope, "b"))
+    assert "pl.tensor.read(seq_lens, [b])" in q_rope_source
+    assert "pl.slice(rope_cos" in q_rope_source
+    assert "pl.slice(rope_sin" in q_rope_source
+    assert "all_q_padded = pl.assemble(all_q_padded" in q_rope_source
+    assert "slot_mapping" not in q_rope_source
+    assert "k_cache = pl.assemble(k_cache" not in q_rope_source
+    assert "v_cache = pl.assemble(v_cache" not in q_rope_source
 
-    guarded_source = ast.unparse(guard)
-    assert "pl.tensor.read(seq_lens, [b])" in guarded_source
-    assert "pl.tensor.read(slot_mapping, [b])" in guarded_source
-    assert "pl.slice(rope_cos" in guarded_source
-    assert "pl.slice(rope_sin" in guarded_source
-    assert "k_cache = pl.assemble(k_cache" in guarded_source
-    assert "v_cache = pl.assemble(v_cache" in guarded_source
+    kv_rope_scope = _spmd_scope(fn, "full_rope_kv_cache")
+    kv_rope_call = kv_rope_scope.items[0].context_expr
+    assert ast.unparse(kv_rope_call.args[0]) == "active_tokens"
+    assert any(
+        keyword.arg == "allow_early_resolve"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in kv_rope_call.keywords
+    )
+    assert (
+        isinstance(kv_rope_scope.items[0].optional_vars, ast.Name)
+        and kv_rope_scope.items[0].optional_vars.id == "full_rope_kv_tid"
+    )
+    kv_rope_source = ast.unparse(_guarded_body(kv_rope_scope, "b"))
+    assert "pl.tensor.read(seq_lens, [b])" in kv_rope_source
+    assert "pl.tensor.read(slot_mapping, [b])" in kv_rope_source
+    assert "pl.slice(rope_cos" in kv_rope_source
+    assert "pl.slice(rope_sin" in kv_rope_source
+    assert "k_cache = pl.assemble(k_cache" in kv_rope_source
+    assert "v_cache = pl.assemble(v_cache" in kv_rope_source
+    assert "all_q_padded" not in kv_rope_source
+
+    fn_source = ast.unparse(fn)
+    assert "full_rope_stage = pl.create_tensor" not in fn_source
+    assert "full_k_rope_stage = pl.create_tensor" not in fn_source
+    assert "full_v_stage = pl.create_tensor" not in fn_source
+
+    qk_call = _spmd_scope(fn, "full_qk_matmul").items[0].context_expr
+    assert any(
+        keyword.arg == "deps"
+        and ast.unparse(keyword.value)
+        == "[full_rope_q_tid, full_rope_kv_tid]"
+        for keyword in qk_call.keywords
+    )
 
 
 def test_all_full_attention_request_spmd_stages_use_runtime_bound() -> None:
@@ -188,7 +248,19 @@ def test_standalone_tp_wrapper_forwards_runtime_num_tokens() -> None:
 def test_full_attention_core_stages_capture_task_ids_and_chain_dependencies() -> None:
     """Dynamic launch extents and scratch consumers must use captured tasks."""
     fn_source = ast.unparse(_function("attention_full"))
+    assert (
+        "with pl.spmd(active_tokens, name_hint='full_rope_q', "
+        "allow_early_resolve=True)"
+    ) in fn_source
+    assert "as full_rope_q_tid" in fn_source
+    assert (
+        "with pl.spmd(active_tokens, name_hint='full_rope_kv_cache', "
+        "allow_early_resolve=True)"
+        in fn_source
+    )
+    assert "as full_rope_kv_tid" in fn_source
     assert "with pl.spmd(full_qk_active_tasks" in fn_source
+    assert "deps=[full_rope_q_tid, full_rope_kv_tid]" in fn_source
     assert "as full_qk_tid" in fn_source
     assert "with pl.spmd(full_softmax_active_tasks" in fn_source
     assert "deps=[full_qk_tid]" in fn_source
@@ -286,7 +358,7 @@ def test_full_attention_task_profiles_are_explicit_and_portable_by_default() -> 
     assert profiles["portable"]["online_reduce_uniform_o1"] == 0
     assert profiles["a2a3"] == {
         "qk_blocks_per_task": 22,
-        "softmax_blocks_per_task": 12,
+        "softmax_blocks_per_task": 16,
         "online_blocks_per_task": 22,
         "online_reduce_fan_in": 8,
         "qk_uniform_o1": 1,

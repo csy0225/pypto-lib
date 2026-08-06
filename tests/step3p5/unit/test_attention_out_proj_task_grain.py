@@ -89,6 +89,30 @@ def test_full_and_swa_out_proj_use_logical_task_grouping() -> None:
     assert "HIDDEN // SWA_OUT_PROJ_VEC_N_CHUNK" in swa
 
 
+def test_full_fused_out_proj_does_not_split_batch_rows() -> None:
+    tree = ast.parse(_FULL.read_text(encoding="utf-8"))
+    matches = []
+    for call in ast.walk(tree):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "pl"
+            and call.func.attr == "spmd"
+        ):
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        name_hint = keywords.get("name_hint")
+        if (
+            isinstance(name_hint, ast.Constant)
+            and name_hint.value == "full_out_proj_matmul"
+        ):
+            matches.append(keywords)
+
+    assert len(matches) == 1
+    assert "optimizations" not in matches[0]
+
+
 def test_out_proj_grain_knobs_remain_runtime_overridable() -> None:
     config = _CONFIG.read_text(encoding="utf-8")
     for key in _ENV_KEYS:

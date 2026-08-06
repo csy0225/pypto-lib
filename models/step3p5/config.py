@@ -81,16 +81,25 @@ if _LIVE_MAX_SEQ <= 0 or _LIVE_MAX_SEQ % 128 != 0:
         f"got {_LIVE_MAX_SEQ}",
     )
 _live_kv_rows_env = os.environ.get("PYPTO_STEP3P5_KV_CACHE_ROWS")
+KV_NUM_LAYERS = int(os.environ.get("PYPTO_STEP3P5_KV_NUM_LAYERS", "45"))
+if KV_NUM_LAYERS <= 0:
+    raise ValueError(
+        "PYPTO_STEP3P5_KV_NUM_LAYERS must be positive, "
+        f"got {KV_NUM_LAYERS}",
+    )
 KV_CACHE_ROWS_DYN = int(_live_kv_rows_env or "4096")
 if KV_CACHE_ROWS_DYN <= 0:
     raise ValueError(
         "PYPTO_STEP3P5_KV_CACHE_ROWS must be positive, "
         f"got {KV_CACHE_ROWS_DYN}",
     )
-if _live_kv_rows_env is not None and KV_CACHE_ROWS_DYN % (45 * 128) != 0:
+if (
+    _live_kv_rows_env is not None
+    and KV_CACHE_ROWS_DYN % (KV_NUM_LAYERS * 128) != 0
+):
     raise ValueError(
         "live PYPTO_STEP3P5_KV_CACHE_ROWS must be divisible by "
-        f"45*128 rows, got {KV_CACHE_ROWS_DYN}",
+        f"{KV_NUM_LAYERS}*128 rows, got {KV_CACHE_ROWS_DYN}",
     )
 _live_mtp_kv_rows_env = os.environ.get("PYPTO_STEP3P5_MTP_KV_CACHE_ROWS")
 if _live_mtp_kv_rows_env is not None:
@@ -101,7 +110,7 @@ elif _live_kv_rows_env is not None:
     # layer.  Derive it from the same vLLM allocator only when live main rows
     # are explicitly configured; the standalone default keeps its historical
     # per-layer 4096-row diagnostic capacity.
-    MTP_KV_CACHE_ROWS_DYN = KV_CACHE_ROWS_DYN // 45
+    MTP_KV_CACHE_ROWS_DYN = KV_CACHE_ROWS_DYN // KV_NUM_LAYERS
 else:
     MTP_KV_CACHE_ROWS_DYN = KV_CACHE_ROWS_DYN
 if MTP_KV_CACHE_ROWS_DYN <= 0 or MTP_KV_CACHE_ROWS_DYN % 128 != 0:
@@ -128,7 +137,9 @@ if ROPE_SEQ_DYN < _LIVE_MAX_SEQ:
         "PYPTO_STEP3P5_ROPE_SEQ must cover PYPTO_STEP3P5_MAX_SEQ, got "
         f"{ROPE_SEQ_DYN} < {_LIVE_MAX_SEQ}",
     )
-LAYER_DYN = 45                             # = NUM_HIDDEN_LAYERS
+# Decoder norm/QK-norm leading rows must match the flat KV layer count.
+# Production keeps the default 45; focused L0-L4 diagnostics set both to 5.
+LAYER_DYN = KV_NUM_LAYERS
 LAYER_HIDDEN_ROWS_DYN = 49152              # = n_full_attn_layers * HIDDEN = 12 * 4096
 LAYER_INTER_ROWS_DYN = 4224                # = n_dense_mlp_layers * INTERMEDIATE_LOCAL = 3 * 1408
 # MoE-only dims that are declared in __all__ but not yet referenced by any
@@ -816,6 +827,7 @@ __all__ = [
     "STORAGE_BATCH_CAPACITY",
     "USER_BATCH_DYN",
     "KV_CACHE_ROWS_DYN",
+    "KV_NUM_LAYERS",
     "MTP_KV_CACHE_ROWS_DYN",
     "BLOCK_TABLE_FLAT_DYN",
     "ROPE_SEQ_DYN",

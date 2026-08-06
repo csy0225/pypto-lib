@@ -154,11 +154,20 @@ ROUTER_FP32_NEG_INF = -3.4028235e38
 ROUTER_SCALE = 3.0  # MOE_ROUTER_SCALING_FACTOR
 
 # Routed-expert kernel constants — mirrors expert_routed.py / moe.ROUTED_*.
+# Keep independent matmul and activation tiles so the cube task grain can be
+# tuned without coupling it to the vector epilogue or changing W8A8 rounding.
+ROUTED_GATE_MM_K_CHUNK = 512
+ROUTED_GATE_MM_N_CHUNK = 64
+ROUTED_GATE_ACT_N_CHUNK = 64
+ROUTED_H_QUANT_N_CHUNK = 64
+# L43/L44 keep the existing specialization until they are tuned separately.
 ROUTED_GATE_K_CHUNK = 64
 ROUTED_GATE_N_CHUNK = 64
 ROUTED_DOWN_K_CHUNK = 64
-ROUTED_DOWN_N_CHUNK = 128
-RECV_TILE = 32
+ROUTED_DOWN_N_CHUNK = 256
+RECV_TILE = 16
+ROUTED_SPECIAL_DOWN_N_CHUNK = 128
+RECV_SPECIAL_TILE = 32
 
 # Shared-expert kernel constants — mirrors expert_shared.py / moe.SHARED_*.
 SHARED_GATE_K_CHUNK = 256
@@ -178,7 +187,7 @@ dispatch_max_per_src = BATCH
 dispatch_recv_per_expert = n_ranks * dispatch_max_per_src
 dispatch_lane_rows = n_local_experts * dispatch_recv_per_expert
 expert_recv_max = dispatch_recv_per_expert
-N_RECV_TILES = expert_recv_max // RECV_TILE
+N_RECV_SPECIAL_TILES = expert_recv_max // RECV_SPECIAL_TILE
 DISPATCH_SCALE_COLS = 1  # V4-Flash: one per-token activation scale
 dispatch_weight_col = 1  # aux[0]=scale, aux[1]=route weight
 dispatch_aux_pad = 8  # physical FP32 row tile; logical cols 0..1
@@ -1077,226 +1086,344 @@ class WholeDecodeStep3p5:
             [local_recv_max, HIDDEN], pl.BF16
         ],
     ):
-        for e in pl.range(n_local_experts):
+        # V4-style stage split: independent gate/up cube tasks publish INT32
+        # accumulators, then the vector activation preserves the canonical
+        # BF16 round before requant and down projection.
+        gate_i32 = pl.create_tensor(
+            [local_recv_max, inter], dtype=pl.INT32,
+        )
+        up_i32 = pl.create_tensor(
+            [local_recv_max, inter], dtype=pl.INT32,
+        )
+
+        for e in pl.parallel(n_local_experts):
             n_rows = pl.read(local_expert_count, [e])
-            offset = pl.cast(e * expert_recv_max, pl.INDEX)
-            for tile_idx in pl.range(N_RECV_TILES):
-                tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
-                tile_rem = n_rows - tile_row0_i32
-                if tile_rem > 0:
-                    tile_row0 = pl.cast(tile_row0_i32, pl.INDEX)
-                    tile_offset = offset + tile_row0
-                    tile_valid = pl.cast(
-                        pl.min(pl.cast(RECV_TILE, pl.INT32), tile_rem),
-                        pl.INDEX,
-                    )
+            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+            expert_base = e * expert_recv_max
+            gate_expert = gate_i32[
+                expert_base : expert_base + expert_recv_max
+            ]
+            up_expert = up_i32[
+                expert_base : expert_base + expert_recv_max
+            ]
 
-                    h_bf16 = pl.create_tensor(
-                        [RECV_TILE, inter], dtype=pl.BF16,
-                    )
+            for tile_idx in pl.parallel(n_tiles):
+                tile_row0 = tile_idx * RECV_TILE
+                tile_offset = expert_base + tile_row0
 
-                    for nb in pl.spmd(
-                        inter // ROUTED_GATE_N_CHUNK,
-                        name_hint="expert_gate_up",
+                for nb in pl.spmd(
+                    inter // ROUTED_GATE_MM_N_CHUNK,
+                    name_hint="expert_gate_mm",
+                ):
+                    n0 = nb * ROUTED_GATE_MM_N_CHUNK
+                    x0 = pl.slice(
+                        local_routed_x,
+                        [RECV_TILE, ROUTED_GATE_MM_K_CHUNK],
+                        [tile_offset, 0],
+                    )
+                    wg0 = pl.reshape(
+                        pl.slice(
+                            w_gate,
+                            [
+                                1,
+                                ROUTED_GATE_MM_K_CHUNK,
+                                ROUTED_GATE_MM_N_CHUNK,
+                            ],
+                            [e, 0, n0],
+                        ),
+                        [ROUTED_GATE_MM_K_CHUNK, ROUTED_GATE_MM_N_CHUNK],
+                    )
+                    gate_acc = pl.matmul(x0, wg0, out_dtype=pl.INT32)
+                    for kb in pl.range(
+                        1, HIDDEN // ROUTED_GATE_MM_K_CHUNK,
                     ):
-                        n0 = nb * ROUTED_GATE_N_CHUNK
-                        x0 = pl.slice(
+                        k0 = kb * ROUTED_GATE_MM_K_CHUNK
+                        xk = pl.slice(
                             local_routed_x,
-                            [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                            [tile_offset, 0],
+                            [RECV_TILE, ROUTED_GATE_MM_K_CHUNK],
+                            [tile_offset, k0],
                         )
-                        wg0_2d = pl.reshape(
+                        wgk = pl.reshape(
                             pl.slice(
                                 w_gate,
-                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                                [e, 0, n0],
+                                [
+                                    1,
+                                    ROUTED_GATE_MM_K_CHUNK,
+                                    ROUTED_GATE_MM_N_CHUNK,
+                                ],
+                                [e, k0, n0],
                             ),
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            [
+                                ROUTED_GATE_MM_K_CHUNK,
+                                ROUTED_GATE_MM_N_CHUNK,
+                            ],
                         )
-                        wu0_2d = pl.reshape(
+                        gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                    gate_expert[
+                        tile_row0 : tile_row0 + RECV_TILE,
+                        n0 : n0 + ROUTED_GATE_MM_N_CHUNK,
+                    ] = gate_acc
+
+                for nb in pl.spmd(
+                    inter // ROUTED_GATE_MM_N_CHUNK,
+                    name_hint="expert_up_mm",
+                ):
+                    n0 = nb * ROUTED_GATE_MM_N_CHUNK
+                    x0 = pl.slice(
+                        local_routed_x,
+                        [RECV_TILE, ROUTED_GATE_MM_K_CHUNK],
+                        [tile_offset, 0],
+                    )
+                    wu0 = pl.reshape(
+                        pl.slice(
+                            w_up,
+                            [
+                                1,
+                                ROUTED_GATE_MM_K_CHUNK,
+                                ROUTED_GATE_MM_N_CHUNK,
+                            ],
+                            [e, 0, n0],
+                        ),
+                        [ROUTED_GATE_MM_K_CHUNK, ROUTED_GATE_MM_N_CHUNK],
+                    )
+                    up_acc = pl.matmul(x0, wu0, out_dtype=pl.INT32)
+                    for kb in pl.range(
+                        1, HIDDEN // ROUTED_GATE_MM_K_CHUNK,
+                    ):
+                        k0 = kb * ROUTED_GATE_MM_K_CHUNK
+                        xk = pl.slice(
+                            local_routed_x,
+                            [RECV_TILE, ROUTED_GATE_MM_K_CHUNK],
+                            [tile_offset, k0],
+                        )
+                        wuk = pl.reshape(
                             pl.slice(
                                 w_up,
-                                [1, ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                                [e, 0, n0],
+                                [
+                                    1,
+                                    ROUTED_GATE_MM_K_CHUNK,
+                                    ROUTED_GATE_MM_N_CHUNK,
+                                ],
+                                [e, k0, n0],
                             ),
-                            [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
+                            [
+                                ROUTED_GATE_MM_K_CHUNK,
+                                ROUTED_GATE_MM_N_CHUNK,
+                            ],
                         )
-                        gate_acc = pl.matmul(x0, wg0_2d, out_dtype=pl.INT32)
-                        up_acc = pl.matmul(x0, wu0_2d, out_dtype=pl.INT32)
-                        for kb in pl.range(1, HIDDEN // ROUTED_GATE_K_CHUNK):
-                            k0 = kb * ROUTED_GATE_K_CHUNK
-                            xk = pl.slice(
-                                local_routed_x,
-                                [RECV_TILE, ROUTED_GATE_K_CHUNK],
-                                [tile_offset, k0],
-                            )
-                            wgk = pl.reshape(
-                                pl.slice(
-                                    w_gate,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
-                                ),
-                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                            )
-                            wuk = pl.reshape(
-                                pl.slice(
-                                    w_up,
-                                    [
-                                        1,
-                                        ROUTED_GATE_K_CHUNK,
-                                        ROUTED_GATE_N_CHUNK,
-                                    ],
-                                    [e, k0, n0],
-                                ),
-                                [ROUTED_GATE_K_CHUNK, ROUTED_GATE_N_CHUNK],
-                            )
-                            gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
-                            up_acc = pl.matmul_acc(up_acc, xk, wuk)
+                        up_acc = pl.matmul_acc(up_acc, xk, wuk)
+                    up_expert[
+                        tile_row0 : tile_row0 + RECV_TILE,
+                        n0 : n0 + ROUTED_GATE_MM_N_CHUNK,
+                    ] = up_acc
 
-                        # Per-token act scale: contiguous [1,RECV_TILE] row-
-                        # slice of the UNPADDED local_routed_x_scale + reshape [RECV_TILE,1]
-                        # (ccec ND2ND-safe; a [RECV_TILE,1] col-slice of a
-                        # padded tensor is a strided ColMajor TLOAD ccec rejects).
-                        x_scale_col = pl.reshape(
-                            pl.slice(
-                                local_routed_x_scale, [1, RECV_TILE], [0, tile_offset],
-                            ),
-                            [RECV_TILE, 1],
-                        )
-                        wg_scale_row = pl.slice(
-                            w_gate_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
-                        )
-                        wu_scale_row = pl.slice(
-                            w_up_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
-                        )
-                        gate_2d = pl.col_expand_mul(
-                            pl.row_expand_mul(
-                                pl.cast(
-                                    gate_acc, target_type=pl.FP32, mode="none",
-                                ),
-                                x_scale_col,
-                            ),
-                            wg_scale_row,
-                        )
-                        up_2d = pl.col_expand_mul(
-                            pl.row_expand_mul(
-                                pl.cast(
-                                    up_acc, target_type=pl.FP32, mode="none",
-                                ),
-                                x_scale_col,
-                            ),
-                            wu_scale_row,
-                        )
-                        sigmoid = pl.recip(
-                            pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
-                        )
-                        silu = pl.mul(gate_2d, sigmoid)
-                        if _ROUTED_SWIGLU_STEP:
-                            silu_c = pl.minimum(silu, _ROUTED_SWIGLU_LIMIT)
-                            up_c = pl.maximum(
-                                pl.minimum(up_2d, _ROUTED_SWIGLU_LIMIT),
-                                -_ROUTED_SWIGLU_LIMIT,
-                            )
-                            gated = pl.mul(silu_c, up_c)
-                        else:
-                            gated = pl.mul(silu, up_2d)
+        for e in pl.parallel(n_local_experts):
+            n_rows = pl.read(local_expert_count, [e])
+            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+            expert_base = e * expert_recv_max
+            gate_expert = gate_i32[
+                expert_base : expert_base + expert_recv_max
+            ]
+            up_expert = up_i32[
+                expert_base : expert_base + expert_recv_max
+            ]
 
-                        gated_v = pl.set_validshape(
-                            gated, tile_valid, ROUTED_GATE_N_CHUNK,
-                        )
-                        gated_m = pl.fillpad(
-                            gated_v, pad_value=pl.PadValue.zero,
-                        )
-                        h_bf16[
-                            :, n0 : n0 + ROUTED_GATE_N_CHUNK
-                        ] = pl.cast(gated_m, target_type=pl.BF16)
+            for tile_idx in pl.parallel(n_tiles):
+                tile_row0 = tile_idx * RECV_TILE
+                tile_offset = expert_base + tile_row0
+                tile_valid = pl.cast(
+                    pl.min(
+                        pl.cast(RECV_TILE, pl.INT32),
+                        n_rows - tile_row0,
+                    ),
+                    pl.INDEX,
+                )
+                h_bf16 = pl.create_tensor(
+                    [RECV_TILE, inter], dtype=pl.BF16,
+                )
 
-                    # Per-token INT8 requant of the swiglu intermediate for
-                    # the INT8 down-proj (moe.py h_i8: BARE slice amax, no
-                    # set_validshape/fillpad — h_bf16 padding rows are already
-                    # zero from the gated fillpad above).
-                    h_i8 = pl.create_tensor(
-                        [RECV_TILE, inter], dtype=pl.INT8,
+                for nb in pl.spmd(
+                    inter // ROUTED_GATE_ACT_N_CHUNK,
+                    name_hint="expert_gate_up_act",
+                ):
+                    n0 = nb * ROUTED_GATE_ACT_N_CHUNK
+                    gate_act_acc = pl.slice(
+                        gate_expert,
+                        [RECV_TILE, ROUTED_GATE_ACT_N_CHUNK],
+                        [tile_row0, n0],
                     )
-                    with pl.at(
-                        level=pl.Level.CORE_GROUP, name_hint="routed_h_quant",
-                    ):
-                        eh_amax = pl.full(
-                            [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
-                        )
-                        for hqa in pl.range(inter // ROUTED_GATE_N_CHUNK):
-                            hqa0 = hqa * ROUTED_GATE_N_CHUNK
-                            eh_a = pl.cast(
-                                pl.slice(
-                                    h_bf16,
-                                    [RECV_TILE, ROUTED_GATE_N_CHUNK],
-                                    [0, hqa0],
-                                ),
+                    up_act_acc = pl.slice(
+                        up_expert,
+                        [RECV_TILE, ROUTED_GATE_ACT_N_CHUNK],
+                        [tile_row0, n0],
+                    )
+                    x_scale_col = pl.reshape(
+                        pl.slice(
+                            local_routed_x_scale,
+                            [1, RECV_TILE],
+                            [0, tile_offset],
+                        ),
+                        [RECV_TILE, 1],
+                    )
+                    wg_scale_row = pl.slice(
+                        w_gate_scale,
+                        [1, ROUTED_GATE_ACT_N_CHUNK],
+                        [e, n0],
+                    )
+                    wu_scale_row = pl.slice(
+                        w_up_scale,
+                        [1, ROUTED_GATE_ACT_N_CHUNK],
+                        [e, n0],
+                    )
+                    gate_2d = pl.col_expand_mul(
+                        pl.row_expand_mul(
+                            pl.cast(
+                                gate_act_acc,
                                 target_type=pl.FP32,
-                            )
-                            eh_amax = pl.maximum(
-                                eh_amax,
-                                pl.reshape(
-                                    pl.row_max(
-                                        pl.maximum(eh_a, pl.neg(eh_a)),
-                                    ),
-                                    [1, RECV_TILE],
+                                mode="none",
+                            ),
+                            x_scale_col,
+                        ),
+                        wg_scale_row,
+                    )
+                    up_2d = pl.col_expand_mul(
+                        pl.row_expand_mul(
+                            pl.cast(
+                                up_act_acc,
+                                target_type=pl.FP32,
+                                mode="none",
+                            ),
+                            x_scale_col,
+                        ),
+                        wu_scale_row,
+                    )
+                    sigmoid = pl.recip(
+                        pl.add(pl.exp(pl.neg(gate_2d)), 1.0),
+                    )
+                    silu = pl.mul(gate_2d, sigmoid)
+                    if _ROUTED_SWIGLU_STEP:
+                        silu_c = pl.minimum(silu, _ROUTED_SWIGLU_LIMIT)
+                        up_c = pl.maximum(
+                            pl.minimum(up_2d, _ROUTED_SWIGLU_LIMIT),
+                            -_ROUTED_SWIGLU_LIMIT,
+                        )
+                        gated = pl.mul(silu_c, up_c)
+                    else:
+                        gated = pl.mul(silu, up_2d)
+                    gated_v = pl.set_validshape(
+                        gated, tile_valid, ROUTED_GATE_ACT_N_CHUNK,
+                    )
+                    gated_m = pl.fillpad(
+                        gated_v, pad_value=pl.PadValue.zero,
+                    )
+                    h_bf16[
+                        :, n0 : n0 + ROUTED_GATE_ACT_N_CHUNK
+                    ] = pl.cast(gated_m, target_type=pl.BF16)
+
+                h_i8 = pl.create_tensor(
+                    [RECV_TILE, inter], dtype=pl.INT8,
+                )
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    name_hint="routed_h_quant",
+                ):
+                    eh_amax = pl.full(
+                        [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                    )
+                    for hqa in pl.range(
+                        inter // ROUTED_H_QUANT_N_CHUNK,
+                    ):
+                        hqa0 = hqa * ROUTED_H_QUANT_N_CHUNK
+                        eh_a = pl.cast(
+                            pl.slice(
+                                h_bf16,
+                                [RECV_TILE, ROUTED_H_QUANT_N_CHUNK],
+                                [0, hqa0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        eh_amax = pl.maximum(
+                            eh_amax,
+                            pl.reshape(
+                                pl.row_max(
+                                    pl.maximum(eh_a, pl.neg(eh_a)),
                                 ),
-                            )
-                        # Keep the native W8A8 row scale mathematically equal
-                        # to 127 / amax. pl.recip also lowers through TDIVS on
-                        # A2/A3, so this spelling is not a TDIV-avoidance fix;
-                        # leave the math unchanged during the signal-layout A/B.
-                        eh_sq_row = pl.mul(
-                            pl.recip(eh_amax),
-                            pl.full(
                                 [1, RECV_TILE],
-                                dtype=pl.FP32,
-                                value=127.0,
                             ),
                         )
-                        h_scale_dq = pl.reshape(
-                            pl.recip(eh_sq_row), [RECV_TILE, 1],
-                        )
-                        eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
-                        for hqn in pl.range(inter // ROUTED_GATE_N_CHUNK):
-                            hqn0 = hqn * ROUTED_GATE_N_CHUNK
-                            eh_q = pl.cast(
-                                pl.slice(
-                                    h_bf16,
-                                    [RECV_TILE, ROUTED_GATE_N_CHUNK],
-                                    [0, hqn0],
-                                ),
-                                target_type=pl.FP32,
-                            )
-                            eh_scaled = pl.row_expand_mul(eh_q, eh_sq_col)
-                            eh_i32 = pl.cast(
-                                eh_scaled, target_type=pl.INT32, mode="rint",
-                            )
-                            eh_half = pl.cast(
-                                eh_i32, target_type=pl.FP16, mode="round",
-                            )
-                            h_i8[
-                                :, hqn0 : hqn0 + ROUTED_GATE_N_CHUNK
-                            ] = pl.cast(
-                                eh_half, target_type=pl.INT8, mode="trunc",
-                            )
-
-                    for db in pl.spmd(
-                        HIDDEN // ROUTED_DOWN_N_CHUNK,
-                        name_hint="expert_down",
+                    eh_sq_row = pl.mul(
+                        pl.recip(eh_amax),
+                        pl.full(
+                            [1, RECV_TILE],
+                            dtype=pl.FP32,
+                            value=127.0,
+                        ),
+                    )
+                    h_scale_dq = pl.reshape(
+                        pl.recip(eh_sq_row), [RECV_TILE, 1],
+                    )
+                    eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                    for hqn in pl.range(
+                        inter // ROUTED_H_QUANT_N_CHUNK,
                     ):
-                        d0 = db * ROUTED_DOWN_N_CHUNK
-                        h0 = pl.slice(
+                        hqn0 = hqn * ROUTED_H_QUANT_N_CHUNK
+                        eh_q = pl.cast(
+                            pl.slice(
+                                h_bf16,
+                                [RECV_TILE, ROUTED_H_QUANT_N_CHUNK],
+                                [0, hqn0],
+                            ),
+                            target_type=pl.FP32,
+                        )
+                        eh_scaled = pl.row_expand_mul(eh_q, eh_sq_col)
+                        eh_i32 = pl.cast(
+                            eh_scaled, target_type=pl.INT32, mode="rint",
+                        )
+                        eh_half = pl.cast(
+                            eh_i32, target_type=pl.FP16, mode="round",
+                        )
+                        h_i8[
+                            :, hqn0 : hqn0 + ROUTED_H_QUANT_N_CHUNK
+                        ] = pl.cast(
+                            eh_half,
+                            target_type=pl.INT8,
+                            mode="trunc",
+                        )
+
+                for db in pl.spmd(
+                    HIDDEN // ROUTED_DOWN_N_CHUNK,
+                    name_hint="expert_down",
+                    allow_early_resolve=True,
+                ):
+                    d0 = db * ROUTED_DOWN_N_CHUNK
+                    h0 = pl.slice(
+                        h_i8,
+                        [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                        [0, 0],
+                    )
+                    wd0 = pl.reshape(
+                        pl.slice(
+                            w_down,
+                            [
+                                1,
+                                ROUTED_DOWN_K_CHUNK,
+                                ROUTED_DOWN_N_CHUNK,
+                            ],
+                            [e, 0, d0],
+                        ),
+                        [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
+                    )
+                    y_acc = pl.matmul(h0, wd0, out_dtype=pl.INT32)
+                    for kb2 in pl.range(
+                        1, inter // ROUTED_DOWN_K_CHUNK,
+                    ):
+                        k0 = kb2 * ROUTED_DOWN_K_CHUNK
+                        hk = pl.slice(
                             h_i8,
                             [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                            [0, 0],
+                            [0, k0],
                         )
-                        wd0 = pl.reshape(
+                        wdk = pl.reshape(
                             pl.slice(
                                 w_down,
                                 [
@@ -1304,67 +1431,51 @@ class WholeDecodeStep3p5:
                                     ROUTED_DOWN_K_CHUNK,
                                     ROUTED_DOWN_N_CHUNK,
                                 ],
-                                [e, 0, d0],
+                                [e, k0, d0],
                             ),
-                            [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
+                            [
+                                ROUTED_DOWN_K_CHUNK,
+                                ROUTED_DOWN_N_CHUNK,
+                            ],
                         )
-                        y_acc = pl.matmul(h0, wd0, out_dtype=pl.INT32)
-                        for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
-                            k0 = kb2 * ROUTED_DOWN_K_CHUNK
-                            hk = pl.slice(
-                                h_i8,
-                                [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                                [0, k0],
-                            )
-                            wdk = pl.reshape(
-                                pl.slice(
-                                    w_down,
-                                    [
-                                        1,
-                                        ROUTED_DOWN_K_CHUNK,
-                                        ROUTED_DOWN_N_CHUNK,
-                                    ],
-                                    [e, k0, d0],
-                                ),
-                                [
-                                    ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
-                                ],
-                            )
-                            y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                        y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
-                        wd_scale_row = pl.slice(
-                            w_down_scale, [1, ROUTED_DOWN_N_CHUNK], [e, d0],
-                        )
-                        route_weight = pl.reshape(
-                            pl.slice(
-                                local_routed_weight,
-                                [RECV_TILE],
-                                [tile_offset],
-                                valid_shape=[tile_valid],
+                    wd_scale_row = pl.slice(
+                        w_down_scale,
+                        [1, ROUTED_DOWN_N_CHUNK],
+                        [e, d0],
+                    )
+                    route_weight = pl.reshape(
+                        pl.slice(
+                            local_routed_weight,
+                            [RECV_TILE],
+                            [tile_offset],
+                            valid_shape=[tile_valid],
+                        ),
+                        [RECV_TILE, 1],
+                    )
+                    y_2d = pl.col_expand_mul(
+                        pl.row_expand_mul(
+                            pl.cast(
+                                y_acc,
+                                target_type=pl.FP32,
+                                mode="none",
                             ),
-                            [RECV_TILE, 1],
-                        )
-                        y_2d = pl.col_expand_mul(
-                            pl.row_expand_mul(
-                                pl.cast(
-                                    y_acc, target_type=pl.FP32, mode="none",
-                                ),
-                                pl.mul(h_scale_dq, route_weight),
-                            ),
-                            wd_scale_row,
-                        )
-                        y_v = pl.set_validshape(
-                            y_2d, tile_valid, ROUTED_DOWN_N_CHUNK,
-                        )
-                        y_m = pl.fillpad(
-                            y_v, pad_value=pl.PadValue.zero,
-                        )
-                        local_routed_y = pl.assemble(
-                            local_routed_y,
-                            pl.cast(y_m, target_type=pl.BF16),
-                            [tile_offset, d0],
-                        )
+                            pl.mul(h_scale_dq, route_weight),
+                        ),
+                        wd_scale_row,
+                    )
+                    y_v = pl.set_validshape(
+                        y_2d, tile_valid, ROUTED_DOWN_N_CHUNK,
+                    )
+                    y_m = pl.fillpad(
+                        y_v, pad_value=pl.PadValue.zero,
+                    )
+                    local_routed_y = pl.assemble(
+                        local_routed_y,
+                        pl.cast(y_m, target_type=pl.BF16),
+                        [tile_offset, d0],
+                    )
 
         return local_routed_y
 
@@ -2261,19 +2372,25 @@ class WholeDecodeStep3p5:
         for e in pl.range(n_local_experts):
             n_rows = pl.read(local_expert_count, [e])
             offset = pl.cast(e * expert_recv_max, pl.INDEX)
-            for tile_idx in pl.range(N_RECV_TILES):
-                tile_row0_i32 = pl.cast(tile_idx * RECV_TILE, pl.INT32)
+            for tile_idx in pl.range(N_RECV_SPECIAL_TILES):
+                tile_row0_i32 = pl.cast(
+                    tile_idx * RECV_SPECIAL_TILE,
+                    pl.INT32,
+                )
                 tile_rem = n_rows - tile_row0_i32
                 if tile_rem > 0:
                     tile_row0 = pl.cast(tile_row0_i32, pl.INDEX)
                     tile_offset = offset + tile_row0
                     tile_valid = pl.cast(
-                        pl.min(pl.cast(RECV_TILE, pl.INT32), tile_rem),
+                        pl.min(
+                            pl.cast(RECV_SPECIAL_TILE, pl.INT32),
+                            tile_rem,
+                        ),
                         pl.INDEX,
                     )
 
                     h_bf16 = pl.create_tensor(
-                        [RECV_TILE, inter], dtype=pl.BF16,
+                        [RECV_SPECIAL_TILE, inter], dtype=pl.BF16,
                     )
 
                     for nb in pl.spmd(
@@ -2283,7 +2400,7 @@ class WholeDecodeStep3p5:
                         n0 = nb * ROUTED_GATE_N_CHUNK
                         x0 = pl.slice(
                             local_routed_x,
-                            [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                            [RECV_SPECIAL_TILE, ROUTED_GATE_K_CHUNK],
                             [tile_offset, 0],
                         )
                         wg0_2d = pl.reshape(
@@ -2308,7 +2425,7 @@ class WholeDecodeStep3p5:
                             k0 = kb * ROUTED_GATE_K_CHUNK
                             xk = pl.slice(
                                 local_routed_x,
-                                [RECV_TILE, ROUTED_GATE_K_CHUNK],
+                                [RECV_SPECIAL_TILE, ROUTED_GATE_K_CHUNK],
                                 [tile_offset, k0],
                             )
                             wgk = pl.reshape(
@@ -2338,15 +2455,18 @@ class WholeDecodeStep3p5:
                             gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
                             up_acc = pl.matmul_acc(up_acc, xk, wuk)
 
-                        # Per-token act scale: contiguous [1,RECV_TILE] row-
-                        # slice of the UNPADDED local_routed_x_scale + reshape [RECV_TILE,1]
-                        # (ccec ND2ND-safe; a [RECV_TILE,1] col-slice of a
-                        # padded tensor is a strided ColMajor TLOAD ccec rejects).
+                        # Per-token act scale: contiguous [1,RECV_SPECIAL_TILE]
+                        # row slice of the unpadded scale, then reshape to
+                        # [RECV_SPECIAL_TILE,1] (ccec ND2ND-safe; a column
+                        # slice of a padded tensor is a strided ColMajor TLOAD
+                        # that ccec rejects).
                         x_scale_col = pl.reshape(
                             pl.slice(
-                                local_routed_x_scale, [1, RECV_TILE], [0, tile_offset],
+                                local_routed_x_scale,
+                                [1, RECV_SPECIAL_TILE],
+                                [0, tile_offset],
                             ),
-                            [RECV_TILE, 1],
+                            [RECV_SPECIAL_TILE, 1],
                         )
                         wg_scale_row = pl.slice(
                             w_gate_scale, [1, ROUTED_GATE_N_CHUNK], [e, n0],
@@ -2401,20 +2521,25 @@ class WholeDecodeStep3p5:
                     # set_validshape/fillpad — h_bf16 padding rows are already
                     # zero from the gated fillpad above).
                     h_i8 = pl.create_tensor(
-                        [RECV_TILE, inter], dtype=pl.INT8,
+                        [RECV_SPECIAL_TILE, inter], dtype=pl.INT8,
                     )
                     with pl.at(
                         level=pl.Level.CORE_GROUP, name_hint="routed_h_quant",
                     ):
                         eh_amax = pl.full(
-                            [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
+                            [1, RECV_SPECIAL_TILE],
+                            dtype=pl.FP32,
+                            value=1e-4,
                         )
                         for hqa in pl.range(inter // ROUTED_GATE_N_CHUNK):
                             hqa0 = hqa * ROUTED_GATE_N_CHUNK
                             eh_a = pl.cast(
                                 pl.slice(
                                     h_bf16,
-                                    [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                    [
+                                        RECV_SPECIAL_TILE,
+                                        ROUTED_GATE_N_CHUNK,
+                                    ],
                                     [0, hqa0],
                                 ),
                                 target_type=pl.FP32,
@@ -2425,7 +2550,7 @@ class WholeDecodeStep3p5:
                                     pl.row_max(
                                         pl.maximum(eh_a, pl.neg(eh_a)),
                                     ),
-                                    [1, RECV_TILE],
+                                    [1, RECV_SPECIAL_TILE],
                                 ),
                             )
                         # Keep the native W8A8 row scale mathematically equal
@@ -2435,21 +2560,28 @@ class WholeDecodeStep3p5:
                         eh_sq_row = pl.mul(
                             pl.recip(eh_amax),
                             pl.full(
-                                [1, RECV_TILE],
+                                [1, RECV_SPECIAL_TILE],
                                 dtype=pl.FP32,
                                 value=127.0,
                             ),
                         )
                         h_scale_dq = pl.reshape(
-                            pl.recip(eh_sq_row), [RECV_TILE, 1],
+                            pl.recip(eh_sq_row),
+                            [RECV_SPECIAL_TILE, 1],
                         )
-                        eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                        eh_sq_col = pl.reshape(
+                            eh_sq_row,
+                            [RECV_SPECIAL_TILE, 1],
+                        )
                         for hqn in pl.range(inter // ROUTED_GATE_N_CHUNK):
                             hqn0 = hqn * ROUTED_GATE_N_CHUNK
                             eh_q = pl.cast(
                                 pl.slice(
                                     h_bf16,
-                                    [RECV_TILE, ROUTED_GATE_N_CHUNK],
+                                    [
+                                        RECV_SPECIAL_TILE,
+                                        ROUTED_GATE_N_CHUNK,
+                                    ],
                                     [0, hqn0],
                                 ),
                                 target_type=pl.FP32,
@@ -2468,13 +2600,13 @@ class WholeDecodeStep3p5:
                             )
 
                     for db in pl.spmd(
-                        HIDDEN // ROUTED_DOWN_N_CHUNK,
+                        HIDDEN // ROUTED_SPECIAL_DOWN_N_CHUNK,
                         name_hint="expert_down",
                     ):
-                        d0 = db * ROUTED_DOWN_N_CHUNK
+                        d0 = db * ROUTED_SPECIAL_DOWN_N_CHUNK
                         h0 = pl.slice(
                             h_i8,
-                            [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                            [RECV_SPECIAL_TILE, ROUTED_DOWN_K_CHUNK],
                             [0, 0],
                         )
                         wd0 = pl.reshape(
@@ -2483,18 +2615,21 @@ class WholeDecodeStep3p5:
                                 [
                                     1,
                                     ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
+                                    ROUTED_SPECIAL_DOWN_N_CHUNK,
                                 ],
                                 [e, 0, d0],
                             ),
-                            [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
+                            [
+                                ROUTED_DOWN_K_CHUNK,
+                                ROUTED_SPECIAL_DOWN_N_CHUNK,
+                            ],
                         )
                         y_acc = pl.matmul(h0, wd0, out_dtype=pl.INT32)
                         for kb2 in pl.range(1, inter // ROUTED_DOWN_K_CHUNK):
                             k0 = kb2 * ROUTED_DOWN_K_CHUNK
                             hk = pl.slice(
                                 h_i8,
-                                [RECV_TILE, ROUTED_DOWN_K_CHUNK],
+                                [RECV_SPECIAL_TILE, ROUTED_DOWN_K_CHUNK],
                                 [0, k0],
                             )
                             wdk = pl.reshape(
@@ -2503,28 +2638,30 @@ class WholeDecodeStep3p5:
                                     [
                                         1,
                                         ROUTED_DOWN_K_CHUNK,
-                                        ROUTED_DOWN_N_CHUNK,
+                                        ROUTED_SPECIAL_DOWN_N_CHUNK,
                                     ],
                                     [e, k0, d0],
                                 ),
                                 [
                                     ROUTED_DOWN_K_CHUNK,
-                                    ROUTED_DOWN_N_CHUNK,
+                                    ROUTED_SPECIAL_DOWN_N_CHUNK,
                                 ],
                             )
                             y_acc = pl.matmul_acc(y_acc, hk, wdk)
 
                         wd_scale_row = pl.slice(
-                            w_down_scale, [1, ROUTED_DOWN_N_CHUNK], [e, d0],
+                            w_down_scale,
+                            [1, ROUTED_SPECIAL_DOWN_N_CHUNK],
+                            [e, d0],
                         )
                         route_weight = pl.reshape(
                             pl.slice(
                                 local_routed_weight,
-                                [RECV_TILE],
+                                [RECV_SPECIAL_TILE],
                                 [tile_offset],
                                 valid_shape=[tile_valid],
                             ),
-                            [RECV_TILE, 1],
+                            [RECV_SPECIAL_TILE, 1],
                         )
                         y_2d = pl.col_expand_mul(
                             pl.row_expand_mul(
@@ -2536,7 +2673,9 @@ class WholeDecodeStep3p5:
                             wd_scale_row,
                         )
                         y_v = pl.set_validshape(
-                            y_2d, tile_valid, ROUTED_DOWN_N_CHUNK,
+                            y_2d,
+                            tile_valid,
+                            ROUTED_SPECIAL_DOWN_N_CHUNK,
                         )
                         y_m = pl.fillpad(
                             y_v, pad_value=pl.PadValue.zero,

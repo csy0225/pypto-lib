@@ -24,6 +24,24 @@ def test_standalone_main_kv_layout_matches_schema_v3() -> None:
     assert all(entry.offset % 512 == 0 for entry in summary.entries)
 
 
+def test_focused_five_layer_kv_layout_is_explicitly_validated() -> None:
+    pool_map = main_kv_layout(
+        num_blocks=8192,
+        rank=0,
+        tp_world_size=8,
+        num_layers=5,
+    )
+    summary = validate_pool_map(pool_map, expected_num_layers=5)
+
+    assert summary.num_layers == 5
+    assert summary.physical_num_blocks == 8207
+    assert len(summary.entries) == 10
+    assert summary.k_section[1] == 5 * 8207 * 128 * 128 * 2
+    assert summary.v_section[1] == summary.k_section[1]
+    with pytest.raises(ValueError, match="num_layers=5 != 45"):
+        validate_pool_map(pool_map)
+
+
 def test_main_kv_probe_row_offset_keeps_layer_base_out_of_slot_mapping() -> None:
     pool_map = main_kv_layout(num_blocks=32, rank=0, tp_world_size=8)
     row_bytes = 128 * 2

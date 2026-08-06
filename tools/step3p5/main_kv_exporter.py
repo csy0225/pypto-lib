@@ -6,7 +6,8 @@ The production Main KV allocation is owned by vLLM and is exported by the
 vLLM KV-pool overlay.  This module is only the standalone device-gate owner:
 it emits the *same* schema-v3 K-major/V-major map consumed by
 ``tools.step3p5.pypto_kv_ipc`` and keeps the ACL allocation alive while the
-resident hidden-only holder runs.
+resident hidden-only holder runs.  Production defaults to all 45 layers;
+focused diagnostics may request an explicit smaller contiguous layer prefix.
 
 The exporter deliberately does not put K/V into the weight IPC pool.  Main
 weights and Main paged KV are separate ownership domains, which is also the
@@ -54,12 +55,16 @@ def main_kv_layout(
     rank: int = 0,
     tp_world_size: int = 8,
     group_id: int = 0,
+    num_layers: int = NUM_LAYERS,
 ) -> dict[str, Any]:
     """Create one validator-compatible Main KV map.
 
     ``num_blocks`` is the scheduler-visible capacity.  The map describes the
     physical allocation including the fifteen allocator-owned padding blocks.
     """
+    num_layers = int(num_layers)
+    if num_layers <= 0:
+        raise ValueError("num_layers must be positive")
     reserve = make_padding_reserve(
         int(num_blocks),
         int(num_blocks) + 15,
@@ -75,15 +80,15 @@ def main_kv_layout(
     )
     if entry_bytes % ALIGNMENT:
         raise ValueError("one Main KV layer entry must be 512-byte aligned")
-    k_section_bytes = NUM_LAYERS * entry_bytes
+    k_section_bytes = num_layers * entry_bytes
     v_section_offset = _align_up(k_section_bytes)
-    v_section_bytes = NUM_LAYERS * entry_bytes
+    v_section_bytes = num_layers * entry_bytes
     pool_bytes = v_section_offset + v_section_bytes
     num_slots = physical_num_blocks * BLOCK_SIZE
 
     entries: dict[str, Any] = {}
     for which, section_offset in (("K", 0), ("V", v_section_offset)):
-        for layer_idx in range(NUM_LAYERS):
+        for layer_idx in range(num_layers):
             offset = section_offset + layer_idx * entry_bytes
             entries[f"L{layer_idx}.{which}"] = {
                 "layer_idx": layer_idx,
@@ -112,7 +117,7 @@ def main_kv_layout(
         "rank": int(rank),
         "tp_world_size": int(tp_world_size),
         "pool_bytes": pool_bytes,
-        "num_layers": NUM_LAYERS,
+        "num_layers": num_layers,
         "head_dim": HEAD_DIM,
         "num_kv_heads": NUM_KV_HEADS,
         "block_size": BLOCK_SIZE,
@@ -125,7 +130,7 @@ def main_kv_layout(
         "groups": [
             {
                 "group_id": int(group_id),
-                "layer_indices": list(range(NUM_LAYERS)),
+                "layer_indices": list(range(num_layers)),
             }
         ],
         "map": entries,
@@ -149,8 +154,12 @@ def main_kv_row_byte_offset(
     """
     layer_idx = int(layer_idx)
     slot = int(slot)
-    if layer_idx not in range(NUM_LAYERS):
-        raise ValueError(f"layer_idx must be 0..{NUM_LAYERS - 1}")
+    try:
+        num_layers = int(pool_map["num_layers"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid Main KV map num_layers") from exc
+    if layer_idx not in range(num_layers):
+        raise ValueError(f"layer_idx must be 0..{num_layers - 1}")
     if which not in ("K", "V"):
         raise ValueError("which must be K or V")
     try:
@@ -228,6 +237,7 @@ class MainKvExporter:
         rank: int,
         tp_world_size: int = 8,
         num_blocks: int,
+        num_layers: int = NUM_LAYERS,
     ) -> dict[str, Any]:
         self._ensure_init()
         if self._pool_ptr is not None:
@@ -237,6 +247,7 @@ class MainKvExporter:
             num_blocks=num_blocks,
             rank=rank,
             tp_world_size=tp_world_size,
+            num_layers=num_layers,
         )
         self._pool_map = pool_map
         pool_bytes = int(pool_map["pool_bytes"])
@@ -320,6 +331,7 @@ class MainKvExporter:
             "rank": int(rank),
             "device": self.dev,
             "pool_bytes": pool_bytes,
+            "num_layers": int(pool_map["num_layers"]),
             "scheduler_num_blocks": int(pool_map["scheduler_num_blocks"]),
             "physical_num_blocks": int(pool_map["physical_num_blocks"]),
             "padding_block_ids": list(pool_map["padding_block_ids"]),

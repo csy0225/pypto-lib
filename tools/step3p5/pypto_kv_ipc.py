@@ -6,7 +6,7 @@ The live bridge has one deliberately narrow ABI:
 
 * one exported allocation per TP rank;
 * K-major then V-major physical order;
-* exactly 45 Step3p5 decoder layers;
+* exactly 45 Step3p5 decoder layers by default;
 * logical cache dtype ``bfloat16`` and head dimension 128;
 * one local KV head per TP rank;
 * vLLM's block size is 128;
@@ -17,7 +17,9 @@ allocator reshapes raw bytes into the configured logical cache dtype later.
 The map therefore describes the *logical* BF16 view, never the raw allocator
 dtype.  Import is fail-closed when the map does not prove that view.
 
-The validator is pure Python and can be used without a device.  Only
+The validator is pure Python and can be used without a device.  Focused
+diagnostics must pass their expected layer count explicitly; callers that do
+not opt in remain fail-closed on the production 45-layer ABI.  Only
 ``kv_device_tensor`` and ``import_kv_all`` touch the PyPTO runtime.
 """
 from __future__ import annotations
@@ -129,7 +131,11 @@ def _validate_range(offset: int, nbytes: int, pool_bytes: int, *, where: str) ->
         )
 
 
-def validate_pool_map(pool_map: Mapping[str, Any]) -> KvMapSummary:
+def validate_pool_map(
+    pool_map: Mapping[str, Any],
+    *,
+    expected_num_layers: int = _NUM_LAYERS,
+) -> KvMapSummary:
     """Validate and normalize a v2 K-major/V-major map.
 
     This function intentionally does not accept the historical interleaved
@@ -156,8 +162,13 @@ def validate_pool_map(pool_map: Mapping[str, Any]) -> KvMapSummary:
         raise KvIpcMapError(f"map: rank={rank} outside tp_world_size={tp_world_size}")
     if pool_bytes <= 0 or pool_bytes % _ALIGNMENT:
         raise KvIpcMapError(f"map: pool_bytes={pool_bytes} is not a positive aligned size")
-    if num_layers != _NUM_LAYERS:
-        raise KvIpcMapError(f"map: num_layers={num_layers} != {_NUM_LAYERS}")
+    expected_num_layers = int(expected_num_layers)
+    if expected_num_layers <= 0:
+        raise KvIpcMapError("expected_num_layers must be positive")
+    if num_layers != expected_num_layers:
+        raise KvIpcMapError(
+            f"map: num_layers={num_layers} != {expected_num_layers}"
+        )
     if head_dim != _HEAD_DIM:
         raise KvIpcMapError(f"map: head_dim={head_dim} != {_HEAD_DIM}")
     if num_kv_heads != _NUM_KV_HEADS:
@@ -205,7 +216,11 @@ def validate_pool_map(pool_map: Mapping[str, Any]) -> KvMapSummary:
     raw_entries = pool_map.get("map")
     if not isinstance(raw_entries, Mapping):
         raise KvIpcMapError("map: map must be an object")
-    expected_keys = {_kv_key(layer, which) for layer in range(_NUM_LAYERS) for which in _WHICH}
+    expected_keys = {
+        _kv_key(layer, which)
+        for layer in range(num_layers)
+        for which in _WHICH
+    }
     if set(raw_entries) != expected_keys:
         missing = sorted(expected_keys - set(raw_entries))
         extra = sorted(set(raw_entries) - expected_keys)
@@ -218,7 +233,7 @@ def validate_pool_map(pool_map: Mapping[str, Any]) -> KvMapSummary:
         expected_offset = section_off
         previous_num_blocks = None
         previous_group_id = None
-        for layer_idx in range(_NUM_LAYERS):
+        for layer_idx in range(num_layers):
             key = _kv_key(layer_idx, which)
             raw = raw_entries[key]
             if not isinstance(raw, Mapping):
@@ -329,17 +344,36 @@ def validate_pool_map(pool_map: Mapping[str, Any]) -> KvMapSummary:
 class KvIpcMap:
     """One rank's validated imported KV pool."""
 
-    def __init__(self, peer_base: int, pool_map: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        peer_base: int,
+        pool_map: Mapping[str, Any],
+        *,
+        expected_num_layers: int = _NUM_LAYERS,
+    ) -> None:
         self.peer_base = int(peer_base)
         self.pool_map = dict(pool_map)
-        self.summary = validate_pool_map(pool_map)
+        self.summary = validate_pool_map(
+            pool_map,
+            expected_num_layers=expected_num_layers,
+        )
         self._entries = {
             (entry.layer_idx, entry.which): entry for entry in self.summary.entries
         }
 
     @classmethod
-    def from_map_obj(cls, peer_base: int, pool_map: Mapping[str, Any]) -> "KvIpcMap":
-        return cls(peer_base, pool_map)
+    def from_map_obj(
+        cls,
+        peer_base: int,
+        pool_map: Mapping[str, Any],
+        *,
+        expected_num_layers: int = _NUM_LAYERS,
+    ) -> "KvIpcMap":
+        return cls(
+            peer_base,
+            pool_map,
+            expected_num_layers=expected_num_layers,
+        )
 
     def _entry(self, layer_idx: int, which: str) -> KvEntry:
         try:
@@ -374,10 +408,11 @@ class KvIpcMap:
             raise ValueError(f"which must be K or V, got {which!r}")
         offset, nbytes = self.summary.k_section if which == "K" else self.summary.v_section
         rows = nbytes // (_HEAD_DIM * _KV_ITEMSIZE)
-        if rows != _NUM_LAYERS * self.num_slots(0, which):
+        if rows != self.summary.num_layers * self.num_slots(0, which):
             raise KvIpcMapError(
                 f"{which} section rows={rows} do not equal "
-                f"{_NUM_LAYERS}*slots={_NUM_LAYERS * self.num_slots(0, which)}"
+                f"{self.summary.num_layers}*slots="
+                f"{self.summary.num_layers * self.num_slots(0, which)}"
             )
         return offset, (rows, _HEAD_DIM), _KV_DTYPE
 
@@ -389,7 +424,14 @@ class KvIpcMap:
         return DeviceTensor(self.peer_base + offset, shape, torch.bfloat16)
 
 
-def import_kv_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List[KvIpcMap]:
+def import_kv_all(
+    rt,
+    out_dir: str,
+    *,
+    tp: int,
+    dev_offset: int = 0,
+    expected_num_layers: int = _NUM_LAYERS,
+) -> List[KvIpcMap]:
     """Import and validate every rank's one-key KV pool."""
     device_key_map: Dict[int, bytes] = {}
     maps_json: List[Mapping[str, Any]] = []
@@ -418,14 +460,23 @@ def import_kv_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List[KvI
         device_key_map[dev_offset + rank] = key
         maps_json.append(pool_map)
     for obj in maps_json:
-        summary = validate_pool_map(obj)
+        summary = validate_pool_map(
+            obj,
+            expected_num_layers=expected_num_layers,
+        )
         if summary.tp_world_size != tp:
             raise KvIpcMapError(
                 f"rank {summary.rank}: tp_world_size={summary.tp_world_size} != requested {tp}"
             )
-    first = validate_pool_map(maps_json[0])
+    first = validate_pool_map(
+        maps_json[0],
+        expected_num_layers=expected_num_layers,
+    )
     for obj in maps_json[1:]:
-        summary = validate_pool_map(obj)
+        summary = validate_pool_map(
+            obj,
+            expected_num_layers=expected_num_layers,
+        )
         if (
             summary.scheduler_num_blocks != first.scheduler_num_blocks
             or summary.physical_num_blocks != first.physical_num_blocks
@@ -447,7 +498,14 @@ def import_kv_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List[KvI
         + str([hex(vas[dev_offset + rank]) for rank in range(tp)]),
         flush=True,
     )
-    return [KvIpcMap(vas[dev_offset + rank], maps_json[rank]) for rank in range(tp)]
+    return [
+        KvIpcMap(
+            vas[dev_offset + rank],
+            maps_json[rank],
+            expected_num_layers=expected_num_layers,
+        )
+        for rank in range(tp)
+    ]
 
 
 def build_stacked_kv(kv_maps: List[KvIpcMap], layer_idx: int):
@@ -465,7 +523,7 @@ def build_stacked_kv(kv_maps: List[KvIpcMap], layer_idx: int):
 
 
 def build_stacked_kv_pool(kv_maps: List[KvIpcMap]):
-    """Build whole-net flat K/V tensors ``[tp, 45*num_slots, 128]``."""
+    """Build flat K/V tensors ``[tp, num_layers*num_slots, 128]``."""
     if not kv_maps:
         raise KvIpcMapError("cannot stack an empty KV map list")
     from pypto.runtime.device_tensor import StackedDeviceTensor  # noqa: PLC0415

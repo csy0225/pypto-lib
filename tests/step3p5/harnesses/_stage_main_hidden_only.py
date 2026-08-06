@@ -45,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt", default=DEFAULT_CKPT)
     parser.add_argument("--out", required=True)
     parser.add_argument("--num-blocks", type=int, default=32)
+    parser.add_argument("--kv-num-layers", type=int, default=45)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument(
         "--active-batch",
@@ -191,6 +192,7 @@ def _export_rank(args: argparse.Namespace) -> int:
         rank=args.export_rank,
         tp_world_size=TP,
         num_blocks=args.num_blocks,
+        num_layers=args.kv_num_layers,
     )
     ready = out / f"ready.rank{args.export_rank}"
     ready.write_text(
@@ -351,6 +353,8 @@ def _start_exporters(args: argparse.Namespace, devices: list[int]) -> list[subpr
                 args.ckpt,
                 "--num-blocks",
                 str(args.num_blocks),
+                "--kv-num-layers",
+                str(getattr(args, "kv_num_layers", 45)),
             ]
         if args.kv_probe:
             command.append("--kv-probe")

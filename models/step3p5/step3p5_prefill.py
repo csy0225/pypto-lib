@@ -266,8 +266,31 @@ def run_smoke(
         )
         mode = "synthetic"
     else:
+        # Native W8A8 routed-expert weights: the single-layer
+        # ``PrefillLayerMoE`` body was migrated BF16 -> INT8 (commit
+        # e885c46), so the loader must produce native INT8 routed weights
+        # + 3 FP32 per-output-channel scales (``int8_routed=True``)
+        # rather than the BF16 dequant bundle the now-W8A8 kernel no
+        # longer consumes. This requires a W8A8_DYNAMIC checkpoint: the
+        # loader raises ``ValueError`` (weight_loader.py:873) if the ckpt
+        # only has the BF16 packed ``moe.{gate,up,down}_proj`` block and
+        # no per-expert ``moe.experts.E.{proj}.weight`` INT8 tensors.
+        # ``verify_bundle_shapes`` is shape-only / dtype-blind, so it
+        # still passes (the routed weight shape is unchanged; the 3
+        # ``*_scale`` keys are warning-only "extra" keys vs
+        # ``expected_shapes``).
+        #
+        # Torch-reference impact: ``_torch_reference_prefill`` is a
+        # shared-expert proxy — it never reads routed expert weights
+        # (KEY_MOE_W_GATE_R / UP_R / DOWN_R), only the dense and shared
+        # expert BF16 tensors. Switching to INT8 routed weights therefore
+        # does NOT change the smoke reference's numerics. Real W8A8
+        # routed-expert numeric validation is the job of the separate
+        # numeric validator (prefill_precision_suite), NOT this smoke —
+        # this path only exercises the loader's INT8 export + shape check.
         bundle = load_step3p5_weights_for_rank(
             ckpt_dir, rank, tp_world_size,
+            int8_routed=True,
         )
         verify_bundle_shapes(bundle, tp_world_size)
         mode = "ckpt"

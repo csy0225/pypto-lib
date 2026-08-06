@@ -340,7 +340,7 @@ class WholePrefillStep3p5:
             )
             pld.system.wait(
                 signal=signal_window, offsets=[prev_rank, 0],
-                expected=step + 1, cmp=pld.WaitCmp.Ge,
+                expected=pl.cast(step + 1, pl.INT32), cmp=pld.WaitCmp.Ge,
             )
             recv_tile = pld.tile.remote_load(
                 tmp_window, peer=prev_rank,
@@ -349,8 +349,16 @@ class WholePrefillStep3p5:
             old_tile = pl.load(
                 local, [0, recv_idx * chunk], [t_rows, chunk],
             )
+            # PTOAS A2/A3 ``tadd`` doesn't support bf16 (only i32/i16/f16/f32);
+            # upcast to f32, add, then downcast for the store — same chain the
+            # PREFILL_T-sized ``tp_all_reduce`` above uses (:258-264, proven on
+            # a2a3: tcvt bf16->f32, tadd f32, tcvt f32->bf16).
+            summed_fp32 = pl.add(
+                pl.cast(old_tile, target_type=pl.FP32),
+                pl.cast(recv_tile, target_type=pl.FP32),
+            )
             pl.store(
-                pl.add(old_tile, recv_tile),
+                pl.cast(summed_fp32, target_type=pl.BF16),
                 [0, recv_idx * chunk], local,
             )
 
@@ -889,14 +897,26 @@ class WholePrefillStep3p5:
         # materialization for send_buf).  slot_map[t,k] gives the send_buf row
         # assigned to route (t,k); self-put (peer=my_rank) writes col 0.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_aux_pack"):
+            # Stage the per-token aux scale (1 FP32 value) into a [1,
+            # dispatch_aux_pad] tile (cols=8 ⇒ 8*4=32B, row_major none_box —
+            # ptoas' 32B column-byte rule rejects the 1x1 col_major tile that a
+            # plain ``pl.load(x_scale, [t,0], [1,1])`` lowers to). This mirrors
+            # decode_fwd.py:946-975: a full tile container, scalar-read x_scale
+            # written into col 0 (cols 1..7 stay 0.0; gather reads col 0 only),
+            # then the whole [1, dispatch_aux_pad] tile stored to the DT — the
+            # same [1,8] tile→DT path proven by ep_a2a_aux_self_copy.
             for t in pl.range(BATCH):
                 for k in pl.range(TOPK):
                     slot = pl.cast(pl.read(slot_map, [t, k]), pl.INDEX)
-                    pl.store(
-                        pl.load(x_scale, [t, 0], [1, DISPATCH_SCALE_COLS]),
-                        [slot, 0],
-                        send_aux,
+                    aux_tile = pl.tile.full(
+                        [1, dispatch_aux_pad], dtype=pl.FP32, value=0.0,
                     )
+                    for sc in pl.range(DISPATCH_SCALE_COLS):
+                        pl.tile.write(
+                            aux_tile, [0, sc],
+                            pl.read(x_scale, [t, sc]),
+                        )
+                    pl.store(aux_tile, [slot, 0], send_aux)
 
         # Reduce peer-published counts into per-src recv_counts and prefix
         # into recv_offsets (PROGRESS.md Session 20 item 6).  pl.read on the
@@ -1055,12 +1075,20 @@ class WholePrefillStep3p5:
                         tile = pl.load(recv_x, [src_row, 0], [1, HIDDEN])
                         pl.store(tile, [dst_row, 0], local_routed_x_out)
                         # Gather the per-token dequant scale alongside the
-                        # activation (decode_fwd.py:1033-1036).
+                        # activation (decode_fwd.py:1033-1036).  A plain
+                        # ``pl.load(recv_aux, [src_row,0], [1,1])`` lowers to a
+                        # 1x1 col_major tile that fails ptoas' 32B column-byte
+                        # rule.  Load the full [1, dispatch_aux_pad] row (cols=8
+                        # ⇒ 32B, row_major — proven by ep_a2a_aux_self_copy),
+                        # then scalar-read col 0 out of that already-allocated
+                        # tile (no new alloc_tile ⇒ no alignment check) and
+                        # scalar-write it to dest.
                         scale_tile = pl.load(
-                            recv_aux, [src_row, 0], [1, DISPATCH_SCALE_COLS],
+                            recv_aux, [src_row, 0], [1, dispatch_aux_pad],
                         )
-                        pl.store(
-                            scale_tile, [0, dst_row], local_routed_x_scale_out,
+                        pl.write(
+                            local_routed_x_scale_out, [0, dst_row],
+                            pl.read(scale_tile, [0, 0]),
                         )
                     running = running + pl.cast(n, pl.INT32)
 

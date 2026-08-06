@@ -538,24 +538,31 @@ def attention_swa_prefill(
     # ── Scope 2.b — causal + sliding-window flash attention. ─────────────
     attn_out = pl.create_tensor([PREFILL_T, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
     bt_stride = pl.cast(32, pl.INDEX)
-    # Pad each token's 12 Q-heads to Q_HEAD_PAD_SWA=24 so the matmul
-    # satisfies the Cube fractal minimum M=16. The 12 padding rows are
-    # zero-filled; set_validshape(Q_HEAD_PAD_SWA // 2 = 12) masks them.
+    # Pad each token's 12 Q-heads to SWA_Q_PAD_ALIGNED=32 so the matmul
+    # satisfies the Cube fractal minimum M=16 (24 is NOT a multiple of 16 —
+    # ptoas' boxed-tile innerRows=16 check rejects rows=24; 32 is). The 20
+    # padding rows are zero-filled; set_validshape(scores, 12, ...) masks
+    # them. Mirrors decode attention_swa.py:530-532 (SWA_Q_PAD_ALIGNED=32,
+    # proven on a2a3). Q_HEAD_PAD_SWA=24 was the prefill's stale value; the
+    # decode side already migrated to 32.
+    SWA_Q_PAD_ALIGNED = 32
     q_rot_flat = pl.reshape(q_rot, [PREFILL_T * 12, HEAD_DIM])
     q_rot_padded = pl.create_tensor(
-        [PREFILL_T * 24, HEAD_DIM], dtype=pl.BF16,
+        [PREFILL_T * SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.BF16,
     )
     for tp in pl.parallel(PREFILL_T):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_q_head_pad"):
             q_rot_padded = pl.assemble(
                 q_rot_padded,
                 pl.slice(q_rot_flat, [12, HEAD_DIM], [tp * 12, 0]),
-                [tp * 24, 0],
+                [tp * SWA_Q_PAD_ALIGNED, 0],
             )
             q_rot_padded = pl.assemble(
                 q_rot_padded,
-                pl.full([12, HEAD_DIM], dtype=pl.BF16, value=0.0),
-                [tp * 24 + 12, 0],
+                pl.full(
+                    [SWA_Q_PAD_ALIGNED - 12, HEAD_DIM], dtype=pl.BF16, value=0.0,
+                ),
+                [tp * SWA_Q_PAD_ALIGNED + 12, 0],
             )
 
     for t in pl.parallel(PREFILL_T):
@@ -570,33 +577,45 @@ def attention_swa_prefill(
         bt_base = pl.cast(0, pl.INDEX) * bt_stride
 
         # GM-level flash accumulators — outside InCore to avoid the Cube
-        # fractal-tile reshape error on [24,1] FP32 shapes.
-        mi_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
-        li_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
-        oi_buf = pl.create_tensor([24, HEAD_DIM], dtype=pl.FP32)
+        # fractal-tile reshape error on [N,1] FP32 shapes. Row dim =
+        # SWA_Q_PAD_ALIGNED=32 (multiple of 16; rows=24 failed ptoas boxed-tile
+        # innerRows=16 check).
+        mi_buf = pl.create_tensor([SWA_Q_PAD_ALIGNED, 1], dtype=pl.FP32)
+        li_buf = pl.create_tensor([SWA_Q_PAD_ALIGNED, 1], dtype=pl.FP32)
+        oi_buf = pl.create_tensor([SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.FP32)
         # Per-KV-block intermediates; reused (overwritten) each iteration.
-        exp_buf = pl.create_tensor([24, 128], dtype=pl.BF16)
-        alpha_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
-        beta_buf = pl.create_tensor([24, 1], dtype=pl.FP32)
+        exp_buf = pl.create_tensor([SWA_Q_PAD_ALIGNED, 128], dtype=pl.BF16)
+        alpha_buf = pl.create_tensor([SWA_Q_PAD_ALIGNED, 1], dtype=pl.FP32)
+        beta_buf = pl.create_tensor([SWA_Q_PAD_ALIGNED, 1], dtype=pl.FP32)
 
         # Initialise running accumulators (mi=-inf, li=0, oi=0).
-        # pl.full([24, 1], FP32) fails pto.alloc_tile: cols*sizeof = 1*4 = 4 bytes,
-        # not 32-byte aligned.  Use pl.full([24, HEAD_DIM], FP32) (128*4=512 bytes,
-        # aligned) and derive the [24,1] init via row_max (reduction, no alloc_tile).
+        # pl.full([N, 1], FP32) fails pto.alloc_tile: cols*sizeof = 1*4 = 4 bytes,
+        # not 32-byte aligned.  Use pl.full([N, HEAD_DIM], FP32) (128*4=512 bytes,
+        # aligned) and derive the [N,1] init via row_max (reduction, no alloc_tile).
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_fa_init"):
             mi_buf = pl.assemble(
                 mi_buf,
-                pl.row_max(pl.full([24, HEAD_DIM], dtype=pl.FP32, value=-3.0e38)),
+                pl.row_max(
+                    pl.full(
+                        [SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.FP32, value=-3.0e38,
+                    ),
+                ),
                 [0, 0],
             )
             li_buf = pl.assemble(
                 li_buf,
-                pl.row_max(pl.full([24, HEAD_DIM], dtype=pl.FP32, value=0.0)),
+                pl.row_max(
+                    pl.full(
+                        [SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.FP32, value=0.0,
+                    ),
+                ),
                 [0, 0],
             )
             oi_buf = pl.assemble(
                 oi_buf,
-                pl.full([24, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                pl.full(
+                    [SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.FP32, value=0.0,
+                ),
                 [0, 0],
             )
 
@@ -629,9 +648,10 @@ def attention_swa_prefill(
                     level=pl.Level.CORE_GROUP,
                     name_hint="prefill_swa_fa_qk",
                 ):
-                    # Padded 24-head block for token t: real [0:12], zero [12:24].
+                    # Padded 32-head block for token t: real [0:12], zero [12:32].
                     q_block = q_rot_padded[
-                        t * 24 : t * 24 + 24, 0 : HEAD_DIM,
+                        t * SWA_Q_PAD_ALIGNED : t * SWA_Q_PAD_ALIGNED + SWA_Q_PAD_ALIGNED,
+                        0 : HEAD_DIM,
                     ]
                     raw_scores = pl.matmul(
                         q_block, k_tile, b_trans=True, out_dtype=pl.FP32,
@@ -650,8 +670,8 @@ def attention_swa_prefill(
                         pl.cast(exp_bf16, target_type=pl.FP32)
                     )
                     # Load running mi/li from GM (MTE load, no fractal constraint).
-                    mi_cur = mi_buf[0:24, 0:1]
-                    li_cur = li_buf[0:24, 0:1]
+                    mi_cur = mi_buf[0:SWA_Q_PAD_ALIGNED, 0:1]
+                    li_cur = li_buf[0:SWA_Q_PAD_ALIGNED, 0:1]
                     mi_new = pl.maximum(mi_cur, cur_mi)
                     alpha = pl.exp(pl.sub(mi_cur, mi_new))
                     beta = pl.exp(pl.sub(cur_mi, mi_new))
@@ -669,11 +689,11 @@ def attention_swa_prefill(
                     level=pl.Level.CORE_GROUP,
                     name_hint="prefill_swa_fa_pv",
                 ):
-                    exp_b2 = exp_buf[0:24, 0:128]
+                    exp_b2 = exp_buf[0:SWA_Q_PAD_ALIGNED, 0:128]
                     oi_tmp = pl.matmul(exp_b2, v_tile_sb, out_dtype=pl.FP32)
-                    oi_cur = oi_buf[0:24, 0:HEAD_DIM]
-                    alpha_b2 = alpha_buf[0:24, 0:1]
-                    beta_b2 = beta_buf[0:24, 0:1]
+                    oi_cur = oi_buf[0:SWA_Q_PAD_ALIGNED, 0:HEAD_DIM]
+                    alpha_b2 = alpha_buf[0:SWA_Q_PAD_ALIGNED, 0:1]
+                    beta_b2 = beta_buf[0:SWA_Q_PAD_ALIGNED, 0:1]
                     oi_new = pl.add(
                         pl.row_expand_mul(oi_cur, alpha_b2),
                         pl.row_expand_mul(oi_tmp, beta_b2),
@@ -685,10 +705,10 @@ def attention_swa_prefill(
                 level=pl.Level.CORE_GROUP,
                 name_hint="prefill_swa_fa_norm",
             ):
-                oi_final = oi_buf[0:24, 0:HEAD_DIM]
-                li_final = li_buf[0:24, 0:1]
+                oi_final = oi_buf[0:SWA_Q_PAD_ALIGNED, 0:HEAD_DIM]
+                li_final = li_buf[0:SWA_Q_PAD_ALIGNED, 0:1]
                 ctx = pl.row_expand_div(oi_final, li_final)
-                # Slice the 12 real head rows (rows 12-23 are zero-pad).
+                # Slice the 12 real head rows (rows 12-31 are zero-pad).
                 ctx_valid = ctx[0:12, 0:HEAD_DIM]
                 ctx_flat = pl.cast(
                     pl.reshape(ctx_valid, [1, 12 * HEAD_DIM]),

@@ -189,14 +189,16 @@ SHARED_DOWN_N_CHUNK = 256
 SHARED_SWIGLU_N_CHUNK = 32
 # Shared gate/up keeps the five validated 32-wide chunks on two workers.
 # Shared down activates one worker for single-token decode and both workers
-# for larger batches. Routed uses a 23-worker fixed grid. This is soft
+# for larger batches. Routed uses the spare-core budget left by shared down:
+# 23 workers for one token and 22 workers for larger batches. This is soft
 # scheduling, not physical affinity.
 SHARED_GATE_UP_ACT_CHUNKS = INTER_S_LOCAL // SHARED_SWIGLU_N_CHUNK
 SHARED_GATE_UP_ACT_BLOCKS = 2
 SHARED_DOWN_WORKERS = 2
-# Regular routed stages use one fixed grid. Logical expert/tile/chunk work is
-# grid-strided inside the kernel so AICPU no longer submits per expert.
+# Regular routed stages use one grid per stage. Logical expert/tile/chunk work
+# is grid-strided inside the kernel so AICPU no longer submits per expert.
 ROUTED_GRID_WORKERS = 23
+ROUTED_MULTIBATCH_GRID_WORKERS = 22
 
 # MoE-local helper constants are module-level for parse-time closure capture.
 n_ranks = tp_size
@@ -1208,6 +1210,7 @@ class WholeDecodeStep3p5:
         local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
         local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
         local_route_count_tid: pl.Scalar[pl.TASK_ID],
+        num_tokens: pl.Scalar[pl.INT32],
         w_gate: pl.Tensor[
             [n_local_experts, HIDDEN, inter], pl.INT8
         ],
@@ -1230,8 +1233,18 @@ class WholeDecodeStep3p5:
         up_i32 = pl.create_tensor(
             [local_recv_max, inter], dtype=pl.INT32,
         )
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > BATCH:
+            active_tokens = pl.cast(BATCH, pl.INDEX)
+        routed_workers = pl.cast(ROUTED_GRID_WORKERS, pl.INDEX)
+        if active_tokens > 1:
+            routed_workers = pl.cast(
+                ROUTED_MULTIBATCH_GRID_WORKERS, pl.INDEX,
+            )
         with pl.spmd(
-            ROUTED_GRID_WORKERS,
+            routed_workers,
             name_hint="expert_gate_up",
             deps=[local_route_count_tid],
             predicate=(local_route_count[0] > 0),
@@ -1248,7 +1261,7 @@ class WholeDecodeStep3p5:
             chunks_per_expert = inter // ROUTED_GATE_MM_N_CHUNK
             gate_up_work = active_expert_count * chunks_per_expert
             for work in pl.range(
-                worker, gate_up_work, ROUTED_GRID_WORKERS,
+                worker, gate_up_work, routed_workers,
             ):
                 active_slot = work // chunks_per_expert
                 nb = work % chunks_per_expert
@@ -1354,7 +1367,7 @@ class WholeDecodeStep3p5:
             [local_recv_max, inter], dtype=pl.BF16,
         )
         with pl.spmd(
-            ROUTED_GRID_WORKERS,
+            routed_workers,
             name_hint="expert_gate_up_act",
             deps=[routed_gate_up_tid],
             predicate=(local_route_count[0] > 0),
@@ -1373,7 +1386,7 @@ class WholeDecodeStep3p5:
                 * (inter // ROUTED_GATE_ACT_N_CHUNK)
             )
             for work in pl.range(
-                worker, act_work, ROUTED_GRID_WORKERS,
+                worker, act_work, routed_workers,
             ):
                 active_slot = work // (
                     inter // ROUTED_GATE_ACT_N_CHUNK
@@ -1478,7 +1491,7 @@ class WholeDecodeStep3p5:
             [1, local_recv_max], dtype=pl.FP32,
         )
         with pl.spmd(
-            ROUTED_GRID_WORKERS,
+            routed_workers,
             name_hint="routed_h_quant",
             deps=[routed_act_tid],
             predicate=(local_route_count[0] > 0),
@@ -1494,7 +1507,7 @@ class WholeDecodeStep3p5:
                 active_expert_count = pl.cast(n_local_experts, pl.INDEX)
             quant_work = active_expert_count
             for work in pl.range(
-                worker, quant_work, ROUTED_GRID_WORKERS,
+                worker, quant_work, routed_workers,
             ):
                 active_slot = work
                 e = pl.cast(
@@ -1575,7 +1588,7 @@ class WholeDecodeStep3p5:
                         )
 
         with pl.spmd(
-            ROUTED_GRID_WORKERS,
+            routed_workers,
             name_hint="expert_down",
             deps=[routed_quant_tid],
             predicate=(local_route_count[0] > 0),
@@ -1594,7 +1607,7 @@ class WholeDecodeStep3p5:
                 * (HIDDEN // ROUTED_DOWN_N_CHUNK)
             )
             for work in pl.range(
-                worker, down_work, ROUTED_GRID_WORKERS,
+                worker, down_work, routed_workers,
             ):
                 active_slot = work // (HIDDEN // ROUTED_DOWN_N_CHUNK)
                 db = work % (HIDDEN // ROUTED_DOWN_N_CHUNK)
@@ -1714,6 +1727,7 @@ class WholeDecodeStep3p5:
         local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
         local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
         local_route_count_tid: pl.Scalar[pl.TASK_ID],
+        num_tokens: pl.Scalar[pl.INT32],
         w_gate_r: pl.Tensor[
             [n_local_experts, HIDDEN, inter], pl.INT8
         ],
@@ -1736,6 +1750,7 @@ class WholeDecodeStep3p5:
             local_routed_weight,
             local_expert_offset, local_expert_count,
             local_route_count, local_route_count_tid,
+            num_tokens,
             w_gate_r, w_gate_r_scale,
             w_up_r, w_up_r_scale,
             w_down_r, w_down_r_scale,
@@ -1756,8 +1771,8 @@ class WholeDecodeStep3p5:
         swiglu_limit: pl.Scalar[pl.FP32],
     ):
         # The runtime has no physical-core affinity API. Keep shared gate/up
-        # on two workers, and activate only one shared-down worker for
-        # single-token decode while routed uses a 23-worker grid.
+        # on two workers, and split the 24-core shared-down/routed budget as
+        # 1+23 for one token or 2+22 for larger batches.
         # The BF16 bridge is the canonical SwiGLU rounding point; do not move
         # the cast into down.
         sh_hidden = pl.create_tensor(
@@ -2266,6 +2281,7 @@ class WholeDecodeStep3p5:
             local_routed_weight,
             local_expert_offset, local_expert_count,
             local_route_count, local_route_count_tid,
+            num_tokens,
             w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
             w_down_r, w_down_r_scale,
             local_routed_y,
@@ -2468,6 +2484,7 @@ class WholeDecodeStep3p5:
             local_routed_weight,
             local_expert_offset, local_expert_count,
             local_route_count, local_route_count_tid,
+            num_tokens,
             w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
             w_down_r, w_down_r_scale,
             local_routed_y,

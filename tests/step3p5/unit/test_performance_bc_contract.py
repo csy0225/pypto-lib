@@ -977,10 +977,33 @@ def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
     )
 
 
-def test_regular_routed_expert_uses_one_static_grid_per_stage() -> None:
+def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     source, tree = _parse(_CANONICAL)
+    assignments = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id
+        in {"ROUTED_GRID_WORKERS", "ROUTED_MULTIBATCH_GRID_WORKERS"}
+    }
+    assert assignments == {
+        "ROUTED_GRID_WORKERS": 23,
+        "ROUTED_MULTIBATCH_GRID_WORKERS": 22,
+    }
     expert = _method(tree, "_expert_routed")
     expert_source = _segment(source, expert)
+    assert "num_tokens" in [arg.arg for arg in expert.args.args]
+    assert (
+        "routed_workers = pl.cast(ROUTED_GRID_WORKERS, pl.INDEX)"
+        in expert_source
+    )
+    assert "if active_tokens > 1:" in expert_source
+    assert (
+        "ROUTED_MULTIBATCH_GRID_WORKERS, pl.INDEX"
+        in expert_source
+    )
     stages = (
         ("expert_gate_up", "local_route_count_tid"),
         ("expert_gate_up_act", "routed_gate_up_tid"),
@@ -993,7 +1016,7 @@ def test_regular_routed_expert_uses_one_static_grid_per_stage() -> None:
         assert isinstance(call, ast.Call)
         assert _call_path(call) == "pl.spmd"
         assert [ast.unparse(arg) for arg in call.args] == [
-            "ROUTED_GRID_WORKERS",
+            "routed_workers",
         ]
         keywords = {
             keyword.arg: ast.unparse(keyword.value)
@@ -1004,6 +1027,17 @@ def test_regular_routed_expert_uses_one_static_grid_per_stage() -> None:
         scope_source = _segment(source, scope)
         assert "pl.read(local_route_count, [1])" in scope_source
         assert "pl.read(local_route_count, [active_slot + 2])" in scope_source
+        grid_stride_loops = [
+            node
+            for node in ast.walk(scope)
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and _call_path(node.iter) == "pl.range"
+            and len(node.iter.args) == 3
+            and ast.unparse(node.iter.args[0]) == "worker"
+            and ast.unparse(node.iter.args[2]) == "routed_workers"
+        ]
+        assert len(grid_stride_loops) == 1
 
     gate = _segment(source, _task_scope(expert, "expert_gate_up"))
     assert (
@@ -1016,6 +1050,25 @@ def test_regular_routed_expert_uses_one_static_grid_per_stage() -> None:
     assert "projection" not in gate
     assert "if projection" not in expert_source
     assert "for e in pl.parallel(n_local_experts)" not in expert_source
+
+    wrapper = _method(tree, "expert_routed_step")
+    assert "num_tokens" in [arg.arg for arg in wrapper.args.args]
+    wrapper_calls = _method_calls(wrapper, "_expert_routed")
+    assert len(wrapper_calls) == 1
+    assert ast.unparse(wrapper_calls[0].args[7]) == "num_tokens"
+
+    orchestration_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "expert_routed_step"
+    ]
+    assert len(orchestration_calls) == 2
+    assert all(
+        ast.unparse(call.args[7]) == "num_tokens"
+        for call in orchestration_calls
+    )
 
 
 def test_routed_down_halves_the_int8_accumulation_chain() -> None:
@@ -1053,38 +1106,41 @@ def test_routed_down_halves_the_int8_accumulation_chain() -> None:
     )
 
 
-def test_fixed_grid_planners_cover_every_active_tile_once() -> None:
-    workers = 23
+def test_adaptive_grid_planners_cover_every_active_tile_once() -> None:
     stage_chunks = {
         "gate_up": 20,
         "act": 20,
         "quant": 1,
         "down": 16,
     }
-    for active_experts in (1, 2, 3, 8, 36):
-        for tiles_per_expert in (1, 2, 4):
-            for chunks in stage_chunks.values():
-                logical_work = active_experts * chunks
-                owners = [
-                    work
-                    for worker in range(workers)
-                    for work in range(worker, logical_work, workers)
-                ]
-                assert sorted(owners) == list(range(logical_work))
-                assert len(owners) == len(set(owners))
+    for workers in (22, 23):
+        for active_experts in (1, 2, 3, 8, 36):
+            for tiles_per_expert in (1, 2, 4):
+                for chunks in stage_chunks.values():
+                    logical_work = active_experts * chunks
+                    owners = [
+                        work
+                        for worker in range(workers)
+                        for work in range(worker, logical_work, workers)
+                    ]
+                    assert sorted(owners) == list(range(logical_work))
+                    assert len(owners) == len(set(owners))
 
-                covered = [
-                    (work // chunks, tile, work % chunks)
-                    for work in owners
-                    for tile in range(tiles_per_expert)
-                ]
-                expected = [
-                    (expert, tile, chunk)
-                    for expert in range(active_experts)
-                    for tile in range(tiles_per_expert)
-                    for chunk in range(chunks)
-                ]
-                assert sorted(covered) == expected
+                    covered = [
+                        (work // chunks, tile, work % chunks)
+                        for work in owners
+                        for tile in range(tiles_per_expert)
+                    ]
+                    expected = [
+                        (expert, tile, chunk)
+                        for expert in range(active_experts)
+                        for tile in range(tiles_per_expert)
+                        for chunk in range(chunks)
+                    ]
+                    assert sorted(covered) == expected
+
+    assert 1 + 23 == 24
+    assert 2 + 22 == 24
 
     shared_gate = [
         chunk

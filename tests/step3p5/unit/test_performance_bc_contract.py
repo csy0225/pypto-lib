@@ -73,6 +73,39 @@ def _single_function(source: str) -> ast.FunctionDef:
     return functions[0]
 
 
+def _task_scope(function: ast.FunctionDef, name_hint: str) -> ast.With:
+    matches: list[ast.With] = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.With):
+            continue
+        for item in node.items:
+            call = item.context_expr
+            if not isinstance(call, ast.Call):
+                continue
+            if any(
+                keyword.arg == "name_hint"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == name_hint
+                for keyword in call.keywords
+            ):
+                matches.append(node)
+    assert len(matches) == 1, (
+        f"expected one task scope {name_hint}, found {len(matches)}"
+    )
+    return matches[0]
+
+
+def _call_path(call: ast.Call) -> str:
+    parts: list[str] = []
+    node: ast.expr = call.func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
 def test_g1_executable_match_is_exact_and_fail_closed() -> None:
     function = _single_function(
         """
@@ -233,6 +266,7 @@ def test_c3_combine_owns_scatter_wait_and_plain_fp32_reduce() -> None:
         "local_routed_y", "sh_y", "moe_out",
         "combine_arrived", "local_route", "routed_y_buf",
         "local_expert_count", "local_expert_offset", "recv_meta_local",
+        "local_route_count", "local_route_count_tid",
         "num_tokens", "my_rank", "moe_epoch",
     ]
     body = _segment(source, function)
@@ -363,6 +397,319 @@ def test_c3_expert_lane_fanout_uses_spmd_and_no_incore_parallel() -> None:
     assert "for k in pl.range(TOPK):" in dispatch
     assert "pld.tensor.put(" in dispatch
     assert "pld.tensor.put(" in combine
+
+
+def test_c3_moe_hybrid_grids_follow_tokens_routes_and_skip_empty_ranks() -> None:
+    source, tree = _parse(_CANONICAL)
+    dispatch = _segment(source, _method(tree, "dispatch_step"))
+    combine = _segment(source, _method(tree, "combine_step"))
+
+    assert "active_routes = active_tokens * TOPK" in dispatch
+    assert "push_blocks = active_tokens" in dispatch
+    assert "if push_blocks < 1:" in dispatch
+    assert "if push_blocks > n_local_experts:" in dispatch
+    assert "scan_blocks = active_routes" in dispatch
+    assert "if scan_blocks < 1:" in dispatch
+    assert "if scan_blocks > n_local_experts:" in dispatch
+    assert "active_blocks" not in dispatch
+    assert dispatch.count("with pl.spmd(\n            push_blocks,") == 1
+    assert dispatch.count("with pl.spmd(\n            scan_blocks,") == 1
+    assert 'name_hint="dispatch_count_publish"' in dispatch
+    assert 'name_hint="dispatch_meta"' in dispatch
+    assert "route_slot = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)" in dispatch
+    assert "self_meta = pl.create_tensor([n_local_experts], dtype=pl.INT32)" in dispatch
+    assert "deps=[meta_publish_tid]" in dispatch
+    assert "pl.read(route_slot, [t, k])" in dispatch
+    assert "moe_epoch * n_local_experts, pl.INT32" in dispatch
+    assert "local_route_count = pl.create_tensor(" in dispatch
+    assert "[local_route_plan_size], dtype=pl.INT32" in dispatch
+    assert dispatch.count("pl.Tensor[[local_route_plan_size], pl.INT32]") == 1
+    assert "active_expert_count_i32 = pl.cast(0, pl.INT32)" in dispatch
+    assert (
+        "pl.write(local_route_count, [1], active_expert_count_i32)"
+        in dispatch
+    )
+    assert "predicate=(local_route_count[0] > 0)" in dispatch
+    assert "deps=[wait_tid, meta_collect_tid]" in dispatch
+    assert "meta_collect_tid," in dispatch
+    assert "worker, active_tokens, push_blocks" in dispatch
+    # Scatter-only experiment: retain the frozen hybrid gather grid.
+    assert "worker, n_local_experts, scan_blocks" in dispatch
+
+    assert (
+        "local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32]"
+        in combine
+    )
+    assert "active_expert_count = pl.cast(" in combine
+    assert "pl.read(local_route_count, [1]), pl.INDEX" in combine
+    assert "scatter_blocks = active_expert_count" in combine
+    assert "if scatter_blocks < 1:" in combine
+    assert "if scatter_blocks > n_local_experts:" in combine
+    assert "active_routes" not in combine
+    assert "active_blocks" not in combine
+    assert "with pl.spmd(\n            scatter_blocks," in combine
+    assert 'name_hint="combine_route_gate"' not in combine
+    assert "predicate=(local_route_count[0] > 0)" in combine
+    assert "local_route_count_tid: pl.Scalar[pl.TASK_ID]" in combine
+    assert "deps=[local_route_count_tid]" in combine
+    assert "pl.read(local_route_count, [worker + 2])" in combine
+    assert "for e in pl.range(worker, n_local_experts, scatter_blocks)" not in combine
+    assert "- pl.cast(scatter_blocks, pl.INT32)" in combine
+    assert "Predicated empty-rank scatter emitted no data block." in combine
+    assert "moe_epoch * n_local_experts, pl.INT32" in combine
+    assert "with pl.spmd(\n            BATCH," in combine
+
+
+def test_c3_route_slot_is_dense_and_token_workers_cover_every_route() -> None:
+    source, tree = _parse(_CANONICAL)
+    function = _method(tree, "dispatch_step")
+    publish = _task_scope(function, "dispatch_count_publish")
+    push = _task_scope(function, "dispatch_push")
+    publish_source = _segment(source, publish)
+    push_source = _segment(source, push)
+
+    # The metadata pass assigns the slot before incrementing its
+    # (destination, local-expert) cursor. Token workers then reuse that stable
+    # slot for every TOPK route without rebuilding any expert-lane scan.
+    slot_write = "pl.write(route_slot, [t, k], slot)"
+    cursor_update = "cursor[cursor_idx] ="
+    assert publish_source.index(slot_write) < publish_source.index(cursor_update)
+    assert "cursor_idx = dst * n_local_experts + loc_e" in publish_source
+    assert "slot = cursor[cursor_idx]" in publish_source
+    assert "deps=[meta_publish_tid]" in push_source
+    assert "worker = pl.tile.get_block_idx()" in push_source
+    assert (
+        "for t in pl.range(worker, active_tokens, push_blocks):"
+        in push_source
+    )
+    assert "for k in pl.range(TOPK):" in push_source
+    assert "route_idx = t * TOPK + k" in push_source
+    assert "pl.read(route_slot, [t, k])" in push_source
+    assert "for route_idx in pl.range(" not in push_source
+    assert "slot_ctr" not in push_source
+    assert "if le == loc_e:" not in push_source
+
+    # Pure-Python scheduling oracle: the token grid covers every route once,
+    # and dense slots make every physical destination row write-disjoint.
+    n_ranks = 8
+    n_local = 36
+    active_tokens = 16
+    topk = 8
+    push_blocks = min(max(active_tokens, 1), n_local)
+    covered_routes = [
+        t * topk + k
+        for worker in range(push_blocks)
+        for t in range(worker, active_tokens, push_blocks)
+        for k in range(topk)
+    ]
+    assert sorted(covered_routes) == list(range(active_tokens * topk))
+    assert len(covered_routes) == len(set(covered_routes))
+
+    dispatch_max_per_src = 16
+    source_rank = 3
+    cursor: dict[tuple[int, int], int] = {}
+    slots: dict[tuple[int, int], list[int]] = {}
+    physical_rows: set[tuple[int, int]] = set()
+    for t in range(active_tokens):
+        for k in range(topk):
+            eid = (t * 29 + k * 41 + (t // 7) * 3) % (n_ranks * n_local)
+            dst, local_expert = divmod(eid, n_local)
+            key = (dst, local_expert)
+            slot = cursor.get(key, 0)
+            cursor[key] = slot + 1
+            slots.setdefault(key, []).append(slot)
+            row = (
+                local_expert * n_ranks * dispatch_max_per_src
+                + source_rank * dispatch_max_per_src
+                + slot
+            )
+            assert (dst, row) not in physical_rows
+            physical_rows.add((dst, row))
+            assert 0 <= slot < dispatch_max_per_src
+    assert len(physical_rows) == active_tokens * topk
+    for key, count in cursor.items():
+        assert slots[key] == list(range(count))
+
+
+def test_c3_combine_scatter_uses_compact_active_expert_plan() -> None:
+    source, tree = _parse(_CANONICAL)
+    dispatch_function = _method(tree, "dispatch_step")
+    combine_function = _method(tree, "combine_step")
+    meta_collect = _task_scope(dispatch_function, "dispatch_meta")
+    gather = _task_scope(dispatch_function, "dispatch_gather")
+    scatter = _task_scope(combine_function, "combine_scatter")
+    meta_source = _segment(source, meta_collect)
+    gather_source = _segment(source, gather)
+    scatter_source = _segment(source, scatter)
+
+    assert "local_route_plan_size = n_local_experts + 2" in source
+    assert "if count > 0:" in meta_source
+    assert "pl.cast(active_expert_count_i32, pl.INDEX)" in meta_source
+    assert "+ pl.cast(2, pl.INDEX)" in meta_source
+    assert "pl.cast(e, pl.INT32)" in meta_source
+    assert "pl.write(local_route_count, [0], total_count)" in meta_source
+    assert (
+        "pl.write(local_route_count, [1], active_expert_count_i32)"
+        in meta_source
+    )
+    assert "pl.read(local_route_count, [worker + 2])" in scatter_source
+
+    # This candidate changes combine only: dispatch gather remains the frozen
+    # hybrid full-expert scan rather than consuming the compact worklist.
+    assert "for e in pl.range(worker, n_local_experts, scan_blocks):" in gather_source
+    assert "pl.read(local_route_count, [work_idx + 2])" not in gather_source
+
+    # Sparse local expert IDs are packed densely and preserve source order.
+    counts = [0, 2, 0, 1, 7, 0, 0, 3] + [0] * 28
+    plan = [0] * (len(counts) + 2)
+    active = []
+    for expert, count in enumerate(counts):
+        plan[0] += count
+        if count > 0:
+            active.append(expert)
+            plan[2 + len(active) - 1] = expert
+    plan[1] = len(active)
+    assert plan[0] == sum(counts)
+    assert plan[2 : 2 + plan[1]] == [1, 3, 4, 7]
+    assert all(counts[expert] > 0 for expert in plan[2 : 2 + plan[1]])
+
+
+def test_c3_fixed_lane_credits_cover_hybrid_work_and_cannot_arrive_early() -> None:
+    source, tree = _parse(_CANONICAL)
+    dispatch_function = _method(tree, "dispatch_step")
+    combine_function = _method(tree, "combine_step")
+    dispatch_push = _task_scope(dispatch_function, "dispatch_push")
+    dispatch_wait = _task_scope(dispatch_function, "dispatch_wait")
+    combine_scatter = _task_scope(combine_function, "combine_scatter")
+    combine_wait = _task_scope(combine_function, "combine_wait")
+
+    dispatch_push_source = _segment(source, dispatch_push)
+    dispatch_wait_source = _segment(source, dispatch_wait)
+    combine_scatter_source = _segment(source, combine_scatter)
+    combine_wait_source = _segment(source, combine_wait)
+
+    assert "completion_delta = pl.cast(1, pl.INT32)" in dispatch_push_source
+    assert "if worker == 0:" in dispatch_push_source
+    assert "- pl.cast(push_blocks, pl.INT32)" in dispatch_push_source
+    assert "target=data_arrived" in dispatch_push_source
+    assert "target=data_arrived" not in dispatch_wait_source
+    assert "moe_epoch * n_local_experts, pl.INT32" in dispatch_wait_source
+
+    assert "completion_delta = pl.cast(1, pl.INT32)" in combine_scatter_source
+    assert "if worker == 0:" in combine_scatter_source
+    assert "- pl.cast(scatter_blocks, pl.INT32)" in combine_scatter_source
+    assert "target=combine_arrived" in combine_scatter_source
+    assert "pl.read(local_route_count, [0]) == 0" in combine_wait_source
+    assert "moe_epoch * n_local_experts, pl.INT32" in combine_wait_source
+    empty_branches = [
+        node
+        for node in ast.walk(combine_wait)
+        if isinstance(node, ast.If)
+        and "pl.read(local_route_count, [0]) == 0" in ast.unparse(node.test)
+    ]
+    assert len(empty_branches) == 1
+    wait_notifies = [
+        call
+        for call in ast.walk(combine_wait)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pld.system.notify"
+        and "combine_arrived" in ast.unparse(call)
+    ]
+    empty_notifies = [
+        call
+        for call in ast.walk(empty_branches[0])
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pld.system.notify"
+        and "combine_arrived" in ast.unparse(call)
+    ]
+    assert wait_notifies
+    assert {id(call) for call in wait_notifies} == {
+        id(call) for call in empty_notifies
+    }
+    assert all(
+        "value=pl.cast(n_local_experts, pl.INT32)" in ast.unparse(call)
+        for call in empty_notifies
+    )
+
+    # Every non-empty producer notifies in the same task, after its payload
+    # operations. Thus reaching the fixed threshold proves every physical
+    # token/scatter worker completed.
+    for scope, payload_paths, notify_target in (
+        (
+            dispatch_push,
+            {"pld.tensor.put", "pld.tile.remote_store"},
+            "data_arrived",
+        ),
+        (combine_scatter, {"pld.tensor.put"}, "combine_arrived"),
+    ):
+        payload_lines = [
+            call.lineno
+            for call in ast.walk(scope)
+            if isinstance(call, ast.Call)
+            and _call_path(call) in payload_paths
+        ]
+        notify_lines = [
+            call.lineno
+            for call in ast.walk(scope)
+            if isinstance(call, ast.Call)
+            and _call_path(call) == "pld.system.notify"
+            and notify_target in ast.unparse(call)
+        ]
+        assert payload_lines and notify_lines
+        assert max(payload_lines) < min(notify_lines)
+
+    n_local = 36
+    topk = 8
+    for active_tokens in range(17):
+        active_routes = active_tokens * topk
+        push_blocks = min(max(active_tokens, 1), n_local)
+        scan_blocks = min(max(active_routes, 1), n_local)
+
+        covered_routes = [
+            t * topk + k
+            for worker in range(push_blocks)
+            for t in range(worker, active_tokens, push_blocks)
+            for k in range(topk)
+        ]
+        assert sorted(covered_routes) == list(range(active_routes))
+        assert len(covered_routes) == len(set(covered_routes))
+
+        scanned_experts = [
+            expert
+            for worker in range(scan_blocks)
+            for expert in range(worker, n_local, scan_blocks)
+        ]
+        assert sorted(scanned_experts) == list(range(n_local))
+
+        dispatch_credits = [
+            1 + (n_local - push_blocks if worker == 0 else 0)
+            for worker in range(push_blocks)
+        ]
+        assert sum(dispatch_credits) == n_local
+        assert all(credit > 0 for credit in dispatch_credits)
+        for credit in dispatch_credits:
+            assert sum(dispatch_credits) - credit < n_local
+
+        max_active_experts = min(active_routes, n_local)
+        for active_experts in range(max_active_experts + 1):
+            scatter_blocks = min(max(active_experts, 1), n_local)
+            if active_experts == 0:
+                # The scheduler predicate retires this defensive one-block
+                # grid; combine_wait publishes all 36 credits instead.
+                continue
+            assert scatter_blocks == active_experts
+            combine_credits = [
+                1 + (n_local - scatter_blocks if worker == 0 else 0)
+                for worker in range(scatter_blocks)
+            ]
+            assert sum(combine_credits) == n_local
+            assert all(credit > 0 for credit in combine_credits)
+            for credit in combine_credits:
+                assert sum(combine_credits) - credit < n_local
+
+    # A rank receiving no routes skips its scatter grid, but its symmetric
+    # control task still advances peers by the same fixed lane budget.
+    assert n_local == 36
 
 
 def test_two_layer_tp_all_reduce_matches_canonical() -> None:
@@ -528,7 +875,12 @@ def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
     assert "total = total + count" not in dispatch
     assert "out_base = pl.cast(e * expert_recv_max, pl.INDEX)" in dispatch
     for body in (expert, expert_swiglu7):
-        assert "offset = pl.cast(e * expert_recv_max, pl.INDEX)" in body
+        assert (
+            "expert_base = e * expert_recv_max" in body
+            or "offset = pl.cast(e * expert_recv_max, pl.INDEX)" in body
+        )
+        assert "tile_offset = " in body
+        assert " + tile_row0" in body
         assert "pl.read(local_expert_offset, [e])" not in body
     assert "expert_base = pl.cast(e * expert_recv_max, pl.INDEX)" in combine
     assert "pl.read(local_expert_offset, [e])" not in combine

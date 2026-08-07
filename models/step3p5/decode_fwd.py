@@ -9,8 +9,11 @@ local-expert-lane dispatch push/gather, independent metadata/payload arrivals,
 combine scatter/arrival, and token-level FP32 reduction.  EP data windows are
 one shared set across all 42 MoE calls and use a monotonic 1-based
 ``moe_epoch`` across independent metadata, payload, and combine arrival
-lineages.  Metadata waits for ``epoch``; payload and combine waits count one
-completion per local-expert lane and use ``epoch * N_LOCAL``.
+lineages. Metadata publishes once per epoch. Payload and combine retain a
+fixed ``N_LOCAL`` completion budget, but distribute those credits over
+runtime-active data blocks so the threshold still proves every producer
+complete. Empty receive ranks retire gather/scatter data grids through
+scheduler-side predicates while symmetric control tasks continue to run.
 
 Attention/shared TP all-reduce scratch remains independent from EP windows.
 Its peer order, single FP32 accumulator, and final one-time BF16 store are not
@@ -199,6 +202,8 @@ sh_inter_local = INTER_S_LOCAL
 local_recv_max = n_local_experts * expert_recv_max
 stage_rows = 8
 n_routes_per_rank = BATCH * TOPK
+# Combine-only compact route plan: total routes, active-expert count, IDs.
+local_route_plan_size = n_local_experts + 2
 per_rank_buckets = PER_RANK_BUCKETS
 sh_tp_chunk = HIDDEN // tp_size
 # G1 runtime ABI: one active-token count per owner rank.  This is an ordinary
@@ -854,6 +859,8 @@ class WholeDecodeStep3p5:
         pl.Tensor[[n_local_experts], pl.INT32],
         pl.Tensor[[n_local_experts], pl.INT32],
         pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
+        pl.Tensor[[local_route_plan_size], pl.INT32],
+        pl.Scalar[pl.TASK_ID],
     ]:
         """V4-Flash dispatch ABI; combine conversion is intentionally separate.
 
@@ -867,13 +874,21 @@ class WholeDecodeStep3p5:
         recv_meta_local = pl.create_tensor(
             [n_ranks, n_local_experts_pad], dtype=pl.INT32, manual_dep=True,
         )
-        # Metadata has an independent arrival lineage so expert counts become
-        # available without waiting for the bulk x/aux/route payload.
+        local_route_count = pl.create_tensor(
+            [local_route_plan_size], dtype=pl.INT32,
+        )
+        route_slot = pl.create_tensor([BATCH, TOPK], dtype=pl.INT32)
+        self_meta = pl.create_tensor([n_local_experts], dtype=pl.INT32)
+        # Publish route counts and stable per-route lane slots first. Payload
+        # push depends only on this producer; metadata collect waits peers in
+        # a separate task so the two network phases overlap. The self row is
+        # kept in a local tensor because remote_store-to-self has no peer
+        # notify to provide a cross-task visibility fence.
         with pl.at(
             level=pl.Level.CORE_GROUP,
-            name_hint="dispatch_meta",
+            name_hint="dispatch_count_publish",
             allow_early_resolve=True,
-        ) as meta_tid:
+        ) as meta_publish_tid:
             active_tokens = pl.cast(num_tokens, pl.INDEX)
             if active_tokens < 0:
                 active_tokens = pl.cast(0, pl.INDEX)
@@ -889,8 +904,11 @@ class WholeDecodeStep3p5:
                     eid = pl.read(expert_indices, [t, k])
                     dst = eid // n_local_experts
                     loc_e = eid - dst * n_local_experts
-                    cursor[dst * n_local_experts + loc_e] = (
-                        cursor[dst * n_local_experts + loc_e] + 1
+                    cursor_idx = dst * n_local_experts + loc_e
+                    slot = cursor[cursor_idx]
+                    pl.write(route_slot, [t, k], slot)
+                    cursor[cursor_idx] = (
+                        slot + pl.cast(1, pl.INT32)
                     )
 
             meta_tile = pl.tile.full(
@@ -901,17 +919,31 @@ class WholeDecodeStep3p5:
                     pl.tile.write(
                         meta_tile, [0, e], cursor[dst * n_local_experts + e],
                     )
-                pld.tile.remote_store(
-                    meta_tile, target=recv_meta, peer=dst,
-                    offsets=[my_rank, 0],
-                )
-                if dst != my_rank:
+                if dst == my_rank:
+                    # Do not rely on a self-target distributed TSTORE draining
+                    # across the publish/collect task boundary.
+                    for e in pl.range(n_local_experts):
+                        pl.write(
+                            self_meta, [e],
+                            cursor[dst * n_local_experts + e],
+                        )
+                else:
+                    pld.tile.remote_store(
+                        meta_tile, target=recv_meta, peer=dst,
+                        offsets=[my_rank, 0],
+                    )
                     pld.system.notify(
                         target=meta_arrived, peer=dst,
                         offsets=[my_rank, 0], value=1,
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="dispatch_meta",
+            deps=[meta_publish_tid],
+            allow_early_resolve=True,
+        ) as meta_collect_tid:
             for src in pl.range(n_ranks):
                 if src != my_rank:
                     pld.system.wait(
@@ -919,6 +951,8 @@ class WholeDecodeStep3p5:
                         expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                     )
 
+            total_count = pl.cast(0, pl.INT32)
+            active_expert_count_i32 = pl.cast(0, pl.INT32)
             for e in pl.range(n_local_experts):
                 pl.write(
                     local_expert_offset, [e],
@@ -926,76 +960,118 @@ class WholeDecodeStep3p5:
                 )
                 count = pl.cast(0, pl.INT32)
                 for src in pl.range(n_ranks):
-                    meta_count = pl.read(recv_meta, [src, e])
+                    meta_count = pl.cast(0, pl.INT32)
+                    if src == my_rank:
+                        meta_count = pl.read(self_meta, [e])
+                    else:
+                        meta_count = pl.read(recv_meta, [src, e])
                     pl.write(recv_meta_local, [src, e], meta_count)
                     count = count + meta_count
                 pl.write(local_expert_count, [e], count)
+                if count > 0:
+                    pl.write(
+                        local_route_count,
+                        [
+                            pl.cast(active_expert_count_i32, pl.INDEX)
+                            + pl.cast(2, pl.INDEX)
+                        ],
+                        pl.cast(e, pl.INT32),
+                    )
+                    active_expert_count_i32 = (
+                        active_expert_count_i32 + pl.cast(1, pl.INT32)
+                    )
+                total_count = total_count + count
+            pl.write(local_route_count, [0], total_count)
+            pl.write(local_route_count, [1], active_expert_count_i32)
 
-        # One block owns one local-expert lane on every destination. This is
-        # the V4-Flash push layout [expert, source, slot].
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > BATCH:
+            active_tokens = pl.cast(BATCH, pl.INDEX)
+        active_routes = active_tokens * TOPK
+        push_blocks = active_tokens
+        if push_blocks < 1:
+            # Defensive zero-token invocation: retain one no-op/control block
+            # so the symmetric communication barrier still advances.
+            push_blocks = pl.cast(1, pl.INDEX)
+        if push_blocks > n_local_experts:
+            push_blocks = pl.cast(n_local_experts, pl.INDEX)
+        scan_blocks = active_routes
+        if scan_blocks < 1:
+            scan_blocks = pl.cast(1, pl.INDEX)
+        if scan_blocks > n_local_experts:
+            scan_blocks = pl.cast(n_local_experts, pl.INDEX)
+
+        # Token workers keep all TOPK routes for one token in the same block.
+        # This preserves route-level work coverage without multiplying the
+        # fixed-credit peer notifications by TOPK. The receive-side scan uses
+        # its independent route-derived grid below.
         with pl.spmd(
-            n_local_experts,
+            push_blocks,
             name_hint="dispatch_push",
+            deps=[meta_publish_tid],
             allow_early_resolve=True,
         ) as dispatch_push_tid:
-            loc_e = pl.tile.get_block_idx()
-            active_tokens = pl.cast(num_tokens, pl.INDEX)
-            if active_tokens < 0:
-                active_tokens = pl.cast(0, pl.INDEX)
-            if active_tokens > BATCH:
-                active_tokens = pl.cast(BATCH, pl.INDEX)
-
-            slot_ctr = pl.array.create(n_ranks, pl.INT32)
-            for d in pl.range(n_ranks):
-                slot_ctr[d] = 0
-            lane_base = (
-                loc_e * dispatch_recv_per_expert
-                + my_rank * dispatch_max_per_src
-            )
+            worker = pl.tile.get_block_idx()
             aux_tile = pl.tile.full(
                 [1, dispatch_aux_pad], dtype=pl.FP32, value=0.0,
             )
             route_tile = pl.tile.full([1, idx_pad], dtype=pl.INT32, value=0)
-            for t in pl.range(active_tokens):
+            for t in pl.range(worker, active_tokens, push_blocks):
                 for k in pl.range(TOPK):
+                    route_idx = t * TOPK + k
                     eid = pl.read(expert_indices, [t, k])
                     dst = eid // n_local_experts
-                    le = eid - dst * n_local_experts
-                    if le == loc_e:
-                        slot = slot_ctr[dst]
-                        slot_ctr[dst] = slot + 1
-                        row = lane_base + slot
-                        pld.tensor.put(
-                            dst=recv_x, peer=dst, src=x,
-                            dst_offsets=[row, 0], src_offsets=[t, 0],
-                            shape=[1, HIDDEN],
-                        )
-                        for sc in pl.range(DISPATCH_SCALE_COLS):
-                            pl.tile.write(
-                                aux_tile, [0, sc], pl.read(x_scale, [t, sc]),
-                            )
+                    loc_e = eid - dst * n_local_experts
+                    route_slot_idx = pl.cast(
+                        pl.read(route_slot, [t, k]), pl.INDEX,
+                    )
+                    row = (
+                        loc_e * dispatch_recv_per_expert
+                        + my_rank * dispatch_max_per_src
+                        + route_slot_idx
+                    )
+                    pld.tensor.put(
+                        dst=recv_x, peer=dst, src=x,
+                        dst_offsets=[row, 0], src_offsets=[t, 0],
+                        shape=[1, HIDDEN],
+                    )
+                    for sc in pl.range(DISPATCH_SCALE_COLS):
                         pl.tile.write(
-                            aux_tile, [0, dispatch_weight_col],
-                            pl.read(expert_weights, [t, k]),
+                            aux_tile, [0, sc], pl.read(x_scale, [t, sc]),
                         )
-                        pld.tile.remote_store(
-                            aux_tile, target=recv_aux, peer=dst,
-                            offsets=[row, 0],
-                        )
-                        pl.tile.write(
-                            route_tile, [0, 0],
-                            pl.cast(t * TOPK + k, pl.INT32),
-                        )
-                        pld.tile.remote_store(
-                            route_tile, target=recv_route, peer=dst,
-                            offsets=[row, 0],
-                        )
+                    pl.tile.write(
+                        aux_tile, [0, dispatch_weight_col],
+                        pl.read(expert_weights, [t, k]),
+                    )
+                    pld.tile.remote_store(
+                        aux_tile, target=recv_aux, peer=dst,
+                        offsets=[row, 0],
+                    )
+                    pl.tile.write(
+                        route_tile, [0, 0], pl.cast(route_idx, pl.INT32),
+                    )
+                    pld.tile.remote_store(
+                        route_tile, target=recv_route, peer=dst,
+                        offsets=[row, 0],
+                    )
 
+            # Keep payload completion in the same task as TSTORE. Every
+            # physical block contributes one credit; block zero supplies the
+            # unused credits so the reusable signal advances by exactly 36.
+            completion_delta = pl.cast(1, pl.INT32)
+            if worker == 0:
+                completion_delta = (
+                    completion_delta
+                    + pl.cast(n_local_experts, pl.INT32)
+                    - pl.cast(push_blocks, pl.INT32)
+                )
             for dst in pl.range(n_ranks):
                 if dst != my_rank:
                     pld.system.notify(
                         target=data_arrived, peer=dst,
-                        offsets=[my_rank, 0], value=1,
+                        offsets=[my_rank, 0], value=completion_delta,
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
@@ -1017,39 +1093,42 @@ class WholeDecodeStep3p5:
                     )
 
         # Gather each expert into its fixed V4 lane. Route weight and route id
-        # stay beside the activation; counts only bound the valid prefix.
+        # stay beside the activation; counts only bound the valid prefix.  The
+        # predicate retires the entire data grid on an empty destination rank.
         with pl.spmd(
-            n_local_experts,
+            scan_blocks,
             name_hint="dispatch_gather",
-            deps=[wait_tid, meta_tid],
+            deps=[wait_tid, meta_collect_tid],
+            predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
         ) as dispatch_gather_tid:
-            e = pl.tile.get_block_idx()
-            out_base = pl.cast(e * expert_recv_max, pl.INDEX)
-            expert_prefix = pl.cast(0, pl.INDEX)
-            lane_e_base = e * dispatch_recv_per_expert
-            for src in pl.range(n_ranks):
-                route_count = pl.cast(
-                    pl.read(recv_meta_local, [src, e]), pl.INDEX,
-                )
-                src_base = lane_e_base + src * dispatch_max_per_src
-                for slot in pl.range(route_count):
-                    in_row = src_base + slot
-                    out_row = out_base + expert_prefix + slot
-                    local_routed_x_out[out_row : out_row + 1, :] = (
-                        recv_x[in_row : in_row + 1, :]
+            worker = pl.tile.get_block_idx()
+            for e in pl.range(worker, n_local_experts, scan_blocks):
+                out_base = pl.cast(e * expert_recv_max, pl.INDEX)
+                expert_prefix = pl.cast(0, pl.INDEX)
+                lane_e_base = e * dispatch_recv_per_expert
+                for src in pl.range(n_ranks):
+                    route_count = pl.cast(
+                        pl.read(recv_meta_local, [src, e]), pl.INDEX,
                     )
-                    pl.write(
-                        local_routed_x_scale_out, [0, out_row],
-                        pl.read(recv_aux, [in_row, 0]),
-                    )
-                    pl.write(
-                        local_routed_weight_out, [out_row],
-                        pl.read(recv_aux, [in_row, dispatch_weight_col]),
-                    )
-                    route = pl.read(recv_route, [in_row, 0])
-                    pl.write(local_route_out, [out_row], route)
-                expert_prefix = expert_prefix + route_count
+                    src_base = lane_e_base + src * dispatch_max_per_src
+                    for slot in pl.range(route_count):
+                        in_row = src_base + slot
+                        out_row = out_base + expert_prefix + slot
+                        local_routed_x_out[out_row : out_row + 1, :] = (
+                            recv_x[in_row : in_row + 1, :]
+                        )
+                        pl.write(
+                            local_routed_x_scale_out, [0, out_row],
+                            pl.read(recv_aux, [in_row, 0]),
+                        )
+                        pl.write(
+                            local_routed_weight_out, [out_row],
+                            pl.read(recv_aux, [in_row, dispatch_weight_col]),
+                        )
+                        route = pl.read(recv_route, [in_row, 0])
+                        pl.write(local_route_out, [out_row], route)
+                    expert_prefix = expert_prefix + route_count
 
         return (
             local_routed_x_out,
@@ -1059,6 +1138,8 @@ class WholeDecodeStep3p5:
             local_expert_offset,
             local_expert_count,
             recv_meta_local,
+            local_route_count,
+            meta_collect_tid,
         )
 
     # ---------- Stage 3a: expert_routed (local 36 experts) ----------
@@ -1861,21 +1942,41 @@ class WholeDecodeStep3p5:
         local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
         local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
         recv_meta_local: pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
+        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count_tid: pl.Scalar[pl.TASK_ID],
         num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
         moe_epoch: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > BATCH:
+            active_tokens = pl.cast(BATCH, pl.INDEX)
+        active_expert_count = pl.cast(
+            pl.read(local_route_count, [1]), pl.INDEX,
+        )
+        scatter_blocks = active_expert_count
+        if scatter_blocks < 1:
+            scatter_blocks = pl.cast(1, pl.INDEX)
+        if scatter_blocks > n_local_experts:
+            scatter_blocks = pl.cast(n_local_experts, pl.INDEX)
+
         with pl.spmd(
-            n_local_experts,
+            scatter_blocks,
             name_hint="combine_scatter",
+            deps=[local_route_count_tid],
+            predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
         ) as combine_scatter_tid:
-            e = pl.tile.get_block_idx()
+            worker = pl.tile.get_block_idx()
+            e = pl.cast(
+                pl.read(local_route_count, [worker + 2]), pl.INDEX,
+            )
             expert_base = pl.cast(e * expert_recv_max, pl.INDEX)
             # ``local_route`` is the V4 route id (token * TOPK + k), not a
-            # packed source-rank route.  Preserve source provenance from the
-            # dispatch lane: rows are [expert, source, slot], and
-            # recv_meta_local supplies the exact source prefix for each lane.
+            # packed source-rank route. Preserve source provenance from
+            # the dispatch lane: rows are [expert, source, slot].
             source_prefix = pl.cast(0, pl.INDEX)
             for src in pl.range(n_ranks):
                 src_count = pl.cast(
@@ -1895,13 +1996,24 @@ class WholeDecodeStep3p5:
                         shape=[1, HIDDEN],
                     )
                 source_prefix = source_prefix + src_count
+
+            # One producer owns one active expert. Block zero supplies the
+            # unused fixed-lane credits, so reaching 36 still proves every
+            # active producer completed its TSTOREs.
+            completion_delta = pl.cast(1, pl.INT32)
+            if worker == 0:
+                completion_delta = (
+                    completion_delta
+                    + pl.cast(n_local_experts, pl.INT32)
+                    - pl.cast(scatter_blocks, pl.INT32)
+                )
             for peer in pl.range(n_ranks):
                 if peer != my_rank:
                     pld.system.notify(
                         target=combine_arrived,
                         peer=peer,
                         offsets=[my_rank, 0],
-                        value=1,
+                        value=completion_delta,
                         op=pld.NotifyOp.AtomicAdd,
                     )
 
@@ -1912,6 +2024,17 @@ class WholeDecodeStep3p5:
             allow_early_resolve=True,
         ) as combine_wait_tid:
             _routed_anchor = pl.read(local_routed_y, [0, 0])
+            if pl.read(local_route_count, [0]) == 0:
+                # Predicated empty-rank scatter emitted no data block.
+                for peer in pl.range(n_ranks):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=combine_arrived,
+                            peer=peer,
+                            offsets=[my_rank, 0],
+                            value=pl.cast(n_local_experts, pl.INT32),
+                            op=pld.NotifyOp.AtomicAdd,
+                        )
             for src in pl.range(n_ranks):
                 if src != my_rank:
                     pld.system.wait(
@@ -1923,11 +2046,6 @@ class WholeDecodeStep3p5:
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > BATCH:
-            active_tokens = pl.cast(BATCH, pl.INDEX)
         with pl.spmd(
             BATCH,
             name_hint="combine_reduce",
@@ -2096,6 +2214,8 @@ class WholeDecodeStep3p5:
             local_expert_offset,
             local_expert_count,
             recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
@@ -2128,6 +2248,8 @@ class WholeDecodeStep3p5:
             combine_arrived,
             local_route, routed_y_buf,
             local_expert_count, local_expert_offset, recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
             num_tokens, my_rank, moe_epoch,
         )
 
@@ -2293,6 +2415,8 @@ class WholeDecodeStep3p5:
             local_expert_offset,
             local_expert_count,
             recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
@@ -2325,6 +2449,8 @@ class WholeDecodeStep3p5:
             combine_arrived,
             local_route, routed_y_buf,
             local_expert_count, local_expert_offset, recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
             num_tokens, my_rank, moe_epoch,
         )
 
@@ -3190,6 +3316,8 @@ class WholeDecodeStep3p5:
             local_expert_offset,
             local_expert_count,
             recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
@@ -3222,6 +3350,8 @@ class WholeDecodeStep3p5:
             combine_arrived,
             local_route, routed_y_buf,
             local_expert_count, local_expert_offset, recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
             num_tokens, my_rank, moe_epoch,
         )
 
@@ -3382,6 +3512,8 @@ class WholeDecodeStep3p5:
             local_expert_offset,
             local_expert_count,
             recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
         ) = self.dispatch_step(
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
@@ -3414,6 +3546,8 @@ class WholeDecodeStep3p5:
             combine_arrived,
             local_route, routed_y_buf,
             local_expert_count, local_expert_offset, recv_meta_local,
+            local_route_count,
+            local_route_count_tid,
             num_tokens, my_rank, moe_epoch,
         )
 

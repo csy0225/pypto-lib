@@ -166,7 +166,10 @@ ROUTED_H_QUANT_N_CHUNK = 64
 # L43/L44 keep the existing specialization until they are tuned separately.
 ROUTED_GATE_K_CHUNK = 64
 ROUTED_GATE_N_CHUNK = 64
-ROUTED_DOWN_K_CHUNK = 64
+# Down projection is INT8×INT8→INT32, so doubling K does not alter the
+# accumulation/rounding contract.  A 128-wide K tile halves the long
+# matmul_acc chain while keeping the validated 256-wide output tile.
+ROUTED_DOWN_K_CHUNK = 128
 ROUTED_DOWN_N_CHUNK = 256
 RECV_TILE = 16
 ROUTED_SPECIAL_DOWN_N_CHUNK = 128

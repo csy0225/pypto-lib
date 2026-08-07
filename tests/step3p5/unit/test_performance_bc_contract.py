@@ -989,6 +989,41 @@ def test_regular_routed_expert_uses_one_static_grid_per_stage() -> None:
     assert "for e in pl.parallel(n_local_experts)" not in expert_source
 
 
+def test_routed_down_halves_the_int8_accumulation_chain() -> None:
+    source, tree = _parse(_CANONICAL)
+    assignments = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "ROUTED_DOWN_K_CHUNK"
+    }
+    assert assignments == {"ROUTED_DOWN_K_CHUNK": 128}
+
+    regular_scope = _task_scope(
+        _method(tree, "_expert_routed"), "expert_down",
+    )
+    special_function = _method(tree, "_expert_routed_swiglu7")
+    regular = _segment(source, regular_scope)
+    special = _segment(source, special_function)
+    for node in (regular_scope, special_function):
+        loops = [
+            item
+            for item in ast.walk(node)
+            if isinstance(item, ast.For)
+            and isinstance(item.iter, ast.Call)
+            and ast.unparse(item.iter)
+            == "pl.range(1, inter // ROUTED_DOWN_K_CHUNK)"
+        ]
+        assert len(loops) == 1
+    assert regular.count("[RECV_TILE, ROUTED_DOWN_K_CHUNK]") == 2
+    assert (
+        special.count("[RECV_SPECIAL_TILE, ROUTED_DOWN_K_CHUNK]")
+        == 2
+    )
+
+
 def test_fixed_grid_planners_cover_every_active_tile_once() -> None:
     workers = 22
     stage_chunks = {

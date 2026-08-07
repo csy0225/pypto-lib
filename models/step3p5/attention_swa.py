@@ -768,15 +768,32 @@ def attention_swa(
                         [1, BLOCK_SIZE],
                         dtype=pl.INT32,
                     )
-                    valid_from_i32 = pl.cmp(
-                        score_cols,
-                        pl.cast(valid_lo, pl.INT32),
-                        cmp_type=5,
+                    zero_i32 = pl.const(0, pl.INT32)
+                    one_i32 = pl.const(1, pl.INT32)
+                    valid_from_i32 = pl.minimum(
+                        pl.maximum(
+                            pl.add(
+                                pl.sub(
+                                    score_cols,
+                                    pl.cast(valid_lo, pl.INT32),
+                                ),
+                                one_i32,
+                            ),
+                            zero_i32,
+                        ),
+                        one_i32,
                     )
-                    valid_to_i32 = pl.cmp(
-                        score_cols,
-                        pl.cast(valid_hi, pl.INT32),
-                        cmp_type=2,
+                    valid_to_i32 = pl.minimum(
+                        pl.maximum(
+                            pl.neg(
+                                pl.sub(
+                                    score_cols,
+                                    pl.cast(valid_hi, pl.INT32),
+                                ),
+                            ),
+                            zero_i32,
+                        ),
+                        one_i32,
                     )
                     valid_mask = pl.cast(
                         pl.mul(valid_from_i32, valid_to_i32),

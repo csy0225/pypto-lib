@@ -214,8 +214,12 @@ def test_swa_source_indexes_tail_window_and_masks_both_edges() -> None:
     assert source.count("[fa_cache_row, 0]") == 2
     assert "valid_shape=[Q_HEAD_BATCH_SWA, valid_len]" not in source
     assert "if valid_len < BLOCK_SIZE:" in source
-    assert "valid_from_i32 = pl.cmp(" in source
-    assert "valid_to_i32 = pl.cmp(" in source
+    assert "zero_i32 = pl.const(0, pl.INT32)" in source
+    assert "one_i32 = pl.const(1, pl.INT32)" in source
+    assert "valid_from_i32 = pl.minimum(" in source
+    assert "valid_to_i32 = pl.minimum(" in source
+    assert "pl.neg(" in source
+    assert "pl.cmp(" not in source
     assert "valid_mask = pl.cast(" in source
     assert "scores = pl.col_expand_add(scores, invalid_bias)" in source
 

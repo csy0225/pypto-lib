@@ -1,13 +1,16 @@
 # Step3p5 canonical test layout
 
-当前测试树只服务于 single-chip hidden-only Main/MTP：
+The active test tree covers single-chip hidden-only Main/MTP plus the
+focused five-layer MoE admission harness:
 
 ```text
 harnesses/
   _stage_main_hidden_only.py
   _stage_mtp_hidden_selected.py
+  _stage_five_layer_moe.py
 unit/
   ABI、metadata、KV reserve、IPC、loader、control-plane contracts
+  test_performance_bc_contract.py
 ci/
   run_whole_network_ci.py
   test_whole_network_ci_runner.py
@@ -26,3 +29,24 @@ python -m tests.step3p5.ci.run_whole_network_ci \
 
 旧 per-layer decode、旧 whole-net IPC wrapper、旧 whole-MTP3 和旧
 generator 不允许重新添加兼容入口。
+
+## MoE runtime-active scheduling contracts
+
+`tests/step3p5/unit/test_performance_bc_contract.py` is the static admission
+gate for the V4-Flash-compatible fixed-lane dispatch/combine schedule. It
+checks that:
+
+1. dispatch data workers follow runtime-active tokens and routes;
+2. dense route slots cover every `(token, top-k)` route exactly once;
+3. combine scatter consumes the compact active-expert plan and skips an empty
+   receive rank's data grid;
+4. payload and combine grids still publish exactly 36 completion credits, so
+   `moe_epoch * 36` cannot be reached before every emitted producer finishes.
+
+Run the focused contracts with:
+
+```bash
+python -m pytest -q -p no:cacheprovider \
+  tests/step3p5/unit/test_attention_swa_active_bound.py \
+  tests/step3p5/unit/test_performance_bc_contract.py
+```

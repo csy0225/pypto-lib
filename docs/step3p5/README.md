@@ -128,6 +128,57 @@ num_tokens_per_owner[0:tp] = valid_tokens
 的 KV write，所以 padding metadata 不能省略，也不能指向 scheduler 正在管理
 的 block。sidecar 最终只返回输出的前 `valid_tokens` 行。
 
+#### V4-Flash runtime-active MoE scheduling
+
+The physical EP lane ABI remains fixed at 36 local experts per rank. Runtime
+scheduling changes only the number of data workers issued for the current
+decode step; it does not change buffer shapes, route IDs, expert-lane bases,
+or the epoch wait contract.
+
+This is a token-major hybrid scheduler over the V4-Flash-compatible fixed-lane
+ABI, not a claim of task-for-task equivalence with DeepSeek V4-Flash.
+
+Let:
+
+```text
+T = clamp(num_tokens, 0, 16)
+R = T * TOPK
+A = number of local experts that receive at least one route on this rank
+E = n_local_experts = 36
+```
+
+The current task grids are:
+
+| Swimlane task | Data grid | Function |
+|---|---:|---|
+| `dispatch_count_publish` | one control task | Assign a dense slot for each `(destination rank, local expert)` route and publish per-expert counts. |
+| `dispatch_push` | `clamp(T, 1, E)` | One token worker owns all `TOPK` routes for its strided token set and writes the V4-Flash `[expert, source, slot]` lanes. |
+| `dispatch_meta` | one control task | Collect peer counts and build `[total_routes, A, active_expert_ids...]`. |
+| `dispatch_gather` | `clamp(R, 1, E)` with `total_routes > 0` predicate | Distribute the scan of all 36 fixed expert lanes across route-sized workers. This stage does not yet consume the compact active-expert list. |
+| routed expert kernels | `ceil(local_expert_count[e] / RECV_TILE)` data tiles per expert | Keep the existing count-bounded expert compute; a zero-count expert emits no routed compute tile. |
+| `combine_scatter` | `clamp(A, 1, E)` with `total_routes > 0` predicate | Consume the compact active-expert list and return only experts that received routes. |
+| `combine_reduce` | fixed storage grid of 16 | Reduce `shared + TOPK routed` in FP32 only for `t < T`; inactive rows preserve the shared result. |
+
+An empty receive rank therefore retires the `dispatch_gather` and
+`combine_scatter` data grids through scheduler predicates, and its zero expert
+counts emit no routed-expert data tiles. The shared-expert branch, local token
+push, metadata, publication, wait, combine-reduce, and epoch-control tasks
+remain present where required. An empty receive rank is therefore not
+removed from the collective graph.
+
+Payload and combine completion signals preserve the fixed V4-Flash credit
+contract:
+
+```text
+credits produced by each non-empty grid = E
+wait threshold at epoch k               = k * E
+```
+
+Each emitted block contributes one credit and block 0 supplies the unused
+`E - emitted_blocks` credits. If `combine_scatter` is predicated away,
+`combine_wait` publishes all `E` credits. Consequently, reducing the data grid
+cannot satisfy a wait before every emitted payload producer has completed.
+
 #### KV ownership 与物理布局
 
 live 路径的 KV allocation 由 vLLM allocator 拥有。Main holder 在
@@ -330,7 +381,7 @@ scripts/run_pypto_mtp3_back8.sh
 tests/step3p5/ci/run_whole_network_ci.py
 ```
 
-## 7. 当前 canonical 状态（2026-07-27）
+## 7. 当前 canonical 状态（2026-08-07）
 
 loop-form Main 已正式位于
 `models/step3p5/decode_fwd.py`，生产 holder 直接编译：
@@ -385,6 +436,31 @@ step 127 / 128 / 255:             PASS
 因此本次正式化只改变 canonical module/program 名称，不改变已验证的数学
 实现。2026-07-27 的清理进一步删除了 retired unroll source、rollback
 selector 和自定义 Main 入口；后续实现与验收统一以 canonical 为 base。
+
+### 7.2 V4-Flash active-route MoE admission
+
+The runtime-active dispatch/combine rewrite was integrated into
+`stepfun/develop` as a fast-forward change:
+
+```text
+base:   63814d4ae62718b3c0721834878e4b4af4e7ac1b
+change: cd19fe6b80f90e27f576091b05753d166a77507c
+```
+
+Admission evidence collected on 0162:
+
+| Gate | Configuration | Result |
+|---|---|---|
+| Focused contracts | `test_attention_swa_active_bound.py` and `test_performance_bc_contract.py` | `30 passed` |
+| Five-layer correctness | matched base/change, BS1, context 65536, layers L3/L4 | BF16 bit-exact, `max_abs_diff = 0` |
+| Five-layer correctness | matched base/change, BS16, context 65536, layers L3/L4 | BF16 bit-exact, `max_abs_diff = 0` |
+| Whole-net smoke/ITL | change only, BS1, context 65536, warmup 5, measured 50 | PASS; finite hidden; mean 38.297 ms, p50 38.244 ms, p99 39.697 ms |
+
+The whole-net ITL entry is a candidate-only absolute measurement. No matched
+whole-net performance A/B was run for this admission, so these numbers must
+not be reported as a speedup or regression percentage. The five-layer runs
+establish numerical non-regression relative to the stated base; they do not
+replace the independent live-oracle gate.
 
 ## 8. 已证实的精度根因
 

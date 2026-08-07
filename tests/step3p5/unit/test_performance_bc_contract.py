@@ -884,3 +884,264 @@ def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
         assert "pl.read(local_expert_offset, [e])" not in body
     assert "expert_base = pl.cast(e * expert_recv_max, pl.INDEX)" in combine
     assert "pl.read(local_expert_offset, [e])" not in combine
+
+
+def test_shared_mlp_uses_two_bounded_fixed_grids() -> None:
+    source, tree = _parse(_CANONICAL)
+    helper = _method(tree, "_expert_shared_local")
+    helper_source = _segment(source, helper)
+    args = [arg.arg for arg in helper.args.args]
+    assert args[1:] == [
+        "x",
+        "w_gate",
+        "w_up",
+        "w_down",
+        "sh_y_shard",
+        "swiglu_limit",
+    ]
+    assert "num_tokens" not in helper_source
+    assert (
+        "[BATCH, sh_inter_local], dtype=pl.BF16, manual_dep=True"
+        in helper_source
+    )
+
+    gate = _task_scope(helper, "sh_gate_up_act")
+    down = _task_scope(helper, "sh_down")
+    for scope, blocks in (
+        (gate, "SHARED_GATE_UP_ACT_BLOCKS"),
+        (down, "SHARED_DOWN_WORKERS"),
+    ):
+        call = scope.items[0].context_expr
+        assert isinstance(call, ast.Call)
+        assert _call_path(call) == "pl.spmd"
+        assert [ast.unparse(arg) for arg in call.args] == [blocks]
+
+    gate_source = _segment(source, gate)
+    assert (
+        "for chunk in pl.range(\n"
+        "                worker,\n"
+        "                SHARED_GATE_UP_ACT_CHUNKS,\n"
+        "                SHARED_GATE_UP_ACT_BLOCKS,"
+    ) in gate_source
+    assert "sh_hidden[" in gate_source
+    assert "pl.cast(gated, target_type=pl.BF16)" in gate_source
+
+    down_source = _segment(source, down)
+    assert "deps=[sh_gate_up_tid]" in down_source
+    assert (
+        "worker, HIDDEN // SHARED_DOWN_N_CHUNK, SHARED_DOWN_WORKERS"
+        in down_source
+    )
+    assert "pl.slice(\n                    sh_hidden," in down_source
+
+    generic_call = _method_calls(
+        _method(tree, "expert_shared_step"),
+        "_expert_shared_local",
+    )
+    assert len(generic_call) == 1
+    assert ast.unparse(generic_call[0].args[-1]) == "_SHARED_SWIGLU_LIMIT"
+    special_call = _method_calls(
+        _method(tree, "_expert_shared_local_swiglu16"),
+        "_expert_shared_local",
+    )
+    assert len(special_call) == 1
+    assert ast.unparse(special_call[0].args[-1]) == "_SHARED_SWIGLU16_LIMIT"
+
+
+def test_regular_routed_expert_uses_one_static_grid_per_stage() -> None:
+    source, tree = _parse(_CANONICAL)
+    expert = _method(tree, "_expert_routed")
+    expert_source = _segment(source, expert)
+    stages = (
+        ("expert_gate_up", "local_route_count_tid"),
+        ("expert_gate_up_act", "routed_gate_up_tid"),
+        ("routed_h_quant", "routed_act_tid"),
+        ("expert_down", "routed_quant_tid"),
+    )
+    for name_hint, dependency in stages:
+        scope = _task_scope(expert, name_hint)
+        call = scope.items[0].context_expr
+        assert isinstance(call, ast.Call)
+        assert _call_path(call) == "pl.spmd"
+        assert [ast.unparse(arg) for arg in call.args] == [
+            "ROUTED_GRID_WORKERS",
+        ]
+        keywords = {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in call.keywords
+        }
+        assert keywords["deps"] == f"[{dependency}]"
+        assert keywords["predicate"] == "local_route_count[0] > 0"
+        scope_source = _segment(source, scope)
+        assert "pl.read(local_route_count, [1])" in scope_source
+        assert "pl.read(local_route_count, [active_slot + 2])" in scope_source
+
+    gate = _segment(source, _task_scope(expert, "expert_gate_up"))
+    assert (
+        "chunks_per_expert = inter // ROUTED_GATE_MM_N_CHUNK"
+        in gate
+    )
+    assert "gate_up_work = active_expert_count * chunks_per_expert" in gate
+    assert "gate_acc = pl.matmul(x0, wg0, out_dtype=pl.INT32)" in gate
+    assert "up_acc = pl.matmul(x0, wu0, out_dtype=pl.INT32)" in gate
+    assert "projection" not in gate
+    assert "if projection" not in expert_source
+    assert "for e in pl.parallel(n_local_experts)" not in expert_source
+
+
+def test_fixed_grid_planners_cover_every_active_tile_once() -> None:
+    workers = 22
+    stage_chunks = {
+        "gate_up": 20,
+        "act": 20,
+        "quant": 1,
+        "down": 16,
+    }
+    for active_experts in (1, 2, 3, 8, 36):
+        for tiles_per_expert in (1, 2, 4):
+            for chunks in stage_chunks.values():
+                logical_work = active_experts * chunks
+                owners = [
+                    work
+                    for worker in range(workers)
+                    for work in range(worker, logical_work, workers)
+                ]
+                assert sorted(owners) == list(range(logical_work))
+                assert len(owners) == len(set(owners))
+
+                covered = [
+                    (work // chunks, tile, work % chunks)
+                    for work in owners
+                    for tile in range(tiles_per_expert)
+                ]
+                expected = [
+                    (expert, tile, chunk)
+                    for expert in range(active_experts)
+                    for tile in range(tiles_per_expert)
+                    for chunk in range(chunks)
+                ]
+                assert sorted(covered) == expected
+
+    shared_gate = [
+        chunk
+        for worker in range(2)
+        for chunk in range(worker, 5, 2)
+    ]
+    shared_down = [
+        block
+        for worker in range(2)
+        for block in range(worker, 16, 2)
+    ]
+    assert sorted(shared_gate) == list(range(5))
+    assert sorted(shared_down) == list(range(16))
+
+
+def test_shared_two_stage_schedule_is_bf16_exact() -> None:
+    import torch
+
+    storage_rows = 8
+    input_hidden = 8
+    swiglu_chunk = 2
+    shared_hidden = 5 * swiglu_chunk
+    down_chunk = 2
+    down_blocks = 16
+    output_hidden = down_blocks * down_chunk
+
+    def bf16(values: torch.Tensor) -> torch.Tensor:
+        return values.to(torch.bfloat16).to(torch.float32)
+
+    x = bf16(
+        torch.sin(
+            torch.arange(
+                storage_rows * input_hidden, dtype=torch.float32,
+            ).reshape(storage_rows, input_hidden)
+            * 0.013
+        )
+    )
+    w_gate = bf16(
+        torch.cos(
+            torch.arange(
+                input_hidden * shared_hidden, dtype=torch.float32,
+            ).reshape(input_hidden, shared_hidden)
+            * 0.017
+        )
+        * 0.25
+    )
+    w_up = bf16(
+        torch.sin(
+            torch.arange(
+                input_hidden * shared_hidden, dtype=torch.float32,
+            ).reshape(input_hidden, shared_hidden)
+            * 0.019
+        )
+        * 0.25
+    )
+    w_down = bf16(
+        torch.cos(
+            torch.arange(
+                shared_hidden * output_hidden, dtype=torch.float32,
+            ).reshape(shared_hidden, output_hidden)
+            * 0.011
+        )
+        * 0.125
+    )
+
+    def activation_chunks(limit: float | None) -> list[torch.Tensor]:
+        chunks: list[torch.Tensor] = []
+        for chunk in range(5):
+            n0 = chunk * swiglu_chunk
+            n1 = n0 + swiglu_chunk
+            gate = x @ w_gate[:, n0:n1]
+            up = x @ w_up[:, n0:n1]
+            silu = gate * torch.reciprocal(torch.exp(-gate) + 1.0)
+            if limit is not None:
+                silu = torch.minimum(silu, torch.tensor(limit))
+                up = torch.clamp(up, -limit, limit)
+            chunks.append(bf16(silu * up))
+        return chunks
+
+    def down_block(
+        chunks: list[torch.Tensor],
+        block: int,
+    ) -> torch.Tensor:
+        d0 = block * down_chunk
+        d1 = d0 + down_chunk
+        acc = chunks[0] @ w_down[0:swiglu_chunk, d0:d1]
+        for chunk in range(1, 5):
+            k0 = chunk * swiglu_chunk
+            k1 = k0 + swiglu_chunk
+            acc = acc + chunks[chunk] @ w_down[k0:k1, d0:d1]
+        return bf16(acc)
+
+    for limit in (None, 16.0):
+        reference_chunks = activation_chunks(limit)
+        reference = torch.empty(
+            [storage_rows, output_hidden],
+            dtype=torch.float32,
+        )
+        for block in range(down_blocks):
+            d0 = block * down_chunk
+            reference[:, d0 : d0 + down_chunk] = down_block(
+                reference_chunks,
+                block,
+            )
+
+        staged_chunks: list[torch.Tensor | None] = [None] * 5
+        computed = activation_chunks(limit)
+        for worker in range(2):
+            for chunk in range(worker, 5, 2):
+                staged_chunks[chunk] = computed[chunk]
+        assert all(chunk is not None for chunk in staged_chunks)
+        concrete_chunks = [
+            chunk for chunk in staged_chunks if chunk is not None
+        ]
+
+        staged = torch.empty_like(reference)
+        for worker in range(2):
+            for block in range(worker, down_blocks, 2):
+                d0 = block * down_chunk
+                staged[:, d0 : d0 + down_chunk] = down_block(
+                    concrete_chunks,
+                    block,
+                )
+        assert torch.equal(staged, reference)

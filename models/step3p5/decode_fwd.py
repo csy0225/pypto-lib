@@ -1709,6 +1709,7 @@ class WholeDecodeStep3p5:
         w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
         w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
         swiglu_limit: pl.Scalar[pl.FP32],
     ):
         # The runtime has no physical-core affinity API. Keep both shared
@@ -1786,41 +1787,93 @@ class WholeDecodeStep3p5:
             allow_early_resolve=True,
         ) as _sh_down_tid:
             worker = pl.tile.get_block_idx()
-            for db in pl.range(
-                worker, HIDDEN // SHARED_DOWN_N_CHUNK, SHARED_DOWN_WORKERS,
-            ):
-                d0 = db * SHARED_DOWN_N_CHUNK
-                h0 = pl.slice(
-                    sh_hidden,
-                    [BATCH, SHARED_SWIGLU_N_CHUNK],
-                    [0, 0],
-                )
-                wd0 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [0, d0],
-                )
-                y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
-                for chunk in pl.range(
-                    1, sh_inter_local // SHARED_SWIGLU_N_CHUNK,
+            active_tokens = pl.cast(num_tokens, pl.INDEX)
+            if active_tokens < 0:
+                active_tokens = pl.cast(0, pl.INDEX)
+            if active_tokens > BATCH:
+                active_tokens = pl.cast(BATCH, pl.INDEX)
+
+            if active_tokens <= 1:
+                if worker == 0:
+                    for db in pl.range(
+                        HIDDEN // SHARED_DOWN_N_CHUNK,
+                    ):
+                        d0 = db * SHARED_DOWN_N_CHUNK
+                        h0 = pl.slice(
+                            sh_hidden,
+                            [BATCH, SHARED_SWIGLU_N_CHUNK],
+                            [0, 0],
+                        )
+                        wd0 = pl.slice(
+                            w_down,
+                            [
+                                SHARED_SWIGLU_N_CHUNK,
+                                SHARED_DOWN_N_CHUNK,
+                            ],
+                            [0, d0],
+                        )
+                        y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                        for chunk in pl.range(
+                            1, sh_inter_local // SHARED_SWIGLU_N_CHUNK,
+                        ):
+                            n0 = chunk * SHARED_SWIGLU_N_CHUNK
+                            hk = pl.slice(
+                                sh_hidden,
+                                [BATCH, SHARED_SWIGLU_N_CHUNK],
+                                [0, n0],
+                            )
+                            wdk = pl.slice(
+                                w_down,
+                                [
+                                    SHARED_SWIGLU_N_CHUNK,
+                                    SHARED_DOWN_N_CHUNK,
+                                ],
+                                [n0, d0],
+                            )
+                            y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                        sh_y_shard = pl.assemble(
+                            sh_y_shard,
+                            pl.cast(y_acc, target_type=pl.BF16),
+                            [0, d0],
+                        )
+            else:
+                for db in pl.range(
+                    worker,
+                    HIDDEN // SHARED_DOWN_N_CHUNK,
+                    SHARED_DOWN_WORKERS,
                 ):
-                    n0 = chunk * SHARED_SWIGLU_N_CHUNK
-                    hk = pl.slice(
+                    d0 = db * SHARED_DOWN_N_CHUNK
+                    h0 = pl.slice(
                         sh_hidden,
                         [BATCH, SHARED_SWIGLU_N_CHUNK],
-                        [0, n0],
+                        [0, 0],
                     )
-                    wdk = pl.slice(
+                    wd0 = pl.slice(
                         w_down,
                         [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                        [n0, d0],
+                        [0, d0],
                     )
-                    y_acc = pl.matmul_acc(y_acc, hk, wdk)
-                sh_y_shard = pl.assemble(
-                    sh_y_shard,
-                    pl.cast(y_acc, target_type=pl.BF16),
-                    [0, d0],
-                )
+                    y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                    for chunk in pl.range(
+                        1, sh_inter_local // SHARED_SWIGLU_N_CHUNK,
+                    ):
+                        n0 = chunk * SHARED_SWIGLU_N_CHUNK
+                        hk = pl.slice(
+                            sh_hidden,
+                            [BATCH, SHARED_SWIGLU_N_CHUNK],
+                            [0, n0],
+                        )
+                        wdk = pl.slice(
+                            w_down,
+                            [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                            [n0, d0],
+                        )
+                        y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                    sh_y_shard = pl.assemble(
+                        sh_y_shard,
+                        pl.cast(y_acc, target_type=pl.BF16),
+                        [0, d0],
+                    )
 
         return sh_y_shard
 
@@ -1838,6 +1891,7 @@ class WholeDecodeStep3p5:
         sh_signal_window: pld.DistributedTensor[
             [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
         ],
+        num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         sh_y = self._expert_shared_local(
@@ -1846,6 +1900,7 @@ class WholeDecodeStep3p5:
             w_up_s,
             w_down_s,
             sh_y,
+            num_tokens,
             _SHARED_SWIGLU_LIMIT,
         )
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
@@ -2114,7 +2169,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 
@@ -2316,7 +2371,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 
@@ -2791,6 +2846,7 @@ class WholeDecodeStep3p5:
         w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
         w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
     ):
         return self._expert_shared_local(
             x,
@@ -2798,6 +2854,7 @@ class WholeDecodeStep3p5:
             w_up,
             w_down,
             sh_y_shard,
+            num_tokens,
             _SHARED_SWIGLU16_LIMIT,
         )
 
@@ -2815,10 +2872,11 @@ class WholeDecodeStep3p5:
         sh_signal_window: pld.DistributedTensor[
             [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
         ],
+        num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         sh_y = self._expert_shared_local_swiglu16(
-            x, w_gate_s, w_up_s, w_down_s, sh_y,
+            x, w_gate_s, w_up_s, w_down_s, sh_y, num_tokens,
         )
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
         if TP_WORLD_SIZE > 1:
@@ -2935,7 +2993,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step_swiglu16(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 
@@ -3131,7 +3189,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 

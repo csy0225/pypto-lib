@@ -886,7 +886,7 @@ def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
     assert "pl.read(local_expert_offset, [e])" not in combine
 
 
-def test_shared_mlp_uses_two_bounded_fixed_grids() -> None:
+def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
     source, tree = _parse(_CANONICAL)
     helper = _method(tree, "_expert_shared_local")
     helper_source = _segment(source, helper)
@@ -897,9 +897,9 @@ def test_shared_mlp_uses_two_bounded_fixed_grids() -> None:
         "w_up",
         "w_down",
         "sh_y_shard",
+        "num_tokens",
         "swiglu_limit",
     ]
-    assert "num_tokens" not in helper_source
     assert (
         "[BATCH, sh_inter_local], dtype=pl.BF16, manual_dep=True"
         in helper_source
@@ -928,24 +928,53 @@ def test_shared_mlp_uses_two_bounded_fixed_grids() -> None:
 
     down_source = _segment(source, down)
     assert "deps=[sh_gate_up_tid]" in down_source
+    assert "active_tokens = pl.cast(num_tokens, pl.INDEX)" in down_source
+    assert "if active_tokens <= 1:" in down_source
+    assert "if worker == 0:" in down_source
+    assert "HIDDEN // SHARED_DOWN_N_CHUNK" in down_source
     assert (
-        "worker, HIDDEN // SHARED_DOWN_N_CHUNK, SHARED_DOWN_WORKERS"
+        "worker,\n"
+        "                    HIDDEN // SHARED_DOWN_N_CHUNK,\n"
+        "                    SHARED_DOWN_WORKERS,"
         in down_source
     )
-    assert "pl.slice(\n                    sh_hidden," in down_source
+    assert down_source.count("sh_hidden,") == 4
 
     generic_call = _method_calls(
         _method(tree, "expert_shared_step"),
         "_expert_shared_local",
     )
     assert len(generic_call) == 1
+    assert ast.unparse(generic_call[0].args[-2]) == "num_tokens"
     assert ast.unparse(generic_call[0].args[-1]) == "_SHARED_SWIGLU_LIMIT"
     special_call = _method_calls(
         _method(tree, "_expert_shared_local_swiglu16"),
         "_expert_shared_local",
     )
     assert len(special_call) == 1
+    assert ast.unparse(special_call[0].args[-2]) == "num_tokens"
     assert ast.unparse(special_call[0].args[-1]) == "_SHARED_SWIGLU16_LIMIT"
+
+    for wrapper_name in (
+        "expert_shared_step",
+        "expert_shared_step_swiglu16",
+    ):
+        wrapper = _method(tree, wrapper_name)
+        assert "num_tokens" in [arg.arg for arg in wrapper.args.args]
+
+    orchestration_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr
+        in {"expert_shared_step", "expert_shared_step_swiglu16"}
+    ]
+    assert len(orchestration_calls) == 4
+    assert all(
+        ast.unparse(call.args[-2]) == "num_tokens"
+        for call in orchestration_calls
+    )
 
 
 def test_regular_routed_expert_uses_one_static_grid_per_stage() -> None:
@@ -1062,13 +1091,21 @@ def test_fixed_grid_planners_cover_every_active_tile_once() -> None:
         for worker in range(2)
         for chunk in range(worker, 5, 2)
     ]
-    shared_down = [
-        block
-        for worker in range(2)
-        for block in range(worker, 16, 2)
-    ]
     assert sorted(shared_gate) == list(range(5))
-    assert sorted(shared_down) == list(range(16))
+    for active_tokens in (0, 1, 2, 16):
+        shared_down = [
+            block
+            for worker in range(2)
+            for block in (
+                range(16)
+                if active_tokens <= 1 and worker == 0
+                else range(0)
+                if active_tokens <= 1
+                else range(worker, 16, 2)
+            )
+        ]
+        assert sorted(shared_down) == list(range(16))
+        assert len(shared_down) == len(set(shared_down))
 
 
 def test_shared_two_stage_schedule_is_bf16_exact() -> None:

@@ -875,6 +875,10 @@ def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
     assert "total = total + count" not in dispatch
     assert "out_base = pl.cast(e * expert_recv_max, pl.INDEX)" in dispatch
     for body in (expert, expert_swiglu7):
+        # The ordinary routed path names the fixed lane base ``expert_base``
+        # while the untouched SwiGLU specialization retains ``offset``.
+        # Both forms must be derived directly from the static expert lane;
+        # neither may consume the dynamic prefix built by dispatch.
         assert (
             "expert_base = e * expert_recv_max" in body
             or "offset = pl.cast(e * expert_recv_max, pl.INDEX)" in body

@@ -19,7 +19,10 @@ pypto `.venv311` 没有 transformers，vanilla oracle 在独立容器里；oracl
 host-networked（host 可直连）。
 
 - Stage 1（oracle 环境，有 transformers + 能连 8000）：`gen_vanilla_oracle.py` 从 seed
-  逐步贪心生成 → `ORACLE_IDS_JSON`。
+  逐步贪心生成 → `ORACLE_IDS_JSON`。请求显式设置
+  `return_tokens_as_token_ids=true`，并且只接受 `logprobs.tokens` 中的
+  `token_id:<id>`；若服务端未返回原生 ID，oracle 直接失败，不把返回文本重新
+  tokenize 成 ID。
 - Stage 2（pypto host，cards 8-15）：`_stage_main_hidden_only --teacher-forced
   --seed-token <seed> --oracle-token <id>...`，每步喂 oracle 正确 token（解耦 token
   链，避免一次翻转污染后续），比 pypto argmax == oracle 下一 token。
@@ -30,12 +33,31 @@ host-networked（host 可直连）。
 然后：
 
 ```bash
-ORACLE_EXEC="sudo -n nsenter -t <sleep-infinity-pid> -m -p -- /usr/local/python3.11.14/bin/python3" \
+ORACLE_PYTHON="/path/to/oracle-python-wrapper" \
+CHECKPOINT_MANIFEST="/path/to/trusted/checkpoint_identity.json" \
 N=128 SEED=6127 \
 bash tests/step3p5/ci/run_live_precision_ab.sh
 ```
 
-准出：`LIVE_AB_ALIGNED >= 95%`。
+`ORACLE_PYTHON` 必须是单个可执行文件路径。若 oracle 位于独立 namespace，
+先准备一个固定 wrapper 可执行文件，再传入该路径；脚本不解析 shell 命令字符串。
+
+默认是 release gate：严格要求 `N=128`、阈值 `>=95%`、当前 checkout clean，
+并从脚本自身路径定位被测 pypto-lib，而不是隐式切到相邻旧工作树。若只做诊断，可显式
+设置 `LIVE_PRECISION_RELEASE_GATE=0`；诊断模式只输出
+`LIVE_AB_DIAGNOSTIC_ALIGNED`，不能作为 release PASS。
+
+两个阶段还必须使用同一份可信的 full-shard checkpoint identity manifest。
+脚本会分别在 oracle 和 PyPTO namespace 中重新计算 config、index 和所有 weight
+shard 的 SHA256，再比较两份 checkpoint evidence；路径可以不同，但 logical ID、
+manifest hash 和 full-shard identity 必须完全一致。任何同尺寸 shard 篡改都会在
+启动模型前 fail closed。
+
+准出：`LIVE_AB_ALIGNED >= 95%`。脚本要求恰好生成 N 个非负 oracle token ID、
+PyPTO 日志包含连续的 `step=0..N-1`，并独立核对每步 `expected_token` 与 frozen
+oracle、`input_token` teacher-forced 链及 `token_exact` 一致性。N 必须为正数，
+门限必须是 `[0,100]` 内的有限值；对齐率低于门限时以非零状态退出。仅打印对齐率
+不构成 PASS。
 
 ## 已验证结果（2026-07-23, 0162, stepfun/develop a632c42e）
 

@@ -76,6 +76,12 @@ _RECV_META_SHAPE = (2, 8, 8, 40)
 _LOCAL_EXPERT_COUNT_SHAPE = (2, 8, 36)
 _RECV_META_WINDOW_SHAPE = (8, 40)
 _RECV_META_WINDOW_BYTES = 8 * 40 * 4
+# Canonical Step3p5 MoE dispatch emits eight routes per active token.
+_MOE_TOPK = 8
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_IMAGE_DIGEST_PATTERN = re.compile(r".+@sha256:[0-9a-f]{64}")
+_GOLDEN_SCHEMA = "step3p5.five-layer-moe-golden.v3"
+_CHECKPOINT_SCHEMA = "step3p5.checkpoint-identity.v1"
 _FROZEN_SOURCE_POLICIES = {
     "baseline": {
         "policy_id": "campaign-baseline-56b3d477-row32-fused-v1",
@@ -1485,6 +1491,15 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _nested_shape(value: Any, field: str) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
@@ -1564,6 +1579,186 @@ def _load_recv_meta_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _require_sha256(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
+        raise ValueError(f"{field}: expected lowercase SHA256")
+    return value
+
+
+def _validated_sidecar_provenance(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("recv_meta sidecar provenance must be a mapping")
+    image_digest = provenance.get("image_digest")
+    if not (
+        isinstance(image_digest, str)
+        and _IMAGE_DIGEST_PATTERN.fullmatch(image_digest)
+    ):
+        raise ValueError("recv_meta provenance image_digest is invalid")
+
+    checkpoint = provenance.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        raise ValueError("recv_meta provenance checkpoint is missing")
+    if checkpoint.get("schema") != _CHECKPOINT_SCHEMA:
+        raise ValueError("recv_meta checkpoint schema is invalid")
+    logical_id = checkpoint.get("logical_id")
+    if (
+        not isinstance(logical_id, str)
+        or not logical_id
+        or "/" in logical_id
+        or "\\" in logical_id
+    ):
+        raise ValueError("recv_meta checkpoint logical_id is invalid")
+    identity_sha256 = _require_sha256(
+        checkpoint.get("identity_sha256"),
+        "recv_meta checkpoint identity_sha256",
+    )
+    index_file = checkpoint.get("index_file")
+    if (
+        not isinstance(index_file, str)
+        or not index_file.endswith(".safetensors.index.json")
+    ):
+        raise ValueError("recv_meta checkpoint index_file is invalid")
+    files = checkpoint.get("files")
+    if not isinstance(files, dict) or len(files) < 3:
+        raise ValueError(
+            "recv_meta checkpoint identity must cover config, index, and shards"
+        )
+    if index_file not in files or "config.json" not in files:
+        raise ValueError("recv_meta checkpoint metadata files are missing")
+    for name, record in files.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).is_absolute()
+            or ".." in Path(name).parts
+        ):
+            raise ValueError("recv_meta checkpoint file name is invalid")
+        if not isinstance(record, dict):
+            raise ValueError("recv_meta checkpoint file record is invalid")
+        _require_sha256(
+            record.get("sha256"),
+            f"recv_meta checkpoint files.{name}.sha256",
+        )
+        if type(record.get("size_bytes")) is not int or (
+            record["size_bytes"] <= 0
+        ):
+            raise ValueError("recv_meta checkpoint file size is invalid")
+    if _json_sha256(files) != identity_sha256:
+        raise ValueError("recv_meta checkpoint identity digest mismatch")
+    for field in ("weight_tensor_count", "weight_shard_count"):
+        if type(checkpoint.get(field)) is not int or checkpoint[field] <= 0:
+            raise ValueError(f"recv_meta checkpoint {field} is invalid")
+    if len(files) != checkpoint["weight_shard_count"] + 2:
+        raise ValueError("recv_meta checkpoint shard count is inconsistent")
+    authority_manifest_sha256 = checkpoint.get(
+        "authority_manifest_sha256"
+    )
+    if authority_manifest_sha256 is not None:
+        _require_sha256(
+            authority_manifest_sha256,
+            "recv_meta checkpoint authority_manifest_sha256",
+        )
+
+    source = provenance.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("recv_meta source provenance is missing")
+    for field in (
+        "source_tree_manifest_sha256",
+        "decode_fwd_sha256",
+        "formal_program_sha256",
+        "route_program_sha256",
+        "route_holder_sha256",
+        "route_stage_sha256",
+    ):
+        _require_sha256(source.get(field), f"recv_meta source.{field}")
+    source_manifest_sha256 = _require_sha256(
+        provenance.get("source_manifest_sha256"),
+        "recv_meta source_manifest_sha256",
+    )
+    if _json_sha256(source) != source_manifest_sha256:
+        raise ValueError("recv_meta source manifest digest mismatch")
+
+    input_contract = provenance.get("input_contract")
+    if not isinstance(input_contract, dict):
+        raise ValueError("recv_meta input_contract is missing")
+    workload = input_contract.get("workload")
+    if not isinstance(workload, dict):
+        raise ValueError("recv_meta workload is missing")
+    active_batch = workload.get("active_batch")
+    if type(active_batch) is not int or not 1 <= active_batch <= 16:
+        raise ValueError("recv_meta active_batch is invalid")
+    if workload.get("context_len") != 65536:
+        raise ValueError("recv_meta context_len must be 65536 per sequence")
+    if workload.get("context_semantics") != "per_active_sequence":
+        raise ValueError("recv_meta context semantics are invalid")
+    input_tokens = input_contract.get("input_tokens")
+    if not (
+        isinstance(input_tokens, list)
+        and len(input_tokens) == active_batch
+        and all(type(token) is int and token >= 0 for token in input_tokens)
+    ):
+        raise ValueError("recv_meta input token contract is invalid")
+    tensor_sha256 = input_contract.get("tensor_sha256")
+    if not isinstance(tensor_sha256, dict) or set(tensor_sha256) != {
+        "active_hidden",
+        "seq_lens",
+        "positions",
+        "block_table",
+        "slot_mapping",
+    }:
+        raise ValueError("recv_meta input tensor provenance is incomplete")
+    for field, digest in tensor_sha256.items():
+        _require_sha256(digest, f"recv_meta input tensor.{field}")
+    input_contract_sha256 = _require_sha256(
+        provenance.get("input_contract_sha256"),
+        "recv_meta input_contract_sha256",
+    )
+    if _json_sha256(input_contract) != input_contract_sha256:
+        raise ValueError("recv_meta input contract digest mismatch")
+
+    golden = provenance.get("formal_golden")
+    if not isinstance(golden, dict):
+        raise ValueError("recv_meta formal_golden provenance is missing")
+    if (
+        golden.get("schema") != _GOLDEN_SCHEMA
+        or golden.get("source_kind") != "baseline"
+        or golden.get("bit_exact") is not True
+        or golden.get("active_batch") != active_batch
+        or golden.get("context_len_per_sequence") != 65536
+        or golden.get("image_ref") != image_digest
+    ):
+        raise ValueError("recv_meta formal_golden semantic contract is invalid")
+    source_run = golden.get("source_run")
+    if not isinstance(source_run, str) or not source_run:
+        raise ValueError("recv_meta formal_golden source_run is missing")
+    for field in (
+        "manifest_sha256",
+        "source_decode_fwd_sha256",
+        "source_manifest_sha256",
+    ):
+        _require_sha256(golden.get(field), f"recv_meta formal_golden.{field}")
+    golden_files = golden.get("files")
+    if not isinstance(golden_files, dict) or set(golden_files) != {
+        "hidden_l3.pt",
+        "hidden_l4.pt",
+    }:
+        raise ValueError("recv_meta formal_golden files are incomplete")
+    for name, digest in golden_files.items():
+        _require_sha256(digest, f"recv_meta formal_golden files.{name}")
+    return {
+        "image_digest": image_digest,
+        "checkpoint_identity_sha256": identity_sha256,
+        "source_manifest_sha256": source_manifest_sha256,
+        "input_contract_sha256": input_contract_sha256,
+        "golden_manifest_sha256": golden["manifest_sha256"],
+        "active_batch": active_batch,
+        "context_len_per_sequence": 65536,
+    }
+
+
 def _validated_route_histogram(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"recv_meta sidecar does not exist: {path}")
@@ -1583,6 +1778,7 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
             f"{path}: expected axes={list(_RECV_META_AXES)}, "
             f"got {payload.get('axes')!r}"
         )
+    provenance = _validated_sidecar_provenance(payload)
 
     recv_shape, recv_meta, recv_dtype = _nested_values(
         payload.get("recv_meta"),
@@ -1640,12 +1836,27 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
             )
         if not isinstance(window_id, (str, int)) or str(window_id) == "":
             raise ValueError(f"{path}: {layer} window_id is missing")
+        if record.get("source_window") != "moe_recv_meta":
+            raise ValueError(f"{path}: {layer} source_window is invalid")
+        if record.get("source_window_reused") is not True:
+            raise ValueError(
+                f"{path}: {layer} must prove source_window_reused=true"
+            )
+        expected_capture = {
+            "L3": "after_l3_before_l4",
+            "L4": "after_l4",
+        }[layer]
+        if record.get("capture_point") != expected_capture:
+            raise ValueError(f"{path}: {layer} capture_point is invalid")
         windows_by_layer[layer] = {
             "layer": layer,
             "window_id": str(window_id),
             "shape": list(shape),
             "dtype": "int32",
             "byte_size": _RECV_META_WINDOW_BYTES,
+            "source_window": "moe_recv_meta",
+            "source_window_reused": True,
+            "capture_point": expected_capture,
         }
     if set(windows_by_layer) != set(_RECV_META_LAYERS):
         raise ValueError(
@@ -1663,6 +1874,7 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
     padding_errors = []
     derived_counts = []
     count_mismatches = []
+    per_layer_per_source: list[list[int]] = []
     for layer_index, layer in enumerate(_RECV_META_LAYERS):
         layer_counts = []
         for dst_rank in range(_EXPECTED_RANKS):
@@ -1696,6 +1908,16 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
                     }
                 )
         derived_counts.append(layer_counts)
+        per_layer_per_source.append(
+            [
+                sum(
+                    recv_meta[layer_index][dst_rank][src_rank][expert]
+                    for dst_rank in range(_EXPECTED_RANKS)
+                    for expert in range(36)
+                )
+                for src_rank in range(_EXPECTED_RANKS)
+            ]
+        )
     if padding_errors:
         raise ValueError(
             f"{path}: recv_meta padding columns 36:40 must be zero; "
@@ -1705,6 +1927,42 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
         raise ValueError(
             f"{path}: local_expert_count != sum_src(recv_meta[..., :36]); "
             f"errors={count_mismatches[:8]}"
+        )
+
+    expected_per_source = provenance["active_batch"] * _MOE_TOPK
+    expected_global = expected_per_source * _EXPECTED_RANKS
+    global_per_layer = [
+        sum(source_totals) for source_totals in per_layer_per_source
+    ]
+    source_total_mismatches = [
+        {
+            "layer": layer,
+            "src_rank": src_rank,
+            "actual": total,
+            "expected": expected_per_source,
+        }
+        for layer_index, layer in enumerate(_RECV_META_LAYERS)
+        for src_rank, total in enumerate(per_layer_per_source[layer_index])
+        if total != expected_per_source
+    ]
+    global_total_mismatches = [
+        {
+            "layer": layer,
+            "actual": total,
+            "expected": expected_global,
+        }
+        for layer, total in zip(_RECV_META_LAYERS, global_per_layer)
+        if total != expected_global
+    ]
+    if source_total_mismatches or global_total_mismatches:
+        raise ValueError(
+            f"{path}: route totals invalid; "
+            "per layer/source must equal active_batch * TOPK="
+            f"{expected_per_source}, "
+            f"mismatches={source_total_mismatches[:8]}; "
+            "global per layer must equal active_batch * TP * TOPK="
+            f"{expected_global}, "
+            f"mismatches={global_total_mismatches[:8]}"
         )
 
     source_sha256 = _sha256(path)
@@ -1729,11 +1987,16 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
                 "sum over eight source ranks from recv_meta."
             ),
             "total_routed_tokens_by_rank": totals,
+            "route_totals_validated": True,
+            "per_layer_per_source": per_layer_per_source[layer_index],
+            "expected_per_source": expected_per_source,
+            "global_per_layer": global_per_layer,
+            "expected_global_per_layer": expected_global,
             "zero_route_ranks": [
                 rank for rank, total in totals.items() if total == 0
             ],
             "max_min_total_skew": max(totals.values()) - min(totals.values()),
-            "source": str(path),
+            "source": path.name,
             "source_sha256": source_sha256,
             "source_schema": _RECV_META_SIDECAR_SCHEMA,
             "source_axes": list(_RECV_META_AXES),
@@ -1743,6 +2006,7 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
             "local_expert_count_dtype": count_dtype,
             "window_provenance": windows_by_layer[layer],
             "window_independence_validated": True,
+            "provenance": provenance,
             "expected_sidecar": "recv_meta",
             "reason": "validated exact recv_meta sidecar",
             "required_input": None,

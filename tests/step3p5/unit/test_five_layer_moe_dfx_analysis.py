@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -250,6 +251,13 @@ def _recv_meta_payload() -> dict:
         ]
         for _layer in range(2)
     ]
+    for src in range(8):
+        recv_meta[0][2][src][src] = 8
+        recv_meta[1][2][src][src] = 8
+
+    recv_meta[0][2][0][0] = 6
+    recv_meta[0][2][1][1] = 5
+    recv_meta[1][2][6][6] = 4
     recv_meta[0][0][0][0] = 2
     recv_meta[0][0][1][0] = 3
     recv_meta[1][7][6][35] = 4
@@ -263,6 +271,49 @@ def _recv_meta_payload() -> dict:
         ]
         for layer in range(2)
     ]
+    checkpoint_files = {
+        "config.json": {"size_bytes": 1, "sha256": "1" * 64},
+        "quant_model_weights.safetensors.index.json": {
+            "size_bytes": 2,
+            "sha256": "2" * 64,
+        },
+        "weights.safetensors": {
+            "size_bytes": 3,
+            "sha256": "3" * 64,
+        },
+    }
+    source = {
+        "source_tree_manifest_sha256": "4" * 64,
+        "decode_fwd_sha256": "5" * 64,
+        "formal_program_sha256": "6" * 64,
+        "route_program_sha256": "7" * 64,
+        "route_holder_sha256": "8" * 64,
+        "route_stage_sha256": "9" * 64,
+    }
+    input_contract = {
+        "workload": {
+            "active_batch": 1,
+            "context_len": 65536,
+            "context_semantics": "per_active_sequence",
+        },
+        "input_tokens": [6127],
+        "tensor_sha256": {
+            "active_hidden": "a" * 64,
+            "seq_lens": "b" * 64,
+            "positions": "c" * 64,
+            "block_table": "d" * 64,
+            "slot_mapping": "e" * 64,
+        },
+    }
+
+    def json_sha256(value) -> str:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(payload).hexdigest()
+
     return {
         "schema": "step3p5.five-layer-moe-recv-meta.v1",
         "layers": ["L3", "L4"],
@@ -276,6 +327,9 @@ def _recv_meta_payload() -> dict:
                 "shape": [8, 40],
                 "dtype": "int32",
                 "byte_size": 1280,
+                "source_window": "moe_recv_meta",
+                "source_window_reused": True,
+                "capture_point": "after_l3_before_l4",
             },
             {
                 "layer": "L4",
@@ -283,8 +337,45 @@ def _recv_meta_payload() -> dict:
                 "shape": [8, 40],
                 "dtype": "int32",
                 "byte_size": 1280,
+                "source_window": "moe_recv_meta",
+                "source_window_reused": True,
+                "capture_point": "after_l4",
             },
         ],
+        "provenance": {
+            "image_digest": "image@sha256:" + "f" * 64,
+            "checkpoint": {
+                "schema": "step3p5.checkpoint-identity.v1",
+                "logical_id": "checkpoint",
+                "index_file": (
+                    "quant_model_weights.safetensors.index.json"
+                ),
+                "weight_tensor_count": 10,
+                "weight_shard_count": 1,
+                "files": checkpoint_files,
+                "identity_sha256": json_sha256(checkpoint_files),
+            },
+            "source": source,
+            "source_manifest_sha256": json_sha256(source),
+            "input_contract": input_contract,
+            "input_contract_sha256": json_sha256(input_contract),
+            "formal_golden": {
+                "schema": "step3p5.five-layer-moe-golden.v3",
+                "manifest_sha256": "0" * 64,
+                "source_run": "baseline-r1-normal-bs1-64k",
+                "source_kind": "baseline",
+                "source_decode_fwd_sha256": "5" * 64,
+                "source_manifest_sha256": "4" * 64,
+                "active_batch": 1,
+                "context_len_per_sequence": 65536,
+                "image_ref": "image@sha256:" + "f" * 64,
+                "files": {
+                    "hidden_l3.pt": "1" * 64,
+                    "hidden_l4.pt": "2" * 64,
+                },
+                "bit_exact": True,
+            },
+        },
     }
 
 
@@ -490,6 +581,12 @@ def test_route_histogram_validates_exact_recv_meta_sidecar(tmp_path) -> None:
     assert result["L4"]["window_independence_validated"]
     assert result["L3"]["publication_evidence_ready"]
     assert not result["L3"]["proxy_fallback_allowed"]
+    assert result["L3"]["route_totals_validated"]
+    assert result["L3"]["per_layer_per_source"] == [8] * 8
+    assert result["L4"]["per_layer_per_source"] == [8] * 8
+    assert result["L3"]["expected_per_source"] == 8
+    assert result["L3"]["global_per_layer"] == [64, 64]
+    assert result["L4"]["expected_global_per_layer"] == 64
 
     ranks = {
         "rank0/d0": {"layers": {"L3": {}, "L4": {}}},
@@ -525,6 +622,36 @@ def test_route_histogram_rejects_overlapping_windows_and_bad_derived_count(
     sidecar = tmp_path / "bad-count.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="sum_src"):
+        _route_histogram_contract(sidecar)
+
+    payload = _recv_meta_payload()
+    payload["recv_meta"][0][0][0][0] += 1
+    payload["local_expert_count"][0][0][0] += 1
+    sidecar = tmp_path / "bad-route-total.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="route totals invalid"):
+        _route_histogram_contract(sidecar)
+
+    payload = _recv_meta_payload()
+    payload["recv_meta"][0][0][0][0] += 1
+    payload["recv_meta"][0][0][1][0] -= 1
+    sidecar = tmp_path / "bad-source-total.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="per layer/source must equal"):
+        _route_histogram_contract(sidecar)
+
+    payload = _recv_meta_payload()
+    payload["window_provenance"][0]["source_window_reused"] = False
+    sidecar = tmp_path / "forged-window.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="source_window_reused"):
+        _route_histogram_contract(sidecar)
+
+    payload = _recv_meta_payload()
+    del payload["provenance"]["formal_golden"]
+    sidecar = tmp_path / "missing-golden.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="formal_golden"):
         _route_histogram_contract(sidecar)
 
 

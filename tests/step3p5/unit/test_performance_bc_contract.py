@@ -1054,7 +1054,7 @@ def test_routed_down_halves_the_int8_accumulation_chain() -> None:
 
 
 def test_fixed_grid_planners_cover_every_active_tile_once() -> None:
-    workers = 22
+    workers = 23
     stage_chunks = {
         "gate_up": 20,
         "act": 20,
@@ -1106,6 +1106,75 @@ def test_fixed_grid_planners_cover_every_active_tile_once() -> None:
         ]
         assert sorted(shared_down) == list(range(16))
         assert len(shared_down) == len(set(shared_down))
+
+
+def test_moe_norm_quant_uses_full_eight_row_blocks() -> None:
+    source, tree = _parse(_CANONICAL)
+    function = _method(tree, "_norm_quant_moe_input")
+    body = _segment(source, function)
+
+    constants: dict[str, object] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            try:
+                constants[node.targets[0].id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                pass
+    assert constants["MOE_NORM_TOKEN_TILE"] == 8
+    assert constants["MOE_NORM_SCALAR_PAD"] == 8
+    assert "assert BATCH % MOE_NORM_TOKEN_TILE == 0" in source
+    assert "MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE" in source
+
+    assert any(
+        ast.unparse(decorator)
+        == "pl.function(type=pl.FunctionType.Inline)"
+        for decorator in function.decorator_list
+    )
+    spmd_loops = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and _call_path(node.iter) == "pl.spmd"
+    ]
+    assert len(spmd_loops) == 1
+    spmd_call = spmd_loops[0].iter
+    assert ast.unparse(spmd_call.args[0]) == "MOE_NORM_BLOCKS"
+    assert {
+        keyword.arg: ast.literal_eval(keyword.value)
+        for keyword in spmd_call.keywords
+    } == {"name_hint": "norm_quant_moe_input"}
+
+    scalar_full_calls = [
+        call
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pl.full"
+        and call.args
+        and ast.unparse(call.args[0])
+        == "[MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD]"
+    ]
+    assert len(scalar_full_calls) == 3
+    assert body.count("[MOE_NORM_TOKEN_TILE, K_CHUNK]") == 2
+    assert "valid_shape=" not in body
+    assert "target_type=pl.BF16" in body
+    assert "target_type=pl.INT32,\n                    mode=\"rint\"" in body
+    assert "target_type=pl.FP16, mode=\"round\"" in body
+    assert "target_type=pl.INT8, mode=\"trunc\"" in body
+
+
+def test_moe_norm_quant_grid_covers_supported_storage_batches() -> None:
+    for storage_batch in (16, 32, 48):
+        written_rows = {
+            token_block * 8 + token_idx
+            for token_block in range(storage_batch // 8)
+            for token_idx in range(8)
+        }
+        assert written_rows == set(range(storage_batch))
 
 
 def test_shared_two_stage_schedule_is_bf16_exact() -> None:

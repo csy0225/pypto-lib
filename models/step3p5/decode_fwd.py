@@ -155,6 +155,13 @@ ROUTER_GATE_K_CHUNK = 256
 ROUTER_GATE_N_CHUNK = 32
 ROUTER_FP32_NEG_INF = -3.4028235e38
 ROUTER_SCALE = 3.0  # MOE_ROUTER_SCALING_FACTOR
+# Eight rows are the smallest backend-safe FP32 scalar store tile. Split the
+# configured decode storage into disjoint token workers without duplicating
+# any norm/quant work.
+MOE_NORM_TOKEN_TILE = 8
+MOE_NORM_SCALAR_PAD = 8
+assert BATCH % MOE_NORM_TOKEN_TILE == 0
+MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE
 
 # Routed-expert kernel constants — mirrors expert_routed.py / moe.ROUTED_*.
 # Keep independent matmul and activation tiles so the cube task grain can be
@@ -166,9 +173,8 @@ ROUTED_H_QUANT_N_CHUNK = 64
 # L43/L44 keep the existing specialization until they are tuned separately.
 ROUTED_GATE_K_CHUNK = 64
 ROUTED_GATE_N_CHUNK = 64
-# Down projection is INT8×INT8→INT32, so doubling K does not alter the
-# accumulation/rounding contract.  A 128-wide K tile halves the long
-# matmul_acc chain while keeping the validated 256-wide output tile.
+# INT8 accumulation is exact across K chunks. A 128-wide tile halves the
+# routed down matmul_acc chain without changing its rounding contract.
 ROUTED_DOWN_K_CHUNK = 128
 ROUTED_DOWN_N_CHUNK = 256
 RECV_TILE = 16
@@ -181,15 +187,16 @@ SHARED_GATE_N_CHUNK = INTER_S_LOCAL  # 160 — one N tile covers the slice
 SHARED_DOWN_K_CHUNK = INTER_S_LOCAL  # 160 — one K tile covers the slice
 SHARED_DOWN_N_CHUNK = 256
 SHARED_SWIGLU_N_CHUNK = 32
-# Shared gate/up keeps the five validated 32-wide chunks but executes them on
-# two workers (3+2 grid-stride ownership). Together with routed's 22 workers,
-# this is a soft 24-AIC concurrency budget; it is not physical affinity.
+# Shared gate/up keeps the five validated 32-wide chunks on two workers.
+# Shared down activates one worker for single-token decode and both workers
+# for larger batches. Routed uses a 23-worker fixed grid. This is soft
+# scheduling, not physical affinity.
 SHARED_GATE_UP_ACT_CHUNKS = INTER_S_LOCAL // SHARED_SWIGLU_N_CHUNK
 SHARED_GATE_UP_ACT_BLOCKS = 2
 SHARED_DOWN_WORKERS = 2
 # Regular routed stages use one fixed grid. Logical expert/tile/chunk work is
 # grid-strided inside the kernel so AICPU no longer submits per expert.
-ROUTED_GRID_WORKERS = 22
+ROUTED_GRID_WORKERS = 23
 
 # MoE-local helper constants are module-level for parse-time closure capture.
 n_ranks = tp_size
@@ -716,7 +723,7 @@ class WholeDecodeStep3p5:
         return expert_indices, expert_weights
 
     # ---------- Stage 2: V4-Flash norm/quant + expert-lane dispatch ----------
-    @pl.function(type=pl.FunctionType.InCore)
+    @pl.function(type=pl.FunctionType.Inline)
     def _norm_quant_moe_input(
         self,
         resid: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
@@ -758,76 +765,112 @@ class WholeDecodeStep3p5:
         if active_gate_tokens > BATCH:
             active_gate_tokens = pl.cast(BATCH, pl.INDEX)
 
-        sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-        xg_amax = pl.full([1, BATCH], dtype=pl.FP32, value=1e-4)
-        for kb in pl.range(HIDDEN // K_CHUNK):
-            k0 = kb * K_CHUNK
-            raw = pl.cast(
-                pl.slice(
-                    resid, [BATCH, K_CHUNK], [0, k0],
-                    valid_shape=[active_gate_tokens, K_CHUNK],
-                ),
-                target_type=pl.FP32,
-            )
-            gamma = pl.slice(
-                post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
-            )
-            xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
-            sq_sum = pl.add(
-                sq_sum,
-                pl.reshape(pl.row_sum(pl.mul(raw, raw)), [1, BATCH]),
-            )
-            xg_amax = pl.maximum(
-                xg_amax,
-                pl.reshape(
-                    pl.row_max(pl.maximum(xg, pl.neg(xg))), [1, BATCH],
+        for token_block in pl.spmd(
+            MOE_NORM_BLOCKS,
+            name_hint="norm_quant_moe_input",
+        ):
+            token0 = token_block * MOE_NORM_TOKEN_TILE
+            sq_sum = pl.row_sum(
+                pl.full(
+                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
+                    dtype=pl.FP32,
+                    value=0.0,
                 ),
             )
+            xg_amax = pl.row_max(
+                pl.full(
+                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
+                    dtype=pl.FP32,
+                    value=1e-4,
+                ),
+            )
+            for kb in pl.range(HIDDEN // K_CHUNK):
+                k0 = kb * K_CHUNK
+                raw = pl.cast(
+                    pl.slice(
+                        resid,
+                        [MOE_NORM_TOKEN_TILE, K_CHUNK],
+                        [token0, k0],
+                    ),
+                    target_type=pl.FP32,
+                )
+                gamma = pl.slice(
+                    post_rms_weight,
+                    [1, K_CHUNK],
+                    [norm_layer_idx, k0],
+                )
+                xg = pl.col_expand_mul(
+                    raw, pl.add(gamma, 1.0),
+                )
+                sq_sum = pl.add(
+                    sq_sum,
+                    pl.row_sum(pl.mul(raw, raw)),
+                )
+                xg_amax = pl.maximum(
+                    xg_amax,
+                    pl.row_max(pl.maximum(xg, pl.neg(xg))),
+                )
 
-        inv_rms_row = pl.recip(
-            pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-        )
-        inv_rms = pl.reshape(inv_rms_row, [BATCH, 1])
-        inv_rms_out[0:BATCH, 0:1] = inv_rms
-        quant_mul_row = pl.div(
-            pl.full([1, BATCH], dtype=pl.FP32, value=127.0), xg_amax,
-        )
-        quant_mul = pl.reshape(quant_mul_row, [BATCH, 1])
-        dequant_scale = pl.reshape(
-            pl.mul(inv_rms_row, pl.mul(xg_amax, 1.0 / 127.0)),
-            [BATCH, 1],
-        )
-        x_scale_out[0:BATCH, 0:1] = dequant_scale
-
-        for kb2 in pl.range(HIDDEN // K_CHUNK):
-            k0 = kb2 * K_CHUNK
-            raw = pl.cast(
-                pl.slice(
-                    resid, [BATCH, K_CHUNK], [0, k0],
-                    valid_shape=[active_gate_tokens, K_CHUNK],
+            inv_rms = pl.recip(
+                pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+            )
+            inv_rms_out[
+                token0 : token0 + MOE_NORM_TOKEN_TILE, 0:1
+            ] = inv_rms
+            quant_numerator = pl.row_max(
+                pl.full(
+                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
+                    dtype=pl.FP32,
+                    value=127.0,
                 ),
-                target_type=pl.FP32,
             )
-            gamma = pl.slice(
-                post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
+            quant_mul = pl.div(quant_numerator, xg_amax)
+            dequant_scale = pl.mul(
+                inv_rms, pl.mul(xg_amax, 1.0 / 127.0),
             )
-            # Current 0726 backend UB cannot retain a full [BATCH,HIDDEN]
-            # FP32 xg buffer, so recompute xg in the emission pass.  This is a
-            # backend/profile trade-off only; norm and quant still share one
-            # producer and the same inv_rms/amax values.
-            xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
-            normed = pl.row_expand_mul(xg, inv_rms)
-            post_norm_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
-                normed, target_type=pl.BF16,
-            )
-            qi32 = pl.cast(
-                pl.row_expand_mul(xg, quant_mul),
-                target_type=pl.INT32, mode="rint",
-            )
-            qf16 = pl.cast(qi32, target_type=pl.FP16, mode="round")
-            x_i8_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
-                qf16, target_type=pl.INT8, mode="trunc",
-            )
+            x_scale_out[
+                token0 : token0 + MOE_NORM_TOKEN_TILE, 0:1
+            ] = dequant_scale
+
+            for kb2 in pl.range(HIDDEN // K_CHUNK):
+                k0 = kb2 * K_CHUNK
+                raw = pl.cast(
+                    pl.slice(
+                        resid,
+                        [MOE_NORM_TOKEN_TILE, K_CHUNK],
+                        [token0, k0],
+                    ),
+                    target_type=pl.FP32,
+                )
+                gamma = pl.slice(
+                    post_rms_weight,
+                    [1, K_CHUNK],
+                    [norm_layer_idx, k0],
+                )
+                # Current backend UB cannot retain the FP32 xg tile across
+                # both passes, so recompute it in the emission pass.
+                xg = pl.col_expand_mul(
+                    raw, pl.add(gamma, 1.0),
+                )
+                normed = pl.row_expand_mul(xg, inv_rms)
+                post_norm_out[
+                    token0 : token0 + MOE_NORM_TOKEN_TILE,
+                    k0 : k0 + K_CHUNK,
+                ] = pl.cast(normed, target_type=pl.BF16)
+                qi32 = pl.cast(
+                    pl.row_expand_mul(xg, quant_mul),
+                    target_type=pl.INT32,
+                    mode="rint",
+                )
+                qf16 = pl.cast(
+                    qi32, target_type=pl.FP16, mode="round",
+                )
+                x_i8_out[
+                    token0 : token0 + MOE_NORM_TOKEN_TILE,
+                    k0 : k0 + K_CHUNK,
+                ] = pl.cast(
+                    qf16, target_type=pl.INT8, mode="trunc",
+                )
         return post_norm_out, inv_rms_out, x_i8_out, x_scale_out
 
     # ---------- Stage 2: dispatch (V4-Flash expert-lane PUSH + gather) ----------
@@ -1712,8 +1755,9 @@ class WholeDecodeStep3p5:
         num_tokens: pl.Scalar[pl.INT32],
         swiglu_limit: pl.Scalar[pl.FP32],
     ):
-        # The runtime has no physical-core affinity API. Keep both shared
-        # phases bounded to two workers while routed uses a 22-worker grid.
+        # The runtime has no physical-core affinity API. Keep shared gate/up
+        # on two workers, and activate only one shared-down worker for
+        # single-token decode while routed uses a 23-worker grid.
         # The BF16 bridge is the canonical SwiGLU rounding point; do not move
         # the cast into down.
         sh_hidden = pl.create_tensor(

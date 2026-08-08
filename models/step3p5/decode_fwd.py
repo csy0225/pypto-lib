@@ -169,7 +169,10 @@ MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE
 ROUTED_GATE_MM_K_CHUNK = 512
 ROUTED_GATE_MM_N_CHUNK = 64
 ROUTED_GATE_ACT_N_CHUNK = 64
-ROUTED_H_QUANT_N_CHUNK = 64
+# Widen both rowwise quant passes from 20 serial slices to five while preserving
+# the full-row amax domain and W8A8 requantization sequence.
+ROUTED_H_QUANT_N_CHUNK = 256
+assert MOE_INTERMEDIATE % ROUTED_H_QUANT_N_CHUNK == 0
 # L43/L44 keep the existing specialization until they are tuned separately.
 ROUTED_GATE_K_CHUNK = 64
 ROUTED_GATE_N_CHUNK = 64

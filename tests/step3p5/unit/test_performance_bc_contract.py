@@ -979,19 +979,30 @@ def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
 
 def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     source, tree = _parse(_CANONICAL)
+    expected_assignments = {
+        "ROUTED_GATE_ACT_N_CHUNK": 64,
+        "ROUTED_H_QUANT_N_CHUNK": 256,
+        "ROUTED_GATE_K_CHUNK": 64,
+        "ROUTED_GATE_N_CHUNK": 64,
+        "ROUTED_GRID_WORKERS": 23,
+        "ROUTED_MULTIBATCH_GRID_WORKERS": 22,
+    }
     assignments = {
         node.targets[0].id: ast.literal_eval(node.value)
         for node in tree.body
         if isinstance(node, ast.Assign)
         and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id
-        in {"ROUTED_GRID_WORKERS", "ROUTED_MULTIBATCH_GRID_WORKERS"}
+        and node.targets[0].id in expected_assignments
     }
-    assert assignments == {
-        "ROUTED_GRID_WORKERS": 23,
-        "ROUTED_MULTIBATCH_GRID_WORKERS": 22,
-    }
+    assert assignments == expected_assignments
+    assert sum(
+        isinstance(node, ast.Assert)
+        and ast.unparse(node.test)
+        == "MOE_INTERMEDIATE % ROUTED_H_QUANT_N_CHUNK == 0"
+        for node in tree.body
+    ) == 1
+
     expert = _method(tree, "_expert_routed")
     expert_source = _segment(source, expert)
     assert "num_tokens" in [arg.arg for arg in expert.args.args]
@@ -1051,6 +1062,75 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     assert "if projection" not in expert_source
     assert "for e in pl.parallel(n_local_experts)" not in expert_source
 
+    for function_name, chunk, rows in (
+        ("_expert_routed", "ROUTED_H_QUANT_N_CHUNK", "RECV_TILE"),
+        ("_expert_routed_swiglu7", "ROUTED_GATE_N_CHUNK", "RECV_SPECIAL_TILE"),
+    ):
+        quant = _task_scope(_method(tree, function_name), "routed_h_quant")
+        quant_source = _segment(source, quant)
+        loops = [
+            node
+            for node in ast.walk(quant)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in {"hqa", "hqn"}
+        ]
+        assert len(loops) == 2
+        assert {loop.target.id for loop in loops} == {"hqa", "hqn"}
+        for loop in loops:
+            assert ast.unparse(loop.iter) == f"pl.range(inter // {chunk})"
+            assert [
+                ast.unparse(call.args[1])
+                for call in ast.walk(loop)
+                if isinstance(call, ast.Call)
+                and _call_path(call) == "pl.slice"
+                and ast.unparse(call.args[0]) == "h_bf16"
+            ] == [f"[{rows}, {chunk}]"]
+
+        hqa = next(loop for loop in loops if loop.target.id == "hqa")
+        parents = [
+            node
+            for node in ast.walk(quant)
+            if hasattr(node, "body") and hqa in node.body
+        ]
+        assert len(parents) == 1
+        parent_body = parents[0].body
+        amax_initializers = [
+            node
+            for node in ast.walk(quant)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and ast.unparse(node.targets[0]) == "eh_amax"
+            and isinstance(node.value, ast.Call)
+            and _call_path(node.value) == "pl.full"
+        ]
+        assert len(amax_initializers) == 1
+        initializer = amax_initializers[0]
+        assert initializer in parent_body
+        assert parent_body.index(initializer) < parent_body.index(hqa)
+        assert ast.unparse(initializer.value.args[0]) == f"[1, {rows}]"
+        hqa_amax_assignments = [
+            node
+            for node in ast.walk(hqa)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and ast.unparse(node.targets[0]) == "eh_amax"
+        ]
+        assert len(hqa_amax_assignments) == 1
+        hqa_amax_update = hqa_amax_assignments[0]
+        assert isinstance(hqa_amax_update.value, ast.Call)
+        assert _call_path(hqa_amax_update.value) == "pl.maximum"
+        assert ast.unparse(hqa_amax_update.value.args[0]) == "eh_amax"
+        assert {
+            keyword.arg: ast.literal_eval(keyword.value)
+            if isinstance(keyword.value, ast.Constant)
+            else ast.unparse(keyword.value)
+            for keyword in initializer.value.keywords
+        } == {"dtype": "pl.FP32", "value": 1e-4}
+
+        if function_name == "_expert_routed_swiglu7":
+            assert "ROUTED_H_QUANT_N_CHUNK" not in quant_source
+
     wrapper = _method(tree, "expert_routed_step")
     assert "num_tokens" in [arg.arg for arg in wrapper.args.args]
     wrapper_calls = _method_calls(wrapper, "_expert_routed")
@@ -1068,6 +1148,77 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     assert all(
         ast.unparse(call.args[7]) == "num_tokens"
         for call in orchestration_calls
+    )
+
+
+def test_regular_routed_quant_math_is_chunk_invariant() -> None:
+    import torch
+
+    rows = 16
+    intermediate = 1280
+    values = torch.arange(rows * intermediate, dtype=torch.float32).reshape(
+        rows,
+        intermediate,
+    )
+    hidden = (
+        torch.sin(values * 0.017)
+        * torch.cos(values * 0.003)
+        * torch.linspace(0.125, 8.0, rows).reshape(rows, 1)
+    ).to(torch.bfloat16).to(torch.float32)
+    hidden[0].zero_()
+    hidden[1, 63] = -9.5
+    hidden[2, 255] = 11.0
+    hidden[3, 1024] = -12.5
+
+    def quantize(chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
+        amax = torch.full([rows], 1e-4, dtype=torch.float32)
+        for offset in range(0, intermediate, chunk):
+            chunk_amax = hidden[:, offset : offset + chunk].abs().amax(dim=1)
+            amax = torch.maximum(amax, chunk_amax)
+        scale_q = torch.reciprocal(amax) * 127.0
+        scale_dq = torch.reciprocal(scale_q)
+
+        quantized = torch.empty_like(hidden, dtype=torch.int8)
+        for offset in range(0, intermediate, chunk):
+            scaled = hidden[:, offset : offset + chunk] * scale_q.reshape(
+                rows,
+                1,
+            )
+            quantized[:, offset : offset + chunk] = (
+                torch.round(scaled)
+                .to(torch.int32)
+                .to(torch.float16)
+                .to(torch.int8)
+            )
+        return quantized, scale_dq
+
+    quant64, scale64 = quantize(64)
+    quant256, scale256 = quantize(256)
+    assert torch.equal(scale256, scale64)
+    assert torch.equal(quant256, quant64)
+
+    def quantize_with_chunk_local_amax(chunk: int) -> torch.Tensor:
+        quantized = torch.empty_like(hidden, dtype=torch.int8)
+        for offset in range(0, intermediate, chunk):
+            tile = hidden[:, offset : offset + chunk]
+            local_amax = torch.maximum(
+                torch.full([rows], 1e-4, dtype=torch.float32),
+                tile.abs().amax(dim=1),
+            )
+            local_scale = torch.reciprocal(local_amax) * 127.0
+            quantized[:, offset : offset + chunk] = (
+                torch.round(tile * local_scale.reshape(rows, 1))
+                .to(torch.int32)
+                .to(torch.float16)
+                .to(torch.int8)
+            )
+        return quantized
+
+    # Prove that the fixture detects the bug guarded by the AST contract:
+    # resetting amax inside the chunk loop makes the result chunk-dependent.
+    assert not torch.equal(
+        quantize_with_chunk_local_amax(64),
+        quantize_with_chunk_local_amax(256),
     )
 
 

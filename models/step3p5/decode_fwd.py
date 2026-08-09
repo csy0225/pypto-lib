@@ -166,9 +166,14 @@ MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE
 # Routed-expert kernel constants — mirrors expert_routed.py / moe.ROUTED_*.
 # Keep independent matmul and activation tiles so the cube task grain can be
 # tuned without coupling it to the vector epilogue or changing W8A8 rounding.
-ROUTED_GATE_MM_K_CHUNK = 512
-ROUTED_GATE_MM_N_CHUNK = 64
+# The routed weights are [K, N] with N contiguous in GM. K256 x N256 keeps the
+# 64 KiB Right/L0B tile ceiling while widening each strided weight load from
+# 64 to 256 contiguous bytes. Four 64 KiB V2C slots retain a 256 KiB pipe.
+ROUTED_GATE_MM_K_CHUNK = 256
+ROUTED_GATE_MM_N_CHUNK = 256
 ROUTED_GATE_ACT_N_CHUNK = 64
+assert HIDDEN % ROUTED_GATE_MM_K_CHUNK == 0
+assert MOE_INTERMEDIATE % ROUTED_GATE_MM_N_CHUNK == 0
 # Widen both rowwise quant passes from 20 serial slices to five while preserving
 # the full-row amax domain and W8A8 requantization sequence.
 ROUTED_H_QUANT_N_CHUNK = 256
@@ -1252,6 +1257,9 @@ class WholeDecodeStep3p5:
             deps=[local_route_count_tid],
             predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
+            optimizations=[
+                pl.split(pl.SplitMode.NONE, slot_num=4),
+            ],
         ) as routed_gate_up_tid:
             worker = pl.tile.get_block_idx()
             active_expert_count = pl.cast(
@@ -1413,12 +1421,12 @@ class WholeDecodeStep3p5:
                         ),
                         pl.INDEX,
                     )
-                    gate_acc = pl.slice(
+                    gate_chunk = pl.slice(
                         gate_i32,
                         [RECV_TILE, ROUTED_GATE_ACT_N_CHUNK],
                         [tile_offset, n0],
                     )
-                    up_acc = pl.slice(
+                    up_chunk = pl.slice(
                         up_i32,
                         [RECV_TILE, ROUTED_GATE_ACT_N_CHUNK],
                         [tile_offset, n0],
@@ -1444,7 +1452,7 @@ class WholeDecodeStep3p5:
                     gate_2d = pl.col_expand_mul(
                         pl.row_expand_mul(
                             pl.cast(
-                                gate_acc,
+                                gate_chunk,
                                 target_type=pl.FP32,
                                 mode="none",
                             ),
@@ -1455,7 +1463,7 @@ class WholeDecodeStep3p5:
                     up_2d = pl.col_expand_mul(
                         pl.row_expand_mul(
                             pl.cast(
-                                up_acc,
+                                up_chunk,
                                 target_type=pl.FP32,
                                 mode="none",
                             ),
@@ -2014,56 +2022,57 @@ class WholeDecodeStep3p5:
             scatter_blocks,
             name_hint="combine_scatter",
             deps=[local_route_count_tid],
-            predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
         ) as combine_scatter_tid:
             worker = pl.tile.get_block_idx()
-            e = pl.cast(
-                pl.read(local_route_count, [worker + 2]), pl.INDEX,
-            )
-            expert_base = pl.cast(e * expert_recv_max, pl.INDEX)
-            # ``local_route`` is the V4 route id (token * TOPK + k), not a
-            # packed source-rank route. Preserve source provenance from
-            # the dispatch lane: rows are [expert, source, slot].
-            source_prefix = pl.cast(0, pl.INDEX)
-            for src in pl.range(n_ranks):
-                src_count = pl.cast(
-                    pl.read(recv_meta_local, [src, e]), pl.INDEX,
+            # Empty ranks execute one no-op scatter block.
+            if pl.read(local_route_count, [0]) > 0:
+                e = pl.cast(
+                    pl.read(local_route_count, [worker + 2]), pl.INDEX,
                 )
-                for slot in pl.range(src_count):
-                    expert_row = expert_base + source_prefix + slot
-                    route = pl.cast(
-                        pl.read(local_route, [expert_row]), pl.INDEX,
+                expert_base = pl.cast(e * expert_recv_max, pl.INDEX)
+                # ``local_route`` is the V4 route id (token * TOPK + k), not a
+                # packed source-rank route. Preserve source provenance from
+                # the dispatch lane: rows are [expert, source, slot].
+                source_prefix = pl.cast(0, pl.INDEX)
+                for src in pl.range(n_ranks):
+                    src_count = pl.cast(
+                        pl.read(recv_meta_local, [src, e]), pl.INDEX,
                     )
-                    pld.tensor.put(
-                        dst=routed_y_buf,
-                        peer=src,
-                        src=local_routed_y,
-                        dst_offsets=[route, 0],
-                        src_offsets=[expert_row, 0],
-                        shape=[1, HIDDEN],
-                    )
-                source_prefix = source_prefix + src_count
+                    for slot in pl.range(src_count):
+                        expert_row = expert_base + source_prefix + slot
+                        route = pl.cast(
+                            pl.read(local_route, [expert_row]), pl.INDEX,
+                        )
+                        pld.tensor.put(
+                            dst=routed_y_buf,
+                            peer=src,
+                            src=local_routed_y,
+                            dst_offsets=[route, 0],
+                            src_offsets=[expert_row, 0],
+                            shape=[1, HIDDEN],
+                        )
+                    source_prefix = source_prefix + src_count
 
-            # One producer owns one active expert. Block zero supplies the
-            # unused fixed-lane credits, so reaching 36 still proves every
-            # active producer completed its TSTOREs.
-            completion_delta = pl.cast(1, pl.INT32)
-            if worker == 0:
-                completion_delta = (
-                    completion_delta
-                    + pl.cast(n_local_experts, pl.INT32)
-                    - pl.cast(scatter_blocks, pl.INT32)
-                )
-            for peer in pl.range(n_ranks):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=combine_arrived,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=completion_delta,
-                        op=pld.NotifyOp.AtomicAdd,
+                # One producer owns one active expert. Block zero supplies the
+                # unused fixed-lane credits, so reaching 36 still proves every
+                # active producer completed its TSTOREs.
+                completion_delta = pl.cast(1, pl.INT32)
+                if worker == 0:
+                    completion_delta = (
+                        completion_delta
+                        + pl.cast(n_local_experts, pl.INT32)
+                        - pl.cast(scatter_blocks, pl.INT32)
                     )
+                for peer in pl.range(n_ranks):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=combine_arrived,
+                            peer=peer,
+                            offsets=[my_rank, 0],
+                            value=completion_delta,
+                            op=pld.NotifyOp.AtomicAdd,
+                        )
 
         with pl.at(
             level=pl.Level.CORE_GROUP,
@@ -2073,7 +2082,7 @@ class WholeDecodeStep3p5:
         ) as combine_wait_tid:
             _routed_anchor = pl.read(local_routed_y, [0, 0])
             if pl.read(local_route_count, [0]) == 0:
-                # Predicated empty-rank scatter emitted no data block.
+                # Empty-rank scatter did not publish data or credits.
                 for peer in pl.range(n_ranks):
                     if peer != my_rank:
                         pld.system.notify(

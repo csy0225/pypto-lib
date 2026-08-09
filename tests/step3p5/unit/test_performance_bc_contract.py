@@ -449,13 +449,15 @@ def test_c3_moe_hybrid_grids_follow_tokens_routes_and_skip_empty_ranks() -> None
     assert "active_blocks" not in combine
     assert "with pl.spmd(\n            scatter_blocks," in combine
     assert 'name_hint="combine_route_gate"' not in combine
-    assert "predicate=(local_route_count[0] > 0)" in combine
+    assert "predicate=(local_route_count[0] > 0)" not in combine
+    assert "if pl.read(local_route_count, [0]) > 0:" in combine
+    assert "allow_early_resolve=True" in combine
     assert "local_route_count_tid: pl.Scalar[pl.TASK_ID]" in combine
     assert "deps=[local_route_count_tid]" in combine
     assert "pl.read(local_route_count, [worker + 2])" in combine
     assert "for e in pl.range(worker, n_local_experts, scatter_blocks)" not in combine
     assert "- pl.cast(scatter_blocks, pl.INT32)" in combine
-    assert "Predicated empty-rank scatter emitted no data block." in combine
+    assert "Empty-rank scatter did not publish data or credits." in combine
     assert "moe_epoch * n_local_experts, pl.INT32" in combine
     assert "with pl.spmd(\n            BATCH," in combine
 
@@ -694,8 +696,9 @@ def test_c3_fixed_lane_credits_cover_hybrid_work_and_cannot_arrive_early() -> No
         for active_experts in range(max_active_experts + 1):
             scatter_blocks = min(max(active_experts, 1), n_local)
             if active_experts == 0:
-                # The scheduler predicate retires this defensive one-block
-                # grid; combine_wait publishes all 36 credits instead.
+                # The non-predicated defensive block is an in-kernel no-op;
+                # combine_wait publishes all 36 credits instead.
+                assert scatter_blocks == 1
                 continue
             assert scatter_blocks == active_experts
             combine_credits = [
@@ -707,8 +710,8 @@ def test_c3_fixed_lane_credits_cover_hybrid_work_and_cannot_arrive_early() -> No
             for credit in combine_credits:
                 assert sum(combine_credits) - credit < n_local
 
-    # A rank receiving no routes skips its scatter grid, but its symmetric
-    # control task still advances peers by the same fixed lane budget.
+    # A rank receiving no routes launches one no-op scatter block, then its
+    # symmetric control task advances peers by the same fixed lane budget.
     assert n_local == 36
 
 
@@ -980,6 +983,8 @@ def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
 def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     source, tree = _parse(_CANONICAL)
     expected_assignments = {
+        "ROUTED_GATE_MM_K_CHUNK": 256,
+        "ROUTED_GATE_MM_N_CHUNK": 256,
         "ROUTED_GATE_ACT_N_CHUNK": 64,
         "ROUTED_H_QUANT_N_CHUNK": 256,
         "ROUTED_GATE_K_CHUNK": 64,
@@ -996,12 +1001,16 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
         and node.targets[0].id in expected_assignments
     }
     assert assignments == expected_assignments
-    assert sum(
-        isinstance(node, ast.Assert)
-        and ast.unparse(node.test)
-        == "MOE_INTERMEDIATE % ROUTED_H_QUANT_N_CHUNK == 0"
-        for node in tree.body
-    ) == 1
+    for divisibility_contract in (
+        "HIDDEN % ROUTED_GATE_MM_K_CHUNK == 0",
+        "MOE_INTERMEDIATE % ROUTED_GATE_MM_N_CHUNK == 0",
+        "MOE_INTERMEDIATE % ROUTED_H_QUANT_N_CHUNK == 0",
+    ):
+        assert sum(
+            isinstance(node, ast.Assert)
+            and ast.unparse(node.test) == divisibility_contract
+            for node in tree.body
+        ) == 1
 
     expert = _method(tree, "_expert_routed")
     expert_source = _segment(source, expert)
@@ -1035,6 +1044,12 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
         }
         assert keywords["deps"] == f"[{dependency}]"
         assert keywords["predicate"] == "local_route_count[0] > 0"
+        if name_hint == "expert_gate_up":
+            assert keywords["optimizations"] == (
+                "[pl.split(pl.SplitMode.NONE, slot_num=4)]"
+            )
+        else:
+            assert "optimizations" not in keywords
         scope_source = _segment(source, scope)
         assert "pl.read(local_route_count, [1])" in scope_source
         assert "pl.read(local_route_count, [active_slot + 2])" in scope_source

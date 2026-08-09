@@ -966,10 +966,11 @@ def attention_swa(
     # the output is a partial [BATCH, HIDDEN] BF16 tensor that must be
     # summed across the TP group via the all-reduce below before residual.
     #
-    # Phase A (2026-06-11): mirror of attention_full.py — split the cube
-    # matmul + vec cast into two separate spmds so PTOAS does not lower
-    # this scope to a MixedKernels dispatch (the mixed-mode AICore root is
-    # the 507018 VEC UB alignment crash site; see phase-15 doc).
+    # Keep the fused mixed task unsplit across batch rows. BATCH_TILE=16 and
+    # UP_DOWN would give each AIV lane an M=8 row fragment while AIC publishes
+    # one full M=16 accumulator. Grouped N tiles would then reuse that split
+    # C2V/V2C pipe for multiple publications, which can expose stale lower
+    # rows. The unsplit [BATCH_TILE, N] accumulator fits the tile budget.
     # Declare both candidate destinations outside the compile-time feature
     # branches.  PyPTO converts the DSL to SSA before it folds config-backed
     # constant branches, so branch-local tensor declarations are otherwise
@@ -985,7 +986,6 @@ def attention_swa(
         for out_task in pl.spmd(
             swa_out_proj_tasks,
             name_hint="swa_out_proj_matmul",
-            optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
         ):
             # Same scheduler-grain control as full attention.  The SWA K
             # width is different, so it is tuned independently.

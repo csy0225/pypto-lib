@@ -449,13 +449,15 @@ def test_c3_moe_hybrid_grids_follow_tokens_routes_and_skip_empty_ranks() -> None
     assert "active_blocks" not in combine
     assert "with pl.spmd(\n            scatter_blocks," in combine
     assert 'name_hint="combine_route_gate"' not in combine
-    assert "predicate=(local_route_count[0] > 0)" in combine
+    assert "predicate=(local_route_count[0] > 0)" not in combine
+    assert "if pl.read(local_route_count, [0]) > 0:" in combine
+    assert "allow_early_resolve=True" in combine
     assert "local_route_count_tid: pl.Scalar[pl.TASK_ID]" in combine
     assert "deps=[local_route_count_tid]" in combine
     assert "pl.read(local_route_count, [worker + 2])" in combine
     assert "for e in pl.range(worker, n_local_experts, scatter_blocks)" not in combine
     assert "- pl.cast(scatter_blocks, pl.INT32)" in combine
-    assert "Predicated empty-rank scatter emitted no data block." in combine
+    assert "Empty-rank scatter did not publish data or credits." in combine
     assert "moe_epoch * n_local_experts, pl.INT32" in combine
     assert "with pl.spmd(\n            BATCH," in combine
 
@@ -694,8 +696,9 @@ def test_c3_fixed_lane_credits_cover_hybrid_work_and_cannot_arrive_early() -> No
         for active_experts in range(max_active_experts + 1):
             scatter_blocks = min(max(active_experts, 1), n_local)
             if active_experts == 0:
-                # The scheduler predicate retires this defensive one-block
-                # grid; combine_wait publishes all 36 credits instead.
+                # The non-predicated defensive block is an in-kernel no-op;
+                # combine_wait publishes all 36 credits instead.
+                assert scatter_blocks == 1
                 continue
             assert scatter_blocks == active_experts
             combine_credits = [
@@ -707,8 +710,8 @@ def test_c3_fixed_lane_credits_cover_hybrid_work_and_cannot_arrive_early() -> No
             for credit in combine_credits:
                 assert sum(combine_credits) - credit < n_local
 
-    # A rank receiving no routes skips its scatter grid, but its symmetric
-    # control task still advances peers by the same fixed lane budget.
+    # A rank receiving no routes launches one no-op scatter block, then its
+    # symmetric control task advances peers by the same fixed lane budget.
     assert n_local == 36
 
 
@@ -888,3 +891,624 @@ def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
         assert "pl.read(local_expert_offset, [e])" not in body
     assert "expert_base = pl.cast(e * expert_recv_max, pl.INDEX)" in combine
     assert "pl.read(local_expert_offset, [e])" not in combine
+
+
+def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
+    source, tree = _parse(_CANONICAL)
+    helper = _method(tree, "_expert_shared_local")
+    helper_source = _segment(source, helper)
+    args = [arg.arg for arg in helper.args.args]
+    assert args[1:] == [
+        "x",
+        "w_gate",
+        "w_up",
+        "w_down",
+        "sh_y_shard",
+        "num_tokens",
+        "swiglu_limit",
+    ]
+    assert (
+        "[BATCH, sh_inter_local], dtype=pl.BF16, manual_dep=True"
+        in helper_source
+    )
+
+    gate = _task_scope(helper, "sh_gate_up_act")
+    down = _task_scope(helper, "sh_down")
+    for scope, blocks in (
+        (gate, "SHARED_GATE_UP_ACT_BLOCKS"),
+        (down, "SHARED_DOWN_WORKERS"),
+    ):
+        call = scope.items[0].context_expr
+        assert isinstance(call, ast.Call)
+        assert _call_path(call) == "pl.spmd"
+        assert [ast.unparse(arg) for arg in call.args] == [blocks]
+
+    gate_source = _segment(source, gate)
+    assert (
+        "for chunk in pl.range(\n"
+        "                worker,\n"
+        "                SHARED_GATE_UP_ACT_CHUNKS,\n"
+        "                SHARED_GATE_UP_ACT_BLOCKS,"
+    ) in gate_source
+    assert "sh_hidden[" in gate_source
+    assert "pl.cast(gated, target_type=pl.BF16)" in gate_source
+
+    down_source = _segment(source, down)
+    assert "deps=[sh_gate_up_tid]" in down_source
+    assert "active_tokens = pl.cast(num_tokens, pl.INDEX)" in down_source
+    assert "if active_tokens <= 1:" in down_source
+    assert "if worker == 0:" in down_source
+    assert "HIDDEN // SHARED_DOWN_N_CHUNK" in down_source
+    assert (
+        "worker,\n"
+        "                    HIDDEN // SHARED_DOWN_N_CHUNK,\n"
+        "                    SHARED_DOWN_WORKERS,"
+        in down_source
+    )
+    assert down_source.count("sh_hidden,") == 4
+
+    generic_call = _method_calls(
+        _method(tree, "expert_shared_step"),
+        "_expert_shared_local",
+    )
+    assert len(generic_call) == 1
+    assert ast.unparse(generic_call[0].args[-2]) == "num_tokens"
+    assert ast.unparse(generic_call[0].args[-1]) == "_SHARED_SWIGLU_LIMIT"
+    special_call = _method_calls(
+        _method(tree, "_expert_shared_local_swiglu16"),
+        "_expert_shared_local",
+    )
+    assert len(special_call) == 1
+    assert ast.unparse(special_call[0].args[-2]) == "num_tokens"
+    assert ast.unparse(special_call[0].args[-1]) == "_SHARED_SWIGLU16_LIMIT"
+
+    for wrapper_name in (
+        "expert_shared_step",
+        "expert_shared_step_swiglu16",
+    ):
+        wrapper = _method(tree, wrapper_name)
+        assert "num_tokens" in [arg.arg for arg in wrapper.args.args]
+
+    orchestration_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr
+        in {"expert_shared_step", "expert_shared_step_swiglu16"}
+    ]
+    assert len(orchestration_calls) == 4
+    assert all(
+        ast.unparse(call.args[-2]) == "num_tokens"
+        for call in orchestration_calls
+    )
+
+
+def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
+    source, tree = _parse(_CANONICAL)
+    expected_assignments = {
+        "ROUTED_GATE_MM_K_CHUNK": 256,
+        "ROUTED_GATE_MM_N_CHUNK": 256,
+        "ROUTED_GATE_ACT_N_CHUNK": 64,
+        "ROUTED_H_QUANT_N_CHUNK": 256,
+        "ROUTED_GATE_K_CHUNK": 64,
+        "ROUTED_GATE_N_CHUNK": 64,
+        "ROUTED_GRID_WORKERS": 23,
+        "ROUTED_MULTIBATCH_GRID_WORKERS": 22,
+    }
+    assignments = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in expected_assignments
+    }
+    assert assignments == expected_assignments
+    for divisibility_contract in (
+        "HIDDEN % ROUTED_GATE_MM_K_CHUNK == 0",
+        "MOE_INTERMEDIATE % ROUTED_GATE_MM_N_CHUNK == 0",
+        "MOE_INTERMEDIATE % ROUTED_H_QUANT_N_CHUNK == 0",
+    ):
+        assert sum(
+            isinstance(node, ast.Assert)
+            and ast.unparse(node.test) == divisibility_contract
+            for node in tree.body
+        ) == 1
+
+    expert = _method(tree, "_expert_routed")
+    expert_source = _segment(source, expert)
+    assert "num_tokens" in [arg.arg for arg in expert.args.args]
+    assert (
+        "routed_workers = pl.cast(ROUTED_GRID_WORKERS, pl.INDEX)"
+        in expert_source
+    )
+    assert "if active_tokens > 1:" in expert_source
+    assert (
+        "ROUTED_MULTIBATCH_GRID_WORKERS, pl.INDEX"
+        in expert_source
+    )
+    stages = (
+        ("expert_gate_up", "local_route_count_tid"),
+        ("expert_gate_up_act", "routed_gate_up_tid"),
+        ("routed_h_quant", "routed_act_tid"),
+        ("expert_down", "routed_quant_tid"),
+    )
+    for name_hint, dependency in stages:
+        scope = _task_scope(expert, name_hint)
+        call = scope.items[0].context_expr
+        assert isinstance(call, ast.Call)
+        assert _call_path(call) == "pl.spmd"
+        assert [ast.unparse(arg) for arg in call.args] == [
+            "routed_workers",
+        ]
+        keywords = {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in call.keywords
+        }
+        assert keywords["deps"] == f"[{dependency}]"
+        assert keywords["predicate"] == "local_route_count[0] > 0"
+        if name_hint == "expert_gate_up":
+            assert keywords["optimizations"] == (
+                "[pl.split(pl.SplitMode.NONE, slot_num=4)]"
+            )
+        else:
+            assert "optimizations" not in keywords
+        scope_source = _segment(source, scope)
+        assert "pl.read(local_route_count, [1])" in scope_source
+        assert "pl.read(local_route_count, [active_slot + 2])" in scope_source
+        grid_stride_loops = [
+            node
+            for node in ast.walk(scope)
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and _call_path(node.iter) == "pl.range"
+            and len(node.iter.args) == 3
+            and ast.unparse(node.iter.args[0]) == "worker"
+            and ast.unparse(node.iter.args[2]) == "routed_workers"
+        ]
+        assert len(grid_stride_loops) == 1
+
+    gate = _segment(source, _task_scope(expert, "expert_gate_up"))
+    assert (
+        "chunks_per_expert = inter // ROUTED_GATE_MM_N_CHUNK"
+        in gate
+    )
+    assert "gate_up_work = active_expert_count * chunks_per_expert" in gate
+    assert "gate_acc = pl.matmul(x0, wg0, out_dtype=pl.INT32)" in gate
+    assert "up_acc = pl.matmul(x0, wu0, out_dtype=pl.INT32)" in gate
+    assert "projection" not in gate
+    assert "if projection" not in expert_source
+    assert "for e in pl.parallel(n_local_experts)" not in expert_source
+
+    for function_name, chunk, rows in (
+        ("_expert_routed", "ROUTED_H_QUANT_N_CHUNK", "RECV_TILE"),
+        ("_expert_routed_swiglu7", "ROUTED_GATE_N_CHUNK", "RECV_SPECIAL_TILE"),
+    ):
+        quant = _task_scope(_method(tree, function_name), "routed_h_quant")
+        quant_source = _segment(source, quant)
+        loops = [
+            node
+            for node in ast.walk(quant)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in {"hqa", "hqn"}
+        ]
+        assert len(loops) == 2
+        assert {loop.target.id for loop in loops} == {"hqa", "hqn"}
+        for loop in loops:
+            assert ast.unparse(loop.iter) == f"pl.range(inter // {chunk})"
+            assert [
+                ast.unparse(call.args[1])
+                for call in ast.walk(loop)
+                if isinstance(call, ast.Call)
+                and _call_path(call) == "pl.slice"
+                and ast.unparse(call.args[0]) == "h_bf16"
+            ] == [f"[{rows}, {chunk}]"]
+
+        hqa = next(loop for loop in loops if loop.target.id == "hqa")
+        parents = [
+            node
+            for node in ast.walk(quant)
+            if hasattr(node, "body") and hqa in node.body
+        ]
+        assert len(parents) == 1
+        parent_body = parents[0].body
+        amax_initializers = [
+            node
+            for node in ast.walk(quant)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and ast.unparse(node.targets[0]) == "eh_amax"
+            and isinstance(node.value, ast.Call)
+            and _call_path(node.value) == "pl.full"
+        ]
+        assert len(amax_initializers) == 1
+        initializer = amax_initializers[0]
+        assert initializer in parent_body
+        assert parent_body.index(initializer) < parent_body.index(hqa)
+        assert ast.unparse(initializer.value.args[0]) == f"[1, {rows}]"
+        hqa_amax_assignments = [
+            node
+            for node in ast.walk(hqa)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and ast.unparse(node.targets[0]) == "eh_amax"
+        ]
+        assert len(hqa_amax_assignments) == 1
+        hqa_amax_update = hqa_amax_assignments[0]
+        assert isinstance(hqa_amax_update.value, ast.Call)
+        assert _call_path(hqa_amax_update.value) == "pl.maximum"
+        assert ast.unparse(hqa_amax_update.value.args[0]) == "eh_amax"
+        assert {
+            keyword.arg: ast.literal_eval(keyword.value)
+            if isinstance(keyword.value, ast.Constant)
+            else ast.unparse(keyword.value)
+            for keyword in initializer.value.keywords
+        } == {"dtype": "pl.FP32", "value": 1e-4}
+
+        if function_name == "_expert_routed_swiglu7":
+            assert "ROUTED_H_QUANT_N_CHUNK" not in quant_source
+
+    wrapper = _method(tree, "expert_routed_step")
+    assert "num_tokens" in [arg.arg for arg in wrapper.args.args]
+    wrapper_calls = _method_calls(wrapper, "_expert_routed")
+    assert len(wrapper_calls) == 1
+    assert ast.unparse(wrapper_calls[0].args[7]) == "num_tokens"
+
+    orchestration_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "expert_routed_step"
+    ]
+    assert len(orchestration_calls) == 2
+    assert all(
+        ast.unparse(call.args[7]) == "num_tokens"
+        for call in orchestration_calls
+    )
+
+
+def test_regular_routed_quant_math_is_chunk_invariant() -> None:
+    import torch
+
+    rows = 16
+    intermediate = 1280
+    values = torch.arange(rows * intermediate, dtype=torch.float32).reshape(
+        rows,
+        intermediate,
+    )
+    hidden = (
+        torch.sin(values * 0.017)
+        * torch.cos(values * 0.003)
+        * torch.linspace(0.125, 8.0, rows).reshape(rows, 1)
+    ).to(torch.bfloat16).to(torch.float32)
+    hidden[0].zero_()
+    hidden[1, 63] = -9.5
+    hidden[2, 255] = 11.0
+    hidden[3, 1024] = -12.5
+
+    def quantize(chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
+        amax = torch.full([rows], 1e-4, dtype=torch.float32)
+        for offset in range(0, intermediate, chunk):
+            chunk_amax = hidden[:, offset : offset + chunk].abs().amax(dim=1)
+            amax = torch.maximum(amax, chunk_amax)
+        scale_q = torch.reciprocal(amax) * 127.0
+        scale_dq = torch.reciprocal(scale_q)
+
+        quantized = torch.empty_like(hidden, dtype=torch.int8)
+        for offset in range(0, intermediate, chunk):
+            scaled = hidden[:, offset : offset + chunk] * scale_q.reshape(
+                rows,
+                1,
+            )
+            quantized[:, offset : offset + chunk] = (
+                torch.round(scaled)
+                .to(torch.int32)
+                .to(torch.float16)
+                .to(torch.int8)
+            )
+        return quantized, scale_dq
+
+    quant64, scale64 = quantize(64)
+    quant256, scale256 = quantize(256)
+    assert torch.equal(scale256, scale64)
+    assert torch.equal(quant256, quant64)
+
+    def quantize_with_chunk_local_amax(chunk: int) -> torch.Tensor:
+        quantized = torch.empty_like(hidden, dtype=torch.int8)
+        for offset in range(0, intermediate, chunk):
+            tile = hidden[:, offset : offset + chunk]
+            local_amax = torch.maximum(
+                torch.full([rows], 1e-4, dtype=torch.float32),
+                tile.abs().amax(dim=1),
+            )
+            local_scale = torch.reciprocal(local_amax) * 127.0
+            quantized[:, offset : offset + chunk] = (
+                torch.round(tile * local_scale.reshape(rows, 1))
+                .to(torch.int32)
+                .to(torch.float16)
+                .to(torch.int8)
+            )
+        return quantized
+
+    # Prove that the fixture detects the bug guarded by the AST contract:
+    # resetting amax inside the chunk loop makes the result chunk-dependent.
+    assert not torch.equal(
+        quantize_with_chunk_local_amax(64),
+        quantize_with_chunk_local_amax(256),
+    )
+
+
+def test_routed_down_halves_the_int8_accumulation_chain() -> None:
+    source, tree = _parse(_CANONICAL)
+    assignments = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "ROUTED_DOWN_K_CHUNK"
+    }
+    assert assignments == {"ROUTED_DOWN_K_CHUNK": 128}
+
+    regular_scope = _task_scope(
+        _method(tree, "_expert_routed"), "expert_down",
+    )
+    special_function = _method(tree, "_expert_routed_swiglu7")
+    regular = _segment(source, regular_scope)
+    special = _segment(source, special_function)
+    for node in (regular_scope, special_function):
+        loops = [
+            item
+            for item in ast.walk(node)
+            if isinstance(item, ast.For)
+            and isinstance(item.iter, ast.Call)
+            and ast.unparse(item.iter)
+            == "pl.range(1, inter // ROUTED_DOWN_K_CHUNK)"
+        ]
+        assert len(loops) == 1
+    assert regular.count("[RECV_TILE, ROUTED_DOWN_K_CHUNK]") == 2
+    assert (
+        special.count("[RECV_SPECIAL_TILE, ROUTED_DOWN_K_CHUNK]")
+        == 2
+    )
+
+
+def test_adaptive_grid_planners_cover_every_active_tile_once() -> None:
+    stage_chunks = {
+        "gate_up": 20,
+        "act": 20,
+        "quant": 1,
+        "down": 16,
+    }
+    for workers in (22, 23):
+        for active_experts in (1, 2, 3, 8, 36):
+            for tiles_per_expert in (1, 2, 4):
+                for chunks in stage_chunks.values():
+                    logical_work = active_experts * chunks
+                    owners = [
+                        work
+                        for worker in range(workers)
+                        for work in range(worker, logical_work, workers)
+                    ]
+                    assert sorted(owners) == list(range(logical_work))
+                    assert len(owners) == len(set(owners))
+
+                    covered = [
+                        (work // chunks, tile, work % chunks)
+                        for work in owners
+                        for tile in range(tiles_per_expert)
+                    ]
+                    expected = [
+                        (expert, tile, chunk)
+                        for expert in range(active_experts)
+                        for tile in range(tiles_per_expert)
+                        for chunk in range(chunks)
+                    ]
+                    assert sorted(covered) == expected
+
+    assert 1 + 23 == 24
+    assert 2 + 22 == 24
+
+    shared_gate = [
+        chunk
+        for worker in range(2)
+        for chunk in range(worker, 5, 2)
+    ]
+    assert sorted(shared_gate) == list(range(5))
+    for active_tokens in (0, 1, 2, 16):
+        shared_down = [
+            block
+            for worker in range(2)
+            for block in (
+                range(16)
+                if active_tokens <= 1 and worker == 0
+                else range(0)
+                if active_tokens <= 1
+                else range(worker, 16, 2)
+            )
+        ]
+        assert sorted(shared_down) == list(range(16))
+        assert len(shared_down) == len(set(shared_down))
+
+
+def test_moe_norm_quant_uses_full_eight_row_blocks() -> None:
+    source, tree = _parse(_CANONICAL)
+    function = _method(tree, "_norm_quant_moe_input")
+    body = _segment(source, function)
+
+    constants: dict[str, object] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            try:
+                constants[node.targets[0].id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                pass
+    assert constants["MOE_NORM_TOKEN_TILE"] == 8
+    assert constants["MOE_NORM_SCALAR_PAD"] == 8
+    assert "assert BATCH % MOE_NORM_TOKEN_TILE == 0" in source
+    assert "MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE" in source
+
+    assert any(
+        ast.unparse(decorator)
+        == "pl.function(type=pl.FunctionType.Inline)"
+        for decorator in function.decorator_list
+    )
+    spmd_loops = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and _call_path(node.iter) == "pl.spmd"
+    ]
+    assert len(spmd_loops) == 1
+    spmd_call = spmd_loops[0].iter
+    assert ast.unparse(spmd_call.args[0]) == "MOE_NORM_BLOCKS"
+    assert {
+        keyword.arg: ast.literal_eval(keyword.value)
+        for keyword in spmd_call.keywords
+    } == {"name_hint": "norm_quant_moe_input"}
+
+    scalar_full_calls = [
+        call
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pl.full"
+        and call.args
+        and ast.unparse(call.args[0])
+        == "[MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD]"
+    ]
+    assert len(scalar_full_calls) == 3
+    assert body.count("[MOE_NORM_TOKEN_TILE, K_CHUNK]") == 2
+    assert "valid_shape=" not in body
+    assert "target_type=pl.BF16" in body
+    assert "target_type=pl.INT32,\n                    mode=\"rint\"" in body
+    assert "target_type=pl.FP16, mode=\"round\"" in body
+    assert "target_type=pl.INT8, mode=\"trunc\"" in body
+
+
+def test_moe_norm_quant_grid_covers_supported_storage_batches() -> None:
+    for storage_batch in (16, 32, 48):
+        written_rows = {
+            token_block * 8 + token_idx
+            for token_block in range(storage_batch // 8)
+            for token_idx in range(8)
+        }
+        assert written_rows == set(range(storage_batch))
+
+
+def test_shared_two_stage_schedule_is_bf16_exact() -> None:
+    import torch
+
+    storage_rows = 8
+    input_hidden = 8
+    swiglu_chunk = 2
+    shared_hidden = 5 * swiglu_chunk
+    down_chunk = 2
+    down_blocks = 16
+    output_hidden = down_blocks * down_chunk
+
+    def bf16(values: torch.Tensor) -> torch.Tensor:
+        return values.to(torch.bfloat16).to(torch.float32)
+
+    x = bf16(
+        torch.sin(
+            torch.arange(
+                storage_rows * input_hidden, dtype=torch.float32,
+            ).reshape(storage_rows, input_hidden)
+            * 0.013
+        )
+    )
+    w_gate = bf16(
+        torch.cos(
+            torch.arange(
+                input_hidden * shared_hidden, dtype=torch.float32,
+            ).reshape(input_hidden, shared_hidden)
+            * 0.017
+        )
+        * 0.25
+    )
+    w_up = bf16(
+        torch.sin(
+            torch.arange(
+                input_hidden * shared_hidden, dtype=torch.float32,
+            ).reshape(input_hidden, shared_hidden)
+            * 0.019
+        )
+        * 0.25
+    )
+    w_down = bf16(
+        torch.cos(
+            torch.arange(
+                shared_hidden * output_hidden, dtype=torch.float32,
+            ).reshape(shared_hidden, output_hidden)
+            * 0.011
+        )
+        * 0.125
+    )
+
+    def activation_chunks(limit: float | None) -> list[torch.Tensor]:
+        chunks: list[torch.Tensor] = []
+        for chunk in range(5):
+            n0 = chunk * swiglu_chunk
+            n1 = n0 + swiglu_chunk
+            gate = x @ w_gate[:, n0:n1]
+            up = x @ w_up[:, n0:n1]
+            silu = gate * torch.reciprocal(torch.exp(-gate) + 1.0)
+            if limit is not None:
+                silu = torch.minimum(silu, torch.tensor(limit))
+                up = torch.clamp(up, -limit, limit)
+            chunks.append(bf16(silu * up))
+        return chunks
+
+    def down_block(
+        chunks: list[torch.Tensor],
+        block: int,
+    ) -> torch.Tensor:
+        d0 = block * down_chunk
+        d1 = d0 + down_chunk
+        acc = chunks[0] @ w_down[0:swiglu_chunk, d0:d1]
+        for chunk in range(1, 5):
+            k0 = chunk * swiglu_chunk
+            k1 = k0 + swiglu_chunk
+            acc = acc + chunks[chunk] @ w_down[k0:k1, d0:d1]
+        return bf16(acc)
+
+    for limit in (None, 16.0):
+        reference_chunks = activation_chunks(limit)
+        reference = torch.empty(
+            [storage_rows, output_hidden],
+            dtype=torch.float32,
+        )
+        for block in range(down_blocks):
+            d0 = block * down_chunk
+            reference[:, d0 : d0 + down_chunk] = down_block(
+                reference_chunks,
+                block,
+            )
+
+        staged_chunks: list[torch.Tensor | None] = [None] * 5
+        computed = activation_chunks(limit)
+        for worker in range(2):
+            for chunk in range(worker, 5, 2):
+                staged_chunks[chunk] = computed[chunk]
+        assert all(chunk is not None for chunk in staged_chunks)
+        concrete_chunks = [
+            chunk for chunk in staged_chunks if chunk is not None
+        ]
+
+        staged = torch.empty_like(reference)
+        for worker in range(2):
+            for block in range(worker, down_blocks, 2):
+                d0 = block * down_chunk
+                staged[:, d0 : d0 + down_chunk] = down_block(
+                    concrete_chunks,
+                    block,
+                )
+        assert torch.equal(staged, reference)

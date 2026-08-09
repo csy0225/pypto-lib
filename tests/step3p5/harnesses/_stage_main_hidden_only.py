@@ -91,6 +91,14 @@ def _parse_args() -> argparse.Namespace:
             "needed). Emits per-context ITL stats to itl_report.json."
         ),
     )
+    parser.add_argument(
+        "--itl-active-batches",
+        default="",
+        help=(
+            "perf-only diagnostic: comma-separated active batch counts to run "
+            "against one resident compiled holder"
+        ),
+    )
     parser.add_argument("--itl-iters", type=int, default=20, help="measured decode iters per context")
     parser.add_argument("--itl-warmup", type=int, default=3, help="warmup decode iters per context (not recorded)")
     parser.add_argument(
@@ -883,6 +891,21 @@ def _run_worker(args: argparse.Namespace) -> int:
     try:
         with holder:
             if args.itl_context_lens:
+                if args.itl_active_batches:
+                    original_active_batch = args.active_batch
+                    for text in args.itl_active_batches.split(","):
+                        active_batch = int(text.strip())
+                        if not 1 <= active_batch <= BATCH:
+                            raise ValueError(
+                                f"--itl-active-batches entry must be in "
+                                f"[1,{BATCH}], got {active_batch}"
+                            )
+                        batch_out = out / f"batch_{active_batch}"
+                        batch_out.mkdir(parents=False, exist_ok=False)
+                        args.active_batch = active_batch
+                        _run_itl(holder, args, batch_out)
+                    args.active_batch = original_active_batch
+                    return 0
                 return _run_itl(holder, args, out)
             token = args.seed_token
             for step in range(args.steps):

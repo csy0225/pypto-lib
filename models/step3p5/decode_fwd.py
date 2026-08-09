@@ -155,18 +155,35 @@ ROUTER_GATE_K_CHUNK = 256
 ROUTER_GATE_N_CHUNK = 32
 ROUTER_FP32_NEG_INF = -3.4028235e38
 ROUTER_SCALE = 3.0  # MOE_ROUTER_SCALING_FACTOR
+# Eight rows are the smallest backend-safe FP32 scalar store tile. Split the
+# configured decode storage into disjoint token workers without duplicating
+# any norm/quant work.
+MOE_NORM_TOKEN_TILE = 8
+MOE_NORM_SCALAR_PAD = 8
+assert BATCH % MOE_NORM_TOKEN_TILE == 0
+MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE
 
 # Routed-expert kernel constants — mirrors expert_routed.py / moe.ROUTED_*.
 # Keep independent matmul and activation tiles so the cube task grain can be
 # tuned without coupling it to the vector epilogue or changing W8A8 rounding.
-ROUTED_GATE_MM_K_CHUNK = 512
-ROUTED_GATE_MM_N_CHUNK = 64
+# The routed weights are [K, N] with N contiguous in GM. K256 x N256 keeps the
+# 64 KiB Right/L0B tile ceiling while widening each strided weight load from
+# 64 to 256 contiguous bytes. Four 64 KiB V2C slots retain a 256 KiB pipe.
+ROUTED_GATE_MM_K_CHUNK = 256
+ROUTED_GATE_MM_N_CHUNK = 256
 ROUTED_GATE_ACT_N_CHUNK = 64
-ROUTED_H_QUANT_N_CHUNK = 64
+assert HIDDEN % ROUTED_GATE_MM_K_CHUNK == 0
+assert MOE_INTERMEDIATE % ROUTED_GATE_MM_N_CHUNK == 0
+# Widen both rowwise quant passes from 20 serial slices to five while preserving
+# the full-row amax domain and W8A8 requantization sequence.
+ROUTED_H_QUANT_N_CHUNK = 256
+assert MOE_INTERMEDIATE % ROUTED_H_QUANT_N_CHUNK == 0
 # L43/L44 keep the existing specialization until they are tuned separately.
 ROUTED_GATE_K_CHUNK = 64
 ROUTED_GATE_N_CHUNK = 64
-ROUTED_DOWN_K_CHUNK = 64
+# INT8 accumulation is exact across K chunks. A 128-wide tile halves the
+# routed down matmul_acc chain without changing its rounding contract.
+ROUTED_DOWN_K_CHUNK = 128
 ROUTED_DOWN_N_CHUNK = 256
 RECV_TILE = 16
 ROUTED_SPECIAL_DOWN_N_CHUNK = 128
@@ -178,6 +195,18 @@ SHARED_GATE_N_CHUNK = INTER_S_LOCAL  # 160 — one N tile covers the slice
 SHARED_DOWN_K_CHUNK = INTER_S_LOCAL  # 160 — one K tile covers the slice
 SHARED_DOWN_N_CHUNK = 256
 SHARED_SWIGLU_N_CHUNK = 32
+# Shared gate/up keeps the five validated 32-wide chunks on two workers.
+# Shared down activates one worker for single-token decode and both workers
+# for larger batches. Routed uses the spare-core budget left by shared down:
+# 23 workers for one token and 22 workers for larger batches. This is soft
+# scheduling, not physical affinity.
+SHARED_GATE_UP_ACT_CHUNKS = INTER_S_LOCAL // SHARED_SWIGLU_N_CHUNK
+SHARED_GATE_UP_ACT_BLOCKS = 2
+SHARED_DOWN_WORKERS = 2
+# Regular routed stages use one grid per stage. Logical expert/tile/chunk work
+# is grid-strided inside the kernel so AICPU no longer submits per expert.
+ROUTED_GRID_WORKERS = 23
+ROUTED_MULTIBATCH_GRID_WORKERS = 22
 
 # MoE-local helper constants are module-level for parse-time closure capture.
 n_ranks = tp_size
@@ -704,7 +733,7 @@ class WholeDecodeStep3p5:
         return expert_indices, expert_weights
 
     # ---------- Stage 2: V4-Flash norm/quant + expert-lane dispatch ----------
-    @pl.function(type=pl.FunctionType.InCore)
+    @pl.function(type=pl.FunctionType.Inline)
     def _norm_quant_moe_input(
         self,
         resid: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
@@ -746,76 +775,112 @@ class WholeDecodeStep3p5:
         if active_gate_tokens > BATCH:
             active_gate_tokens = pl.cast(BATCH, pl.INDEX)
 
-        sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-        xg_amax = pl.full([1, BATCH], dtype=pl.FP32, value=1e-4)
-        for kb in pl.range(HIDDEN // K_CHUNK):
-            k0 = kb * K_CHUNK
-            raw = pl.cast(
-                pl.slice(
-                    resid, [BATCH, K_CHUNK], [0, k0],
-                    valid_shape=[active_gate_tokens, K_CHUNK],
-                ),
-                target_type=pl.FP32,
-            )
-            gamma = pl.slice(
-                post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
-            )
-            xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
-            sq_sum = pl.add(
-                sq_sum,
-                pl.reshape(pl.row_sum(pl.mul(raw, raw)), [1, BATCH]),
-            )
-            xg_amax = pl.maximum(
-                xg_amax,
-                pl.reshape(
-                    pl.row_max(pl.maximum(xg, pl.neg(xg))), [1, BATCH],
+        for token_block in pl.spmd(
+            MOE_NORM_BLOCKS,
+            name_hint="norm_quant_moe_input",
+        ):
+            token0 = token_block * MOE_NORM_TOKEN_TILE
+            sq_sum = pl.row_sum(
+                pl.full(
+                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
+                    dtype=pl.FP32,
+                    value=0.0,
                 ),
             )
+            xg_amax = pl.row_max(
+                pl.full(
+                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
+                    dtype=pl.FP32,
+                    value=1e-4,
+                ),
+            )
+            for kb in pl.range(HIDDEN // K_CHUNK):
+                k0 = kb * K_CHUNK
+                raw = pl.cast(
+                    pl.slice(
+                        resid,
+                        [MOE_NORM_TOKEN_TILE, K_CHUNK],
+                        [token0, k0],
+                    ),
+                    target_type=pl.FP32,
+                )
+                gamma = pl.slice(
+                    post_rms_weight,
+                    [1, K_CHUNK],
+                    [norm_layer_idx, k0],
+                )
+                xg = pl.col_expand_mul(
+                    raw, pl.add(gamma, 1.0),
+                )
+                sq_sum = pl.add(
+                    sq_sum,
+                    pl.row_sum(pl.mul(raw, raw)),
+                )
+                xg_amax = pl.maximum(
+                    xg_amax,
+                    pl.row_max(pl.maximum(xg, pl.neg(xg))),
+                )
 
-        inv_rms_row = pl.recip(
-            pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-        )
-        inv_rms = pl.reshape(inv_rms_row, [BATCH, 1])
-        inv_rms_out[0:BATCH, 0:1] = inv_rms
-        quant_mul_row = pl.div(
-            pl.full([1, BATCH], dtype=pl.FP32, value=127.0), xg_amax,
-        )
-        quant_mul = pl.reshape(quant_mul_row, [BATCH, 1])
-        dequant_scale = pl.reshape(
-            pl.mul(inv_rms_row, pl.mul(xg_amax, 1.0 / 127.0)),
-            [BATCH, 1],
-        )
-        x_scale_out[0:BATCH, 0:1] = dequant_scale
-
-        for kb2 in pl.range(HIDDEN // K_CHUNK):
-            k0 = kb2 * K_CHUNK
-            raw = pl.cast(
-                pl.slice(
-                    resid, [BATCH, K_CHUNK], [0, k0],
-                    valid_shape=[active_gate_tokens, K_CHUNK],
+            inv_rms = pl.recip(
+                pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+            )
+            inv_rms_out[
+                token0 : token0 + MOE_NORM_TOKEN_TILE, 0:1
+            ] = inv_rms
+            quant_numerator = pl.row_max(
+                pl.full(
+                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
+                    dtype=pl.FP32,
+                    value=127.0,
                 ),
-                target_type=pl.FP32,
             )
-            gamma = pl.slice(
-                post_rms_weight, [1, K_CHUNK], [norm_layer_idx, k0],
+            quant_mul = pl.div(quant_numerator, xg_amax)
+            dequant_scale = pl.mul(
+                inv_rms, pl.mul(xg_amax, 1.0 / 127.0),
             )
-            # Current 0726 backend UB cannot retain a full [BATCH,HIDDEN]
-            # FP32 xg buffer, so recompute xg in the emission pass.  This is a
-            # backend/profile trade-off only; norm and quant still share one
-            # producer and the same inv_rms/amax values.
-            xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
-            normed = pl.row_expand_mul(xg, inv_rms)
-            post_norm_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
-                normed, target_type=pl.BF16,
-            )
-            qi32 = pl.cast(
-                pl.row_expand_mul(xg, quant_mul),
-                target_type=pl.INT32, mode="rint",
-            )
-            qf16 = pl.cast(qi32, target_type=pl.FP16, mode="round")
-            x_i8_out[0:BATCH, k0 : k0 + K_CHUNK] = pl.cast(
-                qf16, target_type=pl.INT8, mode="trunc",
-            )
+            x_scale_out[
+                token0 : token0 + MOE_NORM_TOKEN_TILE, 0:1
+            ] = dequant_scale
+
+            for kb2 in pl.range(HIDDEN // K_CHUNK):
+                k0 = kb2 * K_CHUNK
+                raw = pl.cast(
+                    pl.slice(
+                        resid,
+                        [MOE_NORM_TOKEN_TILE, K_CHUNK],
+                        [token0, k0],
+                    ),
+                    target_type=pl.FP32,
+                )
+                gamma = pl.slice(
+                    post_rms_weight,
+                    [1, K_CHUNK],
+                    [norm_layer_idx, k0],
+                )
+                # Current backend UB cannot retain the FP32 xg tile across
+                # both passes, so recompute it in the emission pass.
+                xg = pl.col_expand_mul(
+                    raw, pl.add(gamma, 1.0),
+                )
+                normed = pl.row_expand_mul(xg, inv_rms)
+                post_norm_out[
+                    token0 : token0 + MOE_NORM_TOKEN_TILE,
+                    k0 : k0 + K_CHUNK,
+                ] = pl.cast(normed, target_type=pl.BF16)
+                qi32 = pl.cast(
+                    pl.row_expand_mul(xg, quant_mul),
+                    target_type=pl.INT32,
+                    mode="rint",
+                )
+                qf16 = pl.cast(
+                    qi32, target_type=pl.FP16, mode="round",
+                )
+                x_i8_out[
+                    token0 : token0 + MOE_NORM_TOKEN_TILE,
+                    k0 : k0 + K_CHUNK,
+                ] = pl.cast(
+                    qf16, target_type=pl.INT8, mode="trunc",
+                )
         return post_norm_out, inv_rms_out, x_i8_out, x_scale_out
 
     # ---------- Stage 2: dispatch (V4-Flash expert-lane PUSH + gather) ----------
@@ -1151,6 +1216,9 @@ class WholeDecodeStep3p5:
         local_routed_weight: pl.Tensor[[local_recv_max], pl.FP32],
         local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
         local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count_tid: pl.Scalar[pl.TASK_ID],
+        num_tokens: pl.Scalar[pl.INT32],
         w_gate: pl.Tensor[
             [n_local_experts, HIDDEN, inter], pl.INT8
         ],
@@ -1167,36 +1235,58 @@ class WholeDecodeStep3p5:
             [local_recv_max, HIDDEN], pl.BF16
         ],
     ):
-        # V4-style stage split: independent gate/up cube tasks publish INT32
-        # accumulators, then the vector activation preserves the canonical
-        # BF16 round before requant and down projection.
         gate_i32 = pl.create_tensor(
             [local_recv_max, inter], dtype=pl.INT32,
         )
         up_i32 = pl.create_tensor(
             [local_recv_max, inter], dtype=pl.INT32,
         )
-
-        for e in pl.parallel(n_local_experts):
-            n_rows = pl.read(local_expert_count, [e])
-            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-            expert_base = e * expert_recv_max
-            gate_expert = gate_i32[
-                expert_base : expert_base + expert_recv_max
-            ]
-            up_expert = up_i32[
-                expert_base : expert_base + expert_recv_max
-            ]
-
-            for tile_idx in pl.parallel(n_tiles):
-                tile_row0 = tile_idx * RECV_TILE
-                tile_offset = expert_base + tile_row0
-
-                for nb in pl.spmd(
-                    inter // ROUTED_GATE_MM_N_CHUNK,
-                    name_hint="expert_gate_mm",
-                ):
-                    n0 = nb * ROUTED_GATE_MM_N_CHUNK
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > BATCH:
+            active_tokens = pl.cast(BATCH, pl.INDEX)
+        routed_workers = pl.cast(ROUTED_GRID_WORKERS, pl.INDEX)
+        if active_tokens > 1:
+            routed_workers = pl.cast(
+                ROUTED_MULTIBATCH_GRID_WORKERS, pl.INDEX,
+            )
+        with pl.spmd(
+            routed_workers,
+            name_hint="expert_gate_up",
+            deps=[local_route_count_tid],
+            predicate=(local_route_count[0] > 0),
+            allow_early_resolve=True,
+            optimizations=[
+                pl.split(pl.SplitMode.NONE, slot_num=4),
+            ],
+        ) as routed_gate_up_tid:
+            worker = pl.tile.get_block_idx()
+            active_expert_count = pl.cast(
+                pl.read(local_route_count, [1]), pl.INDEX,
+            )
+            if active_expert_count < 0:
+                active_expert_count = pl.cast(0, pl.INDEX)
+            if active_expert_count > n_local_experts:
+                active_expert_count = pl.cast(n_local_experts, pl.INDEX)
+            chunks_per_expert = inter // ROUTED_GATE_MM_N_CHUNK
+            gate_up_work = active_expert_count * chunks_per_expert
+            for work in pl.range(
+                worker, gate_up_work, routed_workers,
+            ):
+                active_slot = work // chunks_per_expert
+                nb = work % chunks_per_expert
+                n0 = nb * ROUTED_GATE_MM_N_CHUNK
+                e = pl.cast(
+                    pl.read(local_route_count, [active_slot + 2]),
+                    pl.INDEX,
+                )
+                n_rows = pl.read(local_expert_count, [e])
+                n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+                expert_base = e * expert_recv_max
+                for tile_idx in pl.range(n_tiles):
+                    tile_row0 = tile_idx * RECV_TILE
+                    tile_offset = expert_base + tile_row0
                     x0 = pl.slice(
                         local_routed_x,
                         [RECV_TILE, ROUTED_GATE_MM_K_CHUNK],
@@ -1212,9 +1302,28 @@ class WholeDecodeStep3p5:
                             ],
                             [e, 0, n0],
                         ),
-                        [ROUTED_GATE_MM_K_CHUNK, ROUTED_GATE_MM_N_CHUNK],
+                        [
+                            ROUTED_GATE_MM_K_CHUNK,
+                            ROUTED_GATE_MM_N_CHUNK,
+                        ],
+                    )
+                    wu0 = pl.reshape(
+                        pl.slice(
+                            w_up,
+                            [
+                                1,
+                                ROUTED_GATE_MM_K_CHUNK,
+                                ROUTED_GATE_MM_N_CHUNK,
+                            ],
+                            [e, 0, n0],
+                        ),
+                        [
+                            ROUTED_GATE_MM_K_CHUNK,
+                            ROUTED_GATE_MM_N_CHUNK,
+                        ],
                     )
                     gate_acc = pl.matmul(x0, wg0, out_dtype=pl.INT32)
+                    up_acc = pl.matmul(x0, wu0, out_dtype=pl.INT32)
                     for kb in pl.range(
                         1, HIDDEN // ROUTED_GATE_MM_K_CHUNK,
                     ):
@@ -1239,44 +1348,6 @@ class WholeDecodeStep3p5:
                                 ROUTED_GATE_MM_N_CHUNK,
                             ],
                         )
-                        gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
-                    gate_expert[
-                        tile_row0 : tile_row0 + RECV_TILE,
-                        n0 : n0 + ROUTED_GATE_MM_N_CHUNK,
-                    ] = gate_acc
-
-                for nb in pl.spmd(
-                    inter // ROUTED_GATE_MM_N_CHUNK,
-                    name_hint="expert_up_mm",
-                ):
-                    n0 = nb * ROUTED_GATE_MM_N_CHUNK
-                    x0 = pl.slice(
-                        local_routed_x,
-                        [RECV_TILE, ROUTED_GATE_MM_K_CHUNK],
-                        [tile_offset, 0],
-                    )
-                    wu0 = pl.reshape(
-                        pl.slice(
-                            w_up,
-                            [
-                                1,
-                                ROUTED_GATE_MM_K_CHUNK,
-                                ROUTED_GATE_MM_N_CHUNK,
-                            ],
-                            [e, 0, n0],
-                        ),
-                        [ROUTED_GATE_MM_K_CHUNK, ROUTED_GATE_MM_N_CHUNK],
-                    )
-                    up_acc = pl.matmul(x0, wu0, out_dtype=pl.INT32)
-                    for kb in pl.range(
-                        1, HIDDEN // ROUTED_GATE_MM_K_CHUNK,
-                    ):
-                        k0 = kb * ROUTED_GATE_MM_K_CHUNK
-                        xk = pl.slice(
-                            local_routed_x,
-                            [RECV_TILE, ROUTED_GATE_MM_K_CHUNK],
-                            [tile_offset, k0],
-                        )
                         wuk = pl.reshape(
                             pl.slice(
                                 w_up,
@@ -1292,51 +1363,73 @@ class WholeDecodeStep3p5:
                                 ROUTED_GATE_MM_N_CHUNK,
                             ],
                         )
+                        gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
                         up_acc = pl.matmul_acc(up_acc, xk, wuk)
-                    up_expert[
-                        tile_row0 : tile_row0 + RECV_TILE,
+                    gate_i32[
+                        tile_offset : tile_offset + RECV_TILE,
+                        n0 : n0 + ROUTED_GATE_MM_N_CHUNK,
+                    ] = gate_acc
+                    up_i32[
+                        tile_offset : tile_offset + RECV_TILE,
                         n0 : n0 + ROUTED_GATE_MM_N_CHUNK,
                     ] = up_acc
 
-        for e in pl.parallel(n_local_experts):
-            n_rows = pl.read(local_expert_count, [e])
-            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-            expert_base = e * expert_recv_max
-            gate_expert = gate_i32[
-                expert_base : expert_base + expert_recv_max
-            ]
-            up_expert = up_i32[
-                expert_base : expert_base + expert_recv_max
-            ]
-
-            for tile_idx in pl.parallel(n_tiles):
-                tile_row0 = tile_idx * RECV_TILE
-                tile_offset = expert_base + tile_row0
-                tile_valid = pl.cast(
-                    pl.min(
-                        pl.cast(RECV_TILE, pl.INT32),
-                        n_rows - tile_row0,
-                    ),
+        h_bf16 = pl.create_tensor(
+            [local_recv_max, inter], dtype=pl.BF16,
+        )
+        with pl.spmd(
+            routed_workers,
+            name_hint="expert_gate_up_act",
+            deps=[routed_gate_up_tid],
+            predicate=(local_route_count[0] > 0),
+            allow_early_resolve=True,
+        ) as routed_act_tid:
+            worker = pl.tile.get_block_idx()
+            active_expert_count = pl.cast(
+                pl.read(local_route_count, [1]), pl.INDEX,
+            )
+            if active_expert_count < 0:
+                active_expert_count = pl.cast(0, pl.INDEX)
+            if active_expert_count > n_local_experts:
+                active_expert_count = pl.cast(n_local_experts, pl.INDEX)
+            act_work = (
+                active_expert_count
+                * (inter // ROUTED_GATE_ACT_N_CHUNK)
+            )
+            for work in pl.range(
+                worker, act_work, routed_workers,
+            ):
+                active_slot = work // (
+                    inter // ROUTED_GATE_ACT_N_CHUNK
+                )
+                nb = work % (inter // ROUTED_GATE_ACT_N_CHUNK)
+                n0 = nb * ROUTED_GATE_ACT_N_CHUNK
+                e = pl.cast(
+                    pl.read(local_route_count, [active_slot + 2]),
                     pl.INDEX,
                 )
-                h_bf16 = pl.create_tensor(
-                    [RECV_TILE, inter], dtype=pl.BF16,
-                )
-
-                for nb in pl.spmd(
-                    inter // ROUTED_GATE_ACT_N_CHUNK,
-                    name_hint="expert_gate_up_act",
-                ):
-                    n0 = nb * ROUTED_GATE_ACT_N_CHUNK
-                    gate_act_acc = pl.slice(
-                        gate_expert,
-                        [RECV_TILE, ROUTED_GATE_ACT_N_CHUNK],
-                        [tile_row0, n0],
+                n_rows = pl.read(local_expert_count, [e])
+                n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+                expert_base = e * expert_recv_max
+                for tile_idx in pl.range(n_tiles):
+                    tile_row0 = tile_idx * RECV_TILE
+                    tile_offset = expert_base + tile_row0
+                    tile_valid = pl.cast(
+                        pl.min(
+                            pl.cast(RECV_TILE, pl.INT32),
+                            n_rows - tile_row0,
+                        ),
+                        pl.INDEX,
                     )
-                    up_act_acc = pl.slice(
-                        up_expert,
+                    gate_chunk = pl.slice(
+                        gate_i32,
                         [RECV_TILE, ROUTED_GATE_ACT_N_CHUNK],
-                        [tile_row0, n0],
+                        [tile_offset, n0],
+                    )
+                    up_chunk = pl.slice(
+                        up_i32,
+                        [RECV_TILE, ROUTED_GATE_ACT_N_CHUNK],
+                        [tile_offset, n0],
                     )
                     x_scale_col = pl.reshape(
                         pl.slice(
@@ -1359,7 +1452,7 @@ class WholeDecodeStep3p5:
                     gate_2d = pl.col_expand_mul(
                         pl.row_expand_mul(
                             pl.cast(
-                                gate_act_acc,
+                                gate_chunk,
                                 target_type=pl.FP32,
                                 mode="none",
                             ),
@@ -1370,7 +1463,7 @@ class WholeDecodeStep3p5:
                     up_2d = pl.col_expand_mul(
                         pl.row_expand_mul(
                             pl.cast(
-                                up_act_acc,
+                                up_chunk,
                                 target_type=pl.FP32,
                                 mode="none",
                             ),
@@ -1398,16 +1491,46 @@ class WholeDecodeStep3p5:
                         gated_v, pad_value=pl.PadValue.zero,
                     )
                     h_bf16[
-                        :, n0 : n0 + ROUTED_GATE_ACT_N_CHUNK
+                        tile_offset : tile_offset + RECV_TILE,
+                        n0 : n0 + ROUTED_GATE_ACT_N_CHUNK,
                     ] = pl.cast(gated_m, target_type=pl.BF16)
 
-                h_i8 = pl.create_tensor(
-                    [RECV_TILE, inter], dtype=pl.INT8,
+        h_i8 = pl.create_tensor(
+            [local_recv_max, inter], dtype=pl.INT8,
+        )
+        h_scale_dq_all = pl.create_tensor(
+            [1, local_recv_max], dtype=pl.FP32,
+        )
+        with pl.spmd(
+            routed_workers,
+            name_hint="routed_h_quant",
+            deps=[routed_act_tid],
+            predicate=(local_route_count[0] > 0),
+            allow_early_resolve=True,
+        ) as routed_quant_tid:
+            worker = pl.tile.get_block_idx()
+            active_expert_count = pl.cast(
+                pl.read(local_route_count, [1]), pl.INDEX,
+            )
+            if active_expert_count < 0:
+                active_expert_count = pl.cast(0, pl.INDEX)
+            if active_expert_count > n_local_experts:
+                active_expert_count = pl.cast(n_local_experts, pl.INDEX)
+            quant_work = active_expert_count
+            for work in pl.range(
+                worker, quant_work, routed_workers,
+            ):
+                active_slot = work
+                e = pl.cast(
+                    pl.read(local_route_count, [active_slot + 2]),
+                    pl.INDEX,
                 )
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="routed_h_quant",
-                ):
+                n_rows = pl.read(local_expert_count, [e])
+                n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+                expert_base = e * expert_recv_max
+                for tile_idx in pl.range(n_tiles):
+                    tile_row0 = tile_idx * RECV_TILE
+                    tile_offset = expert_base + tile_row0
                     eh_amax = pl.full(
                         [1, RECV_TILE], dtype=pl.FP32, value=1e-4,
                     )
@@ -1419,7 +1542,7 @@ class WholeDecodeStep3p5:
                             pl.slice(
                                 h_bf16,
                                 [RECV_TILE, ROUTED_H_QUANT_N_CHUNK],
-                                [0, hqa0],
+                                [tile_offset, hqa0],
                             ),
                             target_type=pl.FP32,
                         )
@@ -1443,6 +1566,9 @@ class WholeDecodeStep3p5:
                     h_scale_dq = pl.reshape(
                         pl.recip(eh_sq_row), [RECV_TILE, 1],
                     )
+                    h_scale_dq_all[
+                        0:1, tile_offset : tile_offset + RECV_TILE
+                    ] = pl.reshape(h_scale_dq, [1, RECV_TILE])
                     eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
                     for hqn in pl.range(
                         inter // ROUTED_H_QUANT_N_CHUNK,
@@ -1452,7 +1578,7 @@ class WholeDecodeStep3p5:
                             pl.slice(
                                 h_bf16,
                                 [RECV_TILE, ROUTED_H_QUANT_N_CHUNK],
-                                [0, hqn0],
+                                [tile_offset, hqn0],
                             ),
                             target_type=pl.FP32,
                         )
@@ -1464,23 +1590,60 @@ class WholeDecodeStep3p5:
                             eh_i32, target_type=pl.FP16, mode="round",
                         )
                         h_i8[
-                            :, hqn0 : hqn0 + ROUTED_H_QUANT_N_CHUNK
+                            tile_offset : tile_offset + RECV_TILE,
+                            hqn0 : hqn0 + ROUTED_H_QUANT_N_CHUNK,
                         ] = pl.cast(
                             eh_half,
                             target_type=pl.INT8,
                             mode="trunc",
                         )
 
-                for db in pl.spmd(
-                    HIDDEN // ROUTED_DOWN_N_CHUNK,
-                    name_hint="expert_down",
-                    allow_early_resolve=True,
-                ):
-                    d0 = db * ROUTED_DOWN_N_CHUNK
+        with pl.spmd(
+            routed_workers,
+            name_hint="expert_down",
+            deps=[routed_quant_tid],
+            predicate=(local_route_count[0] > 0),
+            allow_early_resolve=True,
+        ) as routed_down_tid:
+            worker = pl.tile.get_block_idx()
+            active_expert_count = pl.cast(
+                pl.read(local_route_count, [1]), pl.INDEX,
+            )
+            if active_expert_count < 0:
+                active_expert_count = pl.cast(0, pl.INDEX)
+            if active_expert_count > n_local_experts:
+                active_expert_count = pl.cast(n_local_experts, pl.INDEX)
+            down_work = (
+                active_expert_count
+                * (HIDDEN // ROUTED_DOWN_N_CHUNK)
+            )
+            for work in pl.range(
+                worker, down_work, routed_workers,
+            ):
+                active_slot = work // (HIDDEN // ROUTED_DOWN_N_CHUNK)
+                db = work % (HIDDEN // ROUTED_DOWN_N_CHUNK)
+                d0 = db * ROUTED_DOWN_N_CHUNK
+                e = pl.cast(
+                    pl.read(local_route_count, [active_slot + 2]),
+                    pl.INDEX,
+                )
+                n_rows = pl.read(local_expert_count, [e])
+                n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+                expert_base = e * expert_recv_max
+                for tile_idx in pl.range(n_tiles):
+                    tile_row0 = tile_idx * RECV_TILE
+                    tile_offset = expert_base + tile_row0
+                    tile_valid = pl.cast(
+                        pl.min(
+                            pl.cast(RECV_TILE, pl.INT32),
+                            n_rows - tile_row0,
+                        ),
+                        pl.INDEX,
+                    )
                     h0 = pl.slice(
                         h_i8,
                         [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                        [0, 0],
+                        [tile_offset, 0],
                     )
                     wd0 = pl.reshape(
                         pl.slice(
@@ -1502,7 +1665,7 @@ class WholeDecodeStep3p5:
                         hk = pl.slice(
                             h_i8,
                             [RECV_TILE, ROUTED_DOWN_K_CHUNK],
-                            [0, k0],
+                            [tile_offset, k0],
                         )
                         wdk = pl.reshape(
                             pl.slice(
@@ -1514,17 +1677,21 @@ class WholeDecodeStep3p5:
                                 ],
                                 [e, k0, d0],
                             ),
-                            [
-                                ROUTED_DOWN_K_CHUNK,
-                                ROUTED_DOWN_N_CHUNK,
-                            ],
+                            [ROUTED_DOWN_K_CHUNK, ROUTED_DOWN_N_CHUNK],
                         )
                         y_acc = pl.matmul_acc(y_acc, hk, wdk)
-
                     wd_scale_row = pl.slice(
                         w_down_scale,
                         [1, ROUTED_DOWN_N_CHUNK],
                         [e, d0],
+                    )
+                    h_scale_dq = pl.reshape(
+                        pl.slice(
+                            h_scale_dq_all,
+                            [1, RECV_TILE],
+                            [0, tile_offset],
+                        ),
+                        [RECV_TILE, 1],
                     )
                     route_weight = pl.reshape(
                         pl.slice(
@@ -1560,6 +1727,7 @@ class WholeDecodeStep3p5:
 
         return local_routed_y
 
+
     @pl.function(type=pl.FunctionType.Inline)
     def expert_routed_step(
         self,
@@ -1568,6 +1736,9 @@ class WholeDecodeStep3p5:
         local_routed_weight: pl.Tensor[[local_recv_max], pl.FP32],
         local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
         local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count_tid: pl.Scalar[pl.TASK_ID],
+        num_tokens: pl.Scalar[pl.INT32],
         w_gate_r: pl.Tensor[
             [n_local_experts, HIDDEN, inter], pl.INT8
         ],
@@ -1589,6 +1760,8 @@ class WholeDecodeStep3p5:
             local_routed_x_scale,
             local_routed_weight,
             local_expert_offset, local_expert_count,
+            local_route_count, local_route_count_tid,
+            num_tokens,
             w_gate_r, w_gate_r_scale,
             w_up_r, w_up_r_scale,
             w_down_r, w_down_r_scale,
@@ -1605,296 +1778,172 @@ class WholeDecodeStep3p5:
         w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
         w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
+        swiglu_limit: pl.Scalar[pl.FP32],
     ):
-        # Keep gate/up activation and down projection in one InCore kernel,
-        # but never assemble a full [BATCH,160] Vec tile.  The wide tile is
-        # miscompiled on A2/A3; five [BATCH,32] tiles match moe.py's
-        # device-validated implementation.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_mlp"):
-            x0_0 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_0 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 0],
-            )
-            wu0_0 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 0],
-            )
-            gate_acc_0 = pl.matmul(x0_0, wg0_0, out_dtype=pl.FP32)
-            up_acc_0 = pl.matmul(x0_0, wu0_0, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_0 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
+        # The runtime has no physical-core affinity API. Keep shared gate/up
+        # on two workers, and split the 24-core shared-down/routed budget as
+        # 1+23 for one token or 2+22 for larger batches.
+        # The BF16 bridge is the canonical SwiGLU rounding point; do not move
+        # the cast into down.
+        sh_hidden = pl.create_tensor(
+            [BATCH, sh_inter_local], dtype=pl.BF16, manual_dep=True,
+        )
+        with pl.spmd(
+            SHARED_GATE_UP_ACT_BLOCKS,
+            name_hint="sh_gate_up_act",
+            allow_early_resolve=True,
+        ) as sh_gate_up_tid:
+            worker = pl.tile.get_block_idx()
+            for chunk in pl.range(
+                worker,
+                SHARED_GATE_UP_ACT_CHUNKS,
+                SHARED_GATE_UP_ACT_BLOCKS,
+            ):
+                n0 = chunk * SHARED_SWIGLU_N_CHUNK
+                x0 = pl.slice(
+                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
                 )
-                wgk_0 = pl.slice(
+                wg0 = pl.slice(
                     w_gate,
                     [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 0],
+                    [0, n0],
                 )
-                wuk_0 = pl.slice(
+                wu0 = pl.slice(
                     w_up,
                     [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 0],
+                    [0, n0],
                 )
-                gate_acc_0 = pl.matmul_acc(gate_acc_0, xk_0, wgk_0)
-                up_acc_0 = pl.matmul_acc(up_acc_0, xk_0, wuk_0)
-            sigmoid_0 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_0)), 1.0),
-            )
-            silu_0 = pl.mul(gate_acc_0, sigmoid_0)
-            if _SHARED_SWIGLU_STEP:
-                silu_c_0 = pl.minimum(
-                    silu_0, _SHARED_SWIGLU_LIMIT,
+                gate_acc = pl.matmul(x0, wg0, out_dtype=pl.FP32)
+                up_acc = pl.matmul(x0, wu0, out_dtype=pl.FP32)
+                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                    k0 = kb * SHARED_GATE_K_CHUNK
+                    xk = pl.slice(
+                        x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
+                    )
+                    wgk = pl.slice(
+                        w_gate,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, n0],
+                    )
+                    wuk = pl.slice(
+                        w_up,
+                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
+                        [k0, n0],
+                    )
+                    gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
+                    up_acc = pl.matmul_acc(up_acc, xk, wuk)
+                sigmoid = pl.recip(
+                    pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
                 )
-                up_c_0 = pl.maximum(
-                    pl.minimum(up_acc_0, _SHARED_SWIGLU_LIMIT),
-                    -_SHARED_SWIGLU_LIMIT,
-                )
-                gated_0 = pl.mul(silu_c_0, up_c_0)
-            else:
-                gated_0 = pl.mul(silu_0, up_acc_0)
-            h_c0 = pl.cast(gated_0, target_type=pl.BF16)
+                silu = pl.mul(gate_acc, sigmoid)
+                if swiglu_limit > 0.0:
+                    silu_c = pl.minimum(silu, swiglu_limit)
+                    up_c = pl.maximum(
+                        pl.minimum(up_acc, swiglu_limit),
+                        -swiglu_limit,
+                    )
+                    gated = pl.mul(silu_c, up_c)
+                else:
+                    gated = pl.mul(silu, up_acc)
+                sh_hidden[
+                    :, n0 : n0 + SHARED_SWIGLU_N_CHUNK
+                ] = pl.cast(gated, target_type=pl.BF16)
 
-            x0_1 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_1 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 32],
-            )
-            wu0_1 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 32],
-            )
-            gate_acc_1 = pl.matmul(x0_1, wg0_1, out_dtype=pl.FP32)
-            up_acc_1 = pl.matmul(x0_1, wu0_1, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_1 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_1 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 32],
-                )
-                wuk_1 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 32],
-                )
-                gate_acc_1 = pl.matmul_acc(gate_acc_1, xk_1, wgk_1)
-                up_acc_1 = pl.matmul_acc(up_acc_1, xk_1, wuk_1)
-            sigmoid_1 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_1)), 1.0),
-            )
-            silu_1 = pl.mul(gate_acc_1, sigmoid_1)
-            if _SHARED_SWIGLU_STEP:
-                silu_c_1 = pl.minimum(
-                    silu_1, _SHARED_SWIGLU_LIMIT,
-                )
-                up_c_1 = pl.maximum(
-                    pl.minimum(up_acc_1, _SHARED_SWIGLU_LIMIT),
-                    -_SHARED_SWIGLU_LIMIT,
-                )
-                gated_1 = pl.mul(silu_c_1, up_c_1)
-            else:
-                gated_1 = pl.mul(silu_1, up_acc_1)
-            h_c1 = pl.cast(gated_1, target_type=pl.BF16)
+        with pl.spmd(
+            SHARED_DOWN_WORKERS,
+            name_hint="sh_down",
+            deps=[sh_gate_up_tid],
+            allow_early_resolve=True,
+        ) as _sh_down_tid:
+            worker = pl.tile.get_block_idx()
+            active_tokens = pl.cast(num_tokens, pl.INDEX)
+            if active_tokens < 0:
+                active_tokens = pl.cast(0, pl.INDEX)
+            if active_tokens > BATCH:
+                active_tokens = pl.cast(BATCH, pl.INDEX)
 
-            x0_2 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_2 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 64],
-            )
-            wu0_2 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 64],
-            )
-            gate_acc_2 = pl.matmul(x0_2, wg0_2, out_dtype=pl.FP32)
-            up_acc_2 = pl.matmul(x0_2, wu0_2, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_2 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_2 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 64],
-                )
-                wuk_2 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 64],
-                )
-                gate_acc_2 = pl.matmul_acc(gate_acc_2, xk_2, wgk_2)
-                up_acc_2 = pl.matmul_acc(up_acc_2, xk_2, wuk_2)
-            sigmoid_2 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_2)), 1.0),
-            )
-            silu_2 = pl.mul(gate_acc_2, sigmoid_2)
-            if _SHARED_SWIGLU_STEP:
-                silu_c_2 = pl.minimum(
-                    silu_2, _SHARED_SWIGLU_LIMIT,
-                )
-                up_c_2 = pl.maximum(
-                    pl.minimum(up_acc_2, _SHARED_SWIGLU_LIMIT),
-                    -_SHARED_SWIGLU_LIMIT,
-                )
-                gated_2 = pl.mul(silu_c_2, up_c_2)
+            if active_tokens <= 1:
+                if worker == 0:
+                    for db in pl.range(
+                        HIDDEN // SHARED_DOWN_N_CHUNK,
+                    ):
+                        d0 = db * SHARED_DOWN_N_CHUNK
+                        h0 = pl.slice(
+                            sh_hidden,
+                            [BATCH, SHARED_SWIGLU_N_CHUNK],
+                            [0, 0],
+                        )
+                        wd0 = pl.slice(
+                            w_down,
+                            [
+                                SHARED_SWIGLU_N_CHUNK,
+                                SHARED_DOWN_N_CHUNK,
+                            ],
+                            [0, d0],
+                        )
+                        y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                        for chunk in pl.range(
+                            1, sh_inter_local // SHARED_SWIGLU_N_CHUNK,
+                        ):
+                            n0 = chunk * SHARED_SWIGLU_N_CHUNK
+                            hk = pl.slice(
+                                sh_hidden,
+                                [BATCH, SHARED_SWIGLU_N_CHUNK],
+                                [0, n0],
+                            )
+                            wdk = pl.slice(
+                                w_down,
+                                [
+                                    SHARED_SWIGLU_N_CHUNK,
+                                    SHARED_DOWN_N_CHUNK,
+                                ],
+                                [n0, d0],
+                            )
+                            y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                        sh_y_shard = pl.assemble(
+                            sh_y_shard,
+                            pl.cast(y_acc, target_type=pl.BF16),
+                            [0, d0],
+                        )
             else:
-                gated_2 = pl.mul(silu_2, up_acc_2)
-            h_c2 = pl.cast(gated_2, target_type=pl.BF16)
-
-            x0_3 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_3 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 96],
-            )
-            wu0_3 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 96],
-            )
-            gate_acc_3 = pl.matmul(x0_3, wg0_3, out_dtype=pl.FP32)
-            up_acc_3 = pl.matmul(x0_3, wu0_3, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_3 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_3 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 96],
-                )
-                wuk_3 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 96],
-                )
-                gate_acc_3 = pl.matmul_acc(gate_acc_3, xk_3, wgk_3)
-                up_acc_3 = pl.matmul_acc(up_acc_3, xk_3, wuk_3)
-            sigmoid_3 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_3)), 1.0),
-            )
-            silu_3 = pl.mul(gate_acc_3, sigmoid_3)
-            if _SHARED_SWIGLU_STEP:
-                silu_c_3 = pl.minimum(
-                    silu_3, _SHARED_SWIGLU_LIMIT,
-                )
-                up_c_3 = pl.maximum(
-                    pl.minimum(up_acc_3, _SHARED_SWIGLU_LIMIT),
-                    -_SHARED_SWIGLU_LIMIT,
-                )
-                gated_3 = pl.mul(silu_c_3, up_c_3)
-            else:
-                gated_3 = pl.mul(silu_3, up_acc_3)
-            h_c3 = pl.cast(gated_3, target_type=pl.BF16)
-
-            x0_4 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_4 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 128],
-            )
-            wu0_4 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 128],
-            )
-            gate_acc_4 = pl.matmul(x0_4, wg0_4, out_dtype=pl.FP32)
-            up_acc_4 = pl.matmul(x0_4, wu0_4, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_4 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_4 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 128],
-                )
-                wuk_4 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 128],
-                )
-                gate_acc_4 = pl.matmul_acc(gate_acc_4, xk_4, wgk_4)
-                up_acc_4 = pl.matmul_acc(up_acc_4, xk_4, wuk_4)
-            sigmoid_4 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_4)), 1.0),
-            )
-            silu_4 = pl.mul(gate_acc_4, sigmoid_4)
-            if _SHARED_SWIGLU_STEP:
-                silu_c_4 = pl.minimum(
-                    silu_4, _SHARED_SWIGLU_LIMIT,
-                )
-                up_c_4 = pl.maximum(
-                    pl.minimum(up_acc_4, _SHARED_SWIGLU_LIMIT),
-                    -_SHARED_SWIGLU_LIMIT,
-                )
-                gated_4 = pl.mul(silu_c_4, up_c_4)
-            else:
-                gated_4 = pl.mul(silu_4, up_acc_4)
-            h_c4 = pl.cast(gated_4, target_type=pl.BF16)
-
-            # Down projection consumes the five narrow activation tiles
-            # directly; recombining them would restore the compiler bug.
-            for db in pl.range(HIDDEN // SHARED_DOWN_N_CHUNK):
-                d0 = db * SHARED_DOWN_N_CHUNK
-                wd_c0 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [0, d0],
-                )
-                y_acc = pl.matmul(h_c0, wd_c0, out_dtype=pl.FP32)
-                wd_c1 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [32, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c1, wd_c1)
-                wd_c2 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [64, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c2, wd_c2)
-                wd_c3 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [96, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c3, wd_c3)
-                wd_c4 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [128, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c4, wd_c4)
-                sh_y_shard = pl.assemble(
-                    sh_y_shard,
-                    pl.cast(y_acc, target_type=pl.BF16),
-                    [0, d0],
-                )
+                for db in pl.range(
+                    worker,
+                    HIDDEN // SHARED_DOWN_N_CHUNK,
+                    SHARED_DOWN_WORKERS,
+                ):
+                    d0 = db * SHARED_DOWN_N_CHUNK
+                    h0 = pl.slice(
+                        sh_hidden,
+                        [BATCH, SHARED_SWIGLU_N_CHUNK],
+                        [0, 0],
+                    )
+                    wd0 = pl.slice(
+                        w_down,
+                        [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                        [0, d0],
+                    )
+                    y_acc = pl.matmul(h0, wd0, out_dtype=pl.FP32)
+                    for chunk in pl.range(
+                        1, sh_inter_local // SHARED_SWIGLU_N_CHUNK,
+                    ):
+                        n0 = chunk * SHARED_SWIGLU_N_CHUNK
+                        hk = pl.slice(
+                            sh_hidden,
+                            [BATCH, SHARED_SWIGLU_N_CHUNK],
+                            [0, n0],
+                        )
+                        wdk = pl.slice(
+                            w_down,
+                            [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
+                            [n0, d0],
+                        )
+                        y_acc = pl.matmul_acc(y_acc, hk, wdk)
+                    sh_y_shard = pl.assemble(
+                        sh_y_shard,
+                        pl.cast(y_acc, target_type=pl.BF16),
+                        [0, d0],
+                    )
 
         return sh_y_shard
 
@@ -1912,10 +1961,17 @@ class WholeDecodeStep3p5:
         sh_signal_window: pld.DistributedTensor[
             [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
         ],
+        num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         sh_y = self._expert_shared_local(
-            x, w_gate_s, w_up_s, w_down_s, sh_y,
+            x,
+            w_gate_s,
+            w_up_s,
+            w_down_s,
+            sh_y,
+            num_tokens,
+            _SHARED_SWIGLU_LIMIT,
         )
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
         if TP_WORLD_SIZE > 1:
@@ -1966,56 +2022,57 @@ class WholeDecodeStep3p5:
             scatter_blocks,
             name_hint="combine_scatter",
             deps=[local_route_count_tid],
-            predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
         ) as combine_scatter_tid:
             worker = pl.tile.get_block_idx()
-            e = pl.cast(
-                pl.read(local_route_count, [worker + 2]), pl.INDEX,
-            )
-            expert_base = pl.cast(e * expert_recv_max, pl.INDEX)
-            # ``local_route`` is the V4 route id (token * TOPK + k), not a
-            # packed source-rank route. Preserve source provenance from
-            # the dispatch lane: rows are [expert, source, slot].
-            source_prefix = pl.cast(0, pl.INDEX)
-            for src in pl.range(n_ranks):
-                src_count = pl.cast(
-                    pl.read(recv_meta_local, [src, e]), pl.INDEX,
+            # Empty ranks execute one no-op scatter block.
+            if pl.read(local_route_count, [0]) > 0:
+                e = pl.cast(
+                    pl.read(local_route_count, [worker + 2]), pl.INDEX,
                 )
-                for slot in pl.range(src_count):
-                    expert_row = expert_base + source_prefix + slot
-                    route = pl.cast(
-                        pl.read(local_route, [expert_row]), pl.INDEX,
+                expert_base = pl.cast(e * expert_recv_max, pl.INDEX)
+                # ``local_route`` is the V4 route id (token * TOPK + k), not a
+                # packed source-rank route. Preserve source provenance from
+                # the dispatch lane: rows are [expert, source, slot].
+                source_prefix = pl.cast(0, pl.INDEX)
+                for src in pl.range(n_ranks):
+                    src_count = pl.cast(
+                        pl.read(recv_meta_local, [src, e]), pl.INDEX,
                     )
-                    pld.tensor.put(
-                        dst=routed_y_buf,
-                        peer=src,
-                        src=local_routed_y,
-                        dst_offsets=[route, 0],
-                        src_offsets=[expert_row, 0],
-                        shape=[1, HIDDEN],
-                    )
-                source_prefix = source_prefix + src_count
+                    for slot in pl.range(src_count):
+                        expert_row = expert_base + source_prefix + slot
+                        route = pl.cast(
+                            pl.read(local_route, [expert_row]), pl.INDEX,
+                        )
+                        pld.tensor.put(
+                            dst=routed_y_buf,
+                            peer=src,
+                            src=local_routed_y,
+                            dst_offsets=[route, 0],
+                            src_offsets=[expert_row, 0],
+                            shape=[1, HIDDEN],
+                        )
+                    source_prefix = source_prefix + src_count
 
-            # One producer owns one active expert. Block zero supplies the
-            # unused fixed-lane credits, so reaching 36 still proves every
-            # active producer completed its TSTOREs.
-            completion_delta = pl.cast(1, pl.INT32)
-            if worker == 0:
-                completion_delta = (
-                    completion_delta
-                    + pl.cast(n_local_experts, pl.INT32)
-                    - pl.cast(scatter_blocks, pl.INT32)
-                )
-            for peer in pl.range(n_ranks):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=combine_arrived,
-                        peer=peer,
-                        offsets=[my_rank, 0],
-                        value=completion_delta,
-                        op=pld.NotifyOp.AtomicAdd,
+                # One producer owns one active expert. Block zero supplies the
+                # unused fixed-lane credits, so reaching 36 still proves every
+                # active producer completed its TSTOREs.
+                completion_delta = pl.cast(1, pl.INT32)
+                if worker == 0:
+                    completion_delta = (
+                        completion_delta
+                        + pl.cast(n_local_experts, pl.INT32)
+                        - pl.cast(scatter_blocks, pl.INT32)
                     )
+                for peer in pl.range(n_ranks):
+                    if peer != my_rank:
+                        pld.system.notify(
+                            target=combine_arrived,
+                            peer=peer,
+                            offsets=[my_rank, 0],
+                            value=completion_delta,
+                            op=pld.NotifyOp.AtomicAdd,
+                        )
 
         with pl.at(
             level=pl.Level.CORE_GROUP,
@@ -2025,7 +2082,7 @@ class WholeDecodeStep3p5:
         ) as combine_wait_tid:
             _routed_anchor = pl.read(local_routed_y, [0, 0])
             if pl.read(local_route_count, [0]) == 0:
-                # Predicated empty-rank scatter emitted no data block.
+                # Empty-rank scatter did not publish data or credits.
                 for peer in pl.range(n_ranks):
                     if peer != my_rank:
                         pld.system.notify(
@@ -2183,7 +2240,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 
@@ -2235,6 +2292,8 @@ class WholeDecodeStep3p5:
             local_routed_x_scale,
             local_routed_weight,
             local_expert_offset, local_expert_count,
+            local_route_count, local_route_count_tid,
+            num_tokens,
             w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
             w_down_r, w_down_r_scale,
             local_routed_y,
@@ -2384,7 +2443,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 
@@ -2436,6 +2495,8 @@ class WholeDecodeStep3p5:
             local_routed_x_scale,
             local_routed_weight,
             local_expert_offset, local_expert_count,
+            local_route_count, local_route_count_tid,
+            num_tokens,
             w_gate_r, w_gate_r_scale, w_up_r, w_up_r_scale,
             w_down_r, w_down_r_scale,
             local_routed_y,
@@ -2858,298 +2919,17 @@ class WholeDecodeStep3p5:
         w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
         w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+        num_tokens: pl.Scalar[pl.INT32],
     ):
-        # Keep gate/up activation and down projection in one InCore kernel,
-        # but never assemble a full [BATCH,160] Vec tile.  The wide tile is
-        # miscompiled on A2/A3; five [BATCH,32] tiles match moe.py's
-        # device-validated implementation.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_mlp"):
-            x0_0 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_0 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 0],
-            )
-            wu0_0 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 0],
-            )
-            gate_acc_0 = pl.matmul(x0_0, wg0_0, out_dtype=pl.FP32)
-            up_acc_0 = pl.matmul(x0_0, wu0_0, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_0 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_0 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 0],
-                )
-                wuk_0 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 0],
-                )
-                gate_acc_0 = pl.matmul_acc(gate_acc_0, xk_0, wgk_0)
-                up_acc_0 = pl.matmul_acc(up_acc_0, xk_0, wuk_0)
-            sigmoid_0 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_0)), 1.0),
-            )
-            silu_0 = pl.mul(gate_acc_0, sigmoid_0)
-            if _SHARED_SWIGLU16_STEP:
-                silu_c_0 = pl.minimum(
-                    silu_0, _SHARED_SWIGLU16_LIMIT,
-                )
-                up_c_0 = pl.maximum(
-                    pl.minimum(up_acc_0, _SHARED_SWIGLU16_LIMIT),
-                    -_SHARED_SWIGLU16_LIMIT,
-                )
-                gated_0 = pl.mul(silu_c_0, up_c_0)
-            else:
-                gated_0 = pl.mul(silu_0, up_acc_0)
-            h_c0 = pl.cast(gated_0, target_type=pl.BF16)
-
-            x0_1 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_1 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 32],
-            )
-            wu0_1 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 32],
-            )
-            gate_acc_1 = pl.matmul(x0_1, wg0_1, out_dtype=pl.FP32)
-            up_acc_1 = pl.matmul(x0_1, wu0_1, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_1 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_1 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 32],
-                )
-                wuk_1 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 32],
-                )
-                gate_acc_1 = pl.matmul_acc(gate_acc_1, xk_1, wgk_1)
-                up_acc_1 = pl.matmul_acc(up_acc_1, xk_1, wuk_1)
-            sigmoid_1 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_1)), 1.0),
-            )
-            silu_1 = pl.mul(gate_acc_1, sigmoid_1)
-            if _SHARED_SWIGLU16_STEP:
-                silu_c_1 = pl.minimum(
-                    silu_1, _SHARED_SWIGLU16_LIMIT,
-                )
-                up_c_1 = pl.maximum(
-                    pl.minimum(up_acc_1, _SHARED_SWIGLU16_LIMIT),
-                    -_SHARED_SWIGLU16_LIMIT,
-                )
-                gated_1 = pl.mul(silu_c_1, up_c_1)
-            else:
-                gated_1 = pl.mul(silu_1, up_acc_1)
-            h_c1 = pl.cast(gated_1, target_type=pl.BF16)
-
-            x0_2 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_2 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 64],
-            )
-            wu0_2 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 64],
-            )
-            gate_acc_2 = pl.matmul(x0_2, wg0_2, out_dtype=pl.FP32)
-            up_acc_2 = pl.matmul(x0_2, wu0_2, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_2 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_2 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 64],
-                )
-                wuk_2 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 64],
-                )
-                gate_acc_2 = pl.matmul_acc(gate_acc_2, xk_2, wgk_2)
-                up_acc_2 = pl.matmul_acc(up_acc_2, xk_2, wuk_2)
-            sigmoid_2 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_2)), 1.0),
-            )
-            silu_2 = pl.mul(gate_acc_2, sigmoid_2)
-            if _SHARED_SWIGLU16_STEP:
-                silu_c_2 = pl.minimum(
-                    silu_2, _SHARED_SWIGLU16_LIMIT,
-                )
-                up_c_2 = pl.maximum(
-                    pl.minimum(up_acc_2, _SHARED_SWIGLU16_LIMIT),
-                    -_SHARED_SWIGLU16_LIMIT,
-                )
-                gated_2 = pl.mul(silu_c_2, up_c_2)
-            else:
-                gated_2 = pl.mul(silu_2, up_acc_2)
-            h_c2 = pl.cast(gated_2, target_type=pl.BF16)
-
-            x0_3 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_3 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 96],
-            )
-            wu0_3 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 96],
-            )
-            gate_acc_3 = pl.matmul(x0_3, wg0_3, out_dtype=pl.FP32)
-            up_acc_3 = pl.matmul(x0_3, wu0_3, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_3 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_3 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 96],
-                )
-                wuk_3 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 96],
-                )
-                gate_acc_3 = pl.matmul_acc(gate_acc_3, xk_3, wgk_3)
-                up_acc_3 = pl.matmul_acc(up_acc_3, xk_3, wuk_3)
-            sigmoid_3 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_3)), 1.0),
-            )
-            silu_3 = pl.mul(gate_acc_3, sigmoid_3)
-            if _SHARED_SWIGLU16_STEP:
-                silu_c_3 = pl.minimum(
-                    silu_3, _SHARED_SWIGLU16_LIMIT,
-                )
-                up_c_3 = pl.maximum(
-                    pl.minimum(up_acc_3, _SHARED_SWIGLU16_LIMIT),
-                    -_SHARED_SWIGLU16_LIMIT,
-                )
-                gated_3 = pl.mul(silu_c_3, up_c_3)
-            else:
-                gated_3 = pl.mul(silu_3, up_acc_3)
-            h_c3 = pl.cast(gated_3, target_type=pl.BF16)
-
-            x0_4 = pl.slice(
-                x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-            )
-            wg0_4 = pl.slice(
-                w_gate,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 128],
-            )
-            wu0_4 = pl.slice(
-                w_up,
-                [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                [0, 128],
-            )
-            gate_acc_4 = pl.matmul(x0_4, wg0_4, out_dtype=pl.FP32)
-            up_acc_4 = pl.matmul(x0_4, wu0_4, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                k0 = kb * SHARED_GATE_K_CHUNK
-                xk_4 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                )
-                wgk_4 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 128],
-                )
-                wuk_4 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [k0, 128],
-                )
-                gate_acc_4 = pl.matmul_acc(gate_acc_4, xk_4, wgk_4)
-                up_acc_4 = pl.matmul_acc(up_acc_4, xk_4, wuk_4)
-            sigmoid_4 = pl.recip(
-                pl.add(pl.exp(pl.neg(gate_acc_4)), 1.0),
-            )
-            silu_4 = pl.mul(gate_acc_4, sigmoid_4)
-            if _SHARED_SWIGLU16_STEP:
-                silu_c_4 = pl.minimum(
-                    silu_4, _SHARED_SWIGLU16_LIMIT,
-                )
-                up_c_4 = pl.maximum(
-                    pl.minimum(up_acc_4, _SHARED_SWIGLU16_LIMIT),
-                    -_SHARED_SWIGLU16_LIMIT,
-                )
-                gated_4 = pl.mul(silu_c_4, up_c_4)
-            else:
-                gated_4 = pl.mul(silu_4, up_acc_4)
-            h_c4 = pl.cast(gated_4, target_type=pl.BF16)
-
-            # Down projection consumes the five narrow activation tiles
-            # directly; recombining them would restore the compiler bug.
-            for db in pl.range(HIDDEN // SHARED_DOWN_N_CHUNK):
-                d0 = db * SHARED_DOWN_N_CHUNK
-                wd_c0 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [0, d0],
-                )
-                y_acc = pl.matmul(h_c0, wd_c0, out_dtype=pl.FP32)
-                wd_c1 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [32, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c1, wd_c1)
-                wd_c2 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [64, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c2, wd_c2)
-                wd_c3 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [96, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c3, wd_c3)
-                wd_c4 = pl.slice(
-                    w_down,
-                    [SHARED_SWIGLU_N_CHUNK, SHARED_DOWN_N_CHUNK],
-                    [128, d0],
-                )
-                y_acc = pl.matmul_acc(y_acc, h_c4, wd_c4)
-                sh_y_shard = pl.assemble(
-                    sh_y_shard,
-                    pl.cast(y_acc, target_type=pl.BF16),
-                    [0, d0],
-                )
-
-        return sh_y_shard
+        return self._expert_shared_local(
+            x,
+            w_gate,
+            w_up,
+            w_down,
+            sh_y_shard,
+            num_tokens,
+            _SHARED_SWIGLU16_LIMIT,
+        )
 
     @pl.function(type=pl.FunctionType.Inline)
     def expert_shared_step_swiglu16(  # noqa: PLR0913
@@ -3165,10 +2945,11 @@ class WholeDecodeStep3p5:
         sh_signal_window: pld.DistributedTensor[
             [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
         ],
+        num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         sh_y = self._expert_shared_local_swiglu16(
-            x, w_gate_s, w_up_s, w_down_s, sh_y,
+            x, w_gate_s, w_up_s, w_down_s, sh_y, num_tokens,
         )
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
         if TP_WORLD_SIZE > 1:
@@ -3285,7 +3066,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step_swiglu16(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 
@@ -3481,7 +3262,7 @@ class WholeDecodeStep3p5:
         sh_y = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         sh_y = self.expert_shared_step(
             post_norm, w_gate_s, w_up_s, w_down_s, sh_y,
-            sh_tmp_window, sh_signal_window, my_rank,
+            sh_tmp_window, sh_signal_window, num_tokens, my_rank,
         )
 
 

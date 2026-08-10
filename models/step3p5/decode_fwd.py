@@ -552,6 +552,12 @@ class WholeDecodeStep3p5:
         biased_buf = pl.create_tensor(
             [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
         )
+        # PERF/GATE-DECOUPLE: raw FP32 gate logits, pre inv_rms/sigmoid/bias.
+        # Only columns below N_EXPERTS are ever read, so the pad needs no
+        # initialization.
+        logit_buf = pl.create_tensor(
+            [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
+        )
 
         # Keep the initialization in a CORE_GROUP scope, but create the
         # expert-column SPMD fan-out at function scope.  PyPTO does not accept
@@ -613,44 +619,66 @@ class WholeDecodeStep3p5:
                     [k0, n0],
                 )
                 logits_n = pl.matmul_acc(logits_n, xk, wk)
-            # xg omits the positive per-token inv_rms factor. Apply it after
-            # the FP32 matmul, exactly as V4-Flash, before step3p5 sigmoid.
-            logits_n = pl.row_expand_mul(logits_n, inv_rms)
-            # Apply sigmoid per N-chunk — vec ops convert cube→vec
-            # block layout, avoiding blayout mismatch when storing
-            # into pre-created score_buf / biased_buf (vec layout).
-            score_n_chunk = pl.recip(
-                pl.add(pl.exp(pl.neg(logits_n)), 1.0),
+            # PERF/GATE-DECOUPLE: inv_rms is a positive per-token scalar
+            # applied *after* the FP32 matmul, so it was the only reason this
+            # cube fan-out had to be serialized behind norm_quant_moe_input.
+            # Store the raw logits and defer inv_rms/sigmoid/bias to
+            # gate_topk, which already waits on inv_rms anyway.
+            # `pl.mul(x, 1.0)` is the vec op that converts the cube block
+            # layout to the vec layout of the pre-created logit_buf; it is
+            # exact for FP32, so score_buf / biased_buf stay byte-identical.
+            logit_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = pl.mul(
+                logits_n, 1.0,
             )
-            bias_chunk = pl.slice(
-                router_bias, [ROUTER_GATE_N_CHUNK], [n0],
-            )
-            bias_row_chunk = pl.reshape(
-                bias_chunk, [1, ROUTER_GATE_N_CHUNK],
-            )
-            # ROUTER-BIAS-BF16 (align moe.py:485-490): vLLM runs
-            # router_bias in BF16; the FP32 loader value's ~0.015 rounding
-            # decides the top-8 tail. Without this the whole-net gate picks
-            # a different top-8 vs vLLM -> wrong routed experts -> argmax
-            # mismatch on the flat next-token distribution.
-            bias_row_chunk = pl.cast(
-                pl.cast(bias_row_chunk, target_type=pl.BF16),
-                target_type=pl.FP32,
-            )
-            biased_n_chunk = pl.add(
-                score_n_chunk,
-                pl.col_expand_mul(
-                    pl.full(
-                        [BATCH, ROUTER_GATE_N_CHUNK],
-                        dtype=pl.FP32, value=1.0,
-                    ),
-                    bias_row_chunk,
-                ),
-            )
-            score_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = score_n_chunk
-            biased_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = biased_n_chunk
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_topk"):
+            # Deferred tail of the gate fan-out (see PERF/GATE-DECOUPLE).
+            # Identical op order and identical ROUTER_GATE_N_CHUNK blocking
+            # as the previous in-fanout version, so score_buf / biased_buf
+            # are byte-identical. Pad columns beyond N_EXPERTS keep the
+            # 0 / NEG_INF values written by gate_init.
+            for nb2 in pl.range(N_EXPERTS // ROUTER_GATE_N_CHUNK):
+                n0b = nb2 * ROUTER_GATE_N_CHUNK
+                logits_b = pl.row_expand_mul(
+                    pl.slice(
+                        logit_buf, [BATCH, ROUTER_GATE_N_CHUNK], [0, n0b],
+                    ),
+                    inv_rms,
+                )
+                score_n_chunk = pl.recip(
+                    pl.add(pl.exp(pl.neg(logits_b)), 1.0),
+                )
+                bias_chunk = pl.slice(
+                    router_bias, [ROUTER_GATE_N_CHUNK], [n0b],
+                )
+                bias_row_chunk = pl.reshape(
+                    bias_chunk, [1, ROUTER_GATE_N_CHUNK],
+                )
+                # ROUTER-BIAS-BF16 (align moe.py:485-490): vLLM runs
+                # router_bias in BF16; the FP32 loader value's ~0.015
+                # rounding decides the top-8 tail. Without this the
+                # whole-net gate picks a different top-8 vs vLLM.
+                bias_row_chunk = pl.cast(
+                    pl.cast(bias_row_chunk, target_type=pl.BF16),
+                    target_type=pl.FP32,
+                )
+                biased_n_chunk = pl.add(
+                    score_n_chunk,
+                    pl.col_expand_mul(
+                        pl.full(
+                            [BATCH, ROUTER_GATE_N_CHUNK],
+                            dtype=pl.FP32, value=1.0,
+                        ),
+                        bias_row_chunk,
+                    ),
+                )
+                score_buf[:, n0b : n0b + ROUTER_GATE_N_CHUNK] = (
+                    score_n_chunk
+                )
+                biased_buf[:, n0b : n0b + ROUTER_GATE_N_CHUNK] = (
+                    biased_n_chunk
+                )
+
             for tt in pl.range(active_tokens):
                 row = biased_buf[tt : tt + 1, :]
                 idx_init = pl.arange(

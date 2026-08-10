@@ -293,7 +293,89 @@ simpler#1037 in earlier sessions.
 
 ---
 
-## 6. Cross-references
+## 6. Iterate tiling / fusion hypotheses on a no-card codegen gate, not on cards
+
+**Cost of the wrong loop** — most tiling, fusion and software-pipelining
+hypotheses die at `AllocateMemoryAddr`, i.e. at **codegen**, long before
+they need an NPU. Testing them on a device A/B/A costs a machine lock
+plus tens of minutes each. Testing them compile-only costs **~14 s at
+`NB=512`** (~88 s at `NB=4096`) and needs **zero cards**, so it can run
+concurrently with someone else's device work.
+
+Minimal shape — a container that only imports the model and calls
+`ir.compile(...)`:
+
+```python
+os.environ["PYPTO_STEP3P5_MAX_SEQ"]  = str(NB * 128)
+os.environ["PYPTO_PROG_BUILD_DIR"]   = "/out/build"     # persist artifacts
+set_backend_type(BackendType.Ascend910B)
+ir.compile(dl.whole_decode_step3p5, platform="a2a3sim",
+           distributed_config=DistributedConfig(device_ids=list(range(8)),
+                                                num_sub_workers=0),
+           skip_ptoas=False, dump_passes=True)           # dump_passes -> §7
+```
+
+**Two `nerdctl` flags are mandatory** (each has bitten us):
+
+| flag | omitting it gives |
+|---|---|
+| `--security-opt apparmor=unconfined` | `apparmor_parser resolves to executable in current directory` |
+| `--net host` | `needs CNI plugin "bridge" ... /opt/cni/bin/bridge: no such file` |
+
+Always record provenance with the verdict — image digest, the edited
+file's `sha256`, `NB`, git HEAD, `rc` — otherwise a PASS/FAIL pair is
+not attributable to a source change. A ready-made wrapper lives at
+`0162:/mnt/persist/chensiyu/workspace/compile_gate.sh <source-tree> <label> [NB]`
+and emits `manifest.txt` + `compile.log`.
+
+**Treat the overflow number as data.** `Vec buffer usage (X bytes)
+exceeds platform limit (188416 bytes)` gives you `X`. Sweeping one
+parameter and fitting `X` is how you separate a real mechanism from a
+plausible story — see
+[known-pypto-pitfalls.md](known-pypto-pitfalls.md) §8.4.
+
+**Caveat** — a compile-only PASS says nothing about numerics or latency.
+It is a *cheap filter* in front of the device gates, never a substitute.
+Conversely a codegen failure on **unmodified** source means `ptoas`
+flaked, not that your change broke it: re-run compile-only on parent and
+candidate in the same image before blaming the diff.
+
+---
+
+## 7. Read the pass dumps; don't infer compiler behaviour from the error message
+
+`dump_passes=True` writes `<build>/passes_dump/NN_after_<Pass>.py` —
+the IR as valid Python after each pass. These are the ground truth for
+"did the compiler actually do what I asked":
+
+| dump | answers |
+|---|---|
+| `18_after_InferTileMemorySpace.py` | which tiles landed in `Vec` / `L1` / `L0C` |
+| `27_after_LowerPipelineLoops.py` | did `pl.pipeline` actually lower, or get ignored |
+| `32_after_MemoryReuse.py` | did liveness analysis collapse per-iteration buffers |
+| `33_after_AllocateMemoryAddr.py` | **final** per-function allocations and offsets |
+
+The most useful one-liner: count `pl.tile.alloc(pl.Mem.Vec, N)` per
+function in `33_after_AllocateMemoryAddr.py`, and read the base offsets
+out of the `pl.MemRef(mem_vec_K, pl.const(OFF, pl.INT64), SZ)`
+annotations. Two allocations reused across sixteen loop iterations look
+completely different from sixteen allocations, and the dump says which
+one you have — no inference required. Grouping by function also shows
+the per-kernel budget directly
+([known-pypto-pitfalls.md](known-pypto-pitfalls.md) §8.1).
+
+Also present and worth checking: `report/perf_hints.log` (`PH001` =
+sub-cache-line store) and `report/memory_after_AllocateMemoryAddr.txt`.
+
+**Where the analysis script lives matters.** Put it next to the
+artifacts it consumes on the execution host, point it at the *original*
+artifact rather than a copy, and emit provenance (absolute input path +
+`sha256`) into the output. A script that ran on a different machine or
+interpreter cannot be re-run by a reviewer on the target host.
+
+---
+
+## 8. Cross-references
 
 - [known-pypto-pitfalls.md](known-pypto-pitfalls.md) — pypto / pto-isa
   / simpler hard limits and bugs at the **kernel / codegen** layer.

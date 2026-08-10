@@ -427,18 +427,161 @@ casts. The HEAD-of-`stepfun/develop` ring all_reduce avoids the issue
 by storing each chunk back to `local` immediately (pattern B applied
 naturally to the ring shape).
 
+**Counter-example — unrolling alone does NOT inflate UB** (measured
+2026-08-10, `stepfun/develop@d13b2ca6`). `decode_fwd.py`'s
+`expert_gate_up` has `for kb in pl.range(1, HIDDEN // 256)` — a
+constant-bound, fully-unrolled 15-iteration loop — and its AIV kernel
+allocates only **two** `pl.tile.alloc(pl.Mem.Vec, 65536)` at offsets
+`0` and `65536`; all 16 K-iterations rewrite the same two offsets.
+Reuse works fine.
+
+The discriminator is therefore **not** "is the bound a Python int" but:
+
+```text
+does any Vec-resident value stay live ACROSS iterations?
+  yes -> every iteration's copy is simultaneously live -> UB = N x per_iter
+  no  -> MemoryReuse assigns the same offsets each iteration -> UB = per_iter
+```
+
+In §7's `tp_all_reduce` the loop-carried `acc` forces every unrolled
+copy live at once. In `expert_gate_up` the accumulator lives on the
+**cube** side (`pl.matmul` / `pl.matmul_acc` produce INT32 in L0C, not
+UB), so the AIV side is a pure staging shuttle with nothing carried.
+
+Diagnostic: don't reason about it — read
+`passes_dump/33_after_AllocateMemoryAddr.py` and count
+`pl.tile.alloc(pl.Mem.Vec, N)` per function (see
+[dev-workflow-gotchas.md](dev-workflow-gotchas.md) §7).
+
 **Cross-reference** — this is **distinct** from §6 ("kernel body must
 use `pl.range/parallel/unroll/...`"). §6 is a frontend rejection of
 raw `for x in range(N):`. §7 is a back-end UB-budget defect that bites
 you even when you correctly use `pl.range`, but the bound is a compile-
-time int.
+time int **and** something is loop-carried in UB. See §8 for the UB
+budget model itself.
 
 ---
 
-## 8. Cross-references and further reading
+## 8. AIV Vec (UB) budget is per-kernel-per-core; fusion is super-additive; `pl.pipeline` buys overlap **with** buffer
+
+Three separate facts that together decide every tiling / fusion /
+software-pipelining question. All measured 2026-08-10 on
+`stepfun/develop@d13b2ca6` (A2A3, `Vec` limit `188416 B`); scripts and
+JSON at
+`0162:/mnt/persist/chensiyu/workspace/perf-2026q3/ub-scope-20260810/`.
+
+### 8.1 The budget is per-kernel-per-core, not a shared pool
+
+| Evidence | Observation |
+|---|---|
+| Sum over all kernels far exceeds the limit, yet compiles | 149 AIV functions allocate `4676512 B` total = **24.8x** the `188416 B` limit; `COMPILE_OK` |
+| Each function restarts at offset 0 | every top consumer reports `min_offset = 0`; `mem_vec_*` numbering is per-function |
+| SPMD grid does not share either | `combine_reduce` has `core_num=16` and `40960 B`; a shared pool would need `655360 B` and fail — it compiles |
+
+UB is a per-AIV-core scratchpad laid out at kernel entry from the static
+offsets `AllocateMemoryAddr` computed, and dead at kernel exit. Kernel
+boundaries isolate it for free — **no task dependency is required to
+make two kernels' UB coexist, because they never coexist.**
+
+The load-bearing consequence: **a kernel cannot leave an intermediate in
+UB for the next kernel to consume.** Any hand-off goes through GM/DDR or
+a c2v/v2c pipe. This is why "fusing two tasks" forces both stagings to
+be simultaneously live.
+
+So a per-kernel usage ranking (e.g. `swa_qk_norm_zc` 148352 /
+`full_rmsnorm_zc` 135488 / `attn_residual_hold` 131072 /
+`expert_gate_up_aiv` 131072 / `tp_all_reduce` 98304 /
+`combine_reduce` 40960) is a list of **independent** occupancies, not a
+sum. Read it as "how much headroom does *this* kernel have".
+
+### 8.2 Fusion cost is super-additive: it adds c2v pipe slots
+
+Merging `expert_gate_up_act` into `expert_gate_up` did **not** cost
+`sum(parts)`. Diffing the pass dumps, the fused AIV kernel gains:
+
+```text
+aiv_initialize_pipe dir_mask   2 (v2c only)  ->  3 (bidirectional)
+                    + a locally allocated c2v_slot_buffer
+kernel body                    + tpop_from_aic x2, + cast x4
+```
+
+Accounting: `2 x 65536` (original v2c staging, charged to AIC via
+`import_peer_buffer`) `+ 4 x 65536` (new local c2v slots) `= 393216 B`
+— which is exactly the number in the overflow message. The extra copies
+are **new pipe slots**, not load/compute/store replicas.
+
+Arithmetic model (verified by prediction, see §8.4):
+
+```text
+slot_size            = K_CHUNK x N_CHUNK        (INT8 operand)
+baseline expert_gate_up  Vec = 512  x K_CHUNK
+fused  gate_up+act       Vec = 1536 x K_CHUNK
+```
+
+**Fusion is not a capability limit.** The same tree already contains a
+fused path that compiles — `full_moe_chip_orch_swiglu7_swiglu16_expert_gate_up_aiv`
+uses `4 x 8192 = 32768 B` by running `K=64 / N=64 /
+RECV_SPECIAL_TILE=32`. Before declaring "the platform can't do X",
+grep the generated kernel names and the other model paths for an
+existing instance of X.
+
+### 8.3 `pl.pipeline(stage=N)` spends buffer to buy overlap
+
+Easy to get backwards. `pl.pipeline` **replicates the loop body `stage`
+times** to enable ping-pong, so both copies must be live at once:
+
+```text
+Vec = stage x n_staging_buffers x K_CHUNK x N_CHUNK
+```
+
+Measured on `expert_gate_up`'s K-reduction loop rewritten in the
+`models/deepseek/v4/expert_routed.py::exp_gate_mm` shape
+(`pl.create_tensor` accumulator + `pl.pipeline(0, HIDDEN, KC, stage=2)`
++ `k0 == 0 ? pl.matmul : pl.matmul_acc`):
+
+| variant | predicted `stage x 2 x KC x 256` | measured |
+|---|---:|---|
+| `KC=256, stage=2` | 262144 B | **FAIL, reports 262144 B** |
+| `KC=128, stage=2` | 131072 B | **COMPILE_OK** |
+
+And the dump confirms it lowered rather than being silently ignored:
+staging goes `2 x 65536` -> **`4 x 32768`**, `aiv_initialize_pipe` shows
+`pipe: (32768, 4)`, and `27_after_LowerPipelineLoops.py` contains the
+pipeline structure.
+
+Practical rule: **to add `stage=2` you must first roughly halve the
+tile.** A kernel already above `94208 B` cannot take `stage=2` at its
+current tiling, no matter what the other kernels do (§8.1).
+
+### 8.4 Method: fit a law, then predict a number
+
+Every wrong root cause in this area was a narrative without a number;
+every correct one came from a prediction that matched. The loop that
+worked:
+
+1. Sweep the one parameter you suspect and record the overflow byte
+   count — the number in `Vec buffer usage (X bytes)` **is a
+   measurement**, not just an error.
+   K_CHUNK sweep gave `256 -> 393216`, `512 -> 786432`,
+   `1024 -> 1572864` — linear in `KC`, which already falsifies
+   "unrolling replicates buffers".
+2. Fit the coefficient (`1536 x KC` fused vs `512 x KC` baseline).
+3. Write the prediction down **before** running: `KC=128 -> 196608
+   FAIL`, `KC=64 -> 98304 PASS`.
+4. Run the no-card codegen gate (~14 s, see
+   [dev-workflow-gotchas.md](dev-workflow-gotchas.md) §6). Both hit
+   exactly.
+5. Only then read the pass dump to confirm the *mechanism*.
+
+---
+
+## 9. Cross-references and further reading
 
 - [pypto-coding-style.md](pypto-coding-style.md) — the canonical happy-
   path API (broadcast ops, slicing, loop primitives, `pl.at` scopes).
+- [performance-tuning.md](performance-tuning.md) — L2 (inter-kernel
+  schedule) and L1/L0 (intra-kernel) tuning rules. §8 above is the
+  **UB budget model** those rules have to fit inside.
 - [dynamic-shape-guidelines.md](dynamic-shape-guidelines.md) — the
   *correct* way to use `pl.dynamic` when you really need it.
 - [debugging.md](debugging.md) — runtime / precision symptom triage.

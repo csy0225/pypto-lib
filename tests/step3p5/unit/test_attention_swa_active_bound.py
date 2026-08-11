@@ -98,51 +98,96 @@ def test_swa_formal_keeps_capacity_and_runtime_num_tokens() -> None:
     assert ast.unparse(function.returns) == "pl.Tensor[[BATCH, HIDDEN], pl.BF16]"
 
 
-def test_swa_rope_kv_producer_uses_active_task_grids() -> None:
+def test_swa_packs_qkv_projection_and_fuses_active_prerope_task() -> None:
     source = _source()
     function = _attention_function()
 
-    q_rope_scope = _spmd_scope(function, "swa_rope_q")
-    q_rope_call = q_rope_scope.items[0].context_expr
-    assert ast.unparse(q_rope_call.args[0]) == "active_tokens"
+    qkv_proj_scope = _spmd_scope(function, "swa_qkv_proj")
+    qkv_proj_call = qkv_proj_scope.items[0].context_expr
+    assert (
+        ast.unparse(qkv_proj_call.args[0])
+        == "BATCH // BATCH_TILE * SWA_QKV_PROJ_BLOCKS"
+    )
     assert any(
         keyword.arg == "allow_early_resolve"
         and isinstance(keyword.value, ast.Constant)
         and keyword.value.value is True
-        for keyword in q_rope_call.keywords
+        for keyword in qkv_proj_call.keywords
     )
     assert (
-        isinstance(q_rope_scope.items[0].optional_vars, ast.Name)
-        and q_rope_scope.items[0].optional_vars.id == "swa_rope_q_tid"
+        isinstance(qkv_proj_scope.items[0].optional_vars, ast.Name)
+        and qkv_proj_scope.items[0].optional_vars.id == "swa_qkv_proj_tid"
     )
-    q_rope_source = _guarded_source(source, q_rope_scope)
-    assert "pl.tensor.read(seq_lens, [b])" in q_rope_source
-    assert "all_q_padded = pl.assemble(" in q_rope_source
-    assert "slot_mapping" not in q_rope_source
-    assert "k_cache = pl.assemble(" not in q_rope_source
-    assert "v_cache = pl.assemble(" not in q_rope_source
+    qkv_proj_source = ast.get_source_segment(source, qkv_proj_scope)
+    assert qkv_proj_source is not None
+    assert "qkv_spmd_idx = pl.tile.get_block_idx()" in qkv_proj_source
+    assert "if qkv_ob < SWA_QKV_Q_BLOCKS:" in qkv_proj_source
+    assert "qkv_kind = qkv_ob - SWA_QKV_Q_BLOCKS" in qkv_proj_source
+    assert "[qkv_b0, SWA_QKV_K_OFFSET]" in qkv_proj_source
+    assert "[qkv_b0, SWA_QKV_V_OFFSET]" in qkv_proj_source
+    for weight in ("wq", "wk", "wv"):
+        assert weight in qkv_proj_source
+    assert source.index('name_hint="swa_qkv_proj"') < source.index(
+        'name_hint="swa_head_gate_expand"'
+    ) < source.index('name_hint="swa_qkv_split_qknorm_rope"')
 
-    kv_rope_scope = _spmd_scope(function, "swa_rope_kv_cache")
-    kv_rope_call = kv_rope_scope.items[0].context_expr
-    assert ast.unparse(kv_rope_call.args[0]) == "active_tokens"
+    prerope_scope = _spmd_scope(function, "swa_qkv_split_qknorm_rope")
+    prerope_call = prerope_scope.items[0].context_expr
+    assert ast.unparse(prerope_call.args[0]) == "active_tokens"
     assert any(
         keyword.arg == "allow_early_resolve"
         and isinstance(keyword.value, ast.Constant)
         and keyword.value.value is True
-        for keyword in kv_rope_call.keywords
+        for keyword in prerope_call.keywords
     )
     assert (
-        isinstance(kv_rope_scope.items[0].optional_vars, ast.Name)
-        and kv_rope_scope.items[0].optional_vars.id == "swa_rope_kv_tid"
+        isinstance(prerope_scope.items[0].optional_vars, ast.Name)
+        and prerope_scope.items[0].optional_vars.id == "swa_qkv_prerope_tid"
     )
-    kv_rope_source = _guarded_source(source, kv_rope_scope)
-    assert "pl.tensor.read(seq_lens, [b])" in kv_rope_source
-    assert "pl.tensor.read(slot_mapping, [b])" in kv_rope_source
-    assert "k_cache = pl.assemble(" in kv_rope_source
-    assert "v_cache = pl.assemble(" in kv_rope_source
-    assert "all_q_padded" not in kv_rope_source
+    assert any(
+        keyword.arg == "deps"
+        and ast.unparse(keyword.value) == "[swa_qkv_proj_tid]"
+        for keyword in prerope_call.keywords
+    )
+    prerope_source = _guarded_source(source, prerope_scope)
+    assert "pl.tensor.read(seq_lens, [b])" in prerope_source
+    assert "pl.tensor.read(slot_mapping, [b])" in prerope_source
+    assert "qkv_proj" in prerope_source
+    assert "qk_sq = pl.row_sum(pl.mul(qk_chunk, qk_chunk))" in prerope_source
+    assert "pl.concat(pl.concat(q_flat, k_chunk), qk_zero_pad)" in prerope_source
+    assert "k_scaled = pl.slice(" in prerope_source
+    assert "[Q_HEAD_BATCH_SWA, 0]" in prerope_source
+    assert "k_chunk_8" not in prerope_source
+    assert "q_pad = pl.slice" not in prerope_source
+    assert "[16, HEAD_DIM]" in prerope_source
+    assert "q_lo = pl.slice(" in prerope_source
+    assert "q_hi = pl.slice(" in prerope_source
+    assert "[16, ROTARY_HALF_SWA]" in prerope_source
+    assert "[pad_row_base, 0]" in prerope_source
+    assert "[pad_row_base, ROTARY_HALF_SWA]" in prerope_source
+    assert "for qh in pl.range(Q_HEAD_BATCH_SWA)" not in prerope_source
+    assert "q_head = pl.slice" not in prerope_source
+    assert "all_q_padded = pl.assemble(" in prerope_source
+    assert "k_cache = pl.assemble(" in prerope_source
+    assert "v_cache = pl.assemble(" in prerope_source
 
     function_source = ast.unparse(function)
+    for retired_hint in (
+        "swa_q_proj",
+        "swa_kv_proj",
+        "swa_qk_norm_zc",
+        "swa_rope_q",
+        "swa_rope_kv_cache",
+    ):
+        assert f"name_hint='{retired_hint}'" not in function_source
+    for retired_tensor in (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "q_proj_norm",
+        "k_proj_norm",
+    ):
+        assert f"    {retired_tensor} = pl.create_tensor" not in source
     assert "swa_rope_stage = pl.create_tensor" not in function_source
     assert "swa_k_rope_stage = pl.create_tensor" not in function_source
     assert "swa_v_stage = pl.create_tensor" not in function_source
@@ -150,8 +195,7 @@ def test_swa_rope_kv_producer_uses_active_task_grids() -> None:
     mix_call = _spmd_scope(function, "swa_attn_mix").items[0].context_expr
     assert any(
         keyword.arg == "deps"
-        and ast.unparse(keyword.value)
-        == "[swa_rope_q_tid, swa_rope_kv_tid]"
+        and ast.unparse(keyword.value) == "[swa_qkv_prerope_tid]"
         for keyword in mix_call.keywords
     )
 
@@ -164,7 +208,7 @@ def test_swa_has_no_padding_slot_fallback_in_decode_rope_kv_path() -> None:
     assert "b_safe" not in scope2
     assert "slot_mapping, [b]" in scope2
     assert "slot_mapping, [b_safe]" not in scope2
-    assert scope2.count("        active_tokens,") == 2
+    assert scope2.count("        active_tokens,") == 1
     assert "if b < active_tokens:" in scope2
 
 

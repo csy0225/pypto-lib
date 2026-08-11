@@ -193,8 +193,10 @@ def test_b3_attention_only_writes_slot_addressed_head_rows() -> None:
         (_SWA_ATTN, "swa"),
     ):
         source = path.read_text(encoding="utf-8")
-        assert f'name_hint="{prefix}_rope_q"' in source
-        assert f'name_hint="{prefix}_rope_kv_cache"' in source
+        assert f'name_hint="{prefix}_qkv_proj"' in source
+        assert f'name_hint="{prefix}_qkv_split_qknorm_rope"' in source
+        assert f'name_hint="{prefix}_rope_q"' not in source
+        assert f'name_hint="{prefix}_rope_kv_cache"' not in source
         assert f"{prefix}_rope_stage = pl.create_tensor(" not in source
         assert f"{prefix}_k_rope_stage = pl.create_tensor(" not in source
         assert f"{prefix}_v_stage = pl.create_tensor(" not in source
@@ -204,14 +206,12 @@ def test_b3_attention_only_writes_slot_addressed_head_rows() -> None:
         assert "slot_mapping, [b_safe]" not in source
         assert "layer_cache_base" in source
         assert "cache_row = (" in source
-        assert (
-            f"deps=[{prefix}_rope_q_tid, {prefix}_rope_kv_tid]"
-            in source
-        )
+        assert f"deps=[{prefix}_qkv_proj_tid]" in source
+        assert f"deps=[{prefix}_qkv_prerope_tid]" in source
         assert "k_cache = pl.assemble(" in source
         assert "v_cache = pl.assemble(" in source
         assert "[cache_row, 0]" in source
-        assert "pl.slice(v_proj, [1, HEAD_DIM]" in source
+        assert "qkv_proj" in source
         # The only cache-row address is layer base + slot-derived block/offset
         # (+ local KV-head lane); slot_mapping never embeds a layer base.
         cache_row_block = source[

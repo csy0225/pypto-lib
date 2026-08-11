@@ -35,23 +35,32 @@ from tests.step3p5.harnesses._stage_two_layer_attn import (
 
 def _valid_attention_codegen_source() -> str:
     return """
-// Spmd full_rope_q_spmd: full_rope_q
+// Spmd full_qkv_proj_spmd: full_qkv_proj
+L0TaskArgs params_t5;
+params_t5.add_inout(qkv_proj_v1);
+params_t5.launch_spec.set_block_num(10);
+params_t5.set_allow_early_resolve(true);
+TaskOutputTensors task_5_outs = rt_submit_aic_task(6, params_t5);
+PTO2TaskId full_qkv_proj_tid = task_5_outs.task_id();
+// Task 6: full_attn_out_zero
+L0TaskArgs params_t6;
+params_t6.add_inout(attn_out_full);
+TaskOutputTensors task_6_outs = rt_submit_aiv_task(7, params_t6);
+// Spmd full_qkv_split_qknorm_rope_spmd: full_qkv_split_qknorm_rope
 L0TaskArgs params_t7;
+params_t7.add_input(qkv_proj_v1);
 params_t7.add_output(all_q_padded_v1);
+params_t7.add_inout(ext_k_cache);
+params_t7.add_inout(ext_v_cache);
 params_t7.add_scalar(active_tokens__rv_v2_inline1);
 params_t7.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
 params_t7.set_allow_early_resolve(true);
+PTO2TaskId params_t7_deps[1];
+uint32_t params_t7_deps_count = 0;
+params_t7_deps[params_t7_deps_count++] = full_qkv_proj_tid;
+params_t7.set_dependencies(params_t7_deps, params_t7_deps_count);
 TaskOutputTensors task_7_outs = rt_submit_aiv_task(8, params_t7);
-PTO2TaskId full_rope_q_tid = task_7_outs.task_id();
-// Spmd full_rope_kv_cache_spmd: full_rope_kv_cache
-L0TaskArgs params_t8;
-params_t8.add_inout(ext_k_cache);
-params_t8.add_inout(ext_v_cache);
-params_t8.add_scalar(active_tokens__rv_v2_inline1);
-params_t8.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
-params_t8.set_allow_early_resolve(true);
-TaskOutputTensors task_8_outs = rt_submit_aiv_task(9, params_t8);
-PTO2TaskId full_rope_kv_tid = task_8_outs.task_id();
+PTO2TaskId full_qkv_prerope_tid = task_7_outs.task_id();
 // Group full_attn_mix: MixedKernels (AIC + AIV lanes)
 L0TaskArgs params_t10;
 params_t10.add_input(all_q_padded_v1);
@@ -61,10 +70,9 @@ params_t10.add_scalar(full_online_softmax_active_tasks__rv_v2_inline149);
 params_t10.launch_spec.set_block_num(
     full_online_softmax_active_tasks__rv_v2_inline149);
 params_t10.set_allow_early_resolve(true);
-PTO2TaskId params_t10_deps[2];
+PTO2TaskId params_t10_deps[1];
 uint32_t params_t10_deps_count = 0;
-params_t10_deps[params_t10_deps_count++] = full_rope_q_tid;
-params_t10_deps[params_t10_deps_count++] = full_rope_kv_tid;
+params_t10_deps[params_t10_deps_count++] = full_qkv_prerope_tid;
 params_t10.set_dependencies(params_t10_deps, params_t10_deps_count);
 TaskOutputTensors task_10_outs = rt_submit_task(mixed_10, params_t10);
 PTO2TaskId full_attn_mix_tid = task_10_outs.task_id();
@@ -90,23 +98,32 @@ params_t14_deps[params_t14_deps_count++] =
     full_online_softmax_reduce_tid;
 params_t14.set_dependencies(params_t14_deps, params_t14_deps_count);
 TaskOutputTensors task_14_outs = rt_submit_aiv_task(16, params_t14);
-// Spmd swa_rope_q_spmd: swa_rope_q
+// Spmd swa_qkv_proj_spmd: swa_qkv_proj
 L0TaskArgs params_t31;
-params_t31.add_output(all_q_padded_swa_v1);
-params_t31.add_scalar(active_tokens__rv_v2_inline1);
-params_t31.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
+params_t31.add_inout(qkv_proj_swa_v1);
+params_t31.launch_spec.set_block_num(14);
 params_t31.set_allow_early_resolve(true);
-TaskOutputTensors task_31_outs = rt_submit_aiv_task(35, params_t31);
-PTO2TaskId swa_rope_q_tid = task_31_outs.task_id();
-// Spmd swa_rope_kv_cache_spmd: swa_rope_kv_cache
+TaskOutputTensors task_31_outs = rt_submit_aic_task(35, params_t31);
+PTO2TaskId swa_qkv_proj_tid = task_31_outs.task_id();
+// Task 32: swa_attn_out_zero
+L0TaskArgs params_t31_zero;
+params_t31_zero.add_inout(attn_out_swa);
+TaskOutputTensors task_31_zero_outs = rt_submit_aiv_task(36, params_t31_zero);
+// Spmd swa_qkv_split_qknorm_rope_spmd: swa_qkv_split_qknorm_rope
 L0TaskArgs params_t32;
+params_t32.add_input(qkv_proj_swa_v1);
+params_t32.add_output(all_q_padded_swa_v1);
 params_t32.add_inout(ext_k_cache_swa);
 params_t32.add_inout(ext_v_cache_swa);
 params_t32.add_scalar(active_tokens__rv_v2_inline1);
 params_t32.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
 params_t32.set_allow_early_resolve(true);
+PTO2TaskId params_t32_deps[1];
+uint32_t params_t32_deps_count = 0;
+params_t32_deps[params_t32_deps_count++] = swa_qkv_proj_tid;
+params_t32.set_dependencies(params_t32_deps, params_t32_deps_count);
 TaskOutputTensors task_32_outs = rt_submit_aiv_task(36, params_t32);
-PTO2TaskId swa_rope_kv_tid = task_32_outs.task_id();
+PTO2TaskId swa_qkv_prerope_tid = task_32_outs.task_id();
 // Group swa_attn_mix: MixedKernels (AIC + AIV lanes)
 L0TaskArgs params_t34;
 params_t34.add_input(all_q_padded_swa_v1);
@@ -114,10 +131,9 @@ params_t34.add_input(ext_k_cache_swa);
 params_t34.add_input(ext_v_cache_swa);
 params_t34.launch_spec.set_block_num(swa_active_tasks__rv_v2_inline207);
 params_t34.set_allow_early_resolve(true);
-PTO2TaskId params_t34_deps[2];
+PTO2TaskId params_t34_deps[1];
 uint32_t params_t34_deps_count = 0;
-params_t34_deps[params_t34_deps_count++] = swa_rope_q_tid;
-params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;
+params_t34_deps[params_t34_deps_count++] = swa_qkv_prerope_tid;
 params_t34.set_dependencies(params_t34_deps, params_t34_deps_count);
 TaskOutputTensors task_34_outs = rt_submit_task(mixed_34, params_t34);
 """
@@ -135,15 +151,15 @@ def test_attention_codegen_contract_rejects_stale_bound_and_dependency() -> None
         "    full_online_softmax_active_tasks__rv_v2_inline149);",
         "params_t10.launch_spec.set_block_num(stale_full_task_bound);",
     ).replace(
-        "params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;",
+        "params_t34_deps[params_t34_deps_count++] = swa_qkv_prerope_tid;",
         "params_t34_deps[params_t34_deps_count++] = stale_swa_task;",
     )
     errors = _attention_codegen_contract_errors(source)
     assert "full mixed attention dynamic launch" in errors
     assert (
-        "SWA mixed attention dependency from "
-        "swa_rope_q_tid, swa_rope_kv_tid"
-    ) in errors
+        "SWA mixed attention dependency from swa_qkv_prerope_tid"
+        in errors
+    )
 
 
 def test_attention_codegen_contract_rejects_incomplete_dependency_wiring() -> None:
@@ -162,18 +178,24 @@ def test_attention_codegen_contract_rejects_incomplete_dependency_wiring() -> No
     ("needle", "expected_error"),
     [
         (
-            "params_t10_deps[params_t10_deps_count++] = full_rope_q_tid;",
-            "full mixed attention dependency from "
-            "full_rope_q_tid, full_rope_kv_tid",
+            "params_t7_deps[params_t7_deps_count++] = full_qkv_proj_tid;",
+            "full packed split/QKNorm/RoPE dependency from full_qkv_proj_tid",
         ),
         (
-            "params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;",
-            "SWA mixed attention dependency from "
-            "swa_rope_q_tid, swa_rope_kv_tid",
+            "params_t10_deps[params_t10_deps_count++] = full_qkv_prerope_tid;",
+            "full mixed attention dependency from full_qkv_prerope_tid",
+        ),
+        (
+            "params_t32_deps[params_t32_deps_count++] = swa_qkv_proj_tid;",
+            "SWA packed split/QKNorm/RoPE dependency from swa_qkv_proj_tid",
+        ),
+        (
+            "params_t34_deps[params_t34_deps_count++] = swa_qkv_prerope_tid;",
+            "SWA mixed attention dependency from swa_qkv_prerope_tid",
         ),
     ],
 )
-def test_attention_codegen_contract_requires_both_rope_producers(
+def test_attention_codegen_contract_requires_packed_prerope_chain(
     needle: str,
     expected_error: str,
 ) -> None:
@@ -185,12 +207,12 @@ def test_attention_codegen_contract_requires_both_rope_producers(
     ("needle", "expected_error"),
     [
         (
-            "params_t7.set_allow_early_resolve(true);",
-            "full Q RoPE early-resolve hint",
+            "params_t5.set_allow_early_resolve(true);",
+            "full packed QKV projection early-resolve hint",
         ),
         (
-            "params_t8.set_allow_early_resolve(true);",
-            "full KV RoPE/cache early-resolve hint",
+            "params_t7.set_allow_early_resolve(true);",
+            "full packed split/QKNorm/RoPE early-resolve hint",
         ),
         (
             "params_t10.set_allow_early_resolve(true);",
@@ -198,11 +220,11 @@ def test_attention_codegen_contract_requires_both_rope_producers(
         ),
         (
             "params_t31.set_allow_early_resolve(true);",
-            "SWA Q RoPE early-resolve hint",
+            "SWA packed QKV projection early-resolve hint",
         ),
         (
             "params_t32.set_allow_early_resolve(true);",
-            "SWA KV RoPE/cache early-resolve hint",
+            "SWA packed split/QKNorm/RoPE early-resolve hint",
         ),
         (
             "params_t34.set_allow_early_resolve(true);",
@@ -216,6 +238,19 @@ def test_attention_codegen_contract_requires_early_resolve(
 ) -> None:
     source = _valid_attention_codegen_source().replace(needle, "")
     assert expected_error in _attention_codegen_contract_errors(source)
+
+
+def test_attention_codegen_contract_checks_packed_projection_bounds() -> None:
+    source = _valid_attention_codegen_source().replace(
+        "params_t5.launch_spec.set_block_num(10);",
+        "params_t5.launch_spec.set_block_num(9);",
+    ).replace(
+        "params_t31.launch_spec.set_block_num(14);",
+        "params_t31.launch_spec.set_block_num(13);",
+    )
+    errors = _attention_codegen_contract_errors(source)
+    assert "full packed QKV projection dynamic launch" in errors
+    assert "SWA packed QKV projection dynamic launch" in errors
 
 
 def test_attention_codegen_contract_checks_swa_mixed_bound() -> None:
@@ -247,6 +282,11 @@ def test_attention_codegen_contract_checks_launch_scalar_ssa_identity() -> None:
     [
         (
             "full",
+            "params_t7.add_input(qkv_proj_v1);",
+            "params_t7.add_input(qkv_proj_v2);",
+        ),
+        (
+            "full",
             "params_t10.add_input(all_q_padded_v1);",
             "params_t10.add_input(all_q_padded_v2);",
         ),
@@ -259,6 +299,11 @@ def test_attention_codegen_contract_checks_launch_scalar_ssa_identity() -> None:
             "full",
             "params_t10.add_input(ext_v_cache);",
             "params_t10.add_input(ext_v_cache_v2);",
+        ),
+        (
+            "swa",
+            "params_t32.add_input(qkv_proj_swa_v1);",
+            "params_t32.add_input(qkv_proj_swa_v2);",
         ),
         (
             "swa",
@@ -277,16 +322,17 @@ def test_attention_codegen_contract_checks_launch_scalar_ssa_identity() -> None:
         ),
     ],
 )
-def test_attention_codegen_contract_rejects_rope_cache_lineage_version_mismatch(
+def test_attention_codegen_contract_rejects_packed_prerope_lineage_mismatch(
     prefix: str,
     needle: str,
     replacement: str,
 ) -> None:
     source = _valid_attention_codegen_source().replace(needle, replacement)
     assert (
-        f"{prefix} mixed RoPE tensor lineage"
+        f"{prefix} packed pre-attention tensor lineage"
         in _attention_codegen_contract_errors(source)
     )
+
 
 def _scan_mapping(tasks_per_row: tuple[int, ...]) -> list[tuple[int, int]]:
     mapping = []

@@ -17,10 +17,22 @@ _SOURCE = (
 
 
 def test_swa_attention_stages_capture_and_chain_runtime_tasks() -> None:
-    assert 'name_hint="swa_rope_q"' in _SOURCE
-    assert ") as swa_rope_q_tid:" in _SOURCE
-    assert 'name_hint="swa_rope_kv_cache"' in _SOURCE
-    assert ") as swa_rope_kv_tid:" in _SOURCE
+    assert 'name_hint="swa_qkv_proj"' in _SOURCE
+    assert ") as swa_qkv_proj_tid:" in _SOURCE
+    assert 'name_hint="swa_qkv_split_qknorm_rope"' in _SOURCE
+    assert (
+        'name_hint="swa_qkv_split_qknorm_rope",\n'
+        "        deps=[swa_qkv_proj_tid],"
+    ) in _SOURCE
+    assert ") as swa_qkv_prerope_tid:" in _SOURCE
+    for retired_hint in (
+        "swa_q_proj",
+        "swa_kv_proj",
+        "swa_qk_norm_zc",
+        "swa_rope_q",
+        "swa_rope_kv_cache",
+    ):
+        assert f'name_hint="{retired_hint}"' not in _SOURCE
     assert (
         "with pl.spmd(\n"
         "        swa_active_tasks,\n"
@@ -28,7 +40,7 @@ def test_swa_attention_stages_capture_and_chain_runtime_tasks() -> None:
     ) in _SOURCE
     assert (
         'name_hint="swa_attn_mix",\n'
-        "        deps=[swa_rope_q_tid, swa_rope_kv_tid],"
+        "        deps=[swa_qkv_prerope_tid],"
     ) in _SOURCE
     for old_hint in (
         "swa_qk_matmul",

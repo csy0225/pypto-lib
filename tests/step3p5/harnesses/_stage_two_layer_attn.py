@@ -343,21 +343,21 @@ def _parse_args() -> argparse.Namespace:
 
 _ATTENTION_CODEGEN_STAGES = (
     {
-        "description": "full Q RoPE",
-        "marker": "full_rope_q",
-        "bound_prefix": "active_tokens__",
-        "bound_is_scalar": True,
-        "producer": "full_rope_q_tid",
+        "description": "full packed QKV projection",
+        "marker": "full_qkv_proj",
+        "bound_prefix": "10",
+        "bound_is_scalar": False,
+        "producer": "full_qkv_proj_tid",
         "dependency": None,
         "allow_early_resolve": True,
     },
     {
-        "description": "full KV RoPE/cache",
-        "marker": "full_rope_kv_cache",
+        "description": "full packed split/QKNorm/RoPE",
+        "marker": "full_qkv_split_qknorm_rope",
         "bound_prefix": "active_tokens__",
         "bound_is_scalar": True,
-        "producer": "full_rope_kv_tid",
-        "dependency": None,
+        "producer": "full_qkv_prerope_tid",
+        "dependency": "full_qkv_proj_tid",
         "allow_early_resolve": True,
     },
     {
@@ -366,7 +366,7 @@ _ATTENTION_CODEGEN_STAGES = (
         "bound_prefix": "full_online_softmax_active_tasks__rv_",
         "bound_is_scalar": True,
         "producer": "full_attn_mix_tid",
-        "dependency": ("full_rope_q_tid", "full_rope_kv_tid"),
+        "dependency": "full_qkv_prerope_tid",
         "allow_early_resolve": True,
     },
     {
@@ -386,21 +386,21 @@ _ATTENTION_CODEGEN_STAGES = (
         "dependency": "full_online_softmax_reduce_tid",
     },
     {
-        "description": "SWA Q RoPE",
-        "marker": "swa_rope_q",
-        "bound_prefix": "active_tokens__",
-        "bound_is_scalar": True,
-        "producer": "swa_rope_q_tid",
+        "description": "SWA packed QKV projection",
+        "marker": "swa_qkv_proj",
+        "bound_prefix": "14",
+        "bound_is_scalar": False,
+        "producer": "swa_qkv_proj_tid",
         "dependency": None,
         "allow_early_resolve": True,
     },
     {
-        "description": "SWA KV RoPE/cache",
-        "marker": "swa_rope_kv_cache",
+        "description": "SWA packed split/QKNorm/RoPE",
+        "marker": "swa_qkv_split_qknorm_rope",
         "bound_prefix": "active_tokens__",
         "bound_is_scalar": True,
-        "producer": "swa_rope_kv_tid",
-        "dependency": None,
+        "producer": "swa_qkv_prerope_tid",
+        "dependency": "swa_qkv_proj_tid",
         "allow_early_resolve": True,
     },
     {
@@ -409,12 +409,12 @@ _ATTENTION_CODEGEN_STAGES = (
         "bound_prefix": "swa_active_tasks__rv_",
         "bound_is_scalar": False,
         "producer": None,
-        "dependency": ("swa_rope_q_tid", "swa_rope_kv_tid"),
+        "dependency": "swa_qkv_prerope_tid",
         "allow_early_resolve": True,
     },
 )
 _CODEGEN_STAGE_COMMENT = re.compile(
-    r"^[ \t]*// (?:Spmd|Group) [^\n]+$",
+    r"^[ \t]*// (?:Spmd|Group|Task) [^\n]+$",
     flags=re.MULTILINE,
 )
 
@@ -539,62 +539,61 @@ def _attention_codegen_contract_errors(source: str) -> list[str]:
                 errors.append(f"{description} task publication")
 
     for prefix in ("full", "swa"):
-        q_rope_marker = f"{prefix}_rope_q"
-        kv_rope_marker = f"{prefix}_rope_kv_cache"
+        proj_marker = f"{prefix}_qkv_proj"
+        prerope_marker = f"{prefix}_qkv_split_qknorm_rope"
         mix_marker = f"{prefix}_attn_mix"
-        q_rope_block = blocks.get(q_rope_marker)
-        kv_rope_block = blocks.get(kv_rope_marker)
+        proj_block = blocks.get(proj_marker)
+        prerope_block = blocks.get(prerope_marker)
         mix_block = blocks.get(mix_marker)
-        if (
-            q_rope_block is None
-            or kv_rope_block is None
-            or mix_block is None
-        ):
+        if proj_block is None or prerope_block is None or mix_block is None:
             continue
-        q_rope_writes = re.findall(
+        proj_writes = re.findall(
             r"\.add_(?:output|inout)\(\s*(\w+)\s*\);",
-            q_rope_block,
+            proj_block,
         )
-        kv_rope_writes = re.findall(
+        prerope_inputs = set(re.findall(
+            r"\.add_input\(\s*(\w+)\s*\);",
+            prerope_block,
+        ))
+        prerope_writes = re.findall(
             r"\.add_(?:output|inout)\(\s*(\w+)\s*\);",
-            kv_rope_block,
+            prerope_block,
         )
         mix_inputs = set(re.findall(
             r"\.add_input\(\s*(\w+)\s*\);",
             mix_block,
         ))
+        qkv_tensors = [
+            tensor
+            for tensor in proj_writes
+            if re.fullmatch(r"qkv_proj\w*", tensor)
+        ]
         q_tensors = [
             tensor
-            for tensor in q_rope_writes
+            for tensor in prerope_writes
             if re.fullmatch(r"all_q_padded\w*", tensor)
         ]
         k_tensors = [
             tensor
-            for tensor in kv_rope_writes
+            for tensor in prerope_writes
             if re.fullmatch(r"(?:ext_)?k_cache\w*", tensor)
         ]
         v_tensors = [
             tensor
-            for tensor in kv_rope_writes
+            for tensor in prerope_writes
             if re.fullmatch(r"(?:ext_)?v_cache\w*", tensor)
         ]
         if (
-            len(q_tensors) != 1
+            len(qkv_tensors) != 1
+            or qkv_tensors[0] not in prerope_inputs
+            or len(q_tensors) != 1
             or len(k_tensors) != 1
             or len(v_tensors) != 1
-            or any(
-                re.fullmatch(r"(?:ext_)?[kv]_cache\w*", tensor)
-                for tensor in q_rope_writes
-            )
-            or any(
-                re.fullmatch(r"all_q_padded\w*", tensor)
-                for tensor in kv_rope_writes
-            )
             or q_tensors[0] not in mix_inputs
             or k_tensors[0] not in mix_inputs
             or v_tensors[0] not in mix_inputs
         ):
-            errors.append(f"{prefix} mixed RoPE tensor lineage")
+            errors.append(f"{prefix} packed pre-attention tensor lineage")
     return errors
 
 
@@ -3535,8 +3534,10 @@ def main() -> int:
             int(task_grains["online_softmax"]),
         )
         expected_logical_blocks = {
-            "full_rope_q": dfx_active_rows,
-            "full_rope_kv_cache": dfx_active_rows,
+            # Packed projection owns one 128-column logical block per Q tile,
+            # plus one K and one V block, for every static batch tile.
+            "full_qkv_proj": (BATCH // cfg.BATCH_TILE) * (HQF // 128 + 2),
+            "full_qkv_split_qknorm_rope": dfx_active_rows,
             # Mixed attention owns one logical block on each AIC/AIV lane for
             # every online-softmax segment.  Keep the resource suffixes so a
             # missing or mis-sized lane cannot be hidden by family folding.
@@ -3557,8 +3558,8 @@ def main() -> int:
                 for context_len in dfx_context_lens
             ),
             "full_online_softmax_finalize": dfx_active_rows,
-            "swa_rope_q": dfx_active_rows,
-            "swa_rope_kv_cache": dfx_active_rows,
+            "swa_qkv_proj": (BATCH // cfg.BATCH_TILE) * (HQS // 128 + 2),
+            "swa_qkv_split_qknorm_rope": dfx_active_rows,
             # SWA launches one mixed logical block per active row on both
             # resources; audit the AIC and AIV ownership independently.
             "swa_attn_mix_aic": dfx_active_rows,

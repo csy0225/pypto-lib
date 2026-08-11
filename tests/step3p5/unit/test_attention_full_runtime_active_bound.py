@@ -4,7 +4,7 @@
 
 These checks intentionally target only the full-attention implementation. The
 static ``BATCH`` dimension remains the storage capacity, while ``num_tokens``
-controls the fused RoPE/KV logical task grid.
+controls the fused split/QKNorm/RoPE/KV-publication logical task grid.
 """
 from __future__ import annotations
 
@@ -87,56 +87,82 @@ def _guarded_body(scope: ast.With, row_name: str) -> ast.If:
     return guards[0]
 
 
-def test_full_attention_rope_and_kv_writes_use_active_task_grids() -> None:
+def test_full_attention_packs_qkv_and_fuses_active_prerope_publication() -> None:
     fn = _function("attention_full")
     assert "num_tokens" in {arg.arg for arg in fn.args.args}
     assert "b_safe" not in ast.unparse(fn)
 
-    q_rope_scope = _spmd_scope(fn, "full_rope_q")
-    q_rope_call = q_rope_scope.items[0].context_expr
-    assert ast.unparse(q_rope_call.args[0]) == "active_tokens"
+    proj_scope = _spmd_scope(fn, "full_qkv_proj")
+    proj_call = proj_scope.items[0].context_expr
+    assert ast.unparse(proj_call.args[0]) == "BATCH // BATCH_TILE * full_qkv_tiles"
     assert any(
         keyword.arg == "allow_early_resolve"
         and isinstance(keyword.value, ast.Constant)
         and keyword.value.value is True
-        for keyword in q_rope_call.keywords
+        for keyword in proj_call.keywords
     )
     assert (
-        isinstance(q_rope_scope.items[0].optional_vars, ast.Name)
-        and q_rope_scope.items[0].optional_vars.id == "full_rope_q_tid"
+        isinstance(proj_scope.items[0].optional_vars, ast.Name)
+        and proj_scope.items[0].optional_vars.id == "full_qkv_proj_tid"
     )
-    q_rope_source = ast.unparse(_guarded_body(q_rope_scope, "b"))
-    assert "pl.tensor.read(seq_lens, [b])" in q_rope_source
-    assert "pl.slice(rope_cos" in q_rope_source
-    assert "pl.slice(rope_sin" in q_rope_source
-    assert "all_q_padded = pl.assemble(all_q_padded" in q_rope_source
-    assert "slot_mapping" not in q_rope_source
-    assert "k_cache = pl.assemble(k_cache" not in q_rope_source
-    assert "v_cache = pl.assemble(v_cache" not in q_rope_source
+    proj_source = ast.unparse(proj_scope)
+    assert "qkv_proj = pl.assemble(qkv_proj" in proj_source
+    assert "full_qkv_q_offset + q_o0" in proj_source
+    assert "full_qkv_k_offset + kv_kind * KV_HIDDEN_LOCAL + kv_o0" in proj_source
+    for weight in ("wq", "wk", "wv"):
+        assert f"pl.slice({weight}" in proj_source
 
-    kv_rope_scope = _spmd_scope(fn, "full_rope_kv_cache")
-    kv_rope_call = kv_rope_scope.items[0].context_expr
-    assert ast.unparse(kv_rope_call.args[0]) == "active_tokens"
+    prerope_scope = _spmd_scope(fn, "full_qkv_split_qknorm_rope")
+    prerope_call = prerope_scope.items[0].context_expr
+    assert ast.unparse(prerope_call.args[0]) == "active_tokens"
     assert any(
         keyword.arg == "allow_early_resolve"
         and isinstance(keyword.value, ast.Constant)
         and keyword.value.value is True
-        for keyword in kv_rope_call.keywords
+        for keyword in prerope_call.keywords
+    )
+    assert any(
+        keyword.arg == "deps"
+        and ast.unparse(keyword.value) == "[full_qkv_proj_tid]"
+        for keyword in prerope_call.keywords
     )
     assert (
-        isinstance(kv_rope_scope.items[0].optional_vars, ast.Name)
-        and kv_rope_scope.items[0].optional_vars.id == "full_rope_kv_tid"
+        isinstance(prerope_scope.items[0].optional_vars, ast.Name)
+        and prerope_scope.items[0].optional_vars.id == "full_qkv_prerope_tid"
     )
-    kv_rope_source = ast.unparse(_guarded_body(kv_rope_scope, "b"))
-    assert "pl.tensor.read(seq_lens, [b])" in kv_rope_source
-    assert "pl.tensor.read(slot_mapping, [b])" in kv_rope_source
-    assert "pl.slice(rope_cos" in kv_rope_source
-    assert "pl.slice(rope_sin" in kv_rope_source
-    assert "k_cache = pl.assemble(k_cache" in kv_rope_source
-    assert "v_cache = pl.assemble(v_cache" in kv_rope_source
-    assert "all_q_padded" not in kv_rope_source
+    prerope_source = ast.unparse(_guarded_body(prerope_scope, "b"))
+    assert "pl.tensor.read(seq_lens, [b])" in prerope_source
+    assert "pl.tensor.read(slot_mapping, [b])" in prerope_source
+    assert "pl.slice(rope_cos" in prerope_source
+    assert "pl.slice(rope_sin" in prerope_source
+    assert "q_chunk_flat = pl.slice(qkv_proj" in prerope_source
+    assert "q_chunk = pl.reshape(q_chunk_flat, [Q_HEAD_BATCH_FULL, HEAD_DIM])" in prerope_source
+    assert "q_sq = pl.row_sum(pl.mul(q_chunk, q_chunk))" in prerope_source
+    assert "k_chunk_8 = pl.reshape(pl.concat(k_chunk_4, k_chunk_4)" in prerope_source
+    assert "k_sq = pl.row_sum(pl.mul(k_chunk_8, k_chunk_8))" in prerope_source
+    assert "pl.add(q_gamma, 1.0)" in prerope_source
+    assert "pl.add(k_gamma, 1.0)" in prerope_source
+    assert "full_qkv_k_offset + kv_col" in prerope_source
+    assert "full_qkv_v_offset + kv_col" in prerope_source
+    assert "all_q_padded = pl.assemble(all_q_padded" in prerope_source
+    assert "k_cache = pl.assemble(k_cache" in prerope_source
+    assert "v_cache = pl.assemble(v_cache" in prerope_source
+    # Full attention is partial-RoPE: the complete normed Q/K row is
+    # published before the rotated 32-lane halves overwrite lanes 0:64.
+    assert "pl.cast(q_head, target_type=pl.BF16)" in prerope_source
+    assert "pl.cast(k_normed, target_type=pl.BF16)" in prerope_source
 
     fn_source = ast.unparse(fn)
+    for retired in (
+        "full_q_proj",
+        "full_kv_proj",
+        "full_qk_norm_zc",
+        "full_rope_q",
+        "full_rope_kv_cache",
+        "q_proj_norm",
+        "k_proj_norm",
+    ):
+        assert retired not in fn_source
     assert "full_rope_stage = pl.create_tensor" not in fn_source
     assert "full_k_rope_stage = pl.create_tensor" not in fn_source
     assert "full_v_stage = pl.create_tensor" not in fn_source
@@ -144,15 +170,14 @@ def test_full_attention_rope_and_kv_writes_use_active_task_grids() -> None:
     mix_call = _spmd_scope(fn, "full_attn_mix").items[0].context_expr
     assert any(
         keyword.arg == "deps"
-        and ast.unparse(keyword.value)
-        == "[full_rope_q_tid, full_rope_kv_tid]"
+        and ast.unparse(keyword.value) == "[full_qkv_prerope_tid]"
         for keyword in mix_call.keywords
     )
-
 
 def test_all_full_attention_request_spmd_stages_use_runtime_bound() -> None:
     fn = _function("attention_full")
     required = {
+        "full_qkv_split_qknorm_rope",
         "full_attn_mix",
         "full_online_softmax_reduce",
         "full_online_softmax_finalize",
@@ -243,20 +268,16 @@ def test_standalone_tp_wrapper_forwards_runtime_num_tokens() -> None:
 def test_full_attention_core_stages_capture_task_ids_and_chain_dependencies() -> None:
     """The mixed producer owns QK/softmax/SV and publishes reduce partials."""
     fn_source = ast.unparse(_function("attention_full"))
+    assert "name_hint='full_qkv_proj'" in fn_source
+    assert "as full_qkv_proj_tid" in fn_source
     assert (
-        "with pl.spmd(active_tokens, name_hint='full_rope_q', "
-        "allow_early_resolve=True)"
+        "with pl.spmd(active_tokens, name_hint='full_qkv_split_qknorm_rope', "
+        "deps=[full_qkv_proj_tid], allow_early_resolve=True)"
     ) in fn_source
-    assert "as full_rope_q_tid" in fn_source
-    assert (
-        "with pl.spmd(active_tokens, name_hint='full_rope_kv_cache', "
-        "allow_early_resolve=True)"
-        in fn_source
-    )
-    assert "as full_rope_kv_tid" in fn_source
+    assert "as full_qkv_prerope_tid" in fn_source
     assert "with pl.spmd(full_online_softmax_active_tasks" in fn_source
     assert "name_hint='full_attn_mix'" in fn_source
-    assert "deps=[full_rope_q_tid, full_rope_kv_tid]" in fn_source
+    assert "deps=[full_qkv_prerope_tid]" in fn_source
     assert "as full_attn_mix_tid" in fn_source
     assert "name_hint='full_online_softmax_reduce'" in fn_source
     assert "deps=[full_attn_mix_tid]" in fn_source

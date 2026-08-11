@@ -274,17 +274,18 @@ def attention_swa(
     layer_qhidden_base = attn_layer_idx * HIDDEN_Q_SWA_LOCAL
     layer_cache_base = norm_layer_idx * decode_layer_cache_rows
 
-    q_proj = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32)
-    k_proj = pl.create_tensor([BATCH, KV_HIDDEN_LOCAL], dtype=pl.FP32)
-    v_proj = pl.create_tensor([BATCH, KV_HIDDEN_LOCAL], dtype=pl.FP32)
-    q_proj_norm = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.FP32)
-    k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN_LOCAL], dtype=pl.FP32)
+    SWA_Q_OUT_CHUNK = Q_OUT_CHUNK // 2
+    SWA_QKV_Q_BLOCKS = HIDDEN_Q_SWA_LOCAL // SWA_Q_OUT_CHUNK
+    SWA_QKV_K_OFFSET = HIDDEN_Q_SWA_LOCAL
+    SWA_QKV_V_OFFSET = SWA_QKV_K_OFFSET + KV_HIDDEN_LOCAL
+    SWA_QKV_WIDTH = SWA_QKV_V_OFFSET + KV_HIDDEN_LOCAL
+    SWA_QKV_PROJ_BLOCKS = SWA_QKV_Q_BLOCKS + 2
+    qkv_proj = pl.create_tensor([BATCH, SWA_QKV_WIDTH], dtype=pl.FP32)
     normed_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     gate_score_t = pl.create_tensor([BATCH, NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.BF16)
     gate_exp = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
     HEAD_GATE_K_SPLITS = 8
     HEAD_GATE_K_PER_SPLIT = HIDDEN // HEAD_GATE_K_SPLITS
-    SWA_Q_OUT_CHUNK = Q_OUT_CHUNK // 2
     gate_logits_partial = pl.create_tensor(
         [BATCH, HEAD_GATE_K_SPLITS * NUM_HEADS_SWA_LOCAL_PAD], dtype=pl.FP32,
     )
@@ -583,6 +584,126 @@ def attention_swa(
             )
         hg_score = pl.recip(pl.add(pl.exp(pl.neg(hg_logits)), 1.0))
         gate_score_t[:, :] = pl.cast(hg_score, target_type=pl.BF16)
+
+    # ----- Scope 1.b-1.d — packed Q/K/V projection. -----
+    # Q, K, and V retain their original matmul accumulation order, but share
+    # one SPMD family and publish into a single [Q | K | V] FP32 tensor. Every
+    # task owns one disjoint 128-column output tile, so the family needs only
+    # one scheduler entry while preserving the existing weight ABI.
+    with pl.spmd(
+        (BATCH // BATCH_TILE) * SWA_QKV_PROJ_BLOCKS,
+        name_hint="swa_qkv_proj",
+        allow_early_resolve=True,
+    ) as swa_qkv_proj_tid:
+        qkv_spmd_idx = pl.tile.get_block_idx()
+        qkv_b_idx = qkv_spmd_idx // SWA_QKV_PROJ_BLOCKS
+        qkv_ob = qkv_spmd_idx % SWA_QKV_PROJ_BLOCKS
+        qkv_b0 = qkv_b_idx * BATCH_TILE
+        if qkv_ob < SWA_QKV_Q_BLOCKS:
+            q_o0 = qkv_ob * SWA_Q_OUT_CHUNK
+            q_tile_a_0 = pl.slice(
+                normed_all,
+                [BATCH_TILE, INPUT_PROJ_K_CHUNK],
+                [qkv_b0, 0],
+            )
+            q_tile_b_0 = pl.slice(
+                wq,
+                [INPUT_PROJ_K_CHUNK, SWA_Q_OUT_CHUNK],
+                [layer_hidden_base, q_o0],
+            )
+            q_acc = pl.matmul(q_tile_a_0, q_tile_b_0, out_dtype=pl.FP32)
+            for kb in pl.range(1, decode_scope1_hidden_blocks):
+                q_k0 = kb * INPUT_PROJ_K_CHUNK
+                q_tile_a = pl.slice(
+                    normed_all,
+                    [BATCH_TILE, INPUT_PROJ_K_CHUNK],
+                    [qkv_b0, q_k0],
+                )
+                q_tile_b = pl.slice(
+                    wq,
+                    [INPUT_PROJ_K_CHUNK, SWA_Q_OUT_CHUNK],
+                    [layer_hidden_base + q_k0, q_o0],
+                )
+                q_acc = pl.matmul_acc(q_acc, q_tile_a, q_tile_b)
+            qkv_proj = pl.assemble(qkv_proj, q_acc, [qkv_b0, q_o0])
+        else:
+            qkv_kind = qkv_ob - SWA_QKV_Q_BLOCKS
+            if qkv_kind == 0:
+                k_tile_a = pl.slice(
+                    normed_all,
+                    [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL],
+                    [qkv_b0, 0],
+                )
+                k_acc = pl.matmul(
+                    k_tile_a,
+                    pl.slice(
+                        wk,
+                        [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL],
+                        [layer_hidden_base, 0],
+                    ),
+                    out_dtype=pl.FP32,
+                )
+                for kb in pl.range(1, kv_proj_hidden_blocks):
+                    k_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
+                    k_acc = pl.matmul_acc(
+                        k_acc,
+                        pl.slice(
+                            normed_all,
+                            [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL],
+                            [qkv_b0, k_k0],
+                        ),
+                        pl.slice(
+                            wk,
+                            [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL],
+                            [layer_hidden_base + k_k0, 0],
+                        ),
+                    )
+                qkv_proj = pl.assemble(
+                    qkv_proj,
+                    k_acc,
+                    [qkv_b0, SWA_QKV_K_OFFSET],
+                )
+            else:
+                v_tile_a = pl.slice(
+                    normed_all,
+                    [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL],
+                    [qkv_b0, 0],
+                )
+                v_acc = pl.matmul(
+                    v_tile_a,
+                    pl.slice(
+                        wv,
+                        [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL],
+                        [layer_hidden_base, 0],
+                    ),
+                    out_dtype=pl.FP32,
+                )
+                for kb in pl.range(1, kv_proj_hidden_blocks):
+                    v_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
+                    v_acc = pl.matmul_acc(
+                        v_acc,
+                        pl.slice(
+                            normed_all,
+                            [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL],
+                            [qkv_b0, v_k0],
+                        ),
+                        pl.slice(
+                            wv,
+                            [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL],
+                            [layer_hidden_base + v_k0, 0],
+                        ),
+                    )
+                qkv_proj = pl.assemble(
+                    qkv_proj,
+                    v_acc,
+                    [qkv_b0, SWA_QKV_V_OFFSET],
+                )
+
+    # Dispatch the 14-slice packed projection before the independent 6-AIC /
+    # 12-AIV gate expansion.  In the five-layer SWA-MoE schedule, expanding
+    # first staggered six projection slices by about 4 us.  This ordering lets
+    # the expansion use the remaining cores while projection is in flight;
+    # dataflow still keeps gate_exp ready before the later output projection.
     swa_head_gate_chunks = HIDDEN_Q_SWA_LOCAL // K_CHUNK
     for hg_task in pl.spmd(
         (BATCH // BATCH_TILE) * swa_head_gate_chunks,
@@ -611,128 +732,16 @@ def attention_swa(
             [hg_b0, hg_n0],
         )
 
-    # ----- Scope 1.b — Q projection. -----
-    # wq is row-sliced (output dim → HIDDEN_Q_SWA_LOCAL = 1536 per rank).
-    for q_spmd_idx in pl.spmd(
-        (BATCH // BATCH_TILE) * (HIDDEN_Q_SWA_LOCAL // SWA_Q_OUT_CHUNK),
-        name_hint="swa_q_proj",
-        allow_early_resolve=True,
-    ):
-        q_b_idx = q_spmd_idx // (HIDDEN_Q_SWA_LOCAL // SWA_Q_OUT_CHUNK)
-        q_ob = q_spmd_idx % (HIDDEN_Q_SWA_LOCAL // SWA_Q_OUT_CHUNK)
-        q_b0 = q_b_idx * BATCH_TILE
-        q_o0 = q_ob * SWA_Q_OUT_CHUNK
-        q_tile_a_0 = pl.slice(normed_all, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [q_b0, 0])
-        q_tile_b_0 = pl.slice(
-            wq, [INPUT_PROJ_K_CHUNK, SWA_Q_OUT_CHUNK], [layer_hidden_base, q_o0],
-        )
-        q_acc = pl.matmul(q_tile_a_0, q_tile_b_0, out_dtype=pl.FP32)
-        for kb in pl.range(1, decode_scope1_hidden_blocks):
-            q_k0 = kb * INPUT_PROJ_K_CHUNK
-            q_tile_a = pl.slice(normed_all, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [q_b0, q_k0])
-            q_tile_b = pl.slice(
-                wq,
-                [INPUT_PROJ_K_CHUNK, SWA_Q_OUT_CHUNK],
-                [layer_hidden_base + q_k0, q_o0],
-            )
-            q_acc = pl.matmul_acc(q_acc, q_tile_a, q_tile_b)
-        q_proj = pl.assemble(q_proj, q_acc, [q_b0, q_o0])
+    # ----- Scope 1.f head-gate remains on-device (RESTORED, path (a)). -----
+    # Logits/sigmoid stay next to Scope 1.a; the independent expansion is
+    # dispatched immediately after qkv projection and o_proj applies it inline.
 
-    # ----- Scope 1.c/1.d — K/V projections. -----
-    # wk is row-sliced (output dim → KV_HEADS_LOCAL * HEAD_DIM = 128 per rank).
-    for kv_spmd_idx in pl.spmd(
-        2 * (BATCH // BATCH_TILE),
-        name_hint="swa_kv_proj",
-        allow_early_resolve=True,
-    ):
-        kv_kind = kv_spmd_idx % 2
-        kv_b0 = (kv_spmd_idx // 2) * BATCH_TILE
-        if kv_kind == 0:
-            k_o0 = 0
-            k_tile_a = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, 0])
-            k_acc = pl.matmul(
-                k_tile_a,
-                pl.slice(wk, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base, k_o0]),
-                out_dtype=pl.FP32,
-            )
-            for kb in pl.range(1, kv_proj_hidden_blocks):
-                k_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
-                k_acc = pl.matmul_acc(
-                    k_acc, pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, k_k0]),
-                    pl.slice(wk, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base + k_k0, k_o0]),
-                )
-            k_proj = pl.assemble(k_proj, k_acc, [kv_b0, k_o0])
-        else:
-            v_o0 = 0
-            v_tile_a = pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, 0])
-            v_acc = pl.matmul(
-                v_tile_a,
-                pl.slice(wv, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base, v_o0]),
-                out_dtype=pl.FP32,
-            )
-            for kb in pl.range(1, kv_proj_hidden_blocks):
-                v_k0 = kb * KV_PROJ_K_CHUNK_LOCAL
-                v_acc = pl.matmul_acc(
-                    v_acc, pl.slice(normed_all, [BATCH_TILE, KV_PROJ_K_CHUNK_LOCAL], [kv_b0, v_k0]),
-                    pl.slice(wv, [KV_PROJ_K_CHUNK_LOCAL, KV_HIDDEN_LOCAL], [layer_hidden_base + v_k0, v_o0]),
-                )
-            v_proj = pl.assemble(v_proj, v_acc, [kv_b0, v_o0])
-
-    # ----- Scope 1.e — per-head zero-centred q_norm / k_norm. -----
-    # q_norm / k_norm gamma [HEAD_DIM] are REPLICATED across TP ranks; only
-    # the per-head loop bounds shrink (KV_HEADS_LOCAL = 1 per rank).
-    # Q and K branches run sequentially in the flat spmd body. The pl.range(2)
-    # sub-tiling (6 heads per sub-tile, [BATCH_TILE*6, HEAD_DIM] FP32 = 49152 B)
-    # keeps the Q-chain Vec/UB peak at ~98688 B (~97 KB clear of the 192 KB
-    # ceiling). After pl.range(2) exits all Q tiles have been assembled into
-    # q_proj_norm, so the K branch starts with a clean slate.
-    for qkn_spmd_idx in pl.spmd(
-        (BATCH // BATCH_TILE) * KV_HEADS_LOCAL, name_hint="swa_qk_norm_zc",
-    ):
-        qkn_b_idx = qkn_spmd_idx // KV_HEADS_LOCAL
-        qkn_h = qkn_spmd_idx % KV_HEADS_LOCAL
-        qkn_b0 = qkn_b_idx * BATCH_TILE
-
-        # Q branch: 2 half-head sub-tiles (Q_HEAD_BATCH_SWA//2 = 6 heads each).
-        qkn_q0 = qkn_h * Q_PER_KV_SWA * HEAD_DIM
-        q_gamma = pl.slice(q_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
-        for qh_sub in pl.range(2):
-            q_sub_col0 = qkn_q0 + qh_sub * (Q_HEAD_BATCH_SWA // 2) * HEAD_DIM
-            q_chunk_sub = pl.reshape(
-                pl.slice(
-                    q_proj,
-                    [BATCH_TILE, (Q_HEAD_BATCH_SWA // 2) * HEAD_DIM],
-                    [qkn_b0, q_sub_col0],
-                ),
-                [BATCH_TILE * (Q_HEAD_BATCH_SWA // 2), HEAD_DIM],
-            )
-            q_sq = pl.row_sum(pl.mul(q_chunk_sub, q_chunk_sub))
-            q_inv = pl.rsqrt(pl.add(pl.mul(q_sq, HEAD_DIM_INV), EPS))
-            q_scaled = pl.row_expand_mul(q_chunk_sub, q_inv)
-            q_normed = pl.col_expand_mul(q_scaled, pl.add(q_gamma, 1.0))
-            q_normed_flat = pl.reshape(
-                q_normed, [BATCH_TILE, (Q_HEAD_BATCH_SWA // 2) * HEAD_DIM],
-            )
-            q_proj_norm = pl.assemble(q_proj_norm, q_normed_flat, [qkn_b0, q_sub_col0])
-
-        # K branch: single head per rank (KV_HEADS_LOCAL = 1).
-        qkn_k0 = qkn_h * HEAD_DIM
-        k_chunk = pl.slice(k_proj, [BATCH_TILE, HEAD_DIM], [qkn_b0, qkn_k0])
-        k_gamma = pl.slice(k_norm_weight, [1, HEAD_DIM], [norm_layer_idx, 0])
-        k_sq = pl.row_sum(pl.mul(k_chunk, k_chunk))
-        k_inv = pl.rsqrt(pl.add(pl.mul(k_sq, HEAD_DIM_INV), EPS))
-        k_scaled = pl.row_expand_mul(k_chunk, k_inv)
-        k_normed = pl.col_expand_mul(k_scaled, pl.add(k_gamma, 1.0))
-        k_proj_norm = pl.assemble(k_proj_norm, k_normed, [qkn_b0, qkn_k0])
-
-    # ----- Scope 1.f head-gate is now computed above (RESTORED, path (a)). ----
-    # gate_exp was computed on-device right after Scope 1.a; o_proj (Scope 3.a)
-    # applies it inline. Mirrors attention_full.py.
-
-    # ----- Scope 2 — full RoPE + paged KV cache write + fa_fused (SWA). -----
-    # Full RoPE (rotary_dim == HEAD_DIM, no pass-through tail). The KV cache
-    # holds KV_HEADS_LOCAL = 1 KV head per rank, so the per-rank loop over
-    # local KV heads collapses to a single iteration.
+    # ----- Scope 2 — packed split + QKNorm + RoPE/cache publication. -----
+    # One active-row vector task consumes the packed [Q | K | V] projection.
+    # Q and K share one aligned [16, 128] row-wise reduction tile (12 Q, 1 K,
+    # 3 zero padding rows), while retaining distinct gamma vectors. Each head
+    # then uses contiguous [1, ROTARY_HALF] slices for RoPE; V is read only for
+    # its final cache publication, with no normalized GM scratch.
     attn_out = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_attn_out_zero"):
         attn_out[:, :] = pl.full(
@@ -742,70 +751,22 @@ def attention_swa(
     # all alloc_tile row-dimension uses so the allocator alignment check passes.
     SWA_Q_PAD_ALIGNED = 32
     all_q_padded = pl.create_tensor(
-        [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED, HEAD_DIM], dtype=pl.BF16,
+        [
+            BATCH
+            * KV_HEADS_LOCAL
+            * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA)
+            * SWA_Q_PAD_ALIGNED,
+            HEAD_DIM,
+        ],
+        dtype=pl.BF16,
     )
 
-    # Separate active-row tasks write Q and update the resident K/V cache.
     with pl.spmd(
         active_tokens,
-        name_hint="swa_rope_q",
+        name_hint="swa_qkv_split_qknorm_rope",
+        deps=[swa_qkv_proj_tid],
         allow_early_resolve=True,
-    ) as swa_rope_q_tid:
-        b = pl.tile.get_block_idx()
-        if b < active_tokens:
-            ctx_len = pl.tensor.read(seq_lens, [b])
-            pos = ctx_len - 1
-            cos_row = pl.slice(rope_cos, [1, ROTARY_HALF_SWA * 2], [pos, 0])
-            sin_row = pl.slice(rope_sin, [1, ROTARY_HALF_SWA * 2], [pos, 0])
-            cos_lo = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, 0])
-            cos_hi = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
-            sin_lo = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, 0])
-            sin_hi = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
-
-            for ki in pl.range(KV_HEADS_LOCAL):
-                # Per-head RoPE using CONTIGUOUS [1, ROTARY_HALF_SWA] slices of
-                # q_proj_norm (mirrors the K path), replacing reshape([.,HEAD_DIM])
-                # + col-offset slice which miscompiled the rot_q_hi write into
-                # all_q_padded. See attention_full.py Scope 2 / _stage_scope12_qk.py.
-                q_base = ki * Q_PER_KV_SWA
-                pad_row_base = b * KV_HEADS_LOCAL * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA) * SWA_Q_PAD_ALIGNED + ki * SWA_Q_PAD_ALIGNED
-                for qh in pl.range(Q_HEAD_BATCH_SWA):
-                    qh_col = (q_base + qh) * HEAD_DIM
-                    q_lo_h = pl.slice(q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col])
-                    q_hi_h = pl.slice(
-                        q_proj_norm, [1, ROTARY_HALF_SWA], [b, qh_col + ROTARY_HALF_SWA],
-                    )
-                    rot_q_lo_h = pl.sub(
-                        pl.col_expand_mul(q_lo_h, cos_lo),
-                        pl.col_expand_mul(q_hi_h, sin_lo),
-                    )
-                    rot_q_hi_h = pl.add(
-                        pl.col_expand_mul(q_hi_h, cos_hi),
-                        pl.col_expand_mul(q_lo_h, sin_hi),
-                    )
-                    q_row = pad_row_base + qh
-                    all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(rot_q_lo_h, target_type=pl.BF16), [q_row, 0],
-                    )
-                    all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(rot_q_hi_h, target_type=pl.BF16),
-                        [q_row, ROTARY_HALF_SWA],
-                    )
-                all_q_padded = pl.assemble(
-                    all_q_padded,
-                    pl.cast(
-                        pl.full([SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA, HEAD_DIM],
-                                dtype=pl.FP32, value=0.0),
-                        target_type=pl.BF16,
-                    ),
-                    [pad_row_base + Q_HEAD_BATCH_SWA, 0],
-                )
-
-    with pl.spmd(
-        active_tokens,
-        name_hint="swa_rope_kv_cache",
-        allow_early_resolve=True,
-    ) as swa_rope_kv_tid:
+    ) as swa_qkv_prerope_tid:
         b = pl.tile.get_block_idx()
         if b < active_tokens:
             ctx_len = pl.tensor.read(seq_lens, [b])
@@ -813,23 +774,139 @@ def attention_swa(
             slot = pl.tensor.read(slot_mapping, [b])
             slot_block = slot // BLOCK_SIZE
             slot_offset = slot - slot_block * BLOCK_SIZE
-            cos_row = pl.slice(rope_cos, [1, ROTARY_HALF_SWA * 2], [pos, 0])
-            sin_row = pl.slice(rope_sin, [1, ROTARY_HALF_SWA * 2], [pos, 0])
+            cos_row = pl.slice(
+                rope_cos,
+                [1, ROTARY_HALF_SWA * 2],
+                [pos, 0],
+            )
+            sin_row = pl.slice(
+                rope_sin,
+                [1, ROTARY_HALF_SWA * 2],
+                [pos, 0],
+            )
             cos_lo = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, 0])
-            cos_hi = pl.slice(cos_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
+            cos_hi = pl.slice(
+                cos_row,
+                [1, ROTARY_HALF_SWA],
+                [0, ROTARY_HALF_SWA],
+            )
             sin_lo = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, 0])
-            sin_hi = pl.slice(sin_row, [1, ROTARY_HALF_SWA], [0, ROTARY_HALF_SWA])
+            sin_hi = pl.slice(
+                sin_row,
+                [1, ROTARY_HALF_SWA],
+                [0, ROTARY_HALF_SWA],
+            )
+            q_gamma = pl.slice(
+                q_norm_weight,
+                [1, HEAD_DIM],
+                [norm_layer_idx, 0],
+            )
+            q_gamma_eff = pl.add(q_gamma, 1.0)
+            k_gamma = pl.slice(
+                k_norm_weight,
+                [1, HEAD_DIM],
+                [norm_layer_idx, 0],
+            )
+            k_gamma_eff = pl.add(k_gamma, 1.0)
 
             for ki in pl.range(KV_HEADS_LOCAL):
-                kv_col = ki * HEAD_DIM
-                cache_row = (
-                    layer_cache_base
-                    + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
-                    + slot_offset
+                q_base = ki * Q_PER_KV_SWA
+                pad_row_base = (
+                    b
+                    * KV_HEADS_LOCAL
+                    * (Q_PER_KV_SWA // Q_HEAD_BATCH_SWA)
+                    * SWA_Q_PAD_ALIGNED
+                    + ki * SWA_Q_PAD_ALIGNED
                 )
-                k_lo = pl.slice(k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col])
+                q_col0 = q_base * HEAD_DIM
+                q_flat = pl.slice(
+                    qkv_proj,
+                    [1, Q_HEAD_BATCH_SWA * HEAD_DIM],
+                    [b, q_col0],
+                )
+                kv_col = ki * HEAD_DIM
+                k_chunk = pl.slice(
+                    qkv_proj,
+                    [1, HEAD_DIM],
+                    [b, SWA_QKV_K_OFFSET + kv_col],
+                )
+                # Normalize 12 Q rows and the single K row with one aligned
+                # [16, 128] reduction.  The three zero rows exist only to keep
+                # the [16, 1] reduction result AIV-aligned.  Row-wise reduction
+                # order for every published Q/K row is unchanged; Q and K still
+                # apply their distinct gamma vectors below.
+                qk_zero_pad = pl.full(
+                    [1, (16 - Q_HEAD_BATCH_SWA - 1) * HEAD_DIM],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
+                qk_chunk = pl.reshape(
+                    pl.concat(pl.concat(q_flat, k_chunk), qk_zero_pad),
+                    [16, HEAD_DIM],
+                )
+                qk_sq = pl.row_sum(pl.mul(qk_chunk, qk_chunk))
+                qk_inv = pl.rsqrt(
+                    pl.add(pl.mul(qk_sq, HEAD_DIM_INV), EPS),
+                )
+                qk_scaled = pl.row_expand_mul(qk_chunk, qk_inv)
+                q_normed = pl.col_expand_mul(qk_scaled, q_gamma_eff)
+                # RoPE all aligned rows in two vector operations instead of
+                # extracting/storing twelve heads one by one.  Rows 0:12 are
+                # the real Q heads; rows 12:16 are overwritten by the padding
+                # zero store below.  Slicing this local [16, 128] tile avoids
+                # the historical reshaped-wide GM column-offset path.
+                q_lo = pl.slice(
+                    q_normed,
+                    [16, ROTARY_HALF_SWA],
+                    [0, 0],
+                )
+                q_hi = pl.slice(
+                    q_normed,
+                    [16, ROTARY_HALF_SWA],
+                    [0, ROTARY_HALF_SWA],
+                )
+                rot_q_lo = pl.sub(
+                    pl.col_expand_mul(q_lo, cos_lo),
+                    pl.col_expand_mul(q_hi, sin_lo),
+                )
+                rot_q_hi = pl.add(
+                    pl.col_expand_mul(q_hi, cos_hi),
+                    pl.col_expand_mul(q_lo, sin_hi),
+                )
+                all_q_padded = pl.assemble(
+                    all_q_padded,
+                    pl.cast(rot_q_lo, target_type=pl.BF16),
+                    [pad_row_base, 0],
+                )
+                all_q_padded = pl.assemble(
+                    all_q_padded,
+                    pl.cast(rot_q_hi, target_type=pl.BF16),
+                    [pad_row_base, ROTARY_HALF_SWA],
+                )
+                all_q_padded = pl.assemble(
+                    all_q_padded,
+                    pl.full(
+                        [
+                            SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA,
+                            HEAD_DIM,
+                        ],
+                        dtype=pl.BF16,
+                        value=0.0,
+                    ),
+                    [pad_row_base + Q_HEAD_BATCH_SWA, 0],
+                )
+
+                k_scaled = pl.slice(
+                    qk_scaled,
+                    [1, HEAD_DIM],
+                    [Q_HEAD_BATCH_SWA, 0],
+                )
+                k_normed = pl.col_expand_mul(k_scaled, k_gamma_eff)
+                k_lo = pl.slice(k_normed, [1, ROTARY_HALF_SWA], [0, 0])
                 k_hi = pl.slice(
-                    k_proj_norm, [1, ROTARY_HALF_SWA], [b, kv_col + ROTARY_HALF_SWA],
+                    k_normed,
+                    [1, ROTARY_HALF_SWA],
+                    [0, ROTARY_HALF_SWA],
                 )
                 rot_k_lo = pl.sub(
                     pl.col_expand_mul(k_lo, cos_lo),
@@ -839,17 +916,31 @@ def attention_swa(
                     pl.col_expand_mul(k_hi, cos_hi),
                     pl.col_expand_mul(k_lo, sin_hi),
                 )
-                k_cache = pl.assemble(
-                    k_cache, pl.cast(rot_k_lo, target_type=pl.BF16), [cache_row, 0],
+                cache_row = (
+                    layer_cache_base
+                    + (slot_block * KV_HEADS_LOCAL + ki) * BLOCK_SIZE
+                    + slot_offset
                 )
                 k_cache = pl.assemble(
-                    k_cache, pl.cast(rot_k_hi, target_type=pl.BF16),
+                    k_cache,
+                    pl.cast(rot_k_lo, target_type=pl.BF16),
+                    [cache_row, 0],
+                )
+                k_cache = pl.assemble(
+                    k_cache,
+                    pl.cast(rot_k_hi, target_type=pl.BF16),
                     [cache_row, ROTARY_HALF_SWA],
                 )
                 v_cache = pl.assemble(
                     v_cache,
-                    pl.cast(pl.slice(v_proj, [1, HEAD_DIM], [b, kv_col]),
-                            target_type=pl.BF16),
+                    pl.cast(
+                        pl.slice(
+                            qkv_proj,
+                            [1, HEAD_DIM],
+                            [b, SWA_QKV_V_OFFSET + kv_col],
+                        ),
+                        target_type=pl.BF16,
+                    ),
                     [cache_row, 0],
                 )
 
@@ -864,7 +955,7 @@ def attention_swa(
     with pl.spmd(
         swa_active_tasks,
         name_hint="swa_attn_mix",
-        deps=[swa_rope_q_tid, swa_rope_kv_tid],
+        deps=[swa_qkv_prerope_tid],
         allow_early_resolve=True,
     ) as _swa_attn_mix_tid:
         fa_b = pl.tile.get_block_idx()

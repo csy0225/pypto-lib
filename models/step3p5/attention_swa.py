@@ -141,6 +141,7 @@ from .config import (
     ROPE_SEQ_DYN,
     ROTARY_HALF_SWA,
     SLIDING_WINDOW,
+    SWA_RMSNORM_ROWS_PER_TASK,
     TP_WORLD_SIZE,
     USER_BATCH_DYN,
     is_full_attention,
@@ -229,6 +230,12 @@ def attention_swa(
     """Step3p5 SWA-attention layer through TP-reduced o_proj + residual."""
 
     decode_scope1_hidden_blocks = HIDDEN // INPUT_PROJ_K_CHUNK
+    swa_rmsnorm_reduce_chunk = INPUT_PROJ_K_CHUNK
+    swa_rmsnorm_parts_per_row = HIDDEN // swa_rmsnorm_reduce_chunk
+    swa_rmsnorm_reduction_rows = (
+        SWA_RMSNORM_ROWS_PER_TASK * swa_rmsnorm_parts_per_row
+    )
+    swa_rmsnorm_norm_k_chunk = HIDDEN
     kv_proj_hidden_blocks = HIDDEN // KV_PROJ_K_CHUNK_LOCAL
     out_proj_k_blocks = HIDDEN_Q_SWA_LOCAL // OUT_PROJ_K_CHUNK
     decode_attn_scale = ATTN_SCALE
@@ -290,36 +297,241 @@ def attention_swa(
 
     # ----- Scope 1.a — zero-centred input RMSNorm. -----
     # input_rms_weight is replicated across TP ranks (HIDDEN dim is not
-    # sliced); every rank computes the same normed_all tile.
-    for rms_spmd_idx in pl.spmd(BATCH // BATCH_TILE, name_hint="swa_rmsnorm_zc"):
-        rms_b0 = rms_spmd_idx * BATCH_TILE
-        partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-        for kb in pl.range(decode_scope1_hidden_blocks):
-            sq_k0 = kb * INPUT_PROJ_K_CHUNK
-            sq_chunk = pl.cast(
-                pl.slice(current_hidden, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [rms_b0, sq_k0]),
-                target_type=pl.FP32,
-            )
-            partial_sq = pl.add(
-                partial_sq,
-                pl.reshape(pl.row_sum(pl.mul(sq_chunk, sq_chunk)), [1, BATCH_TILE]),
-            )
-        variance = pl.reshape(
-            pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH_TILE, 1],
+    # sliced); every rank computes the same normed_all tile. Split the
+    # independent batch rows into workload-derived logical tasks. The
+    # runtime maps those logical tasks onto the available physical cores.
+    for rms_spmd_idx in pl.spmd(
+        BATCH // SWA_RMSNORM_ROWS_PER_TASK,
+        name_hint="swa_rmsnorm_zc",
+    ):
+        rms_b0 = rms_spmd_idx * SWA_RMSNORM_ROWS_PER_TASK
+        # Load every row assigned to this logical task once. Reinterpret
+        # the contiguous storage as independent 256-wide reduction rows;
+        # row_sum then has an aligned [reduction_rows, 1] output while
+        # preserving each source row's partial-sum order exactly.
+        norm_chunk = pl.cast(
+            pl.slice(
+                current_hidden,
+                [SWA_RMSNORM_ROWS_PER_TASK, swa_rmsnorm_norm_k_chunk],
+                [rms_b0, 0],
+                valid_shape=[
+                    SWA_RMSNORM_ROWS_PER_TASK,
+                    swa_rmsnorm_norm_k_chunk,
+                ],
+            ),
+            target_type=pl.FP32,
         )
+        sq_chunk = pl.mul(norm_chunk, norm_chunk)
+        sq_rows = pl.reshape(
+            sq_chunk,
+            [swa_rmsnorm_reduction_rows, swa_rmsnorm_reduce_chunk],
+        )
+        row_partials = pl.reshape(
+            pl.row_sum(sq_rows),
+            [SWA_RMSNORM_ROWS_PER_TASK, swa_rmsnorm_parts_per_row],
+        )
+
+        # Pack every task row's partial into the leading lanes of one
+        # aligned row per chunk; padding lanes stay zero. Sequential tile
+        # adds reproduce the historical 256-chunk left fold without the
+        # unsupported scalar FP32 arith.addf on the A2A3 backend.
+        partial_pairs = pl.full(
+            [swa_rmsnorm_parts_per_row, 8],
+            dtype=pl.FP32,
+            value=0.0,
+        )
+        pl.tensor.write(
+            partial_pairs, [0, 0], pl.tensor.read(row_partials, [0, 0]),
+        )
+        pl.tensor.write(
+            partial_pairs, [0, 1], pl.tensor.read(row_partials, [1, 0]),
+        )
+        pl.tensor.write(
+            partial_pairs, [1, 0], pl.tensor.read(row_partials, [0, 1]),
+        )
+        pl.tensor.write(
+            partial_pairs, [1, 1], pl.tensor.read(row_partials, [1, 1]),
+        )
+        pl.tensor.write(
+            partial_pairs, [2, 0], pl.tensor.read(row_partials, [0, 2]),
+        )
+        pl.tensor.write(
+            partial_pairs, [2, 1], pl.tensor.read(row_partials, [1, 2]),
+        )
+        pl.tensor.write(
+            partial_pairs, [3, 0], pl.tensor.read(row_partials, [0, 3]),
+        )
+        pl.tensor.write(
+            partial_pairs, [3, 1], pl.tensor.read(row_partials, [1, 3]),
+        )
+        pl.tensor.write(
+            partial_pairs, [4, 0], pl.tensor.read(row_partials, [0, 4]),
+        )
+        pl.tensor.write(
+            partial_pairs, [4, 1], pl.tensor.read(row_partials, [1, 4]),
+        )
+        pl.tensor.write(
+            partial_pairs, [5, 0], pl.tensor.read(row_partials, [0, 5]),
+        )
+        pl.tensor.write(
+            partial_pairs, [5, 1], pl.tensor.read(row_partials, [1, 5]),
+        )
+        pl.tensor.write(
+            partial_pairs, [6, 0], pl.tensor.read(row_partials, [0, 6]),
+        )
+        pl.tensor.write(
+            partial_pairs, [6, 1], pl.tensor.read(row_partials, [1, 6]),
+        )
+        pl.tensor.write(
+            partial_pairs, [7, 0], pl.tensor.read(row_partials, [0, 7]),
+        )
+        pl.tensor.write(
+            partial_pairs, [7, 1], pl.tensor.read(row_partials, [1, 7]),
+        )
+        pl.tensor.write(
+            partial_pairs, [8, 0], pl.tensor.read(row_partials, [0, 8]),
+        )
+        pl.tensor.write(
+            partial_pairs, [8, 1], pl.tensor.read(row_partials, [1, 8]),
+        )
+        pl.tensor.write(
+            partial_pairs, [9, 0], pl.tensor.read(row_partials, [0, 9]),
+        )
+        pl.tensor.write(
+            partial_pairs, [9, 1], pl.tensor.read(row_partials, [1, 9]),
+        )
+        pl.tensor.write(
+            partial_pairs, [10, 0], pl.tensor.read(row_partials, [0, 10]),
+        )
+        pl.tensor.write(
+            partial_pairs, [10, 1], pl.tensor.read(row_partials, [1, 10]),
+        )
+        pl.tensor.write(
+            partial_pairs, [11, 0], pl.tensor.read(row_partials, [0, 11]),
+        )
+        pl.tensor.write(
+            partial_pairs, [11, 1], pl.tensor.read(row_partials, [1, 11]),
+        )
+        pl.tensor.write(
+            partial_pairs, [12, 0], pl.tensor.read(row_partials, [0, 12]),
+        )
+        pl.tensor.write(
+            partial_pairs, [12, 1], pl.tensor.read(row_partials, [1, 12]),
+        )
+        pl.tensor.write(
+            partial_pairs, [13, 0], pl.tensor.read(row_partials, [0, 13]),
+        )
+        pl.tensor.write(
+            partial_pairs, [13, 1], pl.tensor.read(row_partials, [1, 13]),
+        )
+        pl.tensor.write(
+            partial_pairs, [14, 0], pl.tensor.read(row_partials, [0, 14]),
+        )
+        pl.tensor.write(
+            partial_pairs, [14, 1], pl.tensor.read(row_partials, [1, 14]),
+        )
+        pl.tensor.write(
+            partial_pairs, [15, 0], pl.tensor.read(row_partials, [0, 15]),
+        )
+        pl.tensor.write(
+            partial_pairs, [15, 1], pl.tensor.read(row_partials, [1, 15]),
+        )
+        partial_sq = pl.slice(partial_pairs, [1, 8], [0, 0])
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [1, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [2, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [3, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [4, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [5, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [6, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [7, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [8, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [9, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [10, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [11, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [12, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [13, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [14, 0]),
+        )
+        partial_sq = pl.add(
+            partial_sq,
+            pl.slice(partial_pairs, [1, 8], [15, 0]),
+        )
+        variance = pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS)
         inv_rms = pl.recip(pl.sqrt(variance))
-        for kb in pl.range(decode_scope1_hidden_blocks):
-            norm_k0 = kb * INPUT_PROJ_K_CHUNK
-            norm_chunk = pl.cast(
-                pl.slice(current_hidden, [BATCH_TILE, INPUT_PROJ_K_CHUNK], [rms_b0, norm_k0]),
-                target_type=pl.FP32,
-            )
-            gamma = pl.slice(input_rms_weight, [1, INPUT_PROJ_K_CHUNK], [norm_layer_idx, norm_k0])
-            scaled = pl.row_expand_mul(norm_chunk, inv_rms)
-            normed = pl.col_expand_mul(scaled, pl.add(gamma, 1.0))
-            normed_all = pl.assemble(
-                normed_all, pl.cast(normed, target_type=pl.BF16), [rms_b0, norm_k0],
-            )
+
+        gamma = pl.slice(
+            input_rms_weight,
+            [1, swa_rmsnorm_norm_k_chunk],
+            [norm_layer_idx, 0],
+        )
+        gamma_eff = pl.add(gamma, 1.0)
+        norm_row0 = pl.slice(
+            norm_chunk,
+            [1, swa_rmsnorm_norm_k_chunk],
+            [0, 0],
+            valid_shape=[1, swa_rmsnorm_norm_k_chunk],
+        )
+        scaled0 = pl.mul(norm_row0, pl.tensor.read(inv_rms, [0, 0]))
+        normed0 = pl.mul(scaled0, gamma_eff)
+        normed_all = pl.assemble(
+            normed_all,
+            pl.cast(normed0, target_type=pl.BF16),
+            [rms_b0, 0],
+        )
+        norm_row1 = pl.slice(
+            norm_chunk,
+            [1, swa_rmsnorm_norm_k_chunk],
+            [1, 0],
+            valid_shape=[1, swa_rmsnorm_norm_k_chunk],
+        )
+        scaled1 = pl.mul(norm_row1, pl.tensor.read(inv_rms, [0, 1]))
+        normed1 = pl.mul(scaled1, gamma_eff)
+        normed_all = pl.assemble(
+            normed_all,
+            pl.cast(normed1, target_type=pl.BF16),
+            [rms_b0 + 1, 0],
+        )
 
     # ----- Scope 1.f — on-device head-gate (RESTORED, path (a)). -----
     # gate_exp[b, h*HEAD_DIM + d] = sigmoid(normed_all @ w_g)[b, h], expanded

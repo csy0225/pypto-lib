@@ -365,6 +365,31 @@ SEQ_TILE = 128
 
 # Scope 1 tiling (input proj).
 INPUT_PROJ_K_CHUNK = 256
+
+# SWA input RMSNorm assigns independent storage rows to logical SPMD tasks.
+# The runtime, rather than this model constant, maps those workload-derived
+# logical tasks onto the target's available vector cores.  Two rows per task
+# is the A2A3 release point validated on 0162.  The environment entry is
+# fail-closed to that profile until another task grain passes the same gates.
+SWA_RMSNORM_ROWS_PER_TASK = int(
+    os.environ.get("PYPTO_STEP3P5_SWA_RMSNORM_ROWS_PER_TASK", "2"),
+)
+if (
+    SWA_RMSNORM_ROWS_PER_TASK <= 0
+    or SWA_RMSNORM_ROWS_PER_TASK > BATCH
+    or BATCH % SWA_RMSNORM_ROWS_PER_TASK != 0
+):
+    raise ValueError(
+        "PYPTO_STEP3P5_SWA_RMSNORM_ROWS_PER_TASK must be positive, not "
+        f"greater than BATCH={BATCH}, and divide BATCH exactly; got "
+        f"{SWA_RMSNORM_ROWS_PER_TASK}",
+    )
+if SWA_RMSNORM_ROWS_PER_TASK != 2:
+    raise ValueError(
+        "PYPTO_STEP3P5_SWA_RMSNORM_ROWS_PER_TASK currently supports only "
+        f"the calibrated value 2, got {SWA_RMSNORM_ROWS_PER_TASK}",
+    )
+
 KV_PROJ_K_CHUNK = INPUT_PROJ_K_CHUNK // 2  # 128 — keeps K/V L0B within 512 KB at TP=1
 Q_OUT_CHUNK = 256
 KV_OUT_CHUNK = 256
@@ -904,6 +929,7 @@ __all__ = [
     "BLOCK_SIZE",
     "SEQ_TILE",
     "INPUT_PROJ_K_CHUNK",
+    "SWA_RMSNORM_ROWS_PER_TASK",
     "KV_PROJ_K_CHUNK",
     "KV_PROJ_K_CHUNK_LOCAL",
     "Q_OUT_CHUNK",

@@ -147,19 +147,19 @@ def test_swa_rope_kv_producer_uses_active_task_grids() -> None:
     assert "swa_k_rope_stage = pl.create_tensor" not in function_source
     assert "swa_v_stage = pl.create_tensor" not in function_source
 
-    qk_call = _spmd_scope(function, "swa_qk_matmul").items[0].context_expr
+    mix_call = _spmd_scope(function, "swa_attn_mix").items[0].context_expr
     assert any(
         keyword.arg == "deps"
         and ast.unparse(keyword.value)
         == "[swa_rope_q_tid, swa_rope_kv_tid]"
-        for keyword in qk_call.keywords
+        for keyword in mix_call.keywords
     )
 
 
 def test_swa_has_no_padding_slot_fallback_in_decode_rope_kv_path() -> None:
     source = _source()
     start = source.index("    all_q_padded = pl.create_tensor(")
-    end = source.index("    # ----- fa_fused (SWA)", start)
+    end = source.index("    # ----- Mixed attention core:", start)
     scope2 = source[start:end]
     assert "b_safe" not in scope2
     assert "slot_mapping, [b]" in scope2
@@ -194,26 +194,20 @@ def test_swa_source_indexes_tail_window_and_masks_both_edges() -> None:
 
     assert function_source.count(
         "fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)"
-    ) == 4
+    ) == 1
     assert function_source.count(
         "fa_first_block = fa_window_start // BLOCK_SIZE"
-    ) == 4
+    ) == 1
     assert function_source.count(
         "fa_end_block = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE"
-    ) == 4
-    assert source.count(
-        "[fa_block_table_base + fa_first_block + sb]"
-    ) == 2
+    ) == 1
+    assert source.count("[fa_block_table_base + fa_block]") == 1
     assert "[fa_block_table_base + sb]" not in source
-    assert "SWA_STORAGE_BLOCKS = SWA_WIN_BLOCKS + 1" in source
+    assert "SWA_STORAGE_BLOCKS" not in function_source
     assert "valid_lo = pl.max(" in source
     assert "valid_hi = pl.min(" in source
-    assert source.count("valid_len = valid_hi - valid_lo") == 1
     assert "[fa_cache_row + valid_lo, 0]" not in source
-    assert "valid_shape=[valid_len, HEAD_DIM]" not in source
     assert source.count("[fa_cache_row, 0]") == 2
-    assert "valid_shape=[Q_HEAD_BATCH_SWA, valid_len]" not in source
-    assert "if valid_len < BLOCK_SIZE:" in source
     assert "zero_i32 = pl.const(0, pl.INT32)" in source
     assert "one_i32 = pl.const(1, pl.INT32)" in source
     assert "valid_from_i32 = pl.minimum(" in source
@@ -222,7 +216,11 @@ def test_swa_source_indexes_tail_window_and_masks_both_edges() -> None:
     assert "pl.cmp(" not in source
     assert "valid_mask = pl.cast(" in source
     assert "scores = pl.col_expand_add(scores, invalid_bias)" in source
-
+    assert "all_raw_scores" not in function_source
+    assert "all_exp_padded" not in function_source
+    assert "all_oi_tmp" not in function_source
+    assert "mi_new = pl.maximum(mi, cur_mi)" in function_source
+    assert "ctx = pl.row_expand_div(oi, li)" in function_source
 
 def _swa_reverse_oracle_fixture(
     *,

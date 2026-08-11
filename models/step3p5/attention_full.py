@@ -99,10 +99,6 @@ from .config import (
     BLOCK_SIZE,
     BLOCK_TABLE_FLAT_DYN,
     EPS,
-    FULL_ATTN_QK_BLOCKS_PER_TASK,
-    FULL_ATTN_QK_UNIFORM_O1,
-    FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK,
-    FULL_ATTN_SOFTMAX_UNIFORM_O1,
     FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK,
     FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK,
     FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1,
@@ -674,526 +670,298 @@ def attention_full(
                 )
 
 
-    # ----- fa_fused — Phase A (2026-06-11): qwen3/32b-style 4-spmd split. -----
-    # The previous fused mixed AIC+AIV single root tripped 507018 / VEC UB
-    # not-aligned at this shape (NUM_HEADS_FULL_LOCAL=8, KV_HEADS_LOCAL=1,
-    # Q_PER_KV_FULL=Q_HEAD_BATCH_FULL=8, Q_HEAD_PAD_FULL=16, HEAD_DIM=128).
-    # We mirror qwen3/32b's split QK/softmax front-end, then fuse SV with the
-    # first online-softmax reduction level. GM scratch carries raw scores and
-    # softmax exp + mi/li between stages. ``pl.slice(..., valid_shape=...)``
-    # replaces set_validshape +
-    # fillpad so the VEC lowering goes through a different (proven-safe)
-    # path. mi/li 以合法宽行落盘，读取后再 reshape 为 reduction column。
-    # See docs/step3p5/phases/15-singlerank-npu.md "Phase A route decision".
+    # ----- Mixed attention core: QK -> typed mask/softmax -> SV. -----
+    # Each logical task owns one contiguous KV-block segment and one disjoint
+    # (O, M, L) partial slot. Full cube boxes are retained across C2V/V2C; the
+    # later vector reductions read only Q_HEAD_BATCH_FULL real head rows.
     MAX_CTX_BLOCKS = MAX_SEQ_DEFAULT // BLOCK_SIZE
-    full_qk_active_tasks = pl.cast(0, pl.INDEX)
-    full_qk_uniform_tasks_per_row = pl.cast(0, pl.INDEX)
-    full_qk_tasks_uniform = pl.cast(
-        FULL_ATTN_QK_UNIFORM_O1, pl.INDEX,
-    )
-    full_softmax_active_tasks = pl.cast(0, pl.INDEX)
-    full_softmax_uniform_tasks_per_row = pl.cast(0, pl.INDEX)
-    full_softmax_tasks_uniform = pl.cast(
-        FULL_ATTN_SOFTMAX_UNIFORM_O1, pl.INDEX,
-    )
+    MAX_SEGMENTS = (
+        MAX_CTX_BLOCKS + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK - 1
+    ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
     full_online_softmax_active_tasks = pl.cast(0, pl.INDEX)
     full_online_uniform_tasks_per_row = pl.cast(0, pl.INDEX)
     full_online_tasks_uniform = pl.cast(
         FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1, pl.INDEX,
     )
-    # Launch exactly the logical tasks implied by active request rows.  A
-    # zero-token request is a graph-level no-op/reject contract: adding a
-    # dummy attention task here penalizes every non-empty request and does not
-    # make the later collectives valid for num_tokens == 0.
     for fa_count_b in pl.range(active_tokens):
         fa_count_ctx_len = pl.tensor.read(seq_lens, [fa_count_b])
         fa_count_ctx_blocks = (
             fa_count_ctx_len + BLOCK_SIZE - 1
         ) // BLOCK_SIZE
-        fa_count_qk_tasks = (
-            fa_count_ctx_blocks + FULL_ATTN_QK_BLOCKS_PER_TASK - 1
-        ) // FULL_ATTN_QK_BLOCKS_PER_TASK
-        fa_count_softmax_tasks = (
-            fa_count_ctx_blocks + FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK - 1
-        ) // FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK
         fa_count_online_tasks = (
             fa_count_ctx_blocks
             + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
             - 1
         ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
         if fa_count_b == 0:
-            full_qk_uniform_tasks_per_row = fa_count_qk_tasks
-            full_softmax_uniform_tasks_per_row = fa_count_softmax_tasks
             full_online_uniform_tasks_per_row = fa_count_online_tasks
         else:
-            # Each switch initializes its route predicate fail-closed.  A
-            # mismatch can only clear the predicate; it can never re-enable a
-            # disabled route.  This matters when a later row has exactly one
-            # more task than row zero.
-            if fa_count_qk_tasks != full_qk_uniform_tasks_per_row:
-                full_qk_tasks_uniform = pl.cast(0, pl.INDEX)
-            if (
-                fa_count_softmax_tasks
-                != full_softmax_uniform_tasks_per_row
-            ):
-                full_softmax_tasks_uniform = pl.cast(0, pl.INDEX)
             if (
                 fa_count_online_tasks
                 != full_online_uniform_tasks_per_row
             ):
                 full_online_tasks_uniform = pl.cast(0, pl.INDEX)
-        full_qk_active_tasks = full_qk_active_tasks + fa_count_qk_tasks
-        full_softmax_active_tasks = (
-            full_softmax_active_tasks + fa_count_softmax_tasks
-        )
         full_online_softmax_active_tasks = (
             full_online_softmax_active_tasks + fa_count_online_tasks
         )
-    all_raw_scores = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS * Q_HEAD_PAD_FULL, BLOCK_SIZE], dtype=pl.FP32,
-    )
-    all_exp_padded = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS * Q_HEAD_PAD_FULL, BLOCK_SIZE], dtype=pl.BF16,
-    )
-    all_cur_mi = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS, Q_HEAD_PAD_FULL], dtype=pl.FP32,
-    )
-    all_cur_li = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS, Q_HEAD_PAD_FULL], dtype=pl.FP32,
-    )
-    # Each segment owns Q_HEAD_PAD_FULL rows for O. Keep M/L in a dedicated
-    # row-major scratch; packing them into O padding rows introduces narrow
-    # row/column reshapes that are fragile in the 0162 lowering.
+
     online_partial = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS * Q_HEAD_PAD_FULL, HEAD_DIM],
+        [BATCH * MAX_SEGMENTS * Q_HEAD_PAD_FULL, HEAD_DIM],
         dtype=pl.FP32,
     )
-    # Pack M and L into one aligned row: [M heads | L heads].  The current
-    # orchestration lowering on 0162 can permute two FP32 scratch lineages
-    # mutated by the segment-reduce stage, even when their formal shapes differ.
-    # A single InOut tensor removes that ambiguous parameter mapping while
-    # retaining 32-byte-aligned [1, H] slices for all vector operations.
     online_partial_ml = pl.create_tensor(
-        [BATCH * MAX_CTX_BLOCKS, 2 * Q_HEAD_BATCH_FULL], dtype=pl.FP32,
+        [BATCH * MAX_SEGMENTS, 2 * Q_HEAD_BATCH_FULL], dtype=pl.FP32,
     )
     with pl.spmd(
-        full_qk_active_tasks,
-        name_hint="full_qk_matmul",
+        full_online_softmax_active_tasks,
+        name_hint="full_attn_mix",
         deps=[full_rope_q_tid, full_rope_kv_tid],
         allow_early_resolve=True,
-    ) as full_qk_tid:
-        fa_task = pl.tile.get_block_idx()
-        if fa_task < full_qk_active_tasks:
-            fa_qk_b = pl.cast(0, pl.INDEX)
-            fa_qk_task_in_b = fa_task
-            if active_tokens != 1:
-                if full_qk_tasks_uniform != 0:
-                    # Traverse uniform rows task-major rather than row-major:
-                    # complete block groups are queued before the shorter tail
-                    # groups.  The runtime can then pull balanced work in the
-                    # first wave and leave only tails for a partial next wave.
-                    fa_qk_task_in_b = fa_task // active_tokens
-                    fa_qk_b = (
-                        fa_task - fa_qk_task_in_b * active_tokens
-                    )
-                else:
-                    fa_qk_task_base = pl.cast(0, pl.INDEX)
-                    for fa_qk_scan_b in pl.range(active_tokens):
-                        fa_qk_scan_ctx_len = pl.tensor.read(
-                            seq_lens, [fa_qk_scan_b],
-                        )
-                        fa_qk_scan_ctx_blocks = (
-                            fa_qk_scan_ctx_len + BLOCK_SIZE - 1
-                        ) // BLOCK_SIZE
-                        fa_qk_scan_tasks = (
-                            fa_qk_scan_ctx_blocks
-                            + FULL_ATTN_QK_BLOCKS_PER_TASK - 1
-                        ) // FULL_ATTN_QK_BLOCKS_PER_TASK
-                        if fa_task >= fa_qk_task_base:
-                            if (
-                                fa_task
-                                < fa_qk_task_base + fa_qk_scan_tasks
-                            ):
-                                fa_qk_b = fa_qk_scan_b
-                                fa_qk_task_in_b = (
-                                    fa_task - fa_qk_task_base
-                                )
-                        fa_qk_task_base = (
-                            fa_qk_task_base + fa_qk_scan_tasks
-                        )
-            fa_qk_sb0 = (
-                fa_qk_task_in_b * FULL_ATTN_QK_BLOCKS_PER_TASK
-            )
-            fa_qk_ctx_len = pl.tensor.read(seq_lens, [fa_qk_b])
-            fa_qk_ctx_blocks = (
-                fa_qk_ctx_len + BLOCK_SIZE - 1
-            ) // BLOCK_SIZE
-            fa_qk_block_table_base = fa_qk_b * bt_stride
-            fa_qk_padded_row = fa_qk_b * Q_HEAD_PAD_FULL
-            fa_qk_padded = pl.slice(
-                all_q_padded,
-                [Q_HEAD_PAD_FULL, HEAD_DIM],
-                [fa_qk_padded_row, 0],
-            )
-            for fa_local in pl.range(FULL_ATTN_QK_BLOCKS_PER_TASK):
-                fa_qk_sb = fa_qk_sb0 + fa_local
-                if fa_qk_sb < fa_qk_ctx_blocks:
-                    fa_qk_pbid = pl.cast(
-                        pl.tensor.read(
-                            block_table,
-                            [fa_qk_block_table_base + fa_qk_sb],
-                        ),
-                        pl.INDEX,
-                    )
-                    fa_qk_cache_row = (
-                        layer_cache_base + fa_qk_pbid * BLOCK_SIZE
-                    )
-                    fa_qk_k_tile = pl.slice(
-                        k_cache,
-                        [BLOCK_SIZE, HEAD_DIM],
-                        [fa_qk_cache_row, 0],
-                    )
-                    fa_qk_raw_scores = pl.matmul(
-                        fa_qk_padded,
-                        fa_qk_k_tile,
-                        b_trans=True,
-                        out_dtype=pl.FP32,
-                    )
-                    fa_qk_scratch_row = (
-                        fa_qk_b * MAX_CTX_BLOCKS + fa_qk_sb
-                    ) * Q_HEAD_PAD_FULL
-                    all_raw_scores = pl.assemble(
-                        all_raw_scores,
-                        fa_qk_raw_scores,
-                        [fa_qk_scratch_row, 0],
-                    )
-
-    with pl.spmd(
-        full_softmax_active_tasks,
-        name_hint="full_softmax",
-        deps=[full_qk_tid],
-        allow_early_resolve=True,
-    ) as full_softmax_tid:
-        fa_task = pl.tile.get_block_idx()
-        if fa_task < full_softmax_active_tasks:
-            fa_sm_b = pl.cast(0, pl.INDEX)
-            fa_sm_task_in_b = fa_task
-            if active_tokens != 1:
-                if full_softmax_tasks_uniform != 0:
-                    fa_sm_task_in_b = fa_task // active_tokens
-                    fa_sm_b = fa_task - fa_sm_task_in_b * active_tokens
-                else:
-                    fa_sm_task_base = pl.cast(0, pl.INDEX)
-                    for fa_sm_scan_b in pl.range(active_tokens):
-                        fa_sm_scan_ctx_len = pl.tensor.read(
-                            seq_lens, [fa_sm_scan_b],
-                        )
-                        fa_sm_scan_ctx_blocks = (
-                            fa_sm_scan_ctx_len + BLOCK_SIZE - 1
-                        ) // BLOCK_SIZE
-                        fa_sm_scan_tasks = (
-                            fa_sm_scan_ctx_blocks
-                            + FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK - 1
-                        ) // FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK
-                        if fa_task >= fa_sm_task_base:
-                            if (
-                                fa_task
-                                < fa_sm_task_base + fa_sm_scan_tasks
-                            ):
-                                fa_sm_b = fa_sm_scan_b
-                                fa_sm_task_in_b = (
-                                    fa_task - fa_sm_task_base
-                                )
-                        fa_sm_task_base = (
-                            fa_sm_task_base + fa_sm_scan_tasks
-                        )
-            fa_sm_sb0 = (
-                fa_sm_task_in_b * FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK
-            )
-            fa_sm_ctx_len = pl.tensor.read(seq_lens, [fa_sm_b])
-            fa_sm_ctx_blocks = (
-                fa_sm_ctx_len + BLOCK_SIZE - 1
-            ) // BLOCK_SIZE
-            for fa_local in pl.range(FULL_ATTN_SOFTMAX_BLOCKS_PER_TASK):
-                fa_sm_sb = fa_sm_sb0 + fa_local
-                if fa_sm_sb < fa_sm_ctx_blocks:
-                    fa_sm_s0 = fa_sm_sb * BLOCK_SIZE
-                    fa_sm_valid_len = pl.min(
-                        BLOCK_SIZE, fa_sm_ctx_len - fa_sm_s0,
-                    )
-                    fa_sm_scratch_row = (
-                        fa_sm_b * MAX_CTX_BLOCKS + fa_sm_sb
-                    ) * Q_HEAD_PAD_FULL
-                    fa_sm_scores_valid = pl.slice(
-                        all_raw_scores,
-                        [Q_HEAD_BATCH_FULL, BLOCK_SIZE],
-                        [fa_sm_scratch_row, 0],
-                        valid_shape=[
-                            Q_HEAD_BATCH_FULL,
-                            fa_sm_valid_len,
-                        ],
-                    )
-                    fa_sm_scores_padded = pl.fillpad(
-                        fa_sm_scores_valid,
-                        pad_value=pl.PadValue.min,
-                    )
-                    fa_sm_scores = pl.mul(
-                        fa_sm_scores_padded, decode_attn_scale,
-                    )
-                    fa_sm_cur_mi = pl.row_max(fa_sm_scores)
-                    fa_sm_exp_scores = pl.exp(
-                        pl.row_expand_sub(fa_sm_scores, fa_sm_cur_mi),
-                    )
-                    fa_sm_exp_scores_bf16 = pl.cast(
-                        fa_sm_exp_scores, target_type=pl.BF16,
-                    )
-                    fa_sm_exp_scores_fp32 = pl.cast(
-                        fa_sm_exp_scores_bf16, target_type=pl.FP32,
-                    )
-                    fa_sm_cur_li = pl.row_sum(fa_sm_exp_scores_fp32)
-                    # SV uses the cube-legal padded head tile. Define every
-                    # row explicitly instead of letting the padded half read
-                    # uninitialized GM.
-                    all_exp_padded = pl.assemble(
-                        all_exp_padded,
-                        fa_sm_exp_scores_bf16,
-                        [fa_sm_scratch_row, 0],
-                    )
-                    fa_sm_exp_zero_heads = pl.full(
-                        [
-                            Q_HEAD_PAD_FULL - Q_HEAD_BATCH_FULL,
-                            BLOCK_SIZE,
-                        ],
-                        dtype=pl.BF16,
-                        value=0.0,
-                    )
-                    all_exp_padded = pl.assemble(
-                        all_exp_padded,
-                        fa_sm_exp_zero_heads,
-                        [fa_sm_scratch_row + Q_HEAD_BATCH_FULL, 0],
-                    )
-                    fa_sm_lm_row = (
-                        fa_sm_b * MAX_CTX_BLOCKS + fa_sm_sb
-                    )
-                    all_cur_mi = pl.assemble(
-                        all_cur_mi,
-                        pl.reshape(
-                            fa_sm_cur_mi, [1, Q_HEAD_BATCH_FULL],
-                        ),
-                        [fa_sm_lm_row, 0],
-                    )
-                    all_cur_li = pl.assemble(
-                        all_cur_li,
-                        pl.reshape(
-                            fa_sm_cur_li, [1, Q_HEAD_BATCH_FULL],
-                        ),
-                        [fa_sm_lm_row, 0],
-                    )
-
-    # Fuse SV and segment-local online recurrence into one mixed task per
-    # segment. Each logical task owns a contiguous KV-block segment, computes
-    # SV on the cube lane,
-    # and immediately performs the segment-local online recurrence on the vector
-    # lane. The SPMD grid is workload-derived; no fixed resident-worker count
-    # or independent first-pass recurrence kernel is introduced.
-    # Keep one AIV owner per mixed task. UP_DOWN would split O into disjoint
-    # head rows but duplicate the unsplit M/L recurrence on both subblocks,
-    # creating a cross-subblock GM read-after-write race between KV blocks.
-    with pl.spmd(
-        full_online_softmax_active_tasks,
-        name_hint="full_sv_matmul",
-        deps=[full_softmax_tid],
-        allow_early_resolve=True,
-    ) as full_sv_online_tid:
+    ) as full_attn_mix_tid:
         fa_task = pl.tile.get_block_idx()
         if fa_task < full_online_softmax_active_tasks:
-            fa_sv_b = pl.cast(0, pl.INDEX)
+            fa_mix_b = pl.cast(0, pl.INDEX)
             if active_tokens == 1:
-                fa_sv_task_in_b = fa_task
+                fa_mix_task_in_b = fa_task
             else:
                 if full_online_tasks_uniform != 0:
-                    fa_sv_task_in_b = fa_task // active_tokens
-                    fa_sv_b = fa_task - fa_sv_task_in_b * active_tokens
+                    fa_mix_task_in_b = fa_task // active_tokens
+                    fa_mix_b = fa_task - fa_mix_task_in_b * active_tokens
                 else:
-                    # Keep countdown as the heterogeneous fallback; cumulative
-                    # task-base lowering previously overwrote row 0.
-                    fa_sv_task_in_b = fa_task
-                    for fa_sv_scan_b in pl.range(active_tokens):
-                        fa_sv_scan_ctx_len = pl.tensor.read(
-                            seq_lens, [fa_sv_scan_b],
+                    fa_mix_task_in_b = fa_task
+                    for fa_mix_scan_b in pl.range(active_tokens):
+                        fa_mix_scan_ctx_len = pl.tensor.read(
+                            seq_lens, [fa_mix_scan_b],
                         )
-                        fa_sv_scan_ctx_blocks = (
-                            fa_sv_scan_ctx_len + BLOCK_SIZE - 1
+                        fa_mix_scan_ctx_blocks = (
+                            fa_mix_scan_ctx_len + BLOCK_SIZE - 1
                         ) // BLOCK_SIZE
-                        fa_sv_scan_tasks = (
-                            fa_sv_scan_ctx_blocks
+                        fa_mix_scan_tasks = (
+                            fa_mix_scan_ctx_blocks
                             + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
                             - 1
                         ) // FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
-                        if fa_sv_scan_b == fa_sv_b:
-                            if fa_sv_task_in_b >= fa_sv_scan_tasks:
-                                fa_sv_task_in_b = (
-                                    fa_sv_task_in_b - fa_sv_scan_tasks
+                        if fa_mix_scan_b == fa_mix_b:
+                            if fa_mix_task_in_b >= fa_mix_scan_tasks:
+                                fa_mix_task_in_b = (
+                                    fa_mix_task_in_b - fa_mix_scan_tasks
                                 )
-                                fa_sv_b = fa_sv_b + 1
+                                fa_mix_b = fa_mix_b + 1
 
-            fa_sv_ctx_len = pl.tensor.read(seq_lens, [fa_sv_b])
-            fa_sv_ctx_blocks = (
-                fa_sv_ctx_len + BLOCK_SIZE - 1
+            fa_mix_ctx_len = pl.tensor.read(seq_lens, [fa_mix_b])
+            fa_mix_ctx_blocks = (
+                fa_mix_ctx_len + BLOCK_SIZE - 1
             ) // BLOCK_SIZE
-            fa_sv_sb0 = (
-                fa_sv_task_in_b
+            fa_mix_sb0 = (
+                fa_mix_task_in_b
                 * FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK
             )
-            fa_sv_sb1 = pl.min(
-                fa_sv_ctx_blocks,
-                fa_sv_sb0 + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK,
+            fa_mix_sb1 = pl.min(
+                fa_mix_ctx_blocks,
+                fa_mix_sb0 + FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK,
             )
-            fa_sv_block_table_base = fa_sv_b * bt_stride
-            fa_sv_segment_row = (
-                fa_sv_b * MAX_CTX_BLOCKS + fa_sv_task_in_b
+            fa_mix_block_table_base = fa_mix_b * bt_stride
+            fa_mix_segment_row = (
+                fa_mix_b * MAX_SEGMENTS + fa_mix_task_in_b
             )
-            fa_sv_segment_row0 = fa_sv_segment_row * Q_HEAD_PAD_FULL
+            fa_mix_segment_row0 = fa_mix_segment_row * Q_HEAD_PAD_FULL
+            fa_mix_q_row = fa_mix_b * Q_HEAD_PAD_FULL
+            fa_mix_q = pl.slice(
+                all_q_padded,
+                [Q_HEAD_PAD_FULL, HEAD_DIM],
+                [fa_mix_q_row, 0],
+            )
 
-            # Every block, including the first, follows the same mixed-lane
-            # path: cube computes SV, C2V publishes it, and AIV either seeds
-            # or updates the segment-local online state.  Keeping a single
-            # cross-core boundary prevents cube-only stores from leaking into
-            # the AIV function and vector-only stores from leaking into AIC.
-            for fa_sv_sb in pl.range(fa_sv_sb0, fa_sv_sb1):
-                fa_sv_pbid = pl.cast(
+            for fa_mix_sb in pl.range(fa_mix_sb0, fa_mix_sb1):
+                fa_mix_pbid = pl.cast(
                     pl.tensor.read(
                         block_table,
-                        [fa_sv_block_table_base + fa_sv_sb],
+                        [fa_mix_block_table_base + fa_mix_sb],
                     ),
                     pl.INDEX,
                 )
-                fa_sv_cache_row = (
-                    layer_cache_base + fa_sv_pbid * BLOCK_SIZE
+                fa_mix_cache_row = (
+                    layer_cache_base + fa_mix_pbid * BLOCK_SIZE
                 )
-                fa_sv_v = pl.slice(
-                    v_cache,
+                fa_mix_k = pl.slice(
+                    k_cache,
                     [BLOCK_SIZE, HEAD_DIM],
-                    [fa_sv_cache_row, 0],
+                    [fa_mix_cache_row, 0],
                 )
-                fa_sv_scratch_row = (
-                    fa_sv_b * MAX_CTX_BLOCKS + fa_sv_sb
-                ) * Q_HEAD_PAD_FULL
-                fa_sv_exp = pl.slice(
-                    all_exp_padded,
-                    [Q_HEAD_PAD_FULL, BLOCK_SIZE],
-                    [fa_sv_scratch_row, 0],
-                )
-                fa_sv_oi = pl.matmul(
-                    fa_sv_exp,
-                    fa_sv_v,
+                fa_mix_raw_scores = pl.matmul(
+                    fa_mix_q,
+                    fa_mix_k,
+                    b_trans=True,
                     out_dtype=pl.FP32,
                 )
-                fa_sv_lm_row = fa_sv_b * MAX_CTX_BLOCKS + fa_sv_sb
-                fa_sv_mi_real = pl.slice(
-                    all_cur_mi,
-                    [1, Q_HEAD_BATCH_FULL],
-                    [fa_sv_lm_row, 0],
+                fa_mix_scores = pl.mul(
+                    fa_mix_raw_scores, decode_attn_scale,
                 )
-                fa_sv_li_real = pl.slice(
-                    all_cur_li,
-                    [1, Q_HEAD_BATCH_FULL],
-                    [fa_sv_lm_row, 0],
+                fa_mix_s0 = fa_mix_sb * BLOCK_SIZE
+                fa_mix_valid_len = pl.min(
+                    BLOCK_SIZE, fa_mix_ctx_len - fa_mix_s0,
                 )
-                fa_sv_zero_heads = pl.full(
+                fa_mix_score_cols = pl.arange(
+                    0,
+                    [1, BLOCK_SIZE],
+                    dtype=pl.INT32,
+                )
+                fa_mix_zero_i32 = pl.const(0, pl.INT32)
+                fa_mix_one_i32 = pl.const(1, pl.INT32)
+                fa_mix_valid_to_i32 = pl.minimum(
+                    pl.maximum(
+                        pl.neg(
+                            pl.sub(
+                                fa_mix_score_cols,
+                                pl.cast(fa_mix_valid_len, pl.INT32),
+                            ),
+                        ),
+                        fa_mix_zero_i32,
+                    ),
+                    fa_mix_one_i32,
+                )
+                fa_mix_valid_mask = pl.cast(
+                    fa_mix_valid_to_i32, target_type=pl.FP32,
+                )
+                fa_mix_invalid_bias = pl.mul(
+                    pl.sub(fa_mix_valid_mask, 1.0),
+                    1.0e20,
+                )
+                fa_mix_scores = pl.col_expand_add(
+                    fa_mix_scores, fa_mix_invalid_bias,
+                )
+                fa_mix_cur_mi = pl.row_max(fa_mix_scores)
+                fa_mix_exp_scores = pl.exp(
+                    pl.row_expand_sub(fa_mix_scores, fa_mix_cur_mi),
+                )
+                fa_mix_exp_bf16 = pl.cast(
+                    fa_mix_exp_scores, target_type=pl.BF16,
+                )
+                fa_mix_exp_fp32 = pl.cast(
+                    fa_mix_exp_bf16, target_type=pl.FP32,
+                )
+                fa_mix_cur_li = pl.row_sum(fa_mix_exp_fp32)
+                fa_mix_v = pl.slice(
+                    v_cache,
+                    [BLOCK_SIZE, HEAD_DIM],
+                    [fa_mix_cache_row, 0],
+                )
+                fa_mix_oi = pl.matmul(
+                    fa_mix_exp_bf16,
+                    fa_mix_v,
+                    out_dtype=pl.FP32,
+                )
+
+                fa_mix_mi_box = pl.reshape(
+                    fa_mix_cur_mi, [1, Q_HEAD_PAD_FULL],
+                )
+                fa_mix_li_box = pl.reshape(
+                    fa_mix_cur_li, [1, Q_HEAD_PAD_FULL],
+                )
+                fa_mix_mi_real = pl.slice(
+                    fa_mix_mi_box,
+                    [1, Q_HEAD_BATCH_FULL],
+                    [0, 0],
+                )
+                fa_mix_li_real = pl.slice(
+                    fa_mix_li_box,
+                    [1, Q_HEAD_BATCH_FULL],
+                    [0, 0],
+                )
+                fa_mix_zero_heads = pl.full(
                     [1, Q_HEAD_PAD_FULL - Q_HEAD_BATCH_FULL],
                     dtype=pl.FP32,
                     value=0.0,
                 )
-                fa_sv_mi = pl.concat(
-                    fa_sv_mi_real, fa_sv_zero_heads,
+                fa_mix_mi = pl.concat(
+                    fa_mix_mi_real, fa_mix_zero_heads,
                 )
-                fa_sv_li = pl.concat(
-                    fa_sv_li_real, fa_sv_zero_heads,
+                fa_mix_li = pl.concat(
+                    fa_mix_li_real, fa_mix_zero_heads,
                 )
-                if fa_sv_sb == fa_sv_sb0:
+                if fa_mix_sb == fa_mix_sb0:
                     online_partial = pl.assemble(
                         online_partial,
-                        fa_sv_oi,
-                        [fa_sv_segment_row0, 0],
+                        fa_mix_oi,
+                        [fa_mix_segment_row0, 0],
                     )
-                    fa_sv_ml = pl.concat(
-                        fa_sv_mi_real, fa_sv_li_real,
+                    fa_mix_ml = pl.concat(
+                        fa_mix_mi_real, fa_mix_li_real,
                     )
                     online_partial_ml = pl.assemble(
                         online_partial_ml,
-                        fa_sv_ml,
-                        [fa_sv_segment_row, 0],
+                        fa_mix_ml,
+                        [fa_mix_segment_row, 0],
                     )
                 else:
-                    fa_sv_acc_oi = pl.slice(
+                    fa_mix_acc_oi = pl.slice(
                         online_partial,
                         [Q_HEAD_PAD_FULL, HEAD_DIM],
-                        [fa_sv_segment_row0, 0],
+                        [fa_mix_segment_row0, 0],
                     )
-                    fa_sv_acc_mi_real = pl.slice(
+                    fa_mix_acc_mi_real = pl.slice(
                         online_partial_ml,
                         [1, Q_HEAD_BATCH_FULL],
-                        [fa_sv_segment_row, 0],
+                        [fa_mix_segment_row, 0],
                     )
-                    fa_sv_acc_li_real = pl.slice(
+                    fa_mix_acc_li_real = pl.slice(
                         online_partial_ml,
                         [1, Q_HEAD_BATCH_FULL],
-                        [fa_sv_segment_row, Q_HEAD_BATCH_FULL],
+                        [fa_mix_segment_row, Q_HEAD_BATCH_FULL],
                     )
-                    fa_sv_acc_mi = pl.concat(
-                        fa_sv_acc_mi_real, fa_sv_zero_heads,
+                    fa_mix_acc_mi = pl.concat(
+                        fa_mix_acc_mi_real, fa_mix_zero_heads,
                     )
-                    fa_sv_acc_li = pl.concat(
-                        fa_sv_acc_li_real, fa_sv_zero_heads,
+                    fa_mix_acc_li = pl.concat(
+                        fa_mix_acc_li_real, fa_mix_zero_heads,
                     )
-                    fa_sv_mi_new = pl.maximum(
-                        fa_sv_acc_mi, fa_sv_mi,
+                    fa_mix_mi_new = pl.maximum(
+                        fa_mix_acc_mi, fa_mix_mi,
                     )
-                    fa_sv_alpha_row = pl.exp(
-                        pl.sub(fa_sv_acc_mi, fa_sv_mi_new),
+                    fa_mix_alpha_row = pl.exp(
+                        pl.sub(fa_mix_acc_mi, fa_mix_mi_new),
                     )
-                    fa_sv_beta_row = pl.exp(
-                        pl.sub(fa_sv_mi, fa_sv_mi_new),
+                    fa_mix_beta_row = pl.exp(
+                        pl.sub(fa_mix_mi, fa_mix_mi_new),
                     )
-                    fa_sv_li_new = pl.add(
-                        pl.mul(fa_sv_alpha_row, fa_sv_acc_li),
-                        pl.mul(fa_sv_beta_row, fa_sv_li),
+                    fa_mix_li_new = pl.add(
+                        pl.mul(fa_mix_alpha_row, fa_mix_acc_li),
+                        pl.mul(fa_mix_beta_row, fa_mix_li),
                     )
-                    fa_sv_alpha = pl.reshape(
-                        fa_sv_alpha_row, [Q_HEAD_PAD_FULL, 1],
+                    fa_mix_alpha = pl.reshape(
+                        fa_mix_alpha_row, [Q_HEAD_PAD_FULL, 1],
                     )
-                    fa_sv_beta = pl.reshape(
-                        fa_sv_beta_row, [Q_HEAD_PAD_FULL, 1],
+                    fa_mix_beta = pl.reshape(
+                        fa_mix_beta_row, [Q_HEAD_PAD_FULL, 1],
                     )
-                    fa_sv_oi_new = pl.add(
+                    fa_mix_oi_new = pl.add(
                         pl.row_expand_mul(
-                            fa_sv_acc_oi, fa_sv_alpha,
+                            fa_mix_acc_oi, fa_mix_alpha,
                         ),
-                        pl.row_expand_mul(fa_sv_oi, fa_sv_beta),
+                        pl.row_expand_mul(fa_mix_oi, fa_mix_beta),
                     )
                     online_partial = pl.assemble(
                         online_partial,
-                        fa_sv_oi_new,
-                        [fa_sv_segment_row0, 0],
+                        fa_mix_oi_new,
+                        [fa_mix_segment_row0, 0],
                     )
-                    fa_sv_mi_new_real = pl.slice(
-                        fa_sv_mi_new,
+                    fa_mix_mi_new_real = pl.slice(
+                        fa_mix_mi_new,
                         [1, Q_HEAD_BATCH_FULL],
                         [0, 0],
                     )
-                    fa_sv_li_new_real = pl.slice(
-                        fa_sv_li_new,
+                    fa_mix_li_new_real = pl.slice(
+                        fa_mix_li_new,
                         [1, Q_HEAD_BATCH_FULL],
                         [0, 0],
                     )
-                    fa_sv_ml_new = pl.concat(
-                        fa_sv_mi_new_real, fa_sv_li_new_real,
+                    fa_mix_ml_new = pl.concat(
+                        fa_mix_mi_new_real, fa_mix_li_new_real,
                     )
                     online_partial_ml = pl.assemble(
                         online_partial_ml,
-                        fa_sv_ml_new,
-                        [fa_sv_segment_row, 0],
+                        fa_mix_ml_new,
+                        [fa_mix_segment_row, 0],
                     )
 
 
@@ -1239,7 +1007,7 @@ def attention_full(
     with pl.spmd(
         full_online_softmax_reduce_tasks,
         name_hint="full_online_softmax_reduce",
-        deps=[full_sv_online_tid],
+        deps=[full_attn_mix_tid],
     ) as full_online_softmax_reduce_tid:
         fa_reduce_task = pl.tile.get_block_idx()
         if fa_reduce_task < full_online_softmax_reduce_tasks:
@@ -1304,7 +1072,7 @@ def attention_full(
                 + FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK,
             )
             fa_reduce_acc_row = (
-                fa_reduce_b * MAX_CTX_BLOCKS + fa_reduce_segment0
+                fa_reduce_b * MAX_SEGMENTS + fa_reduce_segment0
             )
             fa_reduce_acc_row0 = fa_reduce_acc_row * Q_HEAD_PAD_FULL
             # The first segment in each group doubles as its accumulator.
@@ -1329,7 +1097,7 @@ def attention_full(
                     [fa_reduce_acc_row, Q_HEAD_BATCH_FULL],
                 )
                 fa_reduce_source_row = (
-                    fa_reduce_b * MAX_CTX_BLOCKS + fa_reduce_segment
+                    fa_reduce_b * MAX_SEGMENTS + fa_reduce_segment
                 )
                 fa_reduce_source_row0 = (
                     fa_reduce_source_row * Q_HEAD_PAD_FULL
@@ -1414,7 +1182,7 @@ def attention_full(
                 + FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
                 - 1
             ) // FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
-            fa_acc_lm_row = fa_b * MAX_CTX_BLOCKS
+            fa_acc_lm_row = fa_b * MAX_SEGMENTS
             fa_acc_row0 = fa_acc_lm_row * Q_HEAD_PAD_FULL
             fa_acc_oi = pl.slice(
                 online_partial,
@@ -1436,7 +1204,7 @@ def attention_full(
                     fa_reduce_group
                     * FULL_ATTN_ONLINE_SOFTMAX_PARTIALS_PER_REDUCE_TASK
                 )
-                fa_group_row = fa_b * MAX_CTX_BLOCKS + fa_group_segment
+                fa_group_row = fa_b * MAX_SEGMENTS + fa_group_segment
                 fa_group_row0 = fa_group_row * Q_HEAD_PAD_FULL
                 fa_group_oi = pl.slice(
                     online_partial,

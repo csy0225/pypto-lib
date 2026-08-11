@@ -17,18 +17,33 @@ _SOURCE = (
 
 
 def test_swa_attention_stages_capture_and_chain_runtime_tasks() -> None:
-    assert "name_hint=\"swa_rope_q\"" in _SOURCE
+    assert 'name_hint="swa_rope_q"' in _SOURCE
     assert ") as swa_rope_q_tid:" in _SOURCE
-    assert "name_hint=\"swa_rope_kv_cache\"" in _SOURCE
+    assert 'name_hint="swa_rope_kv_cache"' in _SOURCE
     assert ") as swa_rope_kv_tid:" in _SOURCE
-    assert "with pl.spmd(\n        swa_active_tasks,\n        name_hint=\"swa_qk_matmul\"" in _SOURCE
     assert (
-        "name_hint=\"swa_qk_matmul\",\n"
+        "with pl.spmd(\n"
+        "        swa_active_tasks,\n"
+        '        name_hint="swa_attn_mix"'
+    ) in _SOURCE
+    assert (
+        'name_hint="swa_attn_mix",\n'
         "        deps=[swa_rope_q_tid, swa_rope_kv_tid],"
     ) in _SOURCE
-    assert ") as swa_qk_tid:" in _SOURCE
-    assert "name_hint=\"swa_softmax\",\n        deps=[swa_qk_tid]," in _SOURCE
-    assert ") as swa_softmax_tid:" in _SOURCE
-    assert "name_hint=\"swa_sv_matmul\",\n        deps=[swa_softmax_tid]," in _SOURCE
-    assert ") as swa_sv_tid:" in _SOURCE
-    assert "name_hint=\"swa_online_softmax\",\n        deps=[swa_sv_tid]," in _SOURCE
+    for old_hint in (
+        "swa_qk_matmul",
+        "swa_softmax",
+        "swa_sv_matmul",
+        "swa_online_softmax",
+    ):
+        assert f'name_hint="{old_hint}"' not in _SOURCE
+    for scratch in (
+        "all_raw_scores",
+        "all_exp_padded",
+        "all_cur_mi",
+        "all_cur_li",
+        "all_oi_tmp",
+    ):
+        assert scratch not in _SOURCE
+    assert "mi_new = pl.maximum(mi, cur_mi)" in _SOURCE
+    assert "ctx = pl.row_expand_div(oi, li)" in _SOURCE

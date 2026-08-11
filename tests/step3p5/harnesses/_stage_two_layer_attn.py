@@ -361,28 +361,13 @@ _ATTENTION_CODEGEN_STAGES = (
         "allow_early_resolve": True,
     },
     {
-        "description": "full QK",
-        "marker": "full_qk_matmul",
-        "bound_prefix": "full_qk_active_tasks__rv_",
-        "bound_is_scalar": True,
-        "producer": "full_qk_tid",
-        "dependency": ("full_rope_q_tid", "full_rope_kv_tid"),
-    },
-    {
-        "description": "full softmax",
-        "marker": "full_softmax",
-        "bound_prefix": "full_softmax_active_tasks__rv_",
-        "bound_is_scalar": True,
-        "producer": "full_softmax_tid",
-        "dependency": "full_qk_tid",
-    },
-    {
-        "description": "full SV",
-        "marker": "full_sv_matmul",
+        "description": "full mixed attention",
+        "marker": "full_attn_mix",
         "bound_prefix": "full_online_softmax_active_tasks__rv_",
         "bound_is_scalar": True,
-        "producer": "full_sv_online_tid",
-        "dependency": "full_softmax_tid",
+        "producer": "full_attn_mix_tid",
+        "dependency": ("full_rope_q_tid", "full_rope_kv_tid"),
+        "allow_early_resolve": True,
     },
     {
         "description": "full reduce",
@@ -390,7 +375,7 @@ _ATTENTION_CODEGEN_STAGES = (
         "bound_prefix": "full_online_softmax_reduce_tasks__rv_",
         "bound_is_scalar": True,
         "producer": "full_online_softmax_reduce_tid",
-        "dependency": "full_sv_online_tid",
+        "dependency": "full_attn_mix_tid",
     },
     {
         "description": "full finalize",
@@ -419,36 +404,13 @@ _ATTENTION_CODEGEN_STAGES = (
         "allow_early_resolve": True,
     },
     {
-        "description": "SWA QK",
-        "marker": "swa_qk_matmul",
-        "bound_prefix": "swa_active_tasks__rv_",
-        "bound_is_scalar": False,
-        "producer": "swa_qk_tid",
-        "dependency": ("swa_rope_q_tid", "swa_rope_kv_tid"),
-    },
-    {
-        "description": "SWA softmax",
-        "marker": "swa_softmax",
-        "bound_prefix": "swa_active_tasks__rv_",
-        "bound_is_scalar": False,
-        "producer": "swa_softmax_tid",
-        "dependency": "swa_qk_tid",
-    },
-    {
-        "description": "SWA SV",
-        "marker": "swa_sv_matmul",
-        "bound_prefix": "swa_active_tasks__rv_",
-        "bound_is_scalar": False,
-        "producer": "swa_sv_tid",
-        "dependency": "swa_softmax_tid",
-    },
-    {
-        "description": "SWA online softmax",
-        "marker": "swa_online_softmax",
+        "description": "SWA mixed attention",
+        "marker": "swa_attn_mix",
         "bound_prefix": "swa_active_tasks__rv_",
         "bound_is_scalar": False,
         "producer": None,
-        "dependency": "swa_sv_tid",
+        "dependency": ("swa_rope_q_tid", "swa_rope_kv_tid"),
+        "allow_early_resolve": True,
     },
 )
 _CODEGEN_STAGE_COMMENT = re.compile(
@@ -579,21 +541,14 @@ def _attention_codegen_contract_errors(source: str) -> list[str]:
     for prefix in ("full", "swa"):
         q_rope_marker = f"{prefix}_rope_q"
         kv_rope_marker = f"{prefix}_rope_kv_cache"
-        qk_marker = f"{prefix}_qk_matmul"
-        sv_marker = (
-            "full_sv_matmul"
-            if prefix == "full"
-            else "swa_sv_matmul"
-        )
+        mix_marker = f"{prefix}_attn_mix"
         q_rope_block = blocks.get(q_rope_marker)
         kv_rope_block = blocks.get(kv_rope_marker)
-        qk_block = blocks.get(qk_marker)
-        sv_block = blocks.get(sv_marker)
+        mix_block = blocks.get(mix_marker)
         if (
             q_rope_block is None
             or kv_rope_block is None
-            or qk_block is None
-            or sv_block is None
+            or mix_block is None
         ):
             continue
         q_rope_writes = re.findall(
@@ -604,13 +559,9 @@ def _attention_codegen_contract_errors(source: str) -> list[str]:
             r"\.add_(?:output|inout)\(\s*(\w+)\s*\);",
             kv_rope_block,
         )
-        qk_inputs = set(re.findall(
+        mix_inputs = set(re.findall(
             r"\.add_input\(\s*(\w+)\s*\);",
-            qk_block,
-        ))
-        sv_inputs = set(re.findall(
-            r"\.add_input\(\s*(\w+)\s*\);",
-            sv_block,
+            mix_block,
         ))
         q_tensors = [
             tensor
@@ -639,11 +590,11 @@ def _attention_codegen_contract_errors(source: str) -> list[str]:
                 re.fullmatch(r"all_q_padded\w*", tensor)
                 for tensor in kv_rope_writes
             )
-            or q_tensors[0] not in qk_inputs
-            or k_tensors[0] not in qk_inputs
-            or v_tensors[0] not in sv_inputs
+            or q_tensors[0] not in mix_inputs
+            or k_tensors[0] not in mix_inputs
+            or v_tensors[0] not in mix_inputs
         ):
-            errors.append(f"{prefix} split RoPE tensor lineage")
+            errors.append(f"{prefix} mixed RoPE tensor lineage")
     return errors
 
 
@@ -651,7 +602,7 @@ def _verify_attention_codegen_contract(build_dir: Path) -> Path:
     candidates = [
         path
         for path in build_dir.rglob("orchestration/chip_orch.cpp")
-        if "full_qk_matmul" in path.read_text(encoding="utf-8")
+        if "full_attn_mix" in path.read_text(encoding="utf-8")
     ]
     if len(candidates) != 1:
         raise RuntimeError(
@@ -3579,23 +3530,18 @@ def main() -> int:
             if case["context_label"] == dfx_ctx
             and case["active_rows"] == dfx_active_rows
         )
-        full_sv_online_logical_tasks = _sv_online_logical_task_count(
+        full_attn_mix_logical_tasks = _logical_task_count(
             dfx_context_lens,
-            online_blocks_per_task=int(task_grains["online_softmax"]),
+            int(task_grains["online_softmax"]),
         )
         expected_logical_blocks = {
             "full_rope_q": dfx_active_rows,
             "full_rope_kv_cache": dfx_active_rows,
-            "full_qk_matmul": _logical_task_count(
-                dfx_context_lens,
-                int(task_grains["qk"]),
-            ),
-            "full_softmax": _logical_task_count(
-                dfx_context_lens,
-                int(task_grains["softmax"]),
-            ),
-            "full_sv_matmul_aic": full_sv_online_logical_tasks,
-            "full_sv_matmul_aiv": full_sv_online_logical_tasks,
+            # Mixed attention owns one logical block on each AIC/AIV lane for
+            # every online-softmax segment.  Keep the resource suffixes so a
+            # missing or mis-sized lane cannot be hidden by family folding.
+            "full_attn_mix_aic": full_attn_mix_logical_tasks,
+            "full_attn_mix_aiv": full_attn_mix_logical_tasks,
             "full_online_softmax_reduce": sum(
                 (
                     (
@@ -3613,10 +3559,10 @@ def main() -> int:
             "full_online_softmax_finalize": dfx_active_rows,
             "swa_rope_q": dfx_active_rows,
             "swa_rope_kv_cache": dfx_active_rows,
-            "swa_qk_matmul": dfx_active_rows,
-            "swa_softmax": dfx_active_rows,
-            "swa_sv_matmul": dfx_active_rows,
-            "swa_online_softmax": dfx_active_rows,
+            # SWA launches one mixed logical block per active row on both
+            # resources; audit the AIC and AIV ownership independently.
+            "swa_attn_mix_aic": dfx_active_rows,
+            "swa_attn_mix_aiv": dfx_active_rows,
             "full_out_proj_matmul_aic": (BATCH // cfg.BATCH_TILE)
             * (
                 (

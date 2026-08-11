@@ -52,42 +52,22 @@ params_t8.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
 params_t8.set_allow_early_resolve(true);
 TaskOutputTensors task_8_outs = rt_submit_aiv_task(9, params_t8);
 PTO2TaskId full_rope_kv_tid = task_8_outs.task_id();
-// Spmd full_qk_matmul_spmd: full_qk_matmul
+// Group full_attn_mix: MixedKernels (AIC + AIV lanes)
 L0TaskArgs params_t10;
 params_t10.add_input(all_q_padded_v1);
 params_t10.add_input(ext_k_cache);
-params_t10.add_scalar(full_qk_active_tasks__rv_v2_inline153);
-params_t10.launch_spec.set_block_num(full_qk_active_tasks__rv_v2_inline153);
+params_t10.add_input(ext_v_cache);
+params_t10.add_scalar(full_online_softmax_active_tasks__rv_v2_inline149);
+params_t10.launch_spec.set_block_num(
+    full_online_softmax_active_tasks__rv_v2_inline149);
+params_t10.set_allow_early_resolve(true);
 PTO2TaskId params_t10_deps[2];
 uint32_t params_t10_deps_count = 0;
 params_t10_deps[params_t10_deps_count++] = full_rope_q_tid;
 params_t10_deps[params_t10_deps_count++] = full_rope_kv_tid;
 params_t10.set_dependencies(params_t10_deps, params_t10_deps_count);
-TaskOutputTensors task_10_outs = rt_submit_aic_task(11, params_t10);
-PTO2TaskId full_qk_tid = task_10_outs.task_id();
-// Spmd full_softmax_spmd: full_softmax
-L0TaskArgs params_t11;
-params_t11.add_scalar(full_softmax_active_tasks__rv_v2_inline119);
-params_t11.launch_spec.set_block_num(
-    full_softmax_active_tasks__rv_v2_inline119);
-PTO2TaskId params_t11_deps[1];
-uint32_t params_t11_deps_count = 0;
-params_t11_deps[params_t11_deps_count++] = full_qk_tid;
-params_t11.set_dependencies(params_t11_deps, params_t11_deps_count);
-TaskOutputTensors task_11_outs = rt_submit_aiv_task(12, params_t11);
-PTO2TaskId full_softmax_tid = task_11_outs.task_id();
-// Group full_sv_matmul: MixedKernels (AIC + AIV lanes)
-L0TaskArgs params_t12;
-params_t12.add_input(ext_v_cache);
-params_t12.add_scalar(full_online_softmax_active_tasks__rv_v2_inline149);
-params_t12.launch_spec.set_block_num(
-    full_online_softmax_active_tasks__rv_v2_inline149);
-PTO2TaskId params_t12_deps[1];
-uint32_t params_t12_deps_count = 0;
-params_t12_deps[params_t12_deps_count++] = full_softmax_tid;
-params_t12.set_dependencies(params_t12_deps, params_t12_deps_count);
-TaskOutputTensors task_12_outs = rt_submit_task(mixed_12, params_t12);
-PTO2TaskId full_sv_online_tid = task_12_outs.task_id();
+TaskOutputTensors task_10_outs = rt_submit_task(mixed_10, params_t10);
+PTO2TaskId full_attn_mix_tid = task_10_outs.task_id();
 // Spmd full_online_softmax_reduce_spmd: full_online_softmax_reduce
 L0TaskArgs params_t13;
 params_t13.add_scalar(
@@ -96,7 +76,7 @@ params_t13.launch_spec.set_block_num(
     full_online_softmax_reduce_tasks__rv_v2_inline117);
 PTO2TaskId params_t13_deps[1];
 uint32_t params_t13_deps_count = 0;
-params_t13_deps[params_t13_deps_count++] = full_sv_online_tid;
+params_t13_deps[params_t13_deps_count++] = full_attn_mix_tid;
 params_t13.set_dependencies(params_t13_deps, params_t13_deps_count);
 TaskOutputTensors task_13_outs = rt_submit_aiv_task(15, params_t13);
 PTO2TaskId full_online_softmax_reduce_tid = task_13_outs.task_id();
@@ -127,45 +107,19 @@ params_t32.launch_spec.set_block_num(active_tokens__rv_v2_inline1);
 params_t32.set_allow_early_resolve(true);
 TaskOutputTensors task_32_outs = rt_submit_aiv_task(36, params_t32);
 PTO2TaskId swa_rope_kv_tid = task_32_outs.task_id();
-// Spmd swa_qk_matmul_spmd: swa_qk_matmul
+// Group swa_attn_mix: MixedKernels (AIC + AIV lanes)
 L0TaskArgs params_t34;
 params_t34.add_input(all_q_padded_swa_v1);
 params_t34.add_input(ext_k_cache_swa);
+params_t34.add_input(ext_v_cache_swa);
 params_t34.launch_spec.set_block_num(swa_active_tasks__rv_v2_inline207);
+params_t34.set_allow_early_resolve(true);
 PTO2TaskId params_t34_deps[2];
 uint32_t params_t34_deps_count = 0;
 params_t34_deps[params_t34_deps_count++] = swa_rope_q_tid;
 params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;
 params_t34.set_dependencies(params_t34_deps, params_t34_deps_count);
-TaskOutputTensors task_34_outs = rt_submit_aic_task(38, params_t34);
-PTO2TaskId swa_qk_tid = task_34_outs.task_id();
-// Spmd swa_softmax_spmd: swa_softmax
-L0TaskArgs params_t35;
-params_t35.launch_spec.set_block_num(swa_active_tasks__rv_v2_inline207);
-PTO2TaskId params_t35_deps[1];
-uint32_t params_t35_deps_count = 0;
-params_t35_deps[params_t35_deps_count++] = swa_qk_tid;
-params_t35.set_dependencies(params_t35_deps, params_t35_deps_count);
-TaskOutputTensors task_35_outs = rt_submit_aiv_task(39, params_t35);
-PTO2TaskId swa_softmax_tid = task_35_outs.task_id();
-// Spmd swa_sv_matmul_spmd: swa_sv_matmul
-L0TaskArgs params_t36;
-params_t36.add_input(ext_v_cache_swa);
-params_t36.launch_spec.set_block_num(swa_active_tasks__rv_v2_inline207);
-PTO2TaskId params_t36_deps[1];
-uint32_t params_t36_deps_count = 0;
-params_t36_deps[params_t36_deps_count++] = swa_softmax_tid;
-params_t36.set_dependencies(params_t36_deps, params_t36_deps_count);
-TaskOutputTensors task_36_outs = rt_submit_aic_task(40, params_t36);
-PTO2TaskId swa_sv_tid = task_36_outs.task_id();
-// Spmd swa_online_softmax_spmd: swa_online_softmax
-L0TaskArgs params_t37;
-params_t37.launch_spec.set_block_num(swa_active_tasks__rv_v2_inline207);
-PTO2TaskId params_t37_deps[1];
-uint32_t params_t37_deps_count = 0;
-params_t37_deps[params_t37_deps_count++] = swa_sv_tid;
-params_t37.set_dependencies(params_t37_deps, params_t37_deps_count);
-TaskOutputTensors task_37_outs = rt_submit_aiv_task(41, params_t37);
+TaskOutputTensors task_34_outs = rt_submit_task(mixed_34, params_t34);
 """
 
 
@@ -177,15 +131,19 @@ def test_attention_codegen_contract_accepts_dynamic_bounds_and_task_chain() -> N
 
 def test_attention_codegen_contract_rejects_stale_bound_and_dependency() -> None:
     source = _valid_attention_codegen_source().replace(
-        "set_block_num(full_qk_active_tasks__rv_v2_inline153)",
-        "set_block_num(0)",
+        "params_t10.launch_spec.set_block_num(\n"
+        "    full_online_softmax_active_tasks__rv_v2_inline149);",
+        "params_t10.launch_spec.set_block_num(stale_full_task_bound);",
     ).replace(
-        "= swa_sv_tid;",
-        "= stale_swa_task;",
+        "params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;",
+        "params_t34_deps[params_t34_deps_count++] = stale_swa_task;",
     )
     errors = _attention_codegen_contract_errors(source)
-    assert "full QK dynamic launch" in errors
-    assert "SWA online softmax dependency from swa_sv_tid" in errors
+    assert "full mixed attention dynamic launch" in errors
+    assert (
+        "SWA mixed attention dependency from "
+        "swa_rope_q_tid, swa_rope_kv_tid"
+    ) in errors
 
 
 def test_attention_codegen_contract_rejects_incomplete_dependency_wiring() -> None:
@@ -195,7 +153,7 @@ def test_attention_codegen_contract_rejects_incomplete_dependency_wiring() -> No
         "",
     )
     assert (
-        "full reduce dependency from full_sv_online_tid"
+        "full reduce dependency from full_attn_mix_tid"
         in _attention_codegen_contract_errors(source)
     )
 
@@ -205,11 +163,13 @@ def test_attention_codegen_contract_rejects_incomplete_dependency_wiring() -> No
     [
         (
             "params_t10_deps[params_t10_deps_count++] = full_rope_q_tid;",
-            "full QK dependency from full_rope_q_tid, full_rope_kv_tid",
+            "full mixed attention dependency from "
+            "full_rope_q_tid, full_rope_kv_tid",
         ),
         (
             "params_t34_deps[params_t34_deps_count++] = swa_rope_kv_tid;",
-            "SWA QK dependency from swa_rope_q_tid, swa_rope_kv_tid",
+            "SWA mixed attention dependency from "
+            "swa_rope_q_tid, swa_rope_kv_tid",
         ),
     ],
 )
@@ -233,6 +193,10 @@ def test_attention_codegen_contract_requires_both_rope_producers(
             "full KV RoPE/cache early-resolve hint",
         ),
         (
+            "params_t10.set_allow_early_resolve(true);",
+            "full mixed attention early-resolve hint",
+        ),
+        (
             "params_t31.set_allow_early_resolve(true);",
             "SWA Q RoPE early-resolve hint",
         ),
@@ -240,9 +204,13 @@ def test_attention_codegen_contract_requires_both_rope_producers(
             "params_t32.set_allow_early_resolve(true);",
             "SWA KV RoPE/cache early-resolve hint",
         ),
+        (
+            "params_t34.set_allow_early_resolve(true);",
+            "SWA mixed attention early-resolve hint",
+        ),
     ],
 )
-def test_attention_codegen_contract_requires_rope_early_resolve(
+def test_attention_codegen_contract_requires_early_resolve(
     needle: str,
     expected_error: str,
 ) -> None:
@@ -250,28 +218,26 @@ def test_attention_codegen_contract_requires_rope_early_resolve(
     assert expected_error in _attention_codegen_contract_errors(source)
 
 
-def test_attention_codegen_contract_checks_every_swa_stage_bound() -> None:
+def test_attention_codegen_contract_checks_swa_mixed_bound() -> None:
     source = _valid_attention_codegen_source().replace(
-        "params_t36.launch_spec.set_block_num("
+        "params_t34.launch_spec.set_block_num("
         "swa_active_tasks__rv_v2_inline207);",
-        "params_t36.launch_spec.set_block_num(1);",
+        "params_t34.launch_spec.set_block_num(1);",
     )
-    errors = _attention_codegen_contract_errors(source)
-    assert "SWA SV dynamic launch" in errors
-    assert "SWA QK dynamic launch" not in errors
-    assert "SWA softmax dynamic launch" not in errors
-    assert "SWA online softmax dynamic launch" not in errors
+    assert _attention_codegen_contract_errors(source) == [
+        "SWA mixed attention dynamic launch",
+    ]
 
 
 def test_attention_codegen_contract_checks_launch_scalar_ssa_identity() -> None:
     source = _valid_attention_codegen_source().replace(
-        "params_t12.add_scalar("
+        "params_t10.add_scalar("
         "full_online_softmax_active_tasks__rv_v2_inline149);",
-        "params_t12.add_scalar("
+        "params_t10.add_scalar("
         "full_online_softmax_active_tasks__rv_v2_inline0);",
     )
     assert (
-        "full SV launch/scalar SSA agreement"
+        "full mixed attention launch/scalar SSA agreement"
         in _attention_codegen_contract_errors(source)
     )
 
@@ -291,8 +257,8 @@ def test_attention_codegen_contract_checks_launch_scalar_ssa_identity() -> None:
         ),
         (
             "full",
-            "params_t12.add_input(ext_v_cache);",
-            "params_t12.add_input(ext_v_cache_v2);",
+            "params_t10.add_input(ext_v_cache);",
+            "params_t10.add_input(ext_v_cache_v2);",
         ),
         (
             "swa",
@@ -306,8 +272,8 @@ def test_attention_codegen_contract_checks_launch_scalar_ssa_identity() -> None:
         ),
         (
             "swa",
-            "params_t36.add_input(ext_v_cache_swa);",
-            "params_t36.add_input(ext_v_cache_swa_v2);",
+            "params_t34.add_input(ext_v_cache_swa);",
+            "params_t34.add_input(ext_v_cache_swa_v2);",
         ),
     ],
 )
@@ -318,10 +284,9 @@ def test_attention_codegen_contract_rejects_rope_cache_lineage_version_mismatch(
 ) -> None:
     source = _valid_attention_codegen_source().replace(needle, replacement)
     assert (
-        f"{prefix} split RoPE tensor lineage"
+        f"{prefix} mixed RoPE tensor lineage"
         in _attention_codegen_contract_errors(source)
     )
-
 
 def _scan_mapping(tasks_per_row: tuple[int, ...]) -> list[tuple[int, int]]:
     mapping = []

@@ -642,53 +642,19 @@ def attention_swa(
                 )
 
 
-    # ----- fa_fused (SWA) — Phase A (2026-06-11): qwen3/32b-style 4-spmd. -----
-    # Mirror of attention_full.py's Phase A rewrite. SWA differs only in:
-    #   * Q_HEAD_BATCH_SWA=12 / Q_HEAD_PAD_SWA=24 / SWA_Q_PAD_ALIGNED=32
-    #     (instead of full's 8/16/16)
-    #   * the block-table range covers the trailing token window.
-    # See docs/step3p5/phases/15-singlerank-npu.md "Phase A route decision".
-    # Localise the module-level WIN_BLOCKS constant: pypto IR's frontend does
-    # not lift bare module globals computed inside the file (only ``from
-    # .config import`` names round-trip through the trace).
-    SWA_WIN_BLOCKS = (SLIDING_WINDOW + BLOCK_SIZE - 1) // BLOCK_SIZE
-    SWA_STORAGE_BLOCKS = SWA_WIN_BLOCKS + 1
-    all_raw_scores = pl.create_tensor(
-        [BATCH * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
-        dtype=pl.FP32,
-    )
-    all_exp_padded = pl.create_tensor(
-        [BATCH * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
-        dtype=pl.BF16,
-    )
-    # mi/li 以 [1, SWA_Q_PAD_ALIGNED] 宽行落盘，避免从 GM 直接 slice
-    # 出 FP32 [N,1] 窄列 tile。Padded heads 只参与中间计算，最终会裁掉。
-    all_cur_mi = pl.create_tensor(
-        [BATCH * SWA_STORAGE_BLOCKS, SWA_Q_PAD_ALIGNED], dtype=pl.FP32,
-    )
-    all_cur_li = pl.create_tensor(
-        [BATCH * SWA_STORAGE_BLOCKS, SWA_Q_PAD_ALIGNED], dtype=pl.FP32,
-    )
-    all_oi_tmp = pl.create_tensor(
-        [BATCH * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED, HEAD_DIM],
-        dtype=pl.FP32,
-    )
-    # Launch exactly one logical task per active row. Keep the launch extent
-    # as a loop-carried SSA value: older codegen can leave a direct
-    # ``active_tokens`` alias unresolved in ``set_block_num`` when this inline
-    # helper is embedded in chip orchestration. A zero-token request must be
-    # handled by the graph-level no-op/reject contract because later
-    # collectives are not valid for that case.
+    # ----- Mixed attention core: QK -> typed mask/softmax -> SV. -----
+    # One task owns every visible KV block for an active row. The 32-row cube
+    # box stays intact across C2V/V2C, while O/M/L remain local to its AIV lane.
     swa_active_tasks = pl.cast(0, pl.INDEX)
     for swa_count_b in pl.range(active_tokens):
         swa_active_tasks = swa_active_tasks + 1
-    # Stage 1: QK matmul (cube). One core per active batch row.
+
     with pl.spmd(
         swa_active_tasks,
-        name_hint="swa_qk_matmul",
+        name_hint="swa_attn_mix",
         deps=[swa_rope_q_tid, swa_rope_kv_tid],
         allow_early_resolve=True,
-    ) as swa_qk_tid:
+    ) as _swa_attn_mix_tid:
         fa_b = pl.tile.get_block_idx()
         if fa_b < active_tokens:
             fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
@@ -699,15 +665,48 @@ def attention_swa(
             ) // BLOCK_SIZE
             fa_ctx_blocks = fa_end_block - fa_first_block
             fa_block_table_base = fa_b * bt_stride
-            q_padded_row = fa_b * SWA_Q_PAD_ALIGNED  # KV_HEADS_LOCAL=1, Q_GROUPS=1
+            q_padded_row = fa_b * SWA_Q_PAD_ALIGNED
             q_padded = pl.slice(
-                all_q_padded, [SWA_Q_PAD_ALIGNED, HEAD_DIM], [q_padded_row, 0],
+                all_q_padded,
+                [SWA_Q_PAD_ALIGNED, HEAD_DIM],
+                [q_padded_row, 0],
+            )
+            oi = pl.full(
+                [SWA_Q_PAD_ALIGNED, HEAD_DIM],
+                dtype=pl.FP32,
+                value=0.0,
+            )
+            mi = pl.reshape(
+                pl.full(
+                    [1, SWA_Q_PAD_ALIGNED],
+                    dtype=pl.FP32,
+                    value=-1.0e20,
+                ),
+                [SWA_Q_PAD_ALIGNED, 1],
+            )
+            li = pl.reshape(
+                pl.full(
+                    [1, SWA_Q_PAD_ALIGNED],
+                    dtype=pl.FP32,
+                    value=0.0,
+                ),
+                [SWA_Q_PAD_ALIGNED, 1],
             )
             for sb in pl.range(fa_ctx_blocks):
+                fa_block = fa_first_block + sb
+                fa_block_token0 = fa_block * BLOCK_SIZE
+                valid_lo = pl.max(
+                    0,
+                    fa_window_start - fa_block_token0,
+                )
+                valid_hi = pl.min(
+                    BLOCK_SIZE,
+                    fa_ctx_len - fa_block_token0,
+                )
                 fa_pbid = pl.cast(
                     pl.tensor.read(
                         block_table,
-                        [fa_block_table_base + fa_first_block + sb],
+                        [fa_block_table_base + fa_block],
                     ),
                     pl.INDEX,
                 )
@@ -720,239 +719,85 @@ def attention_swa(
                 raw_scores = pl.matmul(
                     q_padded, k_tile, b_trans=True, out_dtype=pl.FP32,
                 )
-                scratch_row = (
-                    fa_b * SWA_STORAGE_BLOCKS + sb
-                ) * SWA_Q_PAD_ALIGNED
-                all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [scratch_row, 0])
-
-    # Stage 2: softmax (vec).
-    with pl.spmd(
-        swa_active_tasks,
-        name_hint="swa_softmax",
-        deps=[swa_qk_tid],
-        allow_early_resolve=True,
-    ) as swa_softmax_tid:
-        fa_b = pl.tile.get_block_idx()
-        if fa_b < active_tokens:
-            fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
-            fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)
-            fa_first_block = fa_window_start // BLOCK_SIZE
-            fa_end_block = (
-                fa_ctx_len + BLOCK_SIZE - 1
-            ) // BLOCK_SIZE
-            fa_ctx_blocks = fa_end_block - fa_first_block
-            for sb in pl.range(fa_ctx_blocks):
-                fa_block = fa_first_block + sb
-                fa_block_token0 = fa_block * BLOCK_SIZE
-                valid_lo = pl.max(
-                    0,
-                    fa_window_start - fa_block_token0,
-                )
-                valid_hi = pl.min(
-                    BLOCK_SIZE,
-                    fa_ctx_len - fa_block_token0,
-                )
-                valid_len = valid_hi - valid_lo
-                scratch_row = (
-                    fa_b * SWA_STORAGE_BLOCKS + sb
-                ) * SWA_Q_PAD_ALIGNED
-                raw_scores = pl.slice(
-                    all_raw_scores,
-                    [SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
-                    [scratch_row, 0],
-                )
                 scores = pl.mul(raw_scores, decode_attn_scale)
-                if valid_len < BLOCK_SIZE:
-                    score_cols = pl.arange(
-                        0,
-                        [1, BLOCK_SIZE],
-                        dtype=pl.INT32,
-                    )
-                    zero_i32 = pl.const(0, pl.INT32)
-                    one_i32 = pl.const(1, pl.INT32)
-                    valid_from_i32 = pl.minimum(
-                        pl.maximum(
-                            pl.add(
-                                pl.sub(
-                                    score_cols,
-                                    pl.cast(valid_lo, pl.INT32),
-                                ),
-                                one_i32,
+                score_cols = pl.arange(
+                    0,
+                    [1, BLOCK_SIZE],
+                    dtype=pl.INT32,
+                )
+                zero_i32 = pl.const(0, pl.INT32)
+                one_i32 = pl.const(1, pl.INT32)
+                valid_from_i32 = pl.minimum(
+                    pl.maximum(
+                        pl.add(
+                            pl.sub(
+                                score_cols,
+                                pl.cast(valid_lo, pl.INT32),
                             ),
-                            zero_i32,
+                            one_i32,
                         ),
-                        one_i32,
-                    )
-                    valid_to_i32 = pl.minimum(
-                        pl.maximum(
-                            pl.neg(
-                                pl.sub(
-                                    score_cols,
-                                    pl.cast(valid_hi, pl.INT32),
-                                ),
+                        zero_i32,
+                    ),
+                    one_i32,
+                )
+                valid_to_i32 = pl.minimum(
+                    pl.maximum(
+                        pl.neg(
+                            pl.sub(
+                                score_cols,
+                                pl.cast(valid_hi, pl.INT32),
                             ),
-                            zero_i32,
                         ),
-                        one_i32,
-                    )
-                    valid_mask = pl.cast(
-                        pl.mul(valid_from_i32, valid_to_i32),
-                        target_type=pl.FP32,
-                    )
-                    invalid_bias = pl.mul(
-                        pl.sub(valid_mask, 1.0),
-                        1.0e20,
-                    )
-                    scores = pl.col_expand_add(scores, invalid_bias)
+                        zero_i32,
+                    ),
+                    one_i32,
+                )
+                valid_mask = pl.cast(
+                    pl.mul(valid_from_i32, valid_to_i32),
+                    target_type=pl.FP32,
+                )
+                invalid_bias = pl.mul(
+                    pl.sub(valid_mask, 1.0),
+                    1.0e20,
+                )
+                scores = pl.col_expand_add(scores, invalid_bias)
                 cur_mi = pl.row_max(scores)
                 exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
+                exp_scores_bf16 = pl.cast(
+                    exp_scores, target_type=pl.BF16,
+                )
+                exp_scores_fp32 = pl.cast(
+                    exp_scores_bf16, target_type=pl.FP32,
+                )
                 cur_li = pl.row_sum(exp_scores_fp32)
-                all_exp_padded = pl.assemble(
-                    all_exp_padded, exp_scores_bf16, [scratch_row, 0],
-                )
-                lm_row = fa_b * SWA_STORAGE_BLOCKS + sb
-                all_cur_mi = pl.assemble(
-                    all_cur_mi,
-                    pl.reshape(cur_mi, [1, SWA_Q_PAD_ALIGNED]),
-                    [lm_row, 0],
-                )
-                all_cur_li = pl.assemble(
-                    all_cur_li,
-                    pl.reshape(cur_li, [1, SWA_Q_PAD_ALIGNED]),
-                    [lm_row, 0],
-                )
-
-    # Stage 3: SV matmul (cube). exp_tile uses the full SWA_Q_PAD_ALIGNED row
-    # stride; matmul output's bottom (SWA_Q_PAD_ALIGNED - Q_HEAD_BATCH_SWA)
-    # rows are garbage from un-initialised GM but are never read by Stage 4.
-    with pl.spmd(
-        swa_active_tasks,
-        name_hint="swa_sv_matmul",
-        deps=[swa_softmax_tid],
-        allow_early_resolve=True,
-    ) as swa_sv_tid:
-        fa_b = pl.tile.get_block_idx()
-        if fa_b < active_tokens:
-            fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
-            fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)
-            fa_first_block = fa_window_start // BLOCK_SIZE
-            fa_end_block = (
-                fa_ctx_len + BLOCK_SIZE - 1
-            ) // BLOCK_SIZE
-            fa_ctx_blocks = fa_end_block - fa_first_block
-            fa_block_table_base = fa_b * bt_stride
-            for sb in pl.range(fa_ctx_blocks):
-                fa_pbid = pl.cast(
-                    pl.tensor.read(
-                        block_table,
-                        [fa_block_table_base + fa_first_block + sb],
-                    ),
-                    pl.INDEX,
-                )
-                fa_cache_row = layer_cache_base + fa_pbid * BLOCK_SIZE
                 v_tile = pl.slice(
                     v_cache,
                     [BLOCK_SIZE, HEAD_DIM],
                     [fa_cache_row, 0],
                 )
-                scratch_row = (
-                    fa_b * SWA_STORAGE_BLOCKS + sb
-                ) * SWA_Q_PAD_ALIGNED
-                exp_tile = pl.slice(
-                    all_exp_padded,
-                    [SWA_Q_PAD_ALIGNED, BLOCK_SIZE],
-                    [scratch_row, 0],
+                oi_tmp = pl.matmul(
+                    exp_scores_bf16, v_tile, out_dtype=pl.FP32,
                 )
-                oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
-                all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [scratch_row, 0])
-
-    # Stage 4: online softmax accumulation + final normalisation + attn_out
-    # write. mi/li 从合法宽行读取后 reshape 成 reduction column。
-    # Operations across padded rows produce garbage but are sliced off
-    # before attn_out write (real heads only). valid_shape is omitted on
-    # the stage-4 slices because pypto's frontend rejects re-assigning a
-    # valid_shape-tagged tile back through arithmetic ops that drop the
-    # valid_shape attribute (e.g., `li = pl.add(pl.mul(alpha, li), ...)`).
-    with pl.spmd(
-        swa_active_tasks,
-        name_hint="swa_online_softmax",
-        deps=[swa_sv_tid],
-        allow_early_resolve=True,
-    ) as _swa_online_softmax_tid:
-        fa_b = pl.tile.get_block_idx()
-        if fa_b < active_tokens:
-            fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
-            fa_window_start = pl.max(0, fa_ctx_len - SLIDING_WINDOW)
-            fa_first_block = fa_window_start // BLOCK_SIZE
-            fa_end_block = (
-                fa_ctx_len + BLOCK_SIZE - 1
-            ) // BLOCK_SIZE
-            fa_ctx_blocks = fa_end_block - fa_first_block
-            oi_row0 = (
-                fa_b * SWA_STORAGE_BLOCKS * SWA_Q_PAD_ALIGNED
-            )
-            lm_row0 = fa_b * SWA_STORAGE_BLOCKS
-            oi = pl.slice(
-                all_oi_tmp, [SWA_Q_PAD_ALIGNED, HEAD_DIM], [oi_row0, 0],
-            )
-            mi = pl.reshape(
-                pl.slice(
-                    all_cur_mi, [1, SWA_Q_PAD_ALIGNED], [lm_row0, 0],
-                ),
-                [SWA_Q_PAD_ALIGNED, 1],
-            )
-            li = pl.reshape(
-                pl.slice(
-                    all_cur_li, [1, SWA_Q_PAD_ALIGNED], [lm_row0, 0],
-                ),
-                [SWA_Q_PAD_ALIGNED, 1],
-            )
-            for sb in pl.range(1, fa_ctx_blocks):
-                sb_oi_row = oi_row0 + sb * SWA_Q_PAD_ALIGNED
-                sb_lm_row = lm_row0 + sb
-                # Use _blk-suffixed names to avoid pypto frontend's strict
-                # type-equality check vs stage 2's `cur_mi`/`cur_li` (which
-                # are row_max/row_sum products without valid_shape).
-                oi_partial_blk = pl.slice(
-                    all_oi_tmp, [SWA_Q_PAD_ALIGNED, HEAD_DIM], [sb_oi_row, 0],
-                )
-                cur_mi_blk = pl.reshape(
-                    pl.slice(
-                        all_cur_mi, [1, SWA_Q_PAD_ALIGNED], [sb_lm_row, 0],
-                    ),
-                    [SWA_Q_PAD_ALIGNED, 1],
-                )
-                cur_li_blk = pl.reshape(
-                    pl.slice(
-                        all_cur_li, [1, SWA_Q_PAD_ALIGNED], [sb_lm_row, 0],
-                    ),
-                    [SWA_Q_PAD_ALIGNED, 1],
-                )
-                mi_new = pl.maximum(mi, cur_mi_blk)
+                mi_new = pl.maximum(mi, cur_mi)
                 alpha = pl.exp(pl.sub(mi, mi_new))
-                beta = pl.exp(pl.sub(cur_mi_blk, mi_new))
-                li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li_blk))
+                beta = pl.exp(pl.sub(cur_mi, mi_new))
+                li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
                 oi = pl.add(
                     pl.row_expand_mul(oi, alpha),
-                    pl.row_expand_mul(oi_partial_blk, beta),
+                    pl.row_expand_mul(oi_tmp, beta),
                 )
                 mi = mi_new
+
             ctx = pl.row_expand_div(oi, li)
-            # ctx shape [SWA_Q_PAD_ALIGNED=32, HEAD_DIM] with valid_shape on the
-            # first Q_HEAD_BATCH_SWA=12 rows. Cast to BF16 first (col_byte_size
-            # 32*2=64B, 32B aligned), reshape to row-major flat [1, 32*HEAD_DIM],
-            # then slice to the real Q_HEAD_BATCH_SWA*HEAD_DIM elements before
-            # writing to attn_out (HIDDEN_Q_SWA_LOCAL = 12 * HEAD_DIM = 1536).
             ctx_bf16 = pl.cast(ctx, target_type=pl.BF16)
             ctx_padded_flat = pl.reshape(
                 ctx_bf16, [1, SWA_Q_PAD_ALIGNED * HEAD_DIM],
             )
             ctx_flat_bf16 = pl.slice(
-                ctx_padded_flat, [1, Q_HEAD_BATCH_SWA * HEAD_DIM], [0, 0],
+                ctx_padded_flat,
+                [1, Q_HEAD_BATCH_SWA * HEAD_DIM],
+                [0, 0],
             )
-            # q_base = kvh * Q_PER_KV_SWA == 0 (KV_HEADS_LOCAL=1, kvh=0).
             attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])
 
     # ----- Scope 2.5 — head-wise gate is applied inline in o_proj below. -----

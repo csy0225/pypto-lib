@@ -141,21 +141,19 @@ def test_full_attention_rope_and_kv_writes_use_active_task_grids() -> None:
     assert "full_k_rope_stage = pl.create_tensor" not in fn_source
     assert "full_v_stage = pl.create_tensor" not in fn_source
 
-    qk_call = _spmd_scope(fn, "full_qk_matmul").items[0].context_expr
+    mix_call = _spmd_scope(fn, "full_attn_mix").items[0].context_expr
     assert any(
         keyword.arg == "deps"
         and ast.unparse(keyword.value)
         == "[full_rope_q_tid, full_rope_kv_tid]"
-        for keyword in qk_call.keywords
+        for keyword in mix_call.keywords
     )
 
 
 def test_all_full_attention_request_spmd_stages_use_runtime_bound() -> None:
     fn = _function("attention_full")
     required = {
-        "full_qk_matmul",
-        "full_softmax",
-        "full_sv_matmul",
+        "full_attn_mix",
         "full_online_softmax_reduce",
         "full_online_softmax_finalize",
     }
@@ -207,9 +205,6 @@ def test_all_full_attention_request_spmd_stages_use_runtime_bound() -> None:
             or (
                 isinstance(spmd_call.args[0], ast.Name)
                 and spmd_call.args[0].id in {
-                    "full_qk_active_tasks",
-                    "full_softmax_active_tasks",
-                    "full_sv_active_tasks",
                     "full_online_softmax_active_tasks",
                     "full_online_softmax_reduce_tasks",
                     "full_online_softmax_active_rows",
@@ -246,7 +241,7 @@ def test_standalone_tp_wrapper_forwards_runtime_num_tokens() -> None:
 
 
 def test_full_attention_core_stages_capture_task_ids_and_chain_dependencies() -> None:
-    """Dynamic launch extents and scratch consumers must use captured tasks."""
+    """The mixed producer owns QK/softmax/SV and publishes reduce partials."""
     fn_source = ast.unparse(_function("attention_full"))
     assert (
         "with pl.spmd(active_tokens, name_hint='full_rope_q', "
@@ -259,66 +254,61 @@ def test_full_attention_core_stages_capture_task_ids_and_chain_dependencies() ->
         in fn_source
     )
     assert "as full_rope_kv_tid" in fn_source
-    assert "with pl.spmd(full_qk_active_tasks" in fn_source
+    assert "with pl.spmd(full_online_softmax_active_tasks" in fn_source
+    assert "name_hint='full_attn_mix'" in fn_source
     assert "deps=[full_rope_q_tid, full_rope_kv_tid]" in fn_source
-    assert "as full_qk_tid" in fn_source
-    assert "with pl.spmd(full_softmax_active_tasks" in fn_source
-    assert "deps=[full_qk_tid]" in fn_source
-    assert "as full_softmax_tid" in fn_source
-    assert "deps=[full_softmax_tid]" in fn_source
-
-
-def test_full_online_softmax_writeback_casts_after_flatten() -> None:
-    """Finalize separately so out-proj consumes attn_out, not partial scratch."""
-    fn = _function("attention_full")
-    fn_source = ast.unparse(fn)
-    assert "name_hint='full_sv_matmul'" in fn_source
-    assert "pl.system.syncall(core_type='mix')" not in fn_source
-    assert "pl.split_aiv(2, mode=pl.SplitMode.NONE)" not in fn_source
-    full_sv_spmd = next(
-        node.items[0].context_expr
-        for node in ast.walk(fn)
-        if isinstance(node, ast.With)
-        and len(node.items) == 1
-        and _call_name(node.items[0].context_expr) == "pl.spmd"
-        and any(
-            keyword.arg == "name_hint"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value == "full_sv_matmul"
-            for keyword in node.items[0].context_expr.keywords
-        )
-    )
-    assert all(
-        keyword.arg != "optimizations"
-        for keyword in full_sv_spmd.keywords
-    ), "recurrent M/L state must have one AIV owner, not two split subblocks"
-    assert "name_hint='full_online_softmax_pass_a'" not in fn_source
-    assert "name_hint='full_online_softmax_pass_b'" not in fn_source
-    assert "name_hint='full_online_softmax_pass_c'" not in fn_source
+    assert "as full_attn_mix_tid" in fn_source
     assert "name_hint='full_online_softmax_reduce'" in fn_source
+    assert "deps=[full_attn_mix_tid]" in fn_source
     assert "as full_online_softmax_reduce_tid" in fn_source
     assert "name_hint='full_online_softmax_finalize'" in fn_source
-    assert "deps=[full_sv_online_tid]" in fn_source
     assert "deps=[full_online_softmax_reduce_tid]" in fn_source
+
+def test_full_online_softmax_writeback_casts_after_flatten() -> None:
+    """Mixed attention keeps one partial owner and a separate final reduce."""
+    fn = _function("attention_full")
+    fn_source = ast.unparse(fn)
+    assert "name_hint='full_attn_mix'" in fn_source
+    assert "name_hint='full_qk_matmul'" not in fn_source
+    assert "name_hint='full_softmax'" not in fn_source
+    assert "name_hint='full_sv_matmul'" not in fn_source
+    assert "pl.system.syncall(core_type='mix')" not in fn_source
+    mix_spmd = _spmd_scope(fn, "full_attn_mix").items[0].context_expr
+    assert all(
+        keyword.arg != "optimizations"
+        for keyword in mix_spmd.keywords
+    ), "segment recurrence must have one AIV owner"
+    assert "fa_mix_raw_scores = pl.matmul(" in fn_source
+    assert "fa_mix_scores = pl.col_expand_add(" in fn_source
+    assert "fa_mix_cur_mi = pl.row_max(fa_mix_scores)" in fn_source
+    assert "fa_mix_exp_bf16 = pl.cast(" in fn_source
+    assert "fa_mix_cur_li = pl.row_sum(fa_mix_exp_fp32)" in fn_source
+    assert "fa_mix_oi = pl.matmul(" in fn_source
+    assert "all_raw_scores" not in fn_source
+    assert "all_exp_padded" not in fn_source
     assert (
-        "online_partial_ml = pl.create_tensor([BATCH * MAX_CTX_BLOCKS, "
+        "MAX_SEGMENTS = (MAX_CTX_BLOCKS + "
+        "FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK - 1) // "
+        "FULL_ATTN_ONLINE_SOFTMAX_BLOCKS_PER_TASK"
+    ) in fn_source
+    assert (
+        "online_partial = pl.create_tensor([BATCH * MAX_SEGMENTS * "
+        "Q_HEAD_PAD_FULL, HEAD_DIM], dtype=pl.FP32)"
+    ) in fn_source
+    assert (
+        "fa_mix_segment_row = fa_mix_b * MAX_SEGMENTS + "
+        "fa_mix_task_in_b"
+    ) in fn_source
+    assert (
+        "online_partial_ml = pl.create_tensor([BATCH * MAX_SEGMENTS, "
         "2 * Q_HEAD_BATCH_FULL], dtype=pl.FP32)"
         in fn_source
     )
-    assert "online_partial_mi" not in fn_source
-    assert "online_partial_li" not in fn_source
-    assert (
-        "fa_sm_exp_zero_heads = pl.full([Q_HEAD_PAD_FULL - "
-        "Q_HEAD_BATCH_FULL, BLOCK_SIZE], dtype=pl.BF16, value=0.0)"
-        in fn_source
-    )
-    assert (
-        "all_exp_padded = pl.assemble(all_exp_padded, "
-        "fa_sm_exp_zero_heads, [fa_sm_scratch_row + "
-        "Q_HEAD_BATCH_FULL, 0])"
-        in fn_source
-    )
-    assert "fa_sv_ml = pl.concat(fa_sv_mi_real, fa_sv_li_real)" in fn_source
+    assert "fa_mix_ml = pl.concat(fa_mix_mi_real, fa_mix_li_real)" in fn_source
+    assert "name_hint='full_online_softmax_reduce'" in fn_source
+    assert "deps=[full_attn_mix_tid]" in fn_source
+    assert "name_hint='full_online_softmax_finalize'" in fn_source
+    assert "deps=[full_online_softmax_reduce_tid]" in fn_source
     assert (
         "fa_acc_ml_new_row = pl.concat(fa_acc_mi_new_row, "
         "fa_acc_li_new_row)"
@@ -333,8 +323,6 @@ def test_full_online_softmax_writeback_casts_after_flatten() -> None:
         in fn_source
     )
     assert "attn_out = pl.assemble(attn_out, ctx_flat_bf16, [fa_b, 0])" in fn_source
-    assert "ctx_bf16 = pl.cast(ctx, target_type=pl.BF16)" not in fn_source
-
 
 def test_full_attention_task_profiles_are_explicit_and_portable_by_default() -> None:
     """A2A3 tuning must not silently become a cross-architecture default."""
@@ -402,61 +390,48 @@ def test_full_attention_task_profiles_are_explicit_and_portable_by_default() -> 
         assert env_name in config_source
 
 
-def test_full_qk_uniform_rows_use_task_major_constant_work_mapping() -> None:
-    """Uniform rows avoid scans and queue full groups before row tails."""
+def test_full_mixed_uniform_rows_use_task_major_constant_work_mapping() -> None:
+    """Uniform rows map mixed segment tasks without orchestration scans."""
     fn_source = ast.unparse(_function("attention_full"))
     assert (
-        "full_qk_uniform_tasks_per_row = pl.cast(0, pl.INDEX)"
+        "full_online_uniform_tasks_per_row = pl.cast(0, pl.INDEX)"
         in fn_source
     )
     assert (
-        "full_qk_tasks_uniform = pl.cast(FULL_ATTN_QK_UNIFORM_O1, "
-        "pl.INDEX)"
-        in fn_source
-    )
-    assert "+ 1 - FULL_ATTN_QK_UNIFORM_O1" not in fn_source
-    assert (
-        "fa_count_qk_tasks != full_qk_uniform_tasks_per_row"
-        in fn_source
-    )
-    assert "if active_tokens != 1:" in fn_source
-    assert (
-        "fa_qk_task_in_b = fa_task // active_tokens"
+        "full_online_tasks_uniform = pl.cast("
+        "FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1, pl.INDEX)"
         in fn_source
     )
     assert (
-        "fa_qk_b = fa_task - fa_qk_task_in_b * active_tokens"
+        "fa_count_online_tasks != full_online_uniform_tasks_per_row"
         in fn_source
     )
-    assert "fa_task // full_qk_uniform_tasks_per_row" not in fn_source
-    assert "for fa_qk_scan_b in pl.range(active_tokens):" in fn_source
+    assert "if active_tokens == 1:" in fn_source
+    assert "fa_mix_task_in_b = fa_task // active_tokens" in fn_source
+    assert (
+        "fa_mix_b = fa_task - fa_mix_task_in_b * active_tokens"
+        in fn_source
+    )
+    assert "for fa_mix_scan_b in pl.range(active_tokens):" in fn_source
+    assert (
+        "fa_mix_segment_row = fa_mix_b * MAX_SEGMENTS + "
+        "fa_mix_task_in_b"
+        in fn_source
+    )
 
-
-def test_every_uniform_o1_mapping_has_an_independent_compile_time_guard() -> None:
+def test_mixed_and_reduce_uniform_mappings_have_compile_time_guards() -> None:
     fn_source = ast.unparse(_function("attention_full"))
     for guard in (
-        "FULL_ATTN_QK_UNIFORM_O1",
-        "FULL_ATTN_SOFTMAX_UNIFORM_O1",
         "FULL_ATTN_ONLINE_SOFTMAX_UNIFORM_O1",
         "FULL_ATTN_ONLINE_SOFTMAX_REDUCE_UNIFORM_O1",
     ):
         assert f"pl.cast({guard}, pl.INDEX)" in fn_source
         assert f"- {guard}" not in fn_source
-    assert "full_softmax_uniform_tasks_per_row" in fn_source
     assert "full_online_uniform_tasks_per_row" in fn_source
     assert "full_online_reduce_uniform_tasks_per_row" in fn_source
     for task, local_task, row in (
-        ("fa_task", "fa_qk_task_in_b", "fa_qk_b"),
-        ("fa_task", "fa_sm_task_in_b", "fa_sm_b"),
-        ("fa_task", "fa_sv_task_in_b", "fa_sv_b"),
-        (
-            "fa_reduce_task",
-            "fa_reduce_task_in_b",
-            "fa_reduce_b",
-        ),
+        ("fa_task", "fa_mix_task_in_b", "fa_mix_b"),
+        ("fa_reduce_task", "fa_reduce_task_in_b", "fa_reduce_b"),
     ):
         assert f"{local_task} = {task} // active_tokens" in fn_source
-        assert (
-            f"{row} = {task} - {local_task} * active_tokens"
-            in fn_source
-        )
+        assert f"{row} = {task} - {local_task} * active_tokens" in fn_source

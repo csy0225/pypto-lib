@@ -3991,18 +3991,25 @@ class WholeDecodeStep3p5:
         next_hidden_out: pl.Out[pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]],
         num_tokens_per_owner: pl.Tensor[[NUM_TOKENS_RUNTIME], pl.INT32],
     ):
-        dense_attn_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
+        # K8: control (signal / arrived) buffers are declared first so that
+        # they form ONE contiguous window prefix.  The reset path can then
+        # restore them with a single blocking memset_all instead of one per
+        # buffer -- broadcast count, not bytes, dominates that path.
         dense_attn_signal_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
-        dense_mlp_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
         dense_mlp_signal_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * COMM_CONTROL_SIGNAL_BYTES)
+        moe_attn_signal_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
+        moe_meta_arrived_stack_buf = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
+        moe_data_arrived_stack_buf = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
+        moe_sh_signal_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
+        moe_combine_arrived_stack_buf = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
+        dense_attn_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
+        dense_mlp_tmp_stack_buf = pld.alloc_window_buffer(NUM_DENSE_LAYERS * BATCH * HIDDEN * 2)
         # MoE attention/shared TP scratch remains per-layer. EP
         # dispatch/combine windows are a single epoch-protected set.
         moe_attn_tmp_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * BATCH * HIDDEN * 2)
-        moe_attn_signal_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
         moe_recv_meta_stack_buf = pld.alloc_window_buffer(
             n_ranks * n_local_experts_pad * 4
         )
-        moe_meta_arrived_stack_buf = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
         moe_recv_x_stack_buf = pld.alloc_window_buffer(dispatch_lane_rows * HIDDEN)
         moe_recv_aux_stack_buf = pld.alloc_window_buffer(
             dispatch_lane_rows * dispatch_aux_pad * 4
@@ -4010,10 +4017,7 @@ class WholeDecodeStep3p5:
         moe_recv_route_stack_buf = pld.alloc_window_buffer(
             dispatch_lane_rows * idx_pad * 4
         )
-        moe_data_arrived_stack_buf = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
         moe_sh_tmp_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * BATCH * HIDDEN * 2)
-        moe_sh_signal_stack_buf = pld.alloc_window_buffer(NUM_MOE_LAYERS_TOTAL * COMM_CONTROL_SIGNAL_BYTES)
-        moe_combine_arrived_stack_buf = pld.alloc_window_buffer(COMM_CONTROL_SIGNAL_BYTES)
         moe_routed_y_buf_stack_buf = pld.alloc_window_buffer(n_routes_per_rank * HIDDEN * 2)
         for r in pl.range(pld.world_size()):
             self.whole_chip_orch(

@@ -304,6 +304,10 @@ def attention_swa(
     for rms_spmd_idx in pl.spmd(
         BATCH // SWA_RMSNORM_ROWS_PER_TASK,
         name_hint="swa_rmsnorm_zc",
+        # Pre-stage the matrix-core consumers while this AIV producer runs.
+        # They remain completion-gated, so this hides scheduler dispatch latency
+        # without relaxing the normed_all data dependency.
+        allow_early_resolve=True,
     ):
         rms_b0 = rms_spmd_idx * SWA_RMSNORM_ROWS_PER_TASK
         # Load every row assigned to this logical task once. Reinterpret

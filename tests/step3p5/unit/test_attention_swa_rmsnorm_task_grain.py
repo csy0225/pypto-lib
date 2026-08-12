@@ -116,6 +116,13 @@ def test_swa_rmsnorm_uses_workload_derived_logical_tasks() -> None:
     assert isinstance(task_count.right, ast.Name)
     assert task_count.right.id == "SWA_RMSNORM_ROWS_PER_TASK"
     assert all(keyword.arg != "optimizations" for keyword in matches[0].keywords)
+    early_resolve = next(
+        keyword.value
+        for keyword in matches[0].keywords
+        if keyword.arg == "allow_early_resolve"
+    )
+    assert isinstance(early_resolve, ast.Constant)
+    assert early_resolve.value is True
     assert "rms_b0 = rms_spmd_idx * SWA_RMSNORM_ROWS_PER_TASK" in _RMS_SCOPE
 
 

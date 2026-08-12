@@ -730,35 +730,44 @@ def test_tp_all_reduce_selects_smallmesh_and_keeps_push_gather_fallback() -> Non
     source, tree = _parse(_CANONICAL)
     method = _method(tree, "tp_all_reduce")
     body = _segment(source, method)
+    normalized = ast.unparse(method)
     assert [arg.arg for arg in method.args.args][-2:] == [
         "active_rows_i32",
         "my_rank",
     ]
     assert "if active_rows == 1:" in body
-    assert body.count("pld.tensor.put(") == 2
+    assert body.count("pld.tensor.put(") == 6
     assert "peer=my_rank" in body
     assert "shape=[1, HIDDEN]" in body
     assert "chunk_rows=1" in body
+    for rows in (2, 4, 8, 16):
+        assert f"active_rows <= {rows}" in body
+        assert f"shape=[{rows}, HIDDEN]" in body
+        assert f"chunk_rows={rows}" in body
     assert "for dst in pl.range(group_size):" in body
     assert "pld.tile.remote_store(" in body
     assert "for ar_b0 in pl.range(0, BATCH, BATCH_TILE):" in body
-    assert "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)" in body
+    assert (
+        "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)"
+        in normalized
+    )
     assert "pl.store(reduced_tile, [ar_b0, owned_base], local)" not in body
     assert "chunk_rows=BATCH_TILE" in body
     assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
-    assert "shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]" in body
-    assert "ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)" in body
+    assert "ar_copy_tiles = (" in body
+    assert "(BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)" in body
     for expected in (1, 2, 3):
         assert f"expected={expected}" in body
 
 
-def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
+def test_tp_all_reduce_uses_only_static_bucket_transfers() -> None:
     source, tree = _parse(_CANONICAL)
     method = _method(tree, "tp_all_reduce")
     body = _segment(source, method)
 
     assert "active_rows = pl.cast(active_rows_i32, pl.INDEX)" in body
     assert "if active_rows > BATCH:" in body
+    assert "if active_rows < 1:" in body
     assert "active_rows = pl.cast(BATCH, pl.INDEX)" in body
     assert "pl.set_validshape(" not in body
     assert "valid_shapes=" not in body
@@ -776,13 +785,14 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
     assert "TP_ALL_REDUCE_OWNED_CHUNK = HIDDEN // TP_WORLD_SIZE" in source
     assert "owned_base = my_rank * TP_ALL_REDUCE_OWNED_CHUNK" in fallback_source
     assert "reduced_tile = pl.cast(acc, target_type=pl.BF16)" in fallback_source
-    assert "shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]" in body
-    assert "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)" in body
+    assert (
+        "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)"
+        in fallback_source
+    )
     assert "[BATCH_TILE, ar_chunk]" in fallback_source
 
-    # Both branches retain fully static transfer shapes. The selector scalar is
-    # used only to choose the 1-row one-shot mesh; the safety fallback transfers
-    # the complete capacity exactly as the baseline implementation did.
+    # Every selected transfer extent is a literal static bucket. Runtime active
+    # rows only select a branch; they never enter a tile or remote shape.
     put_calls = [
         call
         for call in ast.walk(method)
@@ -790,14 +800,20 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "put"
     ]
-    assert len(put_calls) == 2
+    assert len(put_calls) == 6
     put_shapes = {
         ast.unparse(keyword.value)
         for call in put_calls
         for keyword in call.keywords
         if keyword.arg == "shape"
     }
-    assert put_shapes == {"[1, HIDDEN]"}
+    assert put_shapes == {
+        "[1, HIDDEN]",
+        "[2, HIDDEN]",
+        "[4, HIDDEN]",
+        "[8, HIDDEN]",
+        "[16, HIDDEN]",
+    }
     assert any(
         "shape" not in {keyword.arg for keyword in call.keywords}
         for call in put_calls
@@ -810,7 +826,7 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "remote_load"
     ]
-    assert len(remote_loads) == 2
+    assert len(remote_loads) == 6
     remote_shapes = {
         ast.unparse(keyword.value)
         for call in remote_loads
@@ -819,8 +835,32 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
     }
     assert remote_shapes == {
         "[1, HIDDEN]",
+        "[2, TP_ALL_REDUCE_OWNED_CHUNK]",
+        "[4, TP_ALL_REDUCE_OWNED_CHUNK]",
+        "[8, TP_ALL_REDUCE_OWNED_CHUNK]",
+        "[16, TP_ALL_REDUCE_OWNED_CHUNK]",
         "[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]",
     }
+    all_static_shapes = put_shapes | remote_shapes
+    assert all(
+        "active_rows" not in shape and "bucket_rows" not in shape
+        for shape in all_static_shapes
+    )
+
+    local_load_shapes = {
+        ast.unparse(keyword.value)
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "load"
+        for keyword in call.keywords
+        if keyword.arg == "shape"
+    }
+    # pl.load carries shape positionally; guard the final-copy buckets in the
+    # normalized fallback source instead.
+    assert not local_load_shapes
+    for rows in (2, 4, 8, 16):
+        assert f"[{rows}, ar_chunk]" in fallback_source
 
 
 def test_tp_all_reduce_smallmesh_keeps_peer_order_and_two_wave_lifetime() -> None:
@@ -854,10 +894,32 @@ def test_tp_all_reduce_keeps_reduce_scatter_accumulate_serial() -> None:
     # loop kind is not consumed here), and the onephase_par microbenchmark
     # measured parallel re-reduction as slower.
     source, tree = _parse(_CANONICAL)
-    body = _segment(source, _method(tree, "tp_all_reduce"))
+    method = _method(tree, "tp_all_reduce")
+    body = _segment(source, method)
+    normalized = ast.unparse(method)
     assert "for peer in pl.range(group_size):" in body
-    assert "acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)" in body
-    assert body.count("reduced_tile = pl.cast(acc, target_type=pl.BF16)") == 1
+    for suffix in ("2", "4", "8", "16"):
+        assert (
+            f"acc_{suffix} = pl.mul("
+            f"pl.cast(own_tile_{suffix}, target_type=pl.FP32), 0.0)"
+            in normalized
+        )
+    assert (
+        "acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)"
+        in normalized
+    )
+    reduced_casts = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id.startswith("reduced_tile")
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "cast"
+    ]
+    assert len(reduced_casts) == 5
     assert "pl.set_validshape(" not in body
     assert "pl.parallel(group_size)" not in body
 

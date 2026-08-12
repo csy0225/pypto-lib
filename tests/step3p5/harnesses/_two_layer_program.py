@@ -121,6 +121,10 @@ class TwoLayerAttnPerf:
         active_rows = pl.cast(active_rows_i32, pl.INDEX)
         if active_rows > BATCH:
             active_rows = pl.cast(BATCH, pl.INDEX)
+        if active_rows < 1:
+            # Preserve the legacy full-capacity fallback for defensive
+            # out-of-contract zero/negative row counts.
+            active_rows = pl.cast(BATCH, pl.INDEX)
 
         # Match HCCL's small-message selector: a single active BF16 row is
         # only 8 KiB, so a one-shot full-width mesh has fewer remote
@@ -200,14 +204,64 @@ class TwoLayerAttnPerf:
                         expected=2, cmp=pld.WaitCmp.Ge,
                     )
         else:
-            # Self-target TPUT drains before the following notify (PTOAS#872).
-            pld.tensor.put(
-                dst=tmp_window,
-                peer=my_rank,
-                src=local,
-                chunk_rows=BATCH_TILE,
-                chunk_cols=TP_ALL_REDUCE_CHUNK,
-            )
+            # Runtime extents are not legal tensor shapes in the pinned
+            # compiler. Round active rows up to a rank-uniform static bucket
+            # instead. Rows are reduced independently, so a rounded inactive
+            # tail cannot affect the active prefix consumed downstream.
+            if active_rows <= 2:
+                pld.tensor.put(
+                    dst=tmp_window,
+                    peer=my_rank,
+                    src=local,
+                    dst_offsets=[0, 0],
+                    src_offsets=[0, 0],
+                    shape=[2, HIDDEN],
+                    chunk_rows=2,
+                    chunk_cols=TP_ALL_REDUCE_CHUNK,
+                )
+            elif active_rows <= 4:
+                pld.tensor.put(
+                    dst=tmp_window,
+                    peer=my_rank,
+                    src=local,
+                    dst_offsets=[0, 0],
+                    src_offsets=[0, 0],
+                    shape=[4, HIDDEN],
+                    chunk_rows=4,
+                    chunk_cols=TP_ALL_REDUCE_CHUNK,
+                )
+            elif active_rows <= 8:
+                pld.tensor.put(
+                    dst=tmp_window,
+                    peer=my_rank,
+                    src=local,
+                    dst_offsets=[0, 0],
+                    src_offsets=[0, 0],
+                    shape=[8, HIDDEN],
+                    chunk_rows=8,
+                    chunk_cols=TP_ALL_REDUCE_CHUNK,
+                )
+            elif active_rows <= 16:
+                pld.tensor.put(
+                    dst=tmp_window,
+                    peer=my_rank,
+                    src=local,
+                    dst_offsets=[0, 0],
+                    src_offsets=[0, 0],
+                    shape=[16, HIDDEN],
+                    chunk_rows=16,
+                    chunk_cols=TP_ALL_REDUCE_CHUNK,
+                )
+            else:
+                # Configurations with capacity above 16 retain the original
+                # complete-capacity fallback.
+                pld.tensor.put(
+                    dst=tmp_window,
+                    peer=my_rank,
+                    src=local,
+                    chunk_rows=BATCH_TILE,
+                    chunk_cols=TP_ALL_REDUCE_CHUNK,
+                )
 
             # Wave 1 publishes all source partials.
             for peer in pl.range(group_size):
@@ -228,43 +282,205 @@ class TwoLayerAttnPerf:
             # canonical peer order 0..N-1, one FP32 accumulator, and one final
             # BF16 cast to retain the numerical contract of the pull mesh.
             owned_base = my_rank * TP_ALL_REDUCE_OWNED_CHUNK
-            for ar_b0 in pl.range(0, BATCH, BATCH_TILE):
-                own_tile = pl.load(
+            if active_rows <= 2:
+                own_tile_2 = pl.load(
                     tmp_window,
-                    [ar_b0, owned_base],
-                    [BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK],
+                    [0, owned_base],
+                    [2, TP_ALL_REDUCE_OWNED_CHUNK],
                 )
-                acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
+                acc_2 = pl.mul(
+                    pl.cast(own_tile_2, target_type=pl.FP32),
+                    0.0,
+                )
                 for peer in pl.range(group_size):
                     if peer == my_rank:
-                        acc = pl.add(
-                            acc,
-                            pl.cast(own_tile, target_type=pl.FP32),
+                        acc_2 = pl.add(
+                            acc_2,
+                            pl.cast(own_tile_2, target_type=pl.FP32),
                         )
                     else:
-                        remote_tile = pld.tile.remote_load(
+                        remote_tile_2 = pld.tile.remote_load(
                             tmp_window,
                             peer=peer,
-                            offsets=[ar_b0, owned_base],
-                            shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK],
+                            offsets=[0, owned_base],
+                            shape=[2, TP_ALL_REDUCE_OWNED_CHUNK],
                         )
-                        acc = pl.add(
-                            acc,
-                            pl.cast(remote_tile, target_type=pl.FP32),
+                        acc_2 = pl.add(
+                            acc_2,
+                            pl.cast(remote_tile_2, target_type=pl.FP32),
                         )
-                reduced_tile = pl.cast(acc, target_type=pl.BF16)
+                reduced_tile_2 = pl.cast(acc_2, target_type=pl.BF16)
 
                 # Publish the write-disjoint reduced shard with the existing push
                 # path. Batch tiling changes only the transfer tile, not ownership.
-                pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)
+                pl.store(reduced_tile_2, [0, owned_base], tmp_window)
                 for dst in pl.range(group_size):
                     if dst != my_rank:
                         pld.tile.remote_store(
-                            reduced_tile,
+                            reduced_tile_2,
                             target=tmp_window,
                             peer=dst,
-                            offsets=[ar_b0, owned_base],
+                            offsets=[0, owned_base],
                         )
+            elif active_rows <= 4:
+                own_tile_4 = pl.load(
+                    tmp_window,
+                    [0, owned_base],
+                    [4, TP_ALL_REDUCE_OWNED_CHUNK],
+                )
+                acc_4 = pl.mul(
+                    pl.cast(own_tile_4, target_type=pl.FP32),
+                    0.0,
+                )
+                for peer in pl.range(group_size):
+                    if peer == my_rank:
+                        acc_4 = pl.add(
+                            acc_4,
+                            pl.cast(own_tile_4, target_type=pl.FP32),
+                        )
+                    else:
+                        remote_tile_4 = pld.tile.remote_load(
+                            tmp_window,
+                            peer=peer,
+                            offsets=[0, owned_base],
+                            shape=[4, TP_ALL_REDUCE_OWNED_CHUNK],
+                        )
+                        acc_4 = pl.add(
+                            acc_4,
+                            pl.cast(remote_tile_4, target_type=pl.FP32),
+                        )
+                reduced_tile_4 = pl.cast(acc_4, target_type=pl.BF16)
+                pl.store(reduced_tile_4, [0, owned_base], tmp_window)
+                for dst in pl.range(group_size):
+                    if dst != my_rank:
+                        pld.tile.remote_store(
+                            reduced_tile_4,
+                            target=tmp_window,
+                            peer=dst,
+                            offsets=[0, owned_base],
+                        )
+            elif active_rows <= 8:
+                own_tile_8 = pl.load(
+                    tmp_window,
+                    [0, owned_base],
+                    [8, TP_ALL_REDUCE_OWNED_CHUNK],
+                )
+                acc_8 = pl.mul(
+                    pl.cast(own_tile_8, target_type=pl.FP32),
+                    0.0,
+                )
+                for peer in pl.range(group_size):
+                    if peer == my_rank:
+                        acc_8 = pl.add(
+                            acc_8,
+                            pl.cast(own_tile_8, target_type=pl.FP32),
+                        )
+                    else:
+                        remote_tile_8 = pld.tile.remote_load(
+                            tmp_window,
+                            peer=peer,
+                            offsets=[0, owned_base],
+                            shape=[8, TP_ALL_REDUCE_OWNED_CHUNK],
+                        )
+                        acc_8 = pl.add(
+                            acc_8,
+                            pl.cast(remote_tile_8, target_type=pl.FP32),
+                        )
+                reduced_tile_8 = pl.cast(acc_8, target_type=pl.BF16)
+                pl.store(reduced_tile_8, [0, owned_base], tmp_window)
+                for dst in pl.range(group_size):
+                    if dst != my_rank:
+                        pld.tile.remote_store(
+                            reduced_tile_8,
+                            target=tmp_window,
+                            peer=dst,
+                            offsets=[0, owned_base],
+                        )
+            elif active_rows <= 16:
+                own_tile_16 = pl.load(
+                    tmp_window,
+                    [0, owned_base],
+                    [16, TP_ALL_REDUCE_OWNED_CHUNK],
+                )
+                acc_16 = pl.mul(
+                    pl.cast(own_tile_16, target_type=pl.FP32),
+                    0.0,
+                )
+                for peer in pl.range(group_size):
+                    if peer == my_rank:
+                        acc_16 = pl.add(
+                            acc_16,
+                            pl.cast(own_tile_16, target_type=pl.FP32),
+                        )
+                    else:
+                        remote_tile_16 = pld.tile.remote_load(
+                            tmp_window,
+                            peer=peer,
+                            offsets=[0, owned_base],
+                            shape=[16, TP_ALL_REDUCE_OWNED_CHUNK],
+                        )
+                        acc_16 = pl.add(
+                            acc_16,
+                            pl.cast(remote_tile_16, target_type=pl.FP32),
+                        )
+                reduced_tile_16 = pl.cast(
+                    acc_16,
+                    target_type=pl.BF16,
+                )
+                pl.store(reduced_tile_16, [0, owned_base], tmp_window)
+                for dst in pl.range(group_size):
+                    if dst != my_rank:
+                        pld.tile.remote_store(
+                            reduced_tile_16,
+                            target=tmp_window,
+                            peer=dst,
+                            offsets=[0, owned_base],
+                        )
+            else:
+                for ar_b0 in pl.range(0, BATCH, BATCH_TILE):
+                    own_tile = pl.load(
+                        tmp_window,
+                        [ar_b0, owned_base],
+                        [BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK],
+                    )
+                    acc = pl.mul(
+                        pl.cast(own_tile, target_type=pl.FP32),
+                        0.0,
+                    )
+                    for peer in pl.range(group_size):
+                        if peer == my_rank:
+                            acc = pl.add(
+                                acc,
+                                pl.cast(own_tile, target_type=pl.FP32),
+                            )
+                        else:
+                            remote_tile = pld.tile.remote_load(
+                                tmp_window,
+                                peer=peer,
+                                offsets=[ar_b0, owned_base],
+                                shape=[
+                                    BATCH_TILE,
+                                    TP_ALL_REDUCE_OWNED_CHUNK,
+                                ],
+                            )
+                            acc = pl.add(
+                                acc,
+                                pl.cast(remote_tile, target_type=pl.FP32),
+                            )
+                    reduced_tile = pl.cast(acc, target_type=pl.BF16)
+                    pl.store(
+                        reduced_tile,
+                        [ar_b0, owned_base],
+                        tmp_window,
+                    )
+                    for dst in pl.range(group_size):
+                        if dst != my_rank:
+                            pld.tile.remote_store(
+                                reduced_tile,
+                                target=tmp_window,
+                                peer=dst,
+                                offsets=[ar_b0, owned_base],
+                            )
 
             # Wave 2 publishes all pushed result chunks.
             for peer in pl.range(group_size):
@@ -281,19 +497,54 @@ class TwoLayerAttnPerf:
                         expected=2, cmp=pld.WaitCmp.Ge,
                     )
 
-            # The completed temporary window contains the complete reduced vector.
-            ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)
-            for ar_copy in pl.parallel(ar_copy_tiles):
-                ar_b_idx = ar_copy // (HIDDEN // ar_chunk)
-                ar_k_idx = ar_copy % (HIDDEN // ar_chunk)
-                ar_b0 = ar_b_idx * BATCH_TILE
-                k0 = ar_k_idx * ar_chunk
-                result_tile = pl.load(
-                    tmp_window,
-                    [ar_b0, k0],
-                    [BATCH_TILE, ar_chunk],
+            # Copy only the selected static bucket back to the local result.
+            if active_rows <= 2:
+                for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+                    result_tile_2 = pl.load(
+                        tmp_window,
+                        [0, k0],
+                        [2, ar_chunk],
+                    )
+                    pl.store(result_tile_2, [0, k0], local)
+            elif active_rows <= 4:
+                for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+                    result_tile_4 = pl.load(
+                        tmp_window,
+                        [0, k0],
+                        [4, ar_chunk],
+                    )
+                    pl.store(result_tile_4, [0, k0], local)
+            elif active_rows <= 8:
+                for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+                    result_tile_8 = pl.load(
+                        tmp_window,
+                        [0, k0],
+                        [8, ar_chunk],
+                    )
+                    pl.store(result_tile_8, [0, k0], local)
+            elif active_rows <= 16:
+                for k0 in pl.parallel(0, HIDDEN, ar_chunk):
+                    result_tile_16 = pl.load(
+                        tmp_window,
+                        [0, k0],
+                        [16, ar_chunk],
+                    )
+                    pl.store(result_tile_16, [0, k0], local)
+            else:
+                ar_copy_tiles = (
+                    (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)
                 )
-                pl.store(result_tile, [ar_b0, k0], local)
+                for ar_copy in pl.parallel(ar_copy_tiles):
+                    ar_b_idx = ar_copy // (HIDDEN // ar_chunk)
+                    ar_k_idx = ar_copy % (HIDDEN // ar_chunk)
+                    ar_b0 = ar_b_idx * BATCH_TILE
+                    k0 = ar_k_idx * ar_chunk
+                    result_tile = pl.load(
+                        tmp_window,
+                        [ar_b0, k0],
+                        [BATCH_TILE, ar_chunk],
+                    )
+                    pl.store(result_tile, [ar_b0, k0], local)
 
             # Wave 3 closes the communication-window read lifetime.  Every rank
             # finishes its final local reads before the window can be reused.

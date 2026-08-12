@@ -127,6 +127,20 @@ def test_swa_packs_qkv_projection_and_fuses_active_prerope_task() -> None:
     assert "[qkv_b0, SWA_QKV_V_OFFSET]" in qkv_proj_source
     for weight in ("wq", "wk", "wv"):
         assert weight in qkv_proj_source
+
+    head_logits_scope = _spmd_scope(function, "swa_head_gate_logits_mm")
+    head_logits_call = head_logits_scope.items[0].context_expr
+    assert any(
+        keyword.arg == "deps"
+        and ast.unparse(keyword.value) == "[swa_attn_out_zero_tid]"
+        for keyword in head_logits_call.keywords
+    )
+    assert "hg_part = pl.tile.get_block_idx()" in (
+        ast.get_source_segment(source, head_logits_scope) or ""
+    )
+    assert source.index('name_hint="swa_attn_out_zero"') < source.index(
+        'name_hint="swa_head_gate_logits_mm"'
+    )
     assert source.index('name_hint="swa_qkv_proj"') < source.index(
         'name_hint="swa_head_gate_expand"'
     ) < source.index('name_hint="swa_qkv_split_qknorm_rope"')

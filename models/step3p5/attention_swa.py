@@ -538,15 +538,30 @@ def attention_swa(
             [rms_b0 + 1, 0],
         )
 
+    # Keep the non-critical head-gate off the RMS producer's speculative
+    # fanout. This already-required zero task completes far ahead of RMS; its
+    # explicit (unflagged) edge makes head-gate use normal dispatch, while the
+    # critical packed QKV projection remains pre-staged behind RMS.
+    attn_out = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="swa_attn_out_zero",
+    ) as swa_attn_out_zero_tid:
+        attn_out[:, :] = pl.full(
+            [BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16, value=0.0,
+        )
+
     # ----- Scope 1.f — on-device head-gate (RESTORED, path (a)). -----
     # gate_exp[b, h*HEAD_DIM + d] = sigmoid(normed_all @ w_g)[b, h], expanded
     # across HEAD_DIM via the block-diag constant R (= gate_r). Matches vLLM
     # modeling_step3p5 L489 + L527-531. Two scopes bound the UB working set.
-    for hg_part in pl.spmd(
+    with pl.spmd(
         HEAD_GATE_K_SPLITS,
         name_hint="swa_head_gate_logits_mm",
+        deps=[swa_attn_out_zero_tid],
         allow_early_resolve=True,
-    ):
+    ) as _swa_head_gate_logits_tid:
+        hg_part = pl.tile.get_block_idx()
         hg_k0 = hg_part * HEAD_GATE_K_PER_SPLIT
         hg_logits = pl.matmul(
             pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, hg_k0]),
@@ -746,11 +761,6 @@ def attention_swa(
     # 3 zero padding rows), while retaining distinct gamma vectors. Each head
     # then uses contiguous [1, ROTARY_HALF] slices for RoPE; V is read only for
     # its final cache publication, with no normalized GM scratch.
-    attn_out = pl.create_tensor([BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_attn_out_zero"):
-        attn_out[:, :] = pl.full(
-            [BATCH, HIDDEN_Q_SWA_LOCAL], dtype=pl.BF16, value=0.0,
-        )
     # Q_HEAD_PAD_SWA=24 is not a multiple of 16; use SWA_Q_PAD_ALIGNED=32 for
     # all alloc_tile row-dimension uses so the allocator alignment check passes.
     SWA_Q_PAD_ALIGNED = 32

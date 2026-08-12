@@ -118,6 +118,7 @@ KV_HIDDEN_LOCAL_R = KV_HIDDEN_LOCAL                   # 128
 rotary_dim_full = ROTARY_HALF_FULL * 2                # 64
 rotary_dim_swa = ROTARY_HALF_SWA * 2                  # 128
 tp_size = TP_WORLD_SIZE                               # 8
+TP_ALL_REDUCE_OWNED_CHUNK = HIDDEN // TP_WORLD_SIZE  # 512
 
 # Dense-layer counts. L0 = full-attn dense, L1/L2 = swa-attn dense.
 NUM_DENSE_LAYERS = 3
@@ -287,14 +288,15 @@ class WholeDecodeStep3p5:
     # ── TP all-reduce collective ────────────────────────────────────────
     # The inlined attention and dense-MLP bodies call this method to gather
     # o_proj and down_proj partial sums.  Keep the method on this program so
-    # pl.inline resolves those calls locally.  The protocol uses three
-    # completion waves with Ge thresholds 1, 2, and 3.
+    # pl.inline resolves those calls locally. Single-row payloads use a
+    # two-wave one-shot mesh; larger payloads retain the three-wave path.
     @pl.function(type=pl.FunctionType.InCore)
     def tp_all_reduce(
         self,
         local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
         signal_window: pld.DistributedTensor[[COMM_SIGNAL_STRIDE_I32, 1], pl.INT32],
+        active_rows_i32: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         group_size = tp_size
@@ -303,118 +305,198 @@ class WholeDecodeStep3p5:
         # grain is configurable, while reduce-scatter ownership is defined by
         # the TP rank count rather than a fixed core count.
         ar_chunk = TP_ALL_REDUCE_CHUNK
+        active_rows = pl.cast(active_rows_i32, pl.INDEX)
+        if active_rows > BATCH:
+            active_rows = pl.cast(BATCH, pl.INDEX)
 
-        # Self-target TPUT drains before the following notify (PTOAS#872).
-        pld.tensor.put(
-            dst=tmp_window,
-            peer=my_rank,
-            src=local,
-            chunk_rows=BATCH_TILE,
-            chunk_cols=TP_ALL_REDUCE_CHUNK,
-        )
-
-        # Wave 1 publishes all source partials.
-        for peer in pl.range(group_size):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=signal_window, peer=peer,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(group_size):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=signal_window, offsets=[src, 0],
-                    expected=1, cmp=pld.WaitCmp.Ge,
-                )
-
-        # Reduce-scatter: rank r uniquely owns chunk r.  Preserve the
-        # canonical peer order 0..N-1, one FP32 accumulator, and one final
-        # BF16 cast to retain the numerical contract of the pull mesh.
-        owned_chunk = HIDDEN // group_size
-        owned_base = my_rank * owned_chunk
-        for ar_b0 in pl.range(0, BATCH, BATCH_TILE):
-            own_tile = pl.load(
-                tmp_window,
-                [ar_b0, owned_base],
-                [BATCH_TILE, owned_chunk],
+        # Match HCCL's small-message selector: a single active BF16 row is
+        # only 8 KiB, so a one-shot full-width mesh has fewer remote
+        # transactions than reduce-scatter plus push all-gather. All transfer
+        # extents in this branch are static, avoiding dynamic-TPUT and
+        # dynamic-remote-load limitations in the pinned toolchain.
+        if active_rows == 1:
+            # Self-target TPUT drains before the publication wave (PTOAS#872).
+            pld.tensor.put(
+                dst=tmp_window,
+                peer=my_rank,
+                src=local,
+                dst_offsets=[0, 0],
+                src_offsets=[0, 0],
+                shape=[1, HIDDEN],
+                chunk_rows=1,
+                chunk_cols=TP_ALL_REDUCE_CHUNK,
             )
-            acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
+
+            # Publication wave: every peer source row is now readable.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            # The full 1x4096 row fits in UB. Keep canonical peer order, one
+            # FP32 accumulator, and one final BF16 cast for byte-exact output.
+            own_row = pl.load(tmp_window, [0, 0], [1, HIDDEN])
+            row_acc = pl.mul(
+                pl.cast(own_row, target_type=pl.FP32), 0.0,
+            )
             for peer in pl.range(group_size):
                 if peer == my_rank:
-                    acc = pl.add(
-                        acc,
-                        pl.cast(own_tile, target_type=pl.FP32),
+                    row_acc = pl.add(
+                        row_acc,
+                        pl.cast(own_row, target_type=pl.FP32),
                     )
                 else:
-                    remote_tile = pld.tile.remote_load(
+                    remote_row = pld.tile.remote_load(
                         tmp_window,
                         peer=peer,
-                        offsets=[ar_b0, owned_base],
-                        shape=[BATCH_TILE, owned_chunk],
+                        offsets=[0, 0],
+                        shape=[1, HIDDEN],
                     )
-                    acc = pl.add(
-                        acc,
-                        pl.cast(remote_tile, target_type=pl.FP32),
+                    row_acc = pl.add(
+                        row_acc,
+                        pl.cast(remote_row, target_type=pl.FP32),
                     )
-            reduced_tile = pl.cast(acc, target_type=pl.BF16)
-
-            # Publish the write-disjoint reduced shard with the existing push
-            # path. Batch tiling changes only the transfer tile, not ownership.
-            pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)
-            for dst in pl.range(group_size):
-                if dst != my_rank:
-                    pld.tile.remote_store(
-                        reduced_tile,
-                        target=tmp_window,
-                        peer=dst,
-                        offsets=[ar_b0, owned_base],
-                    )
-
-        # Wave 2 publishes all pushed result chunks.
-        for peer in pl.range(group_size):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=signal_window, peer=peer,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(group_size):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=signal_window, offsets=[src, 0],
-                    expected=2, cmp=pld.WaitCmp.Ge,
-                )
-
-        # The completed temporary window contains the complete reduced vector.
-        ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)
-        for ar_copy in pl.parallel(ar_copy_tiles):
-            ar_b_idx = ar_copy // (HIDDEN // ar_chunk)
-            ar_k_idx = ar_copy % (HIDDEN // ar_chunk)
-            ar_b0 = ar_b_idx * BATCH_TILE
-            k0 = ar_k_idx * ar_chunk
-            result_tile = pl.load(
-                tmp_window,
-                [ar_b0, k0],
-                [BATCH_TILE, ar_chunk],
+            pl.store(
+                pl.cast(row_acc, target_type=pl.BF16),
+                [0, 0],
+                local,
             )
-            pl.store(result_tile, [ar_b0, k0], local)
 
-        # Wave 3 closes the communication-window read lifetime.  Every rank
-        # finishes its final local reads before the window can be reused.
-        for peer in pl.range(group_size):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=signal_window, peer=peer,
-                    offsets=[my_rank, 0], value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+            # Completion wave protects peer reads before the per-layer window
+            # can be reset or reused on a later invocation.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
+        else:
+            # Self-target TPUT drains before the following notify (PTOAS#872).
+            pld.tensor.put(
+                dst=tmp_window,
+                peer=my_rank,
+                src=local,
+                chunk_rows=BATCH_TILE,
+                chunk_cols=TP_ALL_REDUCE_CHUNK,
+            )
+
+            # Wave 1 publishes all source partials.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            # Reduce-scatter: rank r uniquely owns chunk r.  Preserve the
+            # canonical peer order 0..N-1, one FP32 accumulator, and one final
+            # BF16 cast to retain the numerical contract of the pull mesh.
+            owned_base = my_rank * TP_ALL_REDUCE_OWNED_CHUNK
+            for ar_b0 in pl.range(0, BATCH, BATCH_TILE):
+                own_tile = pl.load(
+                    tmp_window,
+                    [ar_b0, owned_base],
+                    [BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK],
                 )
-        for src in pl.range(group_size):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=signal_window, offsets=[src, 0],
-                    expected=3, cmp=pld.WaitCmp.Ge,
+                acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
+                for peer in pl.range(group_size):
+                    if peer == my_rank:
+                        acc = pl.add(
+                            acc,
+                            pl.cast(own_tile, target_type=pl.FP32),
+                        )
+                    else:
+                        remote_tile = pld.tile.remote_load(
+                            tmp_window,
+                            peer=peer,
+                            offsets=[ar_b0, owned_base],
+                            shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK],
+                        )
+                        acc = pl.add(
+                            acc,
+                            pl.cast(remote_tile, target_type=pl.FP32),
+                        )
+                reduced_tile = pl.cast(acc, target_type=pl.BF16)
+
+                # Publish the write-disjoint reduced shard with the existing push
+                # path. Batch tiling changes only the transfer tile, not ownership.
+                pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)
+                for dst in pl.range(group_size):
+                    if dst != my_rank:
+                        pld.tile.remote_store(
+                            reduced_tile,
+                            target=tmp_window,
+                            peer=dst,
+                            offsets=[ar_b0, owned_base],
+                        )
+
+            # Wave 2 publishes all pushed result chunks.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
+
+            # The completed temporary window contains the complete reduced vector.
+            ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)
+            for ar_copy in pl.parallel(ar_copy_tiles):
+                ar_b_idx = ar_copy // (HIDDEN // ar_chunk)
+                ar_k_idx = ar_copy % (HIDDEN // ar_chunk)
+                ar_b0 = ar_b_idx * BATCH_TILE
+                k0 = ar_k_idx * ar_chunk
+                result_tile = pl.load(
+                    tmp_window,
+                    [ar_b0, k0],
+                    [BATCH_TILE, ar_chunk],
                 )
+                pl.store(result_tile, [ar_b0, k0], local)
+
+            # Wave 3 closes the communication-window read lifetime.  Every rank
+            # finishes its final local reads before the window can be reused.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=3, cmp=pld.WaitCmp.Ge,
+                    )
         return local
 
     @pl.function(
@@ -468,7 +550,7 @@ class WholeDecodeStep3p5:
         )
         h0_out = dense_mlp_inline(
             resid1, post_rms_weight, w_gate, w_up, w_down,
-            h0_out, norm_layer_idx, mlp_layer_idx,
+            h0_out, norm_layer_idx, mlp_layer_idx, num_tokens,
             mlp_tmp_window, mlp_signal_window, my_rank,
         )
         return h0_out
@@ -524,7 +606,7 @@ class WholeDecodeStep3p5:
         )
         hidden_out = dense_mlp_inline(
             resid1, post_rms_weight, w_gate, w_up, w_down,
-            hidden_out, norm_layer_idx, mlp_layer_idx,
+            hidden_out, norm_layer_idx, mlp_layer_idx, num_tokens,
             mlp_tmp_window, mlp_signal_window, my_rank,
         )
         return hidden_out
@@ -2005,7 +2087,7 @@ class WholeDecodeStep3p5:
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
         if TP_WORLD_SIZE > 1:
             sh_y = self.tp_all_reduce(
-                sh_y, sh_tmp_window, sh_signal_window, my_rank,
+                sh_y, sh_tmp_window, sh_signal_window, num_tokens, my_rank,
             )
         return sh_y
 
@@ -2983,7 +3065,7 @@ class WholeDecodeStep3p5:
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
         if TP_WORLD_SIZE > 1:
             sh_y = self.tp_all_reduce(
-                sh_y, sh_tmp_window, sh_signal_window, my_rank,
+                sh_y, sh_tmp_window, sh_signal_window, num_tokens, my_rank,
             )
         return sh_y
 

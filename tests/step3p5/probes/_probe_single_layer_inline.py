@@ -66,6 +66,7 @@ def main() -> int:
             local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
             tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp, 1], pl.INT32],
+            active_rows_i32: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             group_size = tp

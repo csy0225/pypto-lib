@@ -88,16 +88,26 @@ def test_mtp_all_reduce_uses_tput_source_and_existing_push_gather():
     assert len(methods) == 1
     body = ast.get_source_segment(source, methods[0])
     assert body is not None
+    assert [arg.arg for arg in methods[0].args.args][-2:] == [
+        "active_rows_i32",
+        "my_rank",
+    ]
     assert body.count("pld.tensor.put(") == 1
     assert "peer=my_rank" in body
     assert "pld.tile.remote_store(" in body
     assert "for ar_b0 in pl.range(0, BATCH, BATCH_TILE):" in body
     assert "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)" in body
     assert "pl.store(reduced_tile, [ar_b0, owned_base], local)" not in body
-    assert "owned_chunk = HIDDEN // group_size" in body
+    assert "owned_chunk =" not in body
+    assert "TP_ALL_REDUCE_OWNED_CHUNK = HIDDEN_LOCAL" in source
+    assert "owned_base = my_rank * TP_ALL_REDUCE_OWNED_CHUNK" in body
     assert "chunk_rows=BATCH_TILE" in body
     assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
-    assert "shape=[BATCH_TILE, owned_chunk]" in body
+    assert "shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]" in body
+    assert "active_rows = pl.cast(active_rows_i32, pl.INDEX)" not in body
+    assert "reduced_tile = pl.cast(acc, target_type=pl.BF16)" in body
+    assert "pl.set_validshape(" not in body
+    assert "valid_shapes=" not in body
     assert "ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)" in body
     for expected in (1, 2, 3):
         assert f"expected={expected}" in body
@@ -121,6 +131,7 @@ def test_mtp_input_projection_keeps_all_reduce_return_lineage():
 def test_mtp_lifts_current_swa_out_proj_closure_constants():
     source = _source()
     for name in (
+        "SWA_RMSNORM_ROWS_PER_TASK",
         "SWA_OUT_PROJ_FUSE_CAST",
         "SWA_OUT_PROJ_MATMUL_N_CHUNK",
         "SWA_OUT_PROJ_MATMUL_TILES_PER_TASK",

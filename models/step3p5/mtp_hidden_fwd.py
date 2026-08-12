@@ -46,6 +46,7 @@ from .config import (
     ROPE_SEQ_DYN,
     ROTARY_HALF_SWA,
     SLIDING_WINDOW,
+    SWA_RMSNORM_ROWS_PER_TASK,
     SWA_OUT_PROJ_FUSE_CAST,
     SWA_OUT_PROJ_MATMUL_N_CHUNK,
     SWA_OUT_PROJ_MATMUL_TILES_PER_TASK,
@@ -67,6 +68,7 @@ NUM_MTP = NUM_NEXTN_PREDICT_LAYERS
 # do not inherit canonical Main's stacked/reused 512B slot policy.
 SIGNAL_WINDOW_ROWS = TP_WORLD_SIZE
 HIDDEN_LOCAL = HIDDEN // TP_WORLD_SIZE
+TP_ALL_REDUCE_OWNED_CHUNK = HIDDEN_LOCAL
 INTER_LOCAL = INTERMEDIATE_LOCAL
 MTP_EH_ROWS = NUM_MTP * HIDDEN_LOCAL
 MTP_HIDDEN_ROWS = NUM_MTP * HIDDEN
@@ -286,6 +288,7 @@ def _mtp_input_proj_body(
             partial,
             eh_tmp_window,
             eh_signal_window,
+            BATCH,
             my_rank,
         )
 
@@ -331,12 +334,15 @@ def _build_mtp_layer_hidden_program(
             local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
             tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            active_rows_i32: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             """Three-wave reduce-scatter/all-gather on fresh call windows."""
             group_size = tp_size
             ar_chunk = TP_ALL_REDUCE_CHUNK
 
+            # Keep ``active_rows_i32`` in the shared all-reduce ABI. MTP uses the
+            # full static BATCH payload and therefore deliberately ignores it.
             # Self-target TPUT drains before the following notify (PTOAS#872).
             pld.tensor.put(
                 dst=tmp_window,
@@ -367,13 +373,12 @@ def _build_mtp_layer_hidden_program(
 
             # Reduce-scatter: rank r owns one HIDDEN / TP shard. Preserve the
             # fixed peer order, one FP32 accumulator, and one final BF16 cast.
-            owned_chunk = HIDDEN // group_size
-            owned_base = my_rank * owned_chunk
+            owned_base = my_rank * TP_ALL_REDUCE_OWNED_CHUNK
             for ar_b0 in pl.range(0, BATCH, BATCH_TILE):
                 own_tile = pl.load(
                     tmp_window,
                     [ar_b0, owned_base],
-                    [BATCH_TILE, owned_chunk],
+                    [BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK],
                 )
                 acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)
                 for peer in pl.range(group_size):
@@ -387,7 +392,7 @@ def _build_mtp_layer_hidden_program(
                             tmp_window,
                             peer=peer,
                             offsets=[ar_b0, owned_base],
-                            shape=[BATCH_TILE, owned_chunk],
+                            shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK],
                         )
                         acc = pl.add(
                             acc,
@@ -636,6 +641,7 @@ def _build_mtp_layer_hidden_program(
                 raw_hidden,
                 layer_idx,
                 layer_idx,
+                BATCH,
                 mlp_tmp_window,
                 mlp_signal_window,
                 my_rank,

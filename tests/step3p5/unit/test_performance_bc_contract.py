@@ -726,12 +726,19 @@ def test_two_layer_tp_all_reduce_matches_canonical() -> None:
     )
 
 
-def test_tp_all_reduce_uses_tput_source_and_existing_push_gather() -> None:
+def test_tp_all_reduce_selects_smallmesh_and_keeps_push_gather_fallback() -> None:
     source, tree = _parse(_CANONICAL)
-    body = _segment(source, _method(tree, "tp_all_reduce"))
-    assert body.count("pld.tensor.put(") == 1
+    method = _method(tree, "tp_all_reduce")
+    body = _segment(source, method)
+    assert [arg.arg for arg in method.args.args][-2:] == [
+        "active_rows_i32",
+        "my_rank",
+    ]
+    assert "if active_rows == 1:" in body
+    assert body.count("pld.tensor.put(") == 2
     assert "peer=my_rank" in body
-    assert "dst=tmp_window,\n            peer=my_rank,\n            src=local" in body
+    assert "shape=[1, HIDDEN]" in body
+    assert "chunk_rows=1" in body
     assert "for dst in pl.range(group_size):" in body
     assert "pld.tile.remote_store(" in body
     assert "for ar_b0 in pl.range(0, BATCH, BATCH_TILE):" in body
@@ -739,10 +746,103 @@ def test_tp_all_reduce_uses_tput_source_and_existing_push_gather() -> None:
     assert "pl.store(reduced_tile, [ar_b0, owned_base], local)" not in body
     assert "chunk_rows=BATCH_TILE" in body
     assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
-    assert "shape=[BATCH_TILE, owned_chunk]" in body
+    assert "shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]" in body
     assert "ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)" in body
     for expected in (1, 2, 3):
         assert f"expected={expected}" in body
+
+
+def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
+    source, tree = _parse(_CANONICAL)
+    method = _method(tree, "tp_all_reduce")
+    body = _segment(source, method)
+
+    assert "active_rows = pl.cast(active_rows_i32, pl.INDEX)" in body
+    assert "if active_rows > BATCH:" in body
+    assert "active_rows = pl.cast(BATCH, pl.INDEX)" in body
+    assert "pl.set_validshape(" not in body
+    assert "valid_shapes=" not in body
+
+    branch = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "active_rows == 1"
+    )
+    fallback_source = ast.unparse(
+        ast.Module(body=branch.orelse, type_ignores=[])
+    )
+    assert "owned_chunk =" not in fallback_source
+    assert "TP_ALL_REDUCE_OWNED_CHUNK = HIDDEN // TP_WORLD_SIZE" in source
+    assert "owned_base = my_rank * TP_ALL_REDUCE_OWNED_CHUNK" in fallback_source
+    assert "reduced_tile = pl.cast(acc, target_type=pl.BF16)" in fallback_source
+    assert "shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]" in body
+    assert "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)" in body
+    assert "[BATCH_TILE, ar_chunk]" in fallback_source
+
+    # Both branches retain fully static transfer shapes. The selector scalar is
+    # used only to choose the 1-row one-shot mesh; the safety fallback transfers
+    # the complete capacity exactly as the baseline implementation did.
+    put_calls = [
+        call
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "put"
+    ]
+    assert len(put_calls) == 2
+    put_shapes = {
+        ast.unparse(keyword.value)
+        for call in put_calls
+        for keyword in call.keywords
+        if keyword.arg == "shape"
+    }
+    assert put_shapes == {"[1, HIDDEN]"}
+    assert any(
+        "shape" not in {keyword.arg for keyword in call.keywords}
+        for call in put_calls
+    )
+
+    remote_loads = [
+        call
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "remote_load"
+    ]
+    assert len(remote_loads) == 2
+    remote_shapes = {
+        ast.unparse(keyword.value)
+        for call in remote_loads
+        for keyword in call.keywords
+        if keyword.arg == "shape"
+    }
+    assert remote_shapes == {
+        "[1, HIDDEN]",
+        "[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]",
+    }
+
+
+def test_tp_all_reduce_smallmesh_keeps_peer_order_and_two_wave_lifetime() -> None:
+    source, tree = _parse(_CANONICAL)
+    method = _method(tree, "tp_all_reduce")
+    branch = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "active_rows == 1"
+    )
+    branch_source = ast.unparse(ast.Module(body=branch.body, type_ignores=[]))
+    assert "for peer in pl.range(group_size)" in branch_source
+    assert "remote_row = pld.tile.remote_load" in branch_source
+    assert "row_acc = pl.add" in branch_source
+    assert branch_source.count("pld.system.notify") == 2
+    assert branch_source.count("pld.system.wait") == 2
+    assert "expected=1" in branch_source
+    assert "expected=2" in branch_source
+    assert "pld.tile.remote_store" not in branch_source
+    assert "pl.cast(row_acc, target_type=pl.BF16)" in branch_source
+    assert "pl.store(pl.cast(row_acc, target_type=pl.BF16), [0, 0], local)" in branch_source
 
 
 def test_tp_all_reduce_keeps_reduce_scatter_accumulate_serial() -> None:
@@ -758,6 +858,7 @@ def test_tp_all_reduce_keeps_reduce_scatter_accumulate_serial() -> None:
     assert "for peer in pl.range(group_size):" in body
     assert "acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)" in body
     assert body.count("reduced_tile = pl.cast(acc, target_type=pl.BF16)") == 1
+    assert "pl.set_validshape(" not in body
     assert "pl.parallel(group_size)" not in body
 
 
@@ -836,6 +937,31 @@ def test_g1_decode_attention_inline_calls_preserve_active_token_arity() -> None:
         isinstance(call.args[20], ast.Name) and call.args[20].id == "num_tokens"
         for call in canonical_calls
     )
+
+
+def test_g1_decode_dense_mlp_calls_preserve_active_token_arity() -> None:
+    dense_path = _ROOT / "models" / "step3p5" / "dense_mlp.py"
+    dense_source, dense_tree = _parse(dense_path)
+    dense_body = _method(dense_tree, "dense_mlp_body_tp")
+    assert "num_tokens" in [arg.arg for arg in dense_body.args.args]
+    assert "num_tokens, my_rank" in _segment(dense_source, dense_body)
+
+    for path, expected in (
+        (_CANONICAL, "num_tokens"),
+        (_TWO_LAYER_PROGRAM, "num_tokens"),
+        (_MTP_HIDDEN, "BATCH"),
+    ):
+        _, tree = _parse(path)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "dense_mlp_inline"
+        ]
+        assert calls, f"{path.name} has no dense MLP inline call"
+        assert all(len(call.args) == 12 for call in calls)
+        assert all(ast.unparse(call.args[8]) == expected for call in calls)
 
 
 def test_signal_inline_formal_resolves_wide_only_in_canonical_main() -> None:

@@ -525,7 +525,7 @@ MLP_OUT_CHUNK = 128
 
 # TP all-reduce transfer tile width.  This controls TPUT staging and the final
 # local copy; reduce-scatter ownership remains HIDDEN / TP.  It does not change
-# peer order, FP32 accumulation order, or the three-wave completion protocol.
+# peer order, FP32 accumulation order, or either selected branch's protocol.
 # Keep the A2A3 release default at 512 while allowing platform calibration.
 TP_ALL_REDUCE_CHUNK = int(
     os.environ.get("PYPTO_STEP3P5_TP_ALL_REDUCE_CHUNK", "512"),

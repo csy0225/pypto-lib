@@ -50,6 +50,7 @@ def dense_mlp_body_tp(
     next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     norm_layer_idx: pl.Scalar[pl.INT32],
     mlp_layer_idx: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
     tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
     signal_window: pld.DistributedTensor[[SIGNAL_WINDOW_ROWS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -226,7 +227,7 @@ def dense_mlp_body_tp(
 
     if TP_WORLD_SIZE > 1:
         partial_hidden = self.tp_all_reduce(
-            partial_hidden, tmp_window, signal_window, my_rank,
+            partial_hidden, tmp_window, signal_window, num_tokens, my_rank,
         )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dense_residual_add_tp"):

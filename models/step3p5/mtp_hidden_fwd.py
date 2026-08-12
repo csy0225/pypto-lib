@@ -46,6 +46,7 @@ from .config import (
     ROPE_SEQ_DYN,
     ROTARY_HALF_SWA,
     SLIDING_WINDOW,
+    SWA_RMSNORM_ROWS_PER_TASK,
     SWA_OUT_PROJ_FUSE_CAST,
     SWA_OUT_PROJ_MATMUL_N_CHUNK,
     SWA_OUT_PROJ_MATMUL_TILES_PER_TASK,
@@ -286,6 +287,7 @@ def _mtp_input_proj_body(
             partial,
             eh_tmp_window,
             eh_signal_window,
+            BATCH,
             my_rank,
         )
 
@@ -331,12 +333,19 @@ def _build_mtp_layer_hidden_program(
             local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
             tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            active_rows_i32: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             """Three-wave reduce-scatter/all-gather on fresh call windows."""
             group_size = tp_size
             ar_chunk = TP_ALL_REDUCE_CHUNK
+            active_rows = pl.cast(active_rows_i32, pl.INDEX)
+            if active_rows > BATCH:
+                active_rows = pl.cast(BATCH, pl.INDEX)
 
+            # Self-target TPUT remains static because the pinned PTOAS requires a
+            # positive static TPUT destination shape.  Runtime valid shape is used
+            # only at the push/final-copy boundaries below.
             # Self-target TPUT drains before the following notify (PTOAS#872).
             pld.tensor.put(
                 dst=tmp_window,
@@ -393,8 +402,17 @@ def _build_mtp_layer_hidden_program(
                             acc,
                             pl.cast(recv, target_type=pl.FP32),
                         )
-                reduced_tile = pl.cast(acc, target_type=pl.BF16)
+                publish_active_rows = pl.min(
+                    BATCH_TILE, pl.max(0, active_rows - ar_b0),
+                )
+                reduced_tile_raw = pl.cast(acc, target_type=pl.BF16)
+                reduced_tile = pl.set_validshape(
+                    reduced_tile_raw, publish_active_rows, owned_chunk,
+                )
 
+                # Publish only runtime-active rows.  The physical tile remains
+                # [BATCH_TILE, owned_chunk], preserving UB allocation and the fixed
+                # FP32 peer-order reduction; only the GM transfer extent shrinks.
                 # Publish the write-disjoint reduced shard with the existing
                 # all-gather push path.
                 pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)
@@ -432,10 +450,14 @@ def _build_mtp_layer_hidden_program(
                 ar_k_idx = ar_copy % (HIDDEN // ar_chunk)
                 ar_b0 = ar_b_idx * BATCH_TILE
                 k0 = ar_k_idx * ar_chunk
+                copy_active_rows = pl.min(
+                    BATCH_TILE, pl.max(0, active_rows - ar_b0),
+                )
                 result_tile = pl.load(
                     tmp_window,
                     [ar_b0, k0],
                     [BATCH_TILE, ar_chunk],
+                    valid_shapes=[copy_active_rows, ar_chunk],
                 )
                 pl.store(result_tile, [ar_b0, k0], local)
 
@@ -636,6 +658,7 @@ def _build_mtp_layer_hidden_program(
                 raw_hidden,
                 layer_idx,
                 layer_idx,
+                BATCH,
                 mlp_tmp_window,
                 mlp_signal_window,
                 my_rank,

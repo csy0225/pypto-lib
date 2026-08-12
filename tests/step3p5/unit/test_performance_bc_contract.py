@@ -728,7 +728,12 @@ def test_two_layer_tp_all_reduce_matches_canonical() -> None:
 
 def test_tp_all_reduce_uses_tput_source_and_existing_push_gather() -> None:
     source, tree = _parse(_CANONICAL)
-    body = _segment(source, _method(tree, "tp_all_reduce"))
+    method = _method(tree, "tp_all_reduce")
+    body = _segment(source, method)
+    assert [arg.arg for arg in method.args.args][-2:] == [
+        "active_rows_i32",
+        "my_rank",
+    ]
     assert body.count("pld.tensor.put(") == 1
     assert "peer=my_rank" in body
     assert "dst=tmp_window,\n            peer=my_rank,\n            src=local" in body
@@ -745,6 +750,49 @@ def test_tp_all_reduce_uses_tput_source_and_existing_push_gather() -> None:
         assert f"expected={expected}" in body
 
 
+def test_tp_all_reduce_limits_only_publish_and_final_copy_rows() -> None:
+    source, tree = _parse(_CANONICAL)
+    body = _segment(source, _method(tree, "tp_all_reduce"))
+
+    assert "active_rows = pl.cast(active_rows_i32, pl.INDEX)" in body
+    assert "if active_rows < 0:" not in body
+    assert "if active_rows > BATCH:" in body
+    assert "active_rows = pl.cast(BATCH, pl.INDEX)" in body
+    assert body.count(
+        "BATCH_TILE, pl.max(0, active_rows - ar_b0)"
+    ) == 2
+    assert "reduced_tile_raw = pl.cast(acc, target_type=pl.BF16)" in body
+    assert (
+        "reduced_tile_raw, publish_active_rows, owned_chunk" in body
+    )
+    assert "valid_shapes=[copy_active_rows, ar_chunk]" in body
+
+    # Source publication and peer reads intentionally stay static: the pinned
+    # PTOAS rejects dynamic TPUT destinations and remote_load has no separate
+    # runtime-valid-shape API.
+    put_call = next(
+        call
+        for call in ast.walk(_method(tree, "tp_all_reduce"))
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "put"
+    )
+    assert "shape" not in {keyword.arg for keyword in put_call.keywords}
+    remote_loads = [
+        call
+        for call in ast.walk(_method(tree, "tp_all_reduce"))
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "remote_load"
+    ]
+    assert len(remote_loads) == 1
+    assert any(
+        keyword.arg == "shape"
+        and ast.unparse(keyword.value) == "[BATCH_TILE, owned_chunk]"
+        for keyword in remote_loads[0].keywords
+    )
+
+
 def test_tp_all_reduce_keeps_reduce_scatter_accumulate_serial() -> None:
     # The reduce-scatter accumulate carries an FP32 accumulator across peers in
     # a fixed order and casts to BF16 exactly once.  hidden_tp_spread == 0
@@ -757,7 +805,10 @@ def test_tp_all_reduce_keeps_reduce_scatter_accumulate_serial() -> None:
     body = _segment(source, _method(tree, "tp_all_reduce"))
     assert "for peer in pl.range(group_size):" in body
     assert "acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)" in body
-    assert body.count("reduced_tile = pl.cast(acc, target_type=pl.BF16)") == 1
+    assert body.count(
+        "reduced_tile_raw = pl.cast(acc, target_type=pl.BF16)"
+    ) == 1
+    assert body.count("reduced_tile = pl.set_validshape(") == 1
     assert "pl.parallel(group_size)" not in body
 
 
@@ -836,6 +887,31 @@ def test_g1_decode_attention_inline_calls_preserve_active_token_arity() -> None:
         isinstance(call.args[20], ast.Name) and call.args[20].id == "num_tokens"
         for call in canonical_calls
     )
+
+
+def test_g1_decode_dense_mlp_calls_preserve_active_token_arity() -> None:
+    dense_path = _ROOT / "models" / "step3p5" / "dense_mlp.py"
+    dense_source, dense_tree = _parse(dense_path)
+    dense_body = _method(dense_tree, "dense_mlp_body_tp")
+    assert "num_tokens" in [arg.arg for arg in dense_body.args.args]
+    assert "num_tokens, my_rank" in _segment(dense_source, dense_body)
+
+    for path, expected in (
+        (_CANONICAL, "num_tokens"),
+        (_TWO_LAYER_PROGRAM, "num_tokens"),
+        (_MTP_HIDDEN, "BATCH"),
+    ):
+        _, tree = _parse(path)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "dense_mlp_inline"
+        ]
+        assert calls, f"{path.name} has no dense MLP inline call"
+        assert all(len(call.args) == 12 for call in calls)
+        assert all(ast.unparse(call.args[8]) == expected for call in calls)
 
 
 def test_signal_inline_formal_resolves_wide_only_in_canonical_main() -> None:

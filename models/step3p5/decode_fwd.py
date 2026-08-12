@@ -295,6 +295,7 @@ class WholeDecodeStep3p5:
         local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
         signal_window: pld.DistributedTensor[[COMM_SIGNAL_STRIDE_I32, 1], pl.INT32],
+        active_rows_i32: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
         group_size = tp_size
@@ -303,7 +304,13 @@ class WholeDecodeStep3p5:
         # grain is configurable, while reduce-scatter ownership is defined by
         # the TP rank count rather than a fixed core count.
         ar_chunk = TP_ALL_REDUCE_CHUNK
+        active_rows = pl.cast(active_rows_i32, pl.INDEX)
+        if active_rows > BATCH:
+            active_rows = pl.cast(BATCH, pl.INDEX)
 
+        # Self-target TPUT remains static because the pinned PTOAS requires a
+        # positive static TPUT destination shape.  Runtime valid shape is used
+        # only at the push/final-copy boundaries below.
         # Self-target TPUT drains before the following notify (PTOAS#872).
         pld.tensor.put(
             dst=tmp_window,
@@ -357,8 +364,17 @@ class WholeDecodeStep3p5:
                         acc,
                         pl.cast(remote_tile, target_type=pl.FP32),
                     )
-            reduced_tile = pl.cast(acc, target_type=pl.BF16)
+            publish_active_rows = pl.min(
+                BATCH_TILE, pl.max(0, active_rows - ar_b0),
+            )
+            reduced_tile_raw = pl.cast(acc, target_type=pl.BF16)
+            reduced_tile = pl.set_validshape(
+                reduced_tile_raw, publish_active_rows, owned_chunk,
+            )
 
+            # Publish only runtime-active rows.  The physical tile remains
+            # [BATCH_TILE, owned_chunk], preserving UB allocation and the fixed
+            # FP32 peer-order reduction; only the GM transfer extent shrinks.
             # Publish the write-disjoint reduced shard with the existing push
             # path. Batch tiling changes only the transfer tile, not ownership.
             pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)
@@ -393,10 +409,14 @@ class WholeDecodeStep3p5:
             ar_k_idx = ar_copy % (HIDDEN // ar_chunk)
             ar_b0 = ar_b_idx * BATCH_TILE
             k0 = ar_k_idx * ar_chunk
+            copy_active_rows = pl.min(
+                BATCH_TILE, pl.max(0, active_rows - ar_b0),
+            )
             result_tile = pl.load(
                 tmp_window,
                 [ar_b0, k0],
                 [BATCH_TILE, ar_chunk],
+                valid_shapes=[copy_active_rows, ar_chunk],
             )
             pl.store(result_tile, [ar_b0, k0], local)
 
@@ -468,7 +488,7 @@ class WholeDecodeStep3p5:
         )
         h0_out = dense_mlp_inline(
             resid1, post_rms_weight, w_gate, w_up, w_down,
-            h0_out, norm_layer_idx, mlp_layer_idx,
+            h0_out, norm_layer_idx, mlp_layer_idx, num_tokens,
             mlp_tmp_window, mlp_signal_window, my_rank,
         )
         return h0_out
@@ -524,7 +544,7 @@ class WholeDecodeStep3p5:
         )
         hidden_out = dense_mlp_inline(
             resid1, post_rms_weight, w_gate, w_up, w_down,
-            hidden_out, norm_layer_idx, mlp_layer_idx,
+            hidden_out, norm_layer_idx, mlp_layer_idx, num_tokens,
             mlp_tmp_window, mlp_signal_window, my_rank,
         )
         return hidden_out
@@ -2005,7 +2025,7 @@ class WholeDecodeStep3p5:
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
         if TP_WORLD_SIZE > 1:
             sh_y = self.tp_all_reduce(
-                sh_y, sh_tmp_window, sh_signal_window, my_rank,
+                sh_y, sh_tmp_window, sh_signal_window, num_tokens, my_rank,
             )
         return sh_y
 
@@ -2983,7 +3003,7 @@ class WholeDecodeStep3p5:
         # Phase 15.1 single-rank gate: skip TP=1 (mirror of 15.B).
         if TP_WORLD_SIZE > 1:
             sh_y = self.tp_all_reduce(
-                sh_y, sh_tmp_window, sh_signal_window, my_rank,
+                sh_y, sh_tmp_window, sh_signal_window, num_tokens, my_rank,
             )
         return sh_y
 

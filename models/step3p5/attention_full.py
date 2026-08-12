@@ -1487,6 +1487,7 @@ def attention_full(
             partial_attn_proj,
             tmp_window,
             signal_window,
+            num_tokens,
             my_rank,
         )
 
@@ -1559,6 +1560,7 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
             local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
             tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
             signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            active_rows_i32: pl.Scalar[pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
             """Barrier-style all-reduce(sum) across the TP group."""

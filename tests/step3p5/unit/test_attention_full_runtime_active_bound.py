@@ -92,6 +92,26 @@ def test_full_attention_packs_qkv_and_fuses_active_prerope_publication() -> None
     assert "num_tokens" in {arg.arg for arg in fn.args.args}
     assert "b_safe" not in ast.unparse(fn)
 
+    rms_calls = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and _call_name(node) == "pl.at"
+        and any(
+            keyword.arg == "name_hint"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "full_rmsnorm_zc"
+            for keyword in node.keywords
+        )
+    ]
+    assert len(rms_calls) == 1
+    assert any(
+        keyword.arg == "allow_early_resolve"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in rms_calls[0].keywords
+    )
+
     proj_scope = _spmd_scope(fn, "full_qkv_proj")
     proj_call = proj_scope.items[0].context_expr
     assert ast.unparse(proj_call.args[0]) == "BATCH // BATCH_TILE * full_qkv_tiles"
@@ -111,6 +131,20 @@ def test_full_attention_packs_qkv_and_fuses_active_prerope_publication() -> None
     assert "full_qkv_k_offset + kv_kind * KV_HIDDEN_LOCAL + kv_o0" in proj_source
     for weight in ("wq", "wk", "wv"):
         assert f"pl.slice({weight}" in proj_source
+
+    head_logits_scope = _spmd_scope(fn, "full_head_gate_logits_mm")
+    head_logits_call = head_logits_scope.items[0].context_expr
+    assert any(
+        keyword.arg == "deps"
+        and ast.unparse(keyword.value) == "[full_attn_out_zero_tid]"
+        for keyword in head_logits_call.keywords
+    )
+    assert "hg_part = pl.tile.get_block_idx()" in (
+        ast.get_source_segment(_SOURCE, head_logits_scope) or ""
+    )
+    assert _SOURCE.index('name_hint="full_attn_out_zero"') < _SOURCE.index(
+        'name_hint="full_head_gate_logits_mm"'
+    )
 
     prerope_scope = _spmd_scope(fn, "full_qkv_split_qknorm_rope")
     prerope_call = prerope_scope.items[0].context_expr

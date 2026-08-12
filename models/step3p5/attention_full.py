@@ -298,7 +298,12 @@ def attention_full(
     # the suspected source of the AICore 507018 VEC UB alignment crash at
     # the first MIX SQE task slot (`aicore_kernel_0_mix_aic`). qwen3/32b
     # uses CORE_GROUP + pipeline(stage=4) for the same shape and runs clean.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="full_rmsnorm_zc"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="full_rmsnorm_zc",
+        # Pre-stage the critical packed QKV consumer behind this AIV producer.
+        allow_early_resolve=True,
+    ):
         partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(decode_scope1_hidden_blocks, stage=4):
             sq_k0 = kb * INPUT_PROJ_K_CHUNK
@@ -327,6 +332,19 @@ def attention_full(
                 normed_all, pl.cast(normed, target_type=pl.BF16), [0, norm_k0],
             )
 
+    # Keep the non-critical head-gate off the RMS producer's speculative
+    # fanout. This already-required zero task completes far ahead of RMS; its
+    # explicit (unflagged) edge makes head-gate use normal dispatch, while the
+    # critical packed QKV projection remains pre-staged behind RMS.
+    attn_out = pl.create_tensor([BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16)
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="full_attn_out_zero",
+    ) as full_attn_out_zero_tid:
+        attn_out[:, :] = pl.full(
+            [BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16, value=0.0,
+        )
+
     # ----- Scope 1.f — on-device head-gate (RESTORED, path (a)). -----
     # gate = sigmoid(normed_all @ w_g) per head, then expanded across HEAD_DIM
     # via the block-diag constant R (= the ``gate_r`` input, layer-independent):
@@ -342,11 +360,13 @@ def attention_full(
     # w_g is per-attn-layer stacked (row base = layer_hidden_base); gate_r holds
     # R [NUM_HEADS_FULL_LOCAL_PAD, HIDDEN_Q_FULL_LOCAL]. Two scopes keep the UB
     # working set bounded (K-loop tiles free before the N-chunked expand).
-    for hg_part in pl.spmd(
+    with pl.spmd(
         HEAD_GATE_K_SPLITS,
         name_hint="full_head_gate_logits_mm",
+        deps=[full_attn_out_zero_tid],
         allow_early_resolve=True,
-    ):
+    ) as _full_head_gate_logits_tid:
+        hg_part = pl.tile.get_block_idx()
         hg_k0 = hg_part * HEAD_GATE_K_PER_SPLIT
         hg_logits = pl.matmul(
             pl.slice(normed_all, [BATCH, INPUT_PROJ_K_CHUNK], [0, hg_k0]),
@@ -548,11 +568,6 @@ def attention_full(
     # so the loop over local KV heads collapses to a single iteration (the
     # math below mirrors the single-card draft but the slot/cache strides
     # use KV_HEADS_LOCAL).
-    attn_out = pl.create_tensor([BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="full_attn_out_zero"):
-        attn_out[:, :] = pl.full(
-            [BATCH, HIDDEN_Q_FULL_LOCAL], dtype=pl.BF16, value=0.0,
-        )
     all_q_padded = pl.create_tensor(
         [BATCH * KV_HEADS_LOCAL * (Q_PER_KV_FULL // Q_HEAD_BATCH_FULL) * Q_HEAD_PAD_FULL, HEAD_DIM], dtype=pl.BF16,
     )

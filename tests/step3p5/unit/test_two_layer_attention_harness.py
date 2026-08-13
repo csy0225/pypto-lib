@@ -19,6 +19,7 @@ from tests.step3p5.harnesses._stage_two_layer_attn import (
     _attention_codegen_contract_errors,
     _aggregate_rank_uniformity,
     _collective_low_wait_reference,
+    _postprocess_dfx,
     _full_kv_slot_oracle,
     _kv_slot_audit_layout,
     _linear_percentile,
@@ -949,9 +950,16 @@ def test_family_span_is_summed_per_invocation_and_packing_is_bounded(
         encoding="utf-8",
     )
 
-    report = analyze_uniformity(rank_dir)
+    report = analyze_uniformity(
+        rank_dir,
+        expected_dependency_family_task_counts={"mix": 2},
+        expected_dependency_family_block_counts={"mix": 4},
+        expected_absent_dependency_families={"tp_all_reduce_residual_bs1"},
+    )
 
     assert report is not None
+    assert report["dependency_family_task_counts"] == {"mix": 2}
+    assert report["dependency_family_block_counts"] == {"mix": 4}
     aic = report["families"]["mix_aic"]
     assert aic["invocation_count"] == 2
     assert aic["stage_span_us"] == 20.0
@@ -968,6 +976,69 @@ def test_family_span_is_summed_per_invocation_and_packing_is_bounded(
         "median": 20.0,
         "max": 20.0,
     }
+    with pytest.raises(RuntimeError, match="expected 1 dependency tasks"):
+        analyze_uniformity(
+            rank_dir,
+            expected_dependency_family_task_counts={"mix": 1},
+        )
+    with pytest.raises(RuntimeError, match="expected 3 dependency blocks"):
+        analyze_uniformity(
+            rank_dir,
+            expected_dependency_family_block_counts={"mix": 3},
+        )
+    with pytest.raises(RuntimeError, match="expected no dependency tasks"):
+        analyze_uniformity(
+            rank_dir,
+            expected_absent_dependency_families={"mix"},
+        )
+
+
+def test_postprocess_dfx_fails_closed_on_missing_and_partial_ranks(tmp_path) -> None:
+    build_dir = tmp_path / "build"
+    out = tmp_path / "out"
+    with pytest.raises(RuntimeError, match="DFX output root missing"):
+        _postprocess_dfx(build_dir, out, expected_rank_count=8)
+
+    rank_dir = build_dir / "dfx_outputs" / "rank0" / "d0"
+    rank_dir.mkdir(parents=True)
+    (rank_dir / "deps.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {"task_id": 1, "block_num": 1, "kernel_ids": [7]},
+                ],
+            },
+        ),
+        encoding="utf-8",
+    )
+    (rank_dir / "name_map.json").write_text(
+        json.dumps({"callable_id_to_name": {"7": "tp_all_reduce_aiv"}}),
+        encoding="utf-8",
+    )
+    (rank_dir / "l2_swimlane_records.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "clock_freq_hz": 1_000_000,
+                    "num_cores": 1,
+                    "core_types": ["aiv"],
+                },
+                "aicore_tasks": [[0, 1, 0, 0, 10, 0]],
+            },
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="DFX rank count mismatch"):
+        _postprocess_dfx(
+            build_dir,
+            out,
+            expected_dependency_family_task_counts={"tp_all_reduce": 1},
+            expected_dependency_family_block_counts={"tp_all_reduce": 1},
+            expected_absent_dependency_families={
+                "tp_all_reduce_residual_bs1",
+            },
+            expected_rank_count=8,
+        )
 
 
 def test_collective_low_wait_reference_uses_collective_span_not_makespan() -> None:
@@ -975,19 +1046,26 @@ def test_collective_low_wait_reference_uses_collective_span_not_makespan() -> No
         "rank0/d0": {
             "makespan_us": 700.0,
             "families": {
-                "tp_all_reduce": {"stage_span_us": 90.0},
+                "tp_all_reduce": {"stage_span_us": 40.0},
+                "tp_all_reduce_residual_bs1_aiv": {
+                    "stage_span_us": 30.0,
+                },
                 "full_qk_matmul": {"stage_span_us": 16.0},
             },
         },
         "rank1/d0": {
             "makespan_us": 650.0,
             "families": {
-                "tp_all_reduce": {"stage_span_us": 120.0},
+                "tp_all_reduce": {"stage_span_us": 80.0},
             },
         },
     }
     reference = _collective_low_wait_reference(reports)
     assert reference is not None
     assert reference["rank_tag"] == "rank0/d0"
-    assert reference["tp_all_reduce_stage_span_us"] == 90.0
+    assert reference["tp_all_reduce_stage_span_us"] == 70.0
+    assert reference["tp_all_reduce_family_stage_span_us"] == {
+        "tp_all_reduce": 40.0,
+        "tp_all_reduce_residual_bs1_aiv": 30.0,
+    }
     assert "heuristic" in reference["interpretation"]

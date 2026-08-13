@@ -726,6 +726,213 @@ def test_two_layer_tp_all_reduce_matches_canonical() -> None:
     )
 
 
+
+def test_two_layer_tp_all_reduce_residual_bs1_matches_canonical() -> None:
+    _, canonical_tree = _parse(_CANONICAL)
+    _, two_layer_tree = _parse(_TWO_LAYER_PROGRAM)
+    canonical = _method(canonical_tree, "tp_all_reduce_residual_bs1")
+    two_layer = _method(two_layer_tree, "tp_all_reduce_residual_bs1")
+    assert ast.dump(canonical, include_attributes=False) == ast.dump(
+        two_layer,
+        include_attributes=False,
+    )
+
+
+def test_tp_all_reduce_residual_bs1_keeps_protocol_and_rounding_seams() -> None:
+    source, tree = _parse(_CANONICAL)
+    method = _method(tree, "tp_all_reduce_residual_bs1")
+    body = _segment(source, method)
+    normalized = ast.unparse(method)
+
+    assert [arg.arg for arg in method.args.args] == [
+        "self",
+        "local",
+        "residual_out",
+        "tmp_window",
+        "signal_window",
+        "my_rank",
+    ]
+    assert "active_rows" not in body
+    assert "shape=[1, HIDDEN]" in body
+    assert "chunk_rows=1" in body
+    assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
+    assert "for peer in pl.range(group_size):" in body
+    assert "pl.parallel(group_size)" not in body
+    assert "pl.spmd(group_size)" not in body
+
+    calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)]
+    call_paths = [_call_path(call) for call in calls]
+    assert call_paths.count("pld.tensor.put") == 1
+    assert call_paths.count("pld.tile.remote_load") == 1
+    assert call_paths.count("pld.tile.remote_store") == 0
+    assert call_paths.count("pld.system.notify") == 2
+    assert call_paths.count("pld.system.wait") == 2
+
+    waits = [call for call in calls if _call_path(call) == "pld.system.wait"]
+    assert [
+        ast.literal_eval(
+            next(
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg == "expected"
+            ),
+        )
+        for call in waits
+    ] == [1, 2]
+    for call in calls:
+        if _call_path(call) == "pld.system.notify":
+            keywords = {
+                keyword.arg: ast.unparse(keyword.value)
+                for keyword in call.keywords
+            }
+            assert keywords["offsets"] == "[my_rank, 0]"
+            assert keywords["op"] == "pld.NotifyOp.AtomicAdd"
+        elif _call_path(call) == "pld.system.wait":
+            keywords = {
+                keyword.arg: ast.unparse(keyword.value)
+                for keyword in call.keywords
+            }
+            assert keywords["offsets"] == "[src, 0]"
+
+    reduced_cast = normalized.index(
+        "reduced_bf16 = pl.cast(row_acc, target_type=pl.BF16)",
+    )
+    reduced_store = normalized.index(
+        "pl.store(reduced_bf16, [0, 0], local)",
+    )
+    completion_wait = normalized.index("expected=2")
+    residual_reload = normalized.index(
+        "reduced_chunk = pl.load(local, [0, k0], "
+        "[1, TP_ALL_REDUCE_CHUNK])",
+    )
+    assert reduced_cast < reduced_store < completion_wait < residual_reload
+    assert (
+        "for k0 in pl.range(0, HIDDEN, TP_ALL_REDUCE_CHUNK)"
+        in normalized
+    )
+    assert (
+        "residual_sum = pl.add("
+        "pl.cast(reduced_chunk, target_type=pl.FP32), "
+        "pl.cast(residual_chunk, target_type=pl.FP32))"
+        in normalized
+    )
+    residual_sum = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "residual_sum"
+    )
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "row_acc"
+        for node in ast.walk(residual_sum.value)
+    )
+    assert (
+        "pl.store(pl.cast(residual_sum, target_type=pl.BF16), "
+        "[0, k0], residual_out)"
+        in normalized
+    )
+    assert normalized.rstrip().endswith("return residual_out")
+
+
+def test_attention_bs1_fuses_collective_with_residual_only_on_tp_path() -> None:
+    for path, function_name, residual_hint in (
+        (_FULL_ATTN, "attention_full", "full_out_resid_add"),
+        (_SWA_ATTN, "attention_swa", "swa_out_resid_add"),
+    ):
+        source, tree = _parse(path)
+        function = _method(tree, function_name)
+        outer = next(
+            node
+            for node in function.body
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "TP_WORLD_SIZE > 1"
+        )
+        assert len(outer.body) == 1
+        fused_branch = outer.body[0]
+        assert isinstance(fused_branch, ast.If)
+        assert ast.unparse(fused_branch.test) == "num_tokens == 1"
+
+        fused_calls = _method_calls(fused_branch, "tp_all_reduce_residual_bs1")
+        assert len(fused_calls) == 1
+        assert [ast.unparse(arg) for arg in fused_calls[0].args] == [
+            "partial_attn_proj",
+            "resid1_out",
+            "tmp_window",
+            "signal_window",
+            "my_rank",
+        ]
+        assert len(fused_branch.body) == 1
+        fused_assign = fused_branch.body[0]
+        assert isinstance(fused_assign, ast.Assign)
+        assert ast.unparse(fused_assign.targets[0]) == "resid1_out"
+
+        generic_calls = _method_calls(fused_branch, "tp_all_reduce")
+        assert len(generic_calls) == 1
+        assert [ast.unparse(arg) for arg in generic_calls[0].args][-2:] == [
+            "num_tokens",
+            "my_rank",
+        ]
+        generic_source = ast.unparse(
+            ast.Module(body=fused_branch.orelse, type_ignores=[]),
+        )
+        tp1_source = ast.unparse(
+            ast.Module(body=outer.orelse, type_ignores=[]),
+        )
+        assert residual_hint in generic_source
+        assert residual_hint in tp1_source
+        assert residual_hint not in ast.unparse(
+            ast.Module(body=fused_branch.body, type_ignores=[]),
+        )
+        function_source = _segment(source, function)
+        assert function_source.count(
+            "self.tp_all_reduce_residual_bs1("
+        ) == 1
+        assert function_source.count("self.tp_all_reduce(") == 1
+        assert function_source.count(f'name_hint="{residual_hint}"') == 2
+        assert isinstance(function.body[-1], ast.Return)
+        assert ast.unparse(function.body[-1].value) == "resid1_out"
+
+
+def test_attention_bs1_fused_helper_resolves_in_all_inline_callers() -> None:
+    probe = (
+        _ROOT
+        / "tests"
+        / "step3p5"
+        / "probes"
+        / "_probe_single_layer_inline.py"
+    )
+    for path, signal_rows in (
+        (_FULL_ATTN, "tp_size"),
+        (_SWA_ATTN, "tp_size"),
+        (_MTP_HIDDEN, "tp_size"),
+        (probe, "tp"),
+    ):
+        source, tree = _parse(path)
+        method = _method(tree, "tp_all_reduce_residual_bs1")
+        annotations = {
+            arg.arg: ast.unparse(arg.annotation)
+            for arg in method.args.args
+            if arg.annotation is not None
+        }
+        assert signal_rows in annotations["signal_window"]
+        assert [arg.arg for arg in method.args.args][-5:] == [
+            "local",
+            "residual_out",
+            "tmp_window",
+            "signal_window",
+            "my_rank",
+        ]
+        if path == _MTP_HIDDEN:
+            assert "self.tp_all_reduce_residual_bs1(" not in source
+
+    dense_path = _ROOT / "models" / "step3p5" / "dense_mlp.py"
+    assert "tp_all_reduce_residual_bs1" not in dense_path.read_text(
+        encoding="utf-8",
+    )
+
+
 def test_tp_all_reduce_selects_smallmesh_and_keeps_push_gather_fallback() -> None:
     source, tree = _parse(_CANONICAL)
     method = _method(tree, "tp_all_reduce")

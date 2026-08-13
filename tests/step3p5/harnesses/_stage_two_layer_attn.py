@@ -1380,6 +1380,9 @@ def analyze_uniformity(
     rank_dir: Path,
     *,
     expected_logical_blocks: dict[str, int] | None = None,
+    expected_dependency_family_task_counts: dict[str, int] | None = None,
+    expected_dependency_family_block_counts: dict[str, int] | None = None,
+    expected_absent_dependency_families: set[str] | None = None,
 ) -> dict | None:
     """Per-core occupancy + bubble accounting from one rank's swimlane records.
 
@@ -1420,6 +1423,47 @@ def analyze_uniformity(
             cid = next((k for k in ks if k is not None and k >= 0), None)
             if cid is not None:
                 names[task_id] = nmap.get(str(cid), f"cid{cid}")
+
+    dependency_family_task_counts: collections.Counter = collections.Counter()
+    dependency_family_block_counts: collections.Counter = collections.Counter()
+    for task_id, name in names.items():
+        family = _family(name)
+        dependency_family_task_counts[family] += 1
+        dependency_family_block_counts[family] += task_block_num.get(task_id, 0)
+
+    dependency_contract_errors = []
+    if expected_dependency_family_task_counts is not None:
+        for family, expected in sorted(
+            expected_dependency_family_task_counts.items(),
+        ):
+            actual = dependency_family_task_counts.get(family, 0)
+            if actual != expected:
+                dependency_contract_errors.append(
+                    f"{family}: expected {expected} dependency tasks, "
+                    f"found {actual}",
+                )
+    if expected_dependency_family_block_counts is not None:
+        for family, expected in sorted(
+            expected_dependency_family_block_counts.items(),
+        ):
+            actual = dependency_family_block_counts.get(family, 0)
+            if actual != expected:
+                dependency_contract_errors.append(
+                    f"{family}: expected {expected} dependency blocks, "
+                    f"found {actual}",
+                )
+    if expected_absent_dependency_families is not None:
+        for family in sorted(expected_absent_dependency_families):
+            actual = dependency_family_task_counts.get(family, 0)
+            if actual:
+                dependency_contract_errors.append(
+                    f"{family}: expected no dependency tasks, found {actual}",
+                )
+    if dependency_contract_errors:
+        raise RuntimeError(
+            f"DFX dependency-family contract failed for {rank_dir}: "
+            + "; ".join(dependency_contract_errors),
+        )
 
     us = lambda tk: tk / freq * 1e6  # noqa: E731
     busy_all: collections.Counter = collections.Counter()
@@ -1631,6 +1675,12 @@ def analyze_uniformity(
         "per_core_occupancy_excl_ar": {
             str(c): round(busy_excl.get(c, 0) / makespan, 4) for c in all_core_ids
         },
+        "dependency_family_task_counts": dict(
+            sorted(dependency_family_task_counts.items()),
+        ),
+        "dependency_family_block_counts": dict(
+            sorted(dependency_family_block_counts.items()),
+        ),
         "families": {
             fam: family_stats(fam)
             for fam in sorted(fam_busy, key=lambda f: -fam_busy[f])
@@ -3582,11 +3632,44 @@ def main() -> int:
                 )
                 // int(out_proj_grains["swa"]["matmul_tiles_per_task"])
             ),
-            "full_out_resid_add": (BATCH // cfg.BATCH_TILE)
-            * (HIDDEN // int(out_proj_grains["full"]["vec"])),
-            "swa_out_resid_add": (BATCH // cfg.BATCH_TILE)
-            * (HIDDEN // int(out_proj_grains["swa"]["vec"])),
         }
+        full_resid_blocks = (
+            (BATCH // cfg.BATCH_TILE)
+            * (HIDDEN // int(out_proj_grains["full"]["vec"]))
+        )
+        swa_resid_blocks = (
+            (BATCH // cfg.BATCH_TILE)
+            * (HIDDEN // int(out_proj_grains["swa"]["vec"]))
+        )
+        if dfx_active_rows == 1:
+            expected_dependency_family_task_counts = {
+                "tp_all_reduce": 2,
+                "tp_all_reduce_residual_bs1": 2,
+            }
+            expected_dependency_family_block_counts = {
+                "tp_all_reduce": 2,
+                "tp_all_reduce_residual_bs1": 2,
+            }
+            expected_absent_dependency_families = {
+                "full_out_resid_add",
+                "swa_out_resid_add",
+            }
+        else:
+            expected_logical_blocks["full_out_resid_add"] = full_resid_blocks
+            expected_logical_blocks["swa_out_resid_add"] = swa_resid_blocks
+            expected_dependency_family_task_counts = {
+                "tp_all_reduce": 4,
+                "full_out_resid_add": 1,
+                "swa_out_resid_add": 1,
+            }
+            expected_dependency_family_block_counts = {
+                "tp_all_reduce": 4,
+                "full_out_resid_add": full_resid_blocks,
+                "swa_out_resid_add": swa_resid_blocks,
+            }
+            expected_absent_dependency_families = {
+                "tp_all_reduce_residual_bs1",
+            }
         if not getattr(cfg, "FULL_ATTN_OUT_PROJ_FUSE_CAST", 0):
             expected_logical_blocks["full_out_proj_cast"] = (
                 (BATCH // cfg.BATCH_TILE)
@@ -3601,6 +3684,16 @@ def main() -> int:
             Path(compiled.output_dir),
             out,
             expected_logical_blocks=expected_logical_blocks,
+            expected_dependency_family_task_counts=(
+                expected_dependency_family_task_counts
+            ),
+            expected_dependency_family_block_counts=(
+                expected_dependency_family_block_counts
+            ),
+            expected_absent_dependency_families=(
+                expected_absent_dependency_families
+            ),
+            expected_rank_count=tp,
         )
     return 0
 
@@ -3672,30 +3765,42 @@ def _collective_low_wait_reference(
 ) -> dict | None:
     """Select a diagnostic rank with the least in-kernel collective wait.
 
-    ``tp_all_reduce`` includes peer-arrival spin time, so the all-rank
-    makespan median can be orders of magnitude larger than device compute
-    during DFX capture.  This reference is only a low-wait heuristic; retain
-    the all-rank aggregate alongside it.
+    Every ``tp_all_reduce*`` family includes peer-arrival spin time, so the
+    all-rank makespan median can be orders of magnitude larger than device
+    compute during DFX capture. This reference is only a low-wait heuristic;
+    retain the all-rank aggregate alongside it.
     """
     candidates = []
     for tag, report in rank_reports.items():
-        collective = report["families"].get("tp_all_reduce")
-        if collective is None:
+        collective_families = {
+            family: float(info["stage_span_us"])
+            for family, info in report["families"].items()
+            if family.startswith("tp_all_reduce")
+        }
+        if not collective_families:
             continue
+        collective_us = sum(collective_families.values())
         candidates.append(
             (
-                float(collective["stage_span_us"]),
+                collective_us,
                 float(report["makespan_us"]),
                 tag,
                 report,
+                collective_families,
             ),
         )
     if not candidates:
         return None
-    collective_us, makespan_us, tag, report = min(candidates)
+    collective_us, makespan_us, tag, report, collective_families = min(
+        candidates,
+    )
     return {
         "rank_tag": tag,
         "tp_all_reduce_stage_span_us": round(collective_us, 4),
+        "tp_all_reduce_family_stage_span_us": {
+            family: round(span, 4)
+            for family, span in sorted(collective_families.items())
+        },
         "makespan_us": round(makespan_us, 4),
         "families": report["families"],
         "interpretation": (
@@ -3704,18 +3809,33 @@ def _collective_low_wait_reference(
         ),
     }
 
-
 def _postprocess_dfx(
     build_dir: Path,
     out: Path,
     *,
     expected_logical_blocks: dict[str, int] | None = None,
+    expected_dependency_family_task_counts: dict[str, int] | None = None,
+    expected_dependency_family_block_counts: dict[str, int] | None = None,
+    expected_absent_dependency_families: set[str] | None = None,
+    expected_rank_count: int | None = None,
 ) -> None:
     """Run critical_path over the captured ranks and summarize uniformity."""
+    contract_required = any(
+        value is not None
+        for value in (
+            expected_dependency_family_task_counts,
+            expected_dependency_family_block_counts,
+            expected_absent_dependency_families,
+            expected_rank_count,
+        )
+    )
     dfx_root = build_dir / "dfx_outputs"
     if not dfx_root.exists():
+        if contract_required:
+            raise RuntimeError(f"DFX output root missing under {build_dir}")
         print(f"[two-layer] no dfx_outputs under {build_dir}", file=sys.stderr)
         return
+    out.mkdir(parents=True, exist_ok=True)
     print(f"\n[two-layer] critical_path over {dfx_root}", flush=True)
     proc = subprocess.run(
         [sys.executable, "-m", "simpler_setup.tools.critical_path",
@@ -3731,12 +3851,31 @@ def _postprocess_dfx(
         u = analyze_uniformity(
             d,
             expected_logical_blocks=expected_logical_blocks,
+            expected_dependency_family_task_counts=(
+                expected_dependency_family_task_counts
+            ),
+            expected_dependency_family_block_counts=(
+                expected_dependency_family_block_counts
+            ),
+            expected_absent_dependency_families=(
+                expected_absent_dependency_families
+            ),
         )
         if u is None:
             continue
         rank_summary[str(d.relative_to(dfx_root))] = u
     if not rank_summary:
+        if contract_required:
+            raise RuntimeError(f"DFX rank records missing under {dfx_root}")
         return
+    if (
+        expected_rank_count is not None
+        and len(rank_summary) != expected_rank_count
+    ):
+        raise RuntimeError(
+            f"DFX rank count mismatch: expected {expected_rank_count}, "
+            f"found {len(rank_summary)} under {dfx_root}",
+        )
     for tag, u in rank_summary.items():
         print_uniformity(tag, u)
     aggregate = _aggregate_rank_uniformity(rank_summary)

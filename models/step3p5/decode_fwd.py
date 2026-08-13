@@ -153,6 +153,10 @@ N_ROUTES_PER_RANK = BATCH * TOPK
 ROUTER_SCORE_PAD = 512
 ROUTER_TOPK_PAD = 16
 ROUTER_SORT_PAD = ROUTER_TOPK_PAD * 2
+ROUTER_SORT_HEAD = 256
+ROUTER_SORT_TAIL = N_EXPERTS - ROUTER_SORT_HEAD
+ROUTER_CANDIDATE_PAIR_WIDTH = TOPK * 2
+assert ROUTER_SORT_TAIL == 32
 ROUTER_GATE_M_TILE = 16
 ROUTER_GATE_K_CHUNK = 512
 ROUTER_GATE_N_CHUNK = 16
@@ -985,12 +989,6 @@ class WholeDecodeStep3p5:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > BATCH:
             active_tokens = pl.cast(BATCH, pl.INDEX)
-        score_buf = pl.create_tensor(
-            [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
-        )
-        biased_buf = pl.create_tensor(
-            [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
-        )
         # PERF/GATE-DECOUPLE: raw FP32 gate logits, pre inv_rms/sigmoid/bias.
         # Only columns below N_EXPERTS are ever read, so the pad needs no
         # initialization.
@@ -1080,117 +1078,97 @@ class WholeDecodeStep3p5:
             # the fanout cube-only and avoids a C2V handoff for an identity op.
             logit_buf = pl.assemble(logit_buf, logits_n, [m0, n0])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_topk"):
-            # Process only logical rows. The cube still executes its required
-            # 16-row tile, but sigmoid, bias, sort and normalization scale with
-            # the runtime batch like vLLM-Ascend MoeGatingTopK.
-            for tt in pl.range(active_tokens):
-                score_buf[tt : tt + 1, :] = pl.full(
-                    [1, ROUTER_SCORE_PAD], dtype=pl.FP32, value=0.0,
-                )
-                biased_buf[tt : tt + 1, :] = pl.full(
-                    [1, ROUTER_SCORE_PAD],
-                    dtype=pl.FP32,
-                    value=ROUTER_FP32_NEG_INF,
-                )
-                inv_rms_scalar = pl.read(inv_rms, [tt, 0])
-                for nb2 in pl.range(
-                    N_EXPERTS // ROUTER_GATE_N_CHUNK,
-                ):
-                    n0b = nb2 * ROUTER_GATE_N_CHUNK
-                    logits_b = pl.mul(
-                        pl.slice(
-                            logit_buf,
-                            [1, ROUTER_GATE_N_CHUNK],
-                            [tt, n0b],
-                        ),
-                        inv_rms_scalar,
-                    )
-                    score_n_chunk = pl.recip(
-                        pl.add(pl.exp(pl.neg(logits_b)), 1.0),
-                    )
-                    bias_chunk = pl.slice(
-                        router_bias, [ROUTER_GATE_N_CHUNK], [n0b],
-                    )
-                    bias_row_chunk = pl.reshape(
-                        bias_chunk, [1, ROUTER_GATE_N_CHUNK],
-                    )
-                    # vLLM applies the router bias in BF16. Preserve that
-                    # rounding before widening it for the FP32 selection key.
-                    bias_row_chunk = pl.cast(
-                        pl.cast(bias_row_chunk, target_type=pl.BF16),
-                        target_type=pl.FP32,
-                    )
-                    biased_n_chunk = pl.add(
-                        score_n_chunk,
-                        pl.col_expand_mul(
-                            pl.full(
-                                [1, ROUTER_GATE_N_CHUNK],
-                                dtype=pl.FP32,
-                                value=1.0,
-                            ),
-                            bias_row_chunk,
-                        ),
-                    )
-                    score_buf[
-                        tt : tt + 1,
-                        n0b : n0b + ROUTER_GATE_N_CHUNK,
-                    ] = score_n_chunk
-                    biased_buf[
-                        tt : tt + 1,
-                        n0b : n0b + ROUTER_GATE_N_CHUNK,
-                    ] = biased_n_chunk
+        # One row per runtime task follows active BS instead of serializing all
+        # rows on one vector core. The fanout dependency is explicit; the
+        # inv_rms producer remains an inferred data dependency.
+        with pl.spmd(
+            active_tokens,
+            name_hint="gate_topk",
+            deps=[_gate_fanout_tid],
+            allow_early_resolve=True,
+        ) as _gate_topk_tid:
+            tt = pl.tile.get_block_idx()
+            logits = pl.mul(
+                pl.slice(logit_buf, [1, N_EXPERTS], [tt, 0]),
+                pl.read(inv_rms, [tt, 0]),
+            )
+            score_n = pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0))
+            bias_row = pl.reshape(
+                pl.slice(router_bias, [N_EXPERTS], [0]),
+                [1, N_EXPERTS],
+            )
+            # vLLM applies the router bias in BF16. Preserve that rounding
+            # before widening it for the FP32 selection key.
+            bias_row = pl.cast(
+                pl.cast(bias_row, target_type=pl.BF16),
+                target_type=pl.FP32,
+            )
+            biased_n = pl.add(score_n, bias_row)
 
-                row = biased_buf[tt : tt + 1, :]
-                idx_init = pl.arange(
-                    0, [1, ROUTER_SCORE_PAD], dtype=pl.UINT32,
+            # Sort exactly 288 experts instead of padding to 512. The first
+            # 256 experts form two sorted 128-value runs after the four-way
+            # merge; merge those runs, sort the 32-value tail, then merge only
+            # the top-8 candidates from each partition. A global top-8 cannot
+            # contain an element ranked below eighth in its own partition.
+            head_idx = pl.arange(
+                0, [1, ROUTER_SORT_HEAD], dtype=pl.UINT32,
+            )
+            head_sorted = pl.sort32(
+                biased_n[:, 0:ROUTER_SORT_HEAD], head_idx,
+            )
+            head_sorted = pl.mrgsort(head_sorted, block_len=64)
+            head_sorted = pl.mrgsort(
+                head_sorted[:, 0:ROUTER_SORT_HEAD],
+                head_sorted[
+                    :, ROUTER_SORT_HEAD : 2 * ROUTER_SORT_HEAD
+                ],
+            )
+            tail_idx = pl.arange(
+                ROUTER_SORT_HEAD,
+                [1, ROUTER_SORT_TAIL],
+                dtype=pl.UINT32,
+            )
+            tail_sorted = pl.sort32(
+                biased_n[:, ROUTER_SORT_HEAD:N_EXPERTS], tail_idx,
+            )
+            candidates = pl.mrgsort(
+                head_sorted[:, 0:ROUTER_CANDIDATE_PAIR_WIDTH],
+                tail_sorted[:, 0:ROUTER_CANDIDATE_PAIR_WIDTH],
+            )
+            pairs = candidates[:, 0:ROUTER_CANDIDATE_PAIR_WIDTH]
+            top_idx = pl.gather(
+                pairs,
+                mask_pattern=pl.tile.MaskPattern.P1010,
+                output_dtype=pl.INT32,
+            )
+
+            # Index gather requires tensor operands. Keep the raw sigmoid row
+            # and selected indices as local tensors; no padded score/biased
+            # rows are materialized to GM and reloaded.
+            score_row = pl.create_tensor(
+                [1, N_EXPERTS], dtype=pl.FP32,
+            )
+            score_row[:, :] = score_n
+            topk_idx_tile = pl.create_tensor([1, TOPK], dtype=pl.INT32)
+            topk_idx_tile[:, :] = top_idx
+            gather_all = pl.gather(
+                score_row, dim=-1, index=topk_idx_tile,
+            )
+
+            # A 1x1 FP32 reduction result has a 4-byte col-major footprint,
+            # which ptoas rejects. Replicate one aligned 32-byte row into the
+            # smallest backend-safe 8-row reduction workspace.
+            topk_vals_work = pl.create_tensor([8, TOPK], dtype=pl.FP32)
+            for denom_row in pl.range(8):
+                topk_vals_work = pl.assemble(
+                    topk_vals_work, gather_all, [denom_row, 0],
                 )
-                srt = pl.sort32(row, idx_init)
-                srt = pl.mrgsort(srt, block_len=64)
-                srt = pl.mrgsort(srt, block_len=256)
-                pairs = srt[:, 0:ROUTER_SORT_PAD]
-                top_idx = pl.gather(
-                    pairs,
-                    mask_pattern=pl.tile.MaskPattern.P1010,
-                    output_dtype=pl.INT32,
-                )
-                topk_idx_tile = pl.create_tensor(
-                    [1, ROUTER_TOPK_PAD], dtype=pl.INT32,
-                )
-                topk_idx_tile[:, :] = top_idx
-                gather_all = pl.gather(
-                    score_buf[tt : tt + 1, :],
-                    dim=-1,
-                    index=topk_idx_tile,
-                )
-                gather_valid = pl.set_validshape(gather_all, 1, TOPK)
-                # A 1x1 FP32 reduction result has a 4-byte col-major
-                # footprint, which ptoas rejects. Keep an aligned 8-row
-                # workspace and scatter only its first row.
-                topk_vals_work = pl.create_tensor(
-                    [8, ROUTER_TOPK_PAD], dtype=pl.FP32,
-                )
-                for denom_row in pl.range(8):
-                    topk_vals_work = pl.assemble(
-                        topk_vals_work, gather_valid, [denom_row, 0],
-                    )
-                topk_vals_work_valid = pl.set_validshape(
-                    topk_vals_work, 8, TOPK,
-                )
-                denom = pl.row_sum(topk_vals_work_valid)
-                weights_work = pl.mul(
-                    pl.row_expand_div(topk_vals_work_valid, denom),
-                    ROUTER_SCALE,
-                )
-                for k in pl.range(TOPK):
-                    pl.write(
-                        expert_indices, [tt, k],
-                        pl.read(topk_idx_tile, [0, k]),
-                    )
-                    pl.write(
-                        expert_weights, [tt, k],
-                        pl.read(weights_work, [0, k]),
-                    )
+            denom = pl.row_sum(topk_vals_work)
+            weights_work = pl.mul(
+                pl.row_expand_div(topk_vals_work, denom), ROUTER_SCALE,
+            )
+            expert_indices[tt : tt + 1, :] = topk_idx_tile[:, :]
+            expert_weights[tt : tt + 1, :] = weights_work[0:1, :]
 
         return expert_weights
 

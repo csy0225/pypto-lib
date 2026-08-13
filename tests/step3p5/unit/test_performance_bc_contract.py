@@ -1314,9 +1314,18 @@ def test_router_grid_and_postprocess_scale_with_active_batch() -> None:
     assert "b_trans=True" in fanout_source
 
     topk = _task_scope(gate, "gate_topk")
+    topk_call = topk.items[0].context_expr
+    assert isinstance(topk_call, ast.Call)
+    assert [ast.unparse(arg) for arg in topk_call.args] == ["active_tokens"]
     topk_source = _segment(source, topk)
-    assert "for tt in pl.range(active_tokens):" in topk_source
-    assert "[1, ROUTER_SCORE_PAD]" in topk_source
+    assert "deps=[_gate_fanout_tid]" in topk_source
+    assert "tt = pl.tile.get_block_idx()" in topk_source
+    assert "pl.slice(logit_buf, [1, N_EXPERTS], [tt, 0])" in topk_source
+    assert "biased_n[:, 0:ROUTER_SORT_HEAD]" in topk_source
+    assert "biased_n[:, ROUTER_SORT_HEAD:N_EXPERTS]" in topk_source
+    assert "[1, ROUTER_SCORE_PAD]" not in topk_source
+    assert "expert_indices[tt : tt + 1, :]" in topk_source
+    assert "expert_weights[tt : tt + 1, :]" in topk_source
 
 
 def test_shared_mlp_scales_projection_and_down_grids_with_active_batch() -> None:

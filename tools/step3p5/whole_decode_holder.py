@@ -374,12 +374,12 @@ class WholeDecodeHolder:
                  Wsub(K.KEY_WG_SWA, _MOE_SWA_SLOTS),
                  self.gate_r_moe_swa]
         # MoE expert/router weights
-        args += [W(K.KEY_MOE_GATE_W), W(K.KEY_MOE_ROUTER_BIAS),
+        args += [W(K.KEY_MOE_GATE_W_NK), W(K.KEY_MOE_ROUTER_BIAS),
                  W(K.KEY_MOE_W_GATE_R), W(K.KEY_MOE_W_GATE_R_SCALE),
                  W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_UP_R_SCALE),
                  W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_DOWN_R_SCALE),
-                 W(K.KEY_MOE_W_GATE_S),
-                 W(K.KEY_MOE_W_UP_S), W(K.KEY_MOE_W_DOWN_S)]
+                 W(K.KEY_MOE_W_GATE_S_NK),
+                 W(K.KEY_MOE_W_UP_S_NK), W(K.KEY_MOE_W_DOWN_S)]
         # KV/RoPE metadata
         args += [self.seq_lens, self.block_table, self.slot_mapping,
                  self.rope_cf, self.rope_sf, self.rope_cs, self.rope_ss]

@@ -160,7 +160,7 @@ class FiveLayerMoeRouteInstrumented:
             [N_DENSE_FIVE * INTER_LOCAL, HIDDEN], pl.BF16
         ],
         moe_gate_w: pl.Tensor[
-            [N_MOE_FIVE * HIDDEN, N_EXPERTS], pl.FP32
+            [N_MOE_FIVE * N_EXPERTS, HIDDEN], pl.FP32
         ],
         moe_router_bias: pl.Tensor[
             [N_MOE_FIVE * N_EXPERTS], pl.FP32
@@ -184,10 +184,10 @@ class FiveLayerMoeRouteInstrumented:
             [N_MOE_FIVE * n_local_experts, HIDDEN], pl.FP32
         ],
         moe_w_gate_s: pl.Tensor[
-            [N_MOE_FIVE * HIDDEN, sh_inter_local], pl.BF16
+            [N_MOE_FIVE * sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_up_s: pl.Tensor[
-            [N_MOE_FIVE * HIDDEN, sh_inter_local], pl.BF16
+            [N_MOE_FIVE * sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_down_s: pl.Tensor[
             [N_MOE_FIVE * sh_inter_local, HIDDEN], pl.BF16
@@ -497,7 +497,7 @@ class FiveLayerMoeRouteInstrumented:
                 [2 * nh_swa_pad, 0],
             ),
             post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [0, 0]),
+            pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [0, 0]),
             pl.slice(moe_router_bias, [N_EXPERTS], [0]),
             pl.reshape(
                 pl.slice(
@@ -538,8 +538,8 @@ class FiveLayerMoeRouteInstrumented:
                 [n_local_experts, HIDDEN],
                 [0, 0],
             ),
-            pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [0, 0]),
-            pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [0, 0]),
+            pl.slice(moe_w_gate_s, [sh_inter_local, HIDDEN], [0, 0]),
+            pl.slice(moe_w_up_s, [sh_inter_local, HIDDEN], [0, 0]),
             pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [0, 0]),
             hidden_l3_raw,
             resid_l3,
@@ -614,7 +614,7 @@ class FiveLayerMoeRouteInstrumented:
                 [nh_full_pad, 0],
             ),
             post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [HIDDEN, 0]),
+            pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [N_EXPERTS, 0]),
             pl.slice(moe_router_bias, [N_EXPERTS], [N_EXPERTS]),
             pl.reshape(
                 pl.slice(
@@ -657,13 +657,13 @@ class FiveLayerMoeRouteInstrumented:
             ),
             pl.slice(
                 moe_w_gate_s,
-                [HIDDEN, sh_inter_local],
-                [HIDDEN, 0],
+                [sh_inter_local, HIDDEN],
+                [sh_inter_local, 0],
             ),
             pl.slice(
                 moe_w_up_s,
-                [HIDDEN, sh_inter_local],
-                [HIDDEN, 0],
+                [sh_inter_local, HIDDEN],
+                [sh_inter_local, 0],
             ),
             pl.slice(
                 moe_w_down_s,
@@ -778,7 +778,7 @@ class FiveLayerMoeRouteInstrumented:
             [tp_size, N_DENSE_FIVE, INTER_LOCAL, HIDDEN], pl.BF16
         ],
         moe_gate_w: pl.Tensor[
-            [tp_size, N_MOE_FIVE, HIDDEN, N_EXPERTS], pl.FP32
+            [tp_size, N_MOE_FIVE, N_EXPERTS, HIDDEN], pl.FP32
         ],
         moe_router_bias: pl.Tensor[
             [tp_size, N_MOE_FIVE, N_EXPERTS], pl.FP32
@@ -823,10 +823,10 @@ class FiveLayerMoeRouteInstrumented:
             [tp_size, N_MOE_FIVE, n_local_experts, HIDDEN], pl.FP32
         ],
         moe_w_gate_s: pl.Tensor[
-            [tp_size, N_MOE_FIVE, HIDDEN, sh_inter_local], pl.BF16
+            [tp_size, N_MOE_FIVE, sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_up_s: pl.Tensor[
-            [tp_size, N_MOE_FIVE, HIDDEN, sh_inter_local], pl.BF16
+            [tp_size, N_MOE_FIVE, sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_down_s: pl.Tensor[
             [tp_size, N_MOE_FIVE, sh_inter_local, HIDDEN], pl.BF16
@@ -1000,7 +1000,7 @@ class FiveLayerMoeRouteInstrumented:
                 ),
                 pl.reshape(
                     moe_gate_w[rank],
-                    [N_MOE_FIVE * HIDDEN, N_EXPERTS],
+                    [N_MOE_FIVE * N_EXPERTS, HIDDEN],
                 ),
                 pl.reshape(
                     moe_router_bias[rank],
@@ -1032,11 +1032,11 @@ class FiveLayerMoeRouteInstrumented:
                 ),
                 pl.reshape(
                     moe_w_gate_s[rank],
-                    [N_MOE_FIVE * HIDDEN, sh_inter_local],
+                    [N_MOE_FIVE * sh_inter_local, HIDDEN],
                 ),
                 pl.reshape(
                     moe_w_up_s[rank],
-                    [N_MOE_FIVE * HIDDEN, sh_inter_local],
+                    [N_MOE_FIVE * sh_inter_local, HIDDEN],
                 ),
                 pl.reshape(
                     moe_w_down_s[rank],

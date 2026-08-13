@@ -29,6 +29,10 @@ usage, are documented in:
 
 [docs/step3p5/README.md](docs/step3p5/README.md)
 
+The reusable Step3p5 MoE layout, runtime-grid, and critical-path optimization
+record is documented in
+[docs/step3p5/moe-layout-and-critical-path.md](docs/step3p5/moe-layout-and-critical-path.md).
+
 ## Quick start
 
 Install pypto + simpler + ptoas (see [.claude/skills/setup_env/SKILL.md](.claude/skills/setup_env/SKILL.md)

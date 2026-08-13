@@ -1288,7 +1288,38 @@ def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
     assert "pl.read(local_expert_offset, [e])" not in combine
 
 
-def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
+def test_router_grid_and_postprocess_scale_with_active_batch() -> None:
+    source, tree = _parse(_CANONICAL)
+    gate = _method(tree, "_gate")
+    gate_source = _segment(source, gate)
+    assert "active_tokens = pl.cast(num_tokens, pl.INDEX)" in gate_source
+    assert "active_gate_tiles = (" in gate_source
+    assert "active_tokens + ROUTER_GATE_M_TILE - 1" in gate_source
+    assert ") // ROUTER_GATE_M_TILE" in gate_source
+    assert "gate_n_blocks = N_EXPERTS // ROUTER_GATE_N_CHUNK" in gate_source
+    assert 'name_hint="gate_init"' not in gate_source
+
+    xg = _task_scope(gate, "gate_xg_precompute")
+    fanout = _task_scope(gate, "gate_expert_fanout")
+    xg_call = xg.items[0].context_expr
+    fanout_call = fanout.items[0].context_expr
+    assert isinstance(xg_call, ast.Call)
+    assert isinstance(fanout_call, ast.Call)
+    assert [ast.unparse(arg) for arg in xg_call.args] == ["active_tokens"]
+    assert [ast.unparse(arg) for arg in fanout_call.args] == [
+        "active_gate_tiles * gate_n_blocks"
+    ]
+    fanout_source = _segment(source, fanout)
+    assert "deps=[gate_xg_tid]" in fanout_source
+    assert "b_trans=True" in fanout_source
+
+    topk = _task_scope(gate, "gate_topk")
+    topk_source = _segment(source, topk)
+    assert "for tt in pl.range(active_tokens):" in topk_source
+    assert "[1, ROUTER_SCORE_PAD]" in topk_source
+
+
+def test_shared_mlp_scales_projection_and_down_grids_with_active_batch() -> None:
     source, tree = _parse(_CANONICAL)
     helper = _method(tree, "_expert_shared_local")
     helper_source = _segment(source, helper)
@@ -1306,40 +1337,55 @@ def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
         "[BATCH, sh_inter_local], dtype=pl.BF16, manual_dep=True"
         in helper_source
     )
+    assert "active_shared_tiles = (" in helper_source
+    assert "active_tokens + SHARED_GATE_M_TILE - 1" in helper_source
+    assert ") // SHARED_GATE_M_TILE" in helper_source
+    assert "shared_mm_tasks = active_shared_tiles * shared_n_blocks" in helper_source
+    assert "active_down_tiles = (" in helper_source
+    assert "active_tokens + SHARED_DOWN_M_TILE - 1" in helper_source
+    assert ") // SHARED_DOWN_M_TILE" in helper_source
+    assert "shared_down_tasks = active_down_tiles * SHARED_DOWN_WORKERS" in helper_source
 
-    gate = _task_scope(helper, "sh_gate_up_act")
+    gate_mm = _task_scope(helper, "sh_gate_mm")
+    up_mm = _task_scope(helper, "sh_up_mm")
+    act = _task_scope(helper, "sh_gate_up_act")
     down = _task_scope(helper, "sh_down")
-    for scope, blocks in (
-        (gate, "SHARED_GATE_UP_ACT_BLOCKS"),
-        (down, "SHARED_DOWN_WORKERS"),
-    ):
+    for scope in (gate_mm, up_mm, act):
         call = scope.items[0].context_expr
         assert isinstance(call, ast.Call)
         assert _call_path(call) == "pl.spmd"
-        assert [ast.unparse(arg) for arg in call.args] == [blocks]
+        assert [ast.unparse(arg) for arg in call.args] == ["shared_mm_tasks"]
+    down_call = down.items[0].context_expr
+    assert isinstance(down_call, ast.Call)
+    assert _call_path(down_call) == "pl.spmd"
+    assert [ast.unparse(arg) for arg in down_call.args] == [
+        "shared_down_tasks"
+    ]
 
-    gate_source = _segment(source, gate)
-    assert (
-        "for chunk in pl.range(\n"
-        "                worker,\n"
-        "                SHARED_GATE_UP_ACT_CHUNKS,\n"
-        "                SHARED_GATE_UP_ACT_BLOCKS,"
-    ) in gate_source
-    assert "sh_hidden[" in gate_source
-    assert "pl.cast(gated, target_type=pl.BF16)" in gate_source
+    for scope in (gate_mm, up_mm):
+        mm_source = _segment(source, scope)
+        assert "b_trans=True" in mm_source
+        assert "task = pl.tile.get_block_idx()" in mm_source
+        assert "mb = task // shared_n_blocks" in mm_source
+        assert "chunk = task % shared_n_blocks" in mm_source
+
+    act_source = _segment(source, act)
+    assert "deps=[sh_gate_tid, sh_up_tid]" in act_source
+    assert "sh_hidden[" in act_source
+    assert "pl.cast(gated, target_type=pl.BF16)" in act_source
 
     down_source = _segment(source, down)
     assert "deps=[sh_gate_up_tid]" in down_source
-    assert "active_tokens = pl.cast(num_tokens, pl.INDEX)" in down_source
+    assert "task = pl.tile.get_block_idx()" in down_source
+    assert "mb = task // SHARED_DOWN_WORKERS" in down_source
+    assert "worker = task % SHARED_DOWN_WORKERS" in down_source
+    assert "m0 = mb * SHARED_DOWN_M_TILE" in down_source
     assert "if active_tokens <= 1:" in down_source
-    assert "if worker == 0:" in down_source
+    assert "if mb == 0 and worker == 0:" in down_source
     assert "HIDDEN // SHARED_DOWN_N_CHUNK" in down_source
-    assert (
-        "worker,\n"
-        "                    HIDDEN // SHARED_DOWN_N_CHUNK,\n"
-        "                    SHARED_DOWN_WORKERS,"
-        in down_source
-    )
+    assert "[SHARED_DOWN_M_TILE, SHARED_SWIGLU_N_CHUNK]" in down_source
+    assert "[m0, d0]" in down_source
+    assert "SHARED_DOWN_WORKERS" in down_source
     assert down_source.count("sh_hidden,") == 4
 
     generic_call = _method_calls(

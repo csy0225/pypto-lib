@@ -153,8 +153,10 @@ N_ROUTES_PER_RANK = BATCH * TOPK
 ROUTER_SCORE_PAD = 512
 ROUTER_TOPK_PAD = 16
 ROUTER_SORT_PAD = ROUTER_TOPK_PAD * 2
-ROUTER_GATE_K_CHUNK = 256
-ROUTER_GATE_N_CHUNK = 32
+ROUTER_GATE_M_TILE = 16
+ROUTER_GATE_K_CHUNK = 512
+ROUTER_GATE_N_CHUNK = 16
+assert BATCH % ROUTER_GATE_M_TILE == 0
 ROUTER_FP32_NEG_INF = -3.4028235e38
 ROUTER_SCALE = 3.0  # MOE_ROUTER_SCALING_FACTOR
 # Eight rows are the smallest backend-safe FP32 scalar store tile. Split the
@@ -192,18 +194,21 @@ ROUTED_SPECIAL_DOWN_N_CHUNK = 128
 RECV_SPECIAL_TILE = 32
 
 # Shared-expert kernel constants — mirrors expert_shared.py / moe.SHARED_*.
-SHARED_GATE_K_CHUNK = 256
+SHARED_GATE_M_TILE = 16
+SHARED_GATE_K_CHUNK = 1024
 SHARED_GATE_N_CHUNK = INTER_S_LOCAL  # 160 — one N tile covers the slice
+SHARED_DOWN_M_TILE = 16
 SHARED_DOWN_K_CHUNK = INTER_S_LOCAL  # 160 — one K tile covers the slice
 SHARED_DOWN_N_CHUNK = 256
 SHARED_SWIGLU_N_CHUNK = 32
-# Shared gate/up keeps the five validated 32-wide chunks on two workers.
+# Gate/up/activation launches one task per active M tile and 32-wide chunk.
 # Shared down activates one worker for single-token decode and both workers
 # for larger batches. Routed uses the spare-core budget left by shared down:
 # 23 workers for one token and 22 workers for larger batches. This is soft
 # scheduling, not physical affinity.
 SHARED_GATE_UP_ACT_CHUNKS = INTER_S_LOCAL // SHARED_SWIGLU_N_CHUNK
-SHARED_GATE_UP_ACT_BLOCKS = 2
+assert BATCH % SHARED_GATE_M_TILE == 0
+assert BATCH % SHARED_DOWN_M_TILE == 0
 SHARED_DOWN_WORKERS = 2
 # Regular routed stages use one grid per stage. Logical expert/tile/chunk work
 # is grid-strided inside the kernel so AICPU no longer submits per expert.
@@ -969,7 +974,7 @@ class WholeDecodeStep3p5:
         post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
         norm_layer_idx: pl.Scalar[pl.INT32],
         inv_rms: pl.Tensor[[BATCH, 1], pl.FP32],
-        gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+        gate_w: pl.Tensor[[N_EXPERTS, HIDDEN], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
         expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
@@ -992,128 +997,150 @@ class WholeDecodeStep3p5:
         logit_buf = pl.create_tensor(
             [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32,
         )
+        # Materialize x * (gamma + 1) once per token row. The gate fanout
+        # then reuses the FP32 matrix instead of rebuilding the same 16xK
+        # tile independently for every expert-column worker.
+        gate_xg = pl.create_tensor(
+            [BATCH, HIDDEN], dtype=pl.FP32, manual_dep=True,
+        )
 
-        # Keep the initialization in a CORE_GROUP scope, but create the
-        # expert-column SPMD fan-out at function scope.  PyPTO does not accept
-        # an SPMD region nested inside an AT scope on all compiler versions.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_init"):
-            # Initialise output pads once — columns beyond N_EXPERTS
-            # keep 0 / NEG_INF so topk is not tricked by uninitialised values.
-            score_buf[:, :] = pl.full(
-                [BATCH, ROUTER_SCORE_PAD], dtype=pl.FP32, value=0.0,
-            )
-            biased_buf[:, :] = pl.full(
-                [BATCH, ROUTER_SCORE_PAD],
-                dtype=pl.FP32, value=ROUTER_FP32_NEG_INF,
-            )
-
-        # G1: fan the gate matmul over expert chunks.  The token dimension is
-        # the inner sequential bound, so inactive storage rows never enter
-        # the routing/top-k path.  The A2/A3 cube M tile stays the validated
-        # static 16 rows; active_tokens gates the later row-wise stages.
-        for nb in pl.spmd(
-            N_EXPERTS // ROUTER_GATE_N_CHUNK,
-            name_hint="gate_expert_fanout",
-        ):
-            n0 = nb * ROUTER_GATE_N_CHUNK
-            raw0 = pl.cast(
-                pl.slice(resid, [BATCH, ROUTER_GATE_K_CHUNK], [0, 0]),
-                target_type=pl.FP32,
-            )
-            gamma0 = pl.slice(
-                post_rms_weight, [1, ROUTER_GATE_K_CHUNK],
-                [norm_layer_idx, 0],
-            )
-            # V4 deferred RMSNorm: gate consumes FP32 xg = resid*(gamma+1).
-            # The full xg tensor is recomputed chunk-wise because the 0726
-            # backend UB cannot retain [BATCH,HIDDEN] FP32 as one tile.
-            x0 = pl.col_expand_mul(raw0, pl.add(gamma0, 1.0))
-            w0 = pl.slice(
-                gate_w,
-                [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
-                [0, n0],
-            )
-            logits_n = pl.matmul(x0, w0, out_dtype=pl.FP32)
-            for kb in pl.range(1, HIDDEN // ROUTER_GATE_K_CHUNK):
+        # G1a: materialize only active rows. The task count follows the
+        # runtime batch, while the downstream cube keeps the hardware M=16
+        # minimum tile.
+        with pl.spmd(
+            active_tokens,
+            name_hint="gate_xg_precompute",
+            allow_early_resolve=True,
+        ) as gate_xg_tid:
+            gate_row = pl.tile.get_block_idx()
+            for kb in pl.range(HIDDEN // ROUTER_GATE_K_CHUNK):
                 k0 = kb * ROUTER_GATE_K_CHUNK
-                rawk = pl.cast(
+                raw = pl.cast(
                     pl.slice(
-                        resid, [BATCH, ROUTER_GATE_K_CHUNK], [0, k0],
+                        resid, [1, ROUTER_GATE_K_CHUNK], [gate_row, k0],
                     ),
                     target_type=pl.FP32,
                 )
-                gammak = pl.slice(
+                gamma = pl.slice(
                     post_rms_weight, [1, ROUTER_GATE_K_CHUNK],
                     [norm_layer_idx, k0],
                 )
-                xk = pl.col_expand_mul(rawk, pl.add(gammak, 1.0))
+                gate_xg[
+                    gate_row : gate_row + 1, k0 : k0 + ROUTER_GATE_K_CHUNK
+                ] = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
+
+        # G1b: fan out over the active M tiles and expert-column tiles.
+        # The checkpoint-native [N, K] layout gives every worker contiguous K
+        # loads, matching vLLM-Ascend MatMulV2(false, true). This avoids the
+        # 64-byte strided rows of the previous [K, N] storage.
+        active_gate_tiles = (
+            active_tokens + ROUTER_GATE_M_TILE - 1
+        ) // ROUTER_GATE_M_TILE
+        gate_n_blocks = N_EXPERTS // ROUTER_GATE_N_CHUNK
+        with pl.spmd(
+            active_gate_tiles * gate_n_blocks,
+            name_hint="gate_expert_fanout",
+            deps=[gate_xg_tid],
+            allow_early_resolve=True,
+        ) as _gate_fanout_tid:
+            task = pl.tile.get_block_idx()
+            mb = task // gate_n_blocks
+            nb = task % gate_n_blocks
+            m0 = mb * ROUTER_GATE_M_TILE
+            n0 = nb * ROUTER_GATE_N_CHUNK
+            x0 = pl.slice(
+                gate_xg,
+                [ROUTER_GATE_M_TILE, ROUTER_GATE_K_CHUNK],
+                [m0, 0],
+            )
+            w0 = pl.slice(
+                gate_w,
+                [ROUTER_GATE_N_CHUNK, ROUTER_GATE_K_CHUNK],
+                [n0, 0],
+            )
+            logits_n = pl.matmul(
+                x0, w0, out_dtype=pl.FP32, b_trans=True,
+            )
+            for kb in pl.range(1, HIDDEN // ROUTER_GATE_K_CHUNK):
+                k0 = kb * ROUTER_GATE_K_CHUNK
+                xk = pl.slice(
+                    gate_xg,
+                    [ROUTER_GATE_M_TILE, ROUTER_GATE_K_CHUNK],
+                    [m0, k0],
+                )
                 wk = pl.slice(
                     gate_w,
-                    [ROUTER_GATE_K_CHUNK, ROUTER_GATE_N_CHUNK],
-                    [k0, n0],
+                    [ROUTER_GATE_N_CHUNK, ROUTER_GATE_K_CHUNK],
+                    [n0, k0],
                 )
-                logits_n = pl.matmul_acc(logits_n, xk, wk)
-            # PERF/GATE-DECOUPLE: inv_rms is a positive per-token scalar
-            # applied *after* the FP32 matmul, so it was the only reason this
-            # cube fan-out had to be serialized behind norm_quant_moe_input.
-            # Store the raw logits and defer inv_rms/sigmoid/bias to
-            # gate_topk, which already waits on inv_rms anyway.
-            # `pl.mul(x, 1.0)` is the vec op that converts the cube block
-            # layout to the vec layout of the pre-created logit_buf; it is
-            # exact for FP32, so score_buf / biased_buf stay byte-identical.
-            logit_buf[:, n0 : n0 + ROUTER_GATE_N_CHUNK] = pl.mul(
-                logits_n, 1.0,
-            )
+                logits_n = pl.matmul_acc(
+                    logits_n, xk, wk, b_trans=True,
+                )
+            # Store the FP32 accumulator directly through FIXPIPE. This keeps
+            # the fanout cube-only and avoids a C2V handoff for an identity op.
+            logit_buf = pl.assemble(logit_buf, logits_n, [m0, n0])
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_topk"):
-            # Deferred tail of the gate fan-out (see PERF/GATE-DECOUPLE).
-            # Identical op order and identical ROUTER_GATE_N_CHUNK blocking
-            # as the previous in-fanout version, so score_buf / biased_buf
-            # are byte-identical. Pad columns beyond N_EXPERTS keep the
-            # 0 / NEG_INF values written by gate_init.
-            for nb2 in pl.range(N_EXPERTS // ROUTER_GATE_N_CHUNK):
-                n0b = nb2 * ROUTER_GATE_N_CHUNK
-                logits_b = pl.row_expand_mul(
-                    pl.slice(
-                        logit_buf, [BATCH, ROUTER_GATE_N_CHUNK], [0, n0b],
-                    ),
-                    inv_rms,
-                )
-                score_n_chunk = pl.recip(
-                    pl.add(pl.exp(pl.neg(logits_b)), 1.0),
-                )
-                bias_chunk = pl.slice(
-                    router_bias, [ROUTER_GATE_N_CHUNK], [n0b],
-                )
-                bias_row_chunk = pl.reshape(
-                    bias_chunk, [1, ROUTER_GATE_N_CHUNK],
-                )
-                # ROUTER-BIAS-BF16 (align moe.py:485-490): vLLM runs
-                # router_bias in BF16; the FP32 loader value's ~0.015
-                # rounding decides the top-8 tail. Without this the
-                # whole-net gate picks a different top-8 vs vLLM.
-                bias_row_chunk = pl.cast(
-                    pl.cast(bias_row_chunk, target_type=pl.BF16),
-                    target_type=pl.FP32,
-                )
-                biased_n_chunk = pl.add(
-                    score_n_chunk,
-                    pl.col_expand_mul(
-                        pl.full(
-                            [BATCH, ROUTER_GATE_N_CHUNK],
-                            dtype=pl.FP32, value=1.0,
-                        ),
-                        bias_row_chunk,
-                    ),
-                )
-                score_buf[:, n0b : n0b + ROUTER_GATE_N_CHUNK] = (
-                    score_n_chunk
-                )
-                biased_buf[:, n0b : n0b + ROUTER_GATE_N_CHUNK] = (
-                    biased_n_chunk
-                )
-
+            # Process only logical rows. The cube still executes its required
+            # 16-row tile, but sigmoid, bias, sort and normalization scale with
+            # the runtime batch like vLLM-Ascend MoeGatingTopK.
             for tt in pl.range(active_tokens):
+                score_buf[tt : tt + 1, :] = pl.full(
+                    [1, ROUTER_SCORE_PAD], dtype=pl.FP32, value=0.0,
+                )
+                biased_buf[tt : tt + 1, :] = pl.full(
+                    [1, ROUTER_SCORE_PAD],
+                    dtype=pl.FP32,
+                    value=ROUTER_FP32_NEG_INF,
+                )
+                inv_rms_scalar = pl.read(inv_rms, [tt, 0])
+                for nb2 in pl.range(
+                    N_EXPERTS // ROUTER_GATE_N_CHUNK,
+                ):
+                    n0b = nb2 * ROUTER_GATE_N_CHUNK
+                    logits_b = pl.mul(
+                        pl.slice(
+                            logit_buf,
+                            [1, ROUTER_GATE_N_CHUNK],
+                            [tt, n0b],
+                        ),
+                        inv_rms_scalar,
+                    )
+                    score_n_chunk = pl.recip(
+                        pl.add(pl.exp(pl.neg(logits_b)), 1.0),
+                    )
+                    bias_chunk = pl.slice(
+                        router_bias, [ROUTER_GATE_N_CHUNK], [n0b],
+                    )
+                    bias_row_chunk = pl.reshape(
+                        bias_chunk, [1, ROUTER_GATE_N_CHUNK],
+                    )
+                    # vLLM applies the router bias in BF16. Preserve that
+                    # rounding before widening it for the FP32 selection key.
+                    bias_row_chunk = pl.cast(
+                        pl.cast(bias_row_chunk, target_type=pl.BF16),
+                        target_type=pl.FP32,
+                    )
+                    biased_n_chunk = pl.add(
+                        score_n_chunk,
+                        pl.col_expand_mul(
+                            pl.full(
+                                [1, ROUTER_GATE_N_CHUNK],
+                                dtype=pl.FP32,
+                                value=1.0,
+                            ),
+                            bias_row_chunk,
+                        ),
+                    )
+                    score_buf[
+                        tt : tt + 1,
+                        n0b : n0b + ROUTER_GATE_N_CHUNK,
+                    ] = score_n_chunk
+                    biased_buf[
+                        tt : tt + 1,
+                        n0b : n0b + ROUTER_GATE_N_CHUNK,
+                    ] = biased_n_chunk
+
                 row = biased_buf[tt : tt + 1, :]
                 idx_init = pl.arange(
                     0, [1, ROUTER_SCORE_PAD], dtype=pl.UINT32,
@@ -1123,7 +1150,8 @@ class WholeDecodeStep3p5:
                 srt = pl.mrgsort(srt, block_len=256)
                 pairs = srt[:, 0:ROUTER_SORT_PAD]
                 top_idx = pl.gather(
-                    pairs, mask_pattern=pl.tile.MaskPattern.P1010,
+                    pairs,
+                    mask_pattern=pl.tile.MaskPattern.P1010,
                     output_dtype=pl.INT32,
                 )
                 topk_idx_tile = pl.create_tensor(
@@ -1137,17 +1165,11 @@ class WholeDecodeStep3p5:
                 )
                 gather_valid = pl.set_validshape(gather_all, 1, TOPK)
                 # A 1x1 FP32 reduction result has a 4-byte col-major
-                # footprint, which ptoas rejects.  Keep the one-token
-                # semantics but reduce an aligned 8-row workspace: row 0
-                # contains the real top-k values and rows 1..7 are zero.  Do
-                # the assemble before fillpad: a padded source tile cannot
-                # be assembled into an unpadded destination in current PTOAS.
+                # footprint, which ptoas rejects. Keep an aligned 8-row
+                # workspace and scatter only its first row.
                 topk_vals_work = pl.create_tensor(
                     [8, ROUTER_TOPK_PAD], dtype=pl.FP32,
                 )
-                # Replicate the one real row into the aligned workspace so
-                # every row has a non-zero denominator (avoid 0/0 in the
-                # inactive helper rows; only row 0 is scattered afterward).
                 for denom_row in pl.range(8):
                     topk_vals_work = pl.assemble(
                         topk_vals_work, gather_valid, [denom_row, 0],
@@ -1179,7 +1201,7 @@ class WholeDecodeStep3p5:
         post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
         norm_layer_idx: pl.Scalar[pl.INT32],
         inv_rms: pl.Tensor[[BATCH, 1], pl.FP32],
-        gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+        gate_w: pl.Tensor[[N_EXPERTS, HIDDEN], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         expert_indices: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
         expert_weights: pl.Out[pl.Tensor[[BATCH, TOPK], pl.FP32]],
@@ -1190,7 +1212,8 @@ class WholeDecodeStep3p5:
     ]:
         self._gate(
             resid, post_rms_weight, norm_layer_idx, inv_rms,
-            gate_w, router_bias, expert_indices, expert_weights, num_tokens,
+            gate_w, router_bias,
+            expert_indices, expert_weights, num_tokens,
         )
         return expert_indices, expert_weights
 
@@ -2236,105 +2259,171 @@ class WholeDecodeStep3p5:
     def _expert_shared_local(
         self,
         x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        w_gate: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
         swiglu_limit: pl.Scalar[pl.FP32],
     ):
-        # The runtime has no physical-core affinity API. Keep shared gate/up
-        # on two workers, and split the 24-core shared-down/routed budget as
-        # 1+23 for one token or 2+22 for larger batches.
-        # The BF16 bridge is the canonical SwiGLU rounding point; do not move
-        # the cast into down.
+        # Gate and up are independent checkpoint-native [N, K] products.
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > BATCH:
+            active_tokens = pl.cast(BATCH, pl.INDEX)
+        active_shared_tiles = (
+            active_tokens + SHARED_GATE_M_TILE - 1
+        ) // SHARED_GATE_M_TILE
+        shared_n_blocks = SHARED_GATE_UP_ACT_CHUNKS
+        shared_mm_tasks = active_shared_tiles * shared_n_blocks
         sh_hidden = pl.create_tensor(
             [BATCH, sh_inter_local], dtype=pl.BF16, manual_dep=True,
         )
-        with pl.spmd(
-            SHARED_GATE_UP_ACT_BLOCKS,
-            name_hint="sh_gate_up_act",
-            allow_early_resolve=True,
-        ) as sh_gate_up_tid:
-            worker = pl.tile.get_block_idx()
-            for chunk in pl.range(
-                worker,
-                SHARED_GATE_UP_ACT_CHUNKS,
-                SHARED_GATE_UP_ACT_BLOCKS,
-            ):
-                n0 = chunk * SHARED_SWIGLU_N_CHUNK
-                x0 = pl.slice(
-                    x, [BATCH, SHARED_GATE_K_CHUNK], [0, 0],
-                )
-                wg0 = pl.slice(
-                    w_gate,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [0, n0],
-                )
-                wu0 = pl.slice(
-                    w_up,
-                    [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                    [0, n0],
-                )
-                gate_acc = pl.matmul(x0, wg0, out_dtype=pl.FP32)
-                up_acc = pl.matmul(x0, wu0, out_dtype=pl.FP32)
-                for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
-                    k0 = kb * SHARED_GATE_K_CHUNK
-                    xk = pl.slice(
-                        x, [BATCH, SHARED_GATE_K_CHUNK], [0, k0],
-                    )
-                    wgk = pl.slice(
-                        w_gate,
-                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                        [k0, n0],
-                    )
-                    wuk = pl.slice(
-                        w_up,
-                        [SHARED_GATE_K_CHUNK, SHARED_SWIGLU_N_CHUNK],
-                        [k0, n0],
-                    )
-                    gate_acc = pl.matmul_acc(gate_acc, xk, wgk)
-                    up_acc = pl.matmul_acc(up_acc, xk, wuk)
-                sigmoid = pl.recip(
-                    pl.add(pl.exp(pl.neg(gate_acc)), 1.0),
-                )
-                silu = pl.mul(gate_acc, sigmoid)
-                if swiglu_limit > 0.0:
-                    silu_c = pl.minimum(silu, swiglu_limit)
-                    up_c = pl.maximum(
-                        pl.minimum(up_acc, swiglu_limit),
-                        -swiglu_limit,
-                    )
-                    gated = pl.mul(silu_c, up_c)
-                else:
-                    gated = pl.mul(silu, up_acc)
-                sh_hidden[
-                    :, n0 : n0 + SHARED_SWIGLU_N_CHUNK
-                ] = pl.cast(gated, target_type=pl.BF16)
+        sh_gate_acc = pl.create_tensor(
+            [BATCH, sh_inter_local], dtype=pl.FP32, manual_dep=True,
+        )
+        sh_up_acc = pl.create_tensor(
+            [BATCH, sh_inter_local], dtype=pl.FP32, manual_dep=True,
+        )
 
         with pl.spmd(
-            SHARED_DOWN_WORKERS,
+            shared_mm_tasks,
+            name_hint="sh_gate_mm",
+            allow_early_resolve=True,
+        ) as sh_gate_tid:
+            task = pl.tile.get_block_idx()
+            mb = task // shared_n_blocks
+            chunk = task % shared_n_blocks
+            m0 = mb * SHARED_GATE_M_TILE
+            n0 = chunk * SHARED_SWIGLU_N_CHUNK
+            x0 = pl.slice(
+                x, [SHARED_GATE_M_TILE, SHARED_GATE_K_CHUNK], [m0, 0],
+            )
+            wg0 = pl.slice(
+                w_gate,
+                [SHARED_SWIGLU_N_CHUNK, SHARED_GATE_K_CHUNK],
+                [n0, 0],
+            )
+            gate_acc = pl.matmul(
+                x0, wg0, out_dtype=pl.FP32, b_trans=True,
+            )
+            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                k0 = kb * SHARED_GATE_K_CHUNK
+                xk = pl.slice(
+                    x,
+                    [SHARED_GATE_M_TILE, SHARED_GATE_K_CHUNK],
+                    [m0, k0],
+                )
+                wgk = pl.slice(
+                    w_gate,
+                    [SHARED_SWIGLU_N_CHUNK, SHARED_GATE_K_CHUNK],
+                    [n0, k0],
+                )
+                gate_acc = pl.matmul_acc(
+                    gate_acc, xk, wgk, b_trans=True,
+                )
+            sh_gate_acc = pl.assemble(sh_gate_acc, gate_acc, [m0, n0])
+
+        with pl.spmd(
+            shared_mm_tasks,
+            name_hint="sh_up_mm",
+            allow_early_resolve=True,
+        ) as sh_up_tid:
+            task = pl.tile.get_block_idx()
+            mb = task // shared_n_blocks
+            chunk = task % shared_n_blocks
+            m0 = mb * SHARED_GATE_M_TILE
+            n0 = chunk * SHARED_SWIGLU_N_CHUNK
+            x0 = pl.slice(
+                x, [SHARED_GATE_M_TILE, SHARED_GATE_K_CHUNK], [m0, 0],
+            )
+            wu0 = pl.slice(
+                w_up,
+                [SHARED_SWIGLU_N_CHUNK, SHARED_GATE_K_CHUNK],
+                [n0, 0],
+            )
+            up_acc = pl.matmul(
+                x0, wu0, out_dtype=pl.FP32, b_trans=True,
+            )
+            for kb in pl.range(1, HIDDEN // SHARED_GATE_K_CHUNK):
+                k0 = kb * SHARED_GATE_K_CHUNK
+                xk = pl.slice(
+                    x,
+                    [SHARED_GATE_M_TILE, SHARED_GATE_K_CHUNK],
+                    [m0, k0],
+                )
+                wuk = pl.slice(
+                    w_up,
+                    [SHARED_SWIGLU_N_CHUNK, SHARED_GATE_K_CHUNK],
+                    [n0, k0],
+                )
+                up_acc = pl.matmul_acc(
+                    up_acc, xk, wuk, b_trans=True,
+                )
+            sh_up_acc = pl.assemble(sh_up_acc, up_acc, [m0, n0])
+
+        with pl.spmd(
+            shared_mm_tasks,
+            name_hint="sh_gate_up_act",
+            deps=[sh_gate_tid, sh_up_tid],
+            allow_early_resolve=True,
+        ) as sh_gate_up_tid:
+            task = pl.tile.get_block_idx()
+            mb = task // shared_n_blocks
+            chunk = task % shared_n_blocks
+            m0 = mb * SHARED_GATE_M_TILE
+            n0 = chunk * SHARED_SWIGLU_N_CHUNK
+            gate_acc = pl.slice(
+                sh_gate_acc,
+                [SHARED_GATE_M_TILE, SHARED_SWIGLU_N_CHUNK],
+                [m0, n0],
+            )
+            up_acc = pl.slice(
+                sh_up_acc,
+                [SHARED_GATE_M_TILE, SHARED_SWIGLU_N_CHUNK],
+                [m0, n0],
+            )
+            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
+            silu = pl.mul(gate_acc, sigmoid)
+            if swiglu_limit > 0.0:
+                silu_c = pl.minimum(silu, swiglu_limit)
+                up_c = pl.maximum(
+                    pl.minimum(up_acc, swiglu_limit),
+                    -swiglu_limit,
+                )
+                gated = pl.mul(silu_c, up_c)
+            else:
+                gated = pl.mul(silu, up_acc)
+            sh_hidden[
+                m0 : m0 + SHARED_GATE_M_TILE,
+                n0 : n0 + SHARED_SWIGLU_N_CHUNK,
+            ] = pl.cast(gated, target_type=pl.BF16)
+
+        active_down_tiles = (
+            active_tokens + SHARED_DOWN_M_TILE - 1
+        ) // SHARED_DOWN_M_TILE
+        shared_down_tasks = active_down_tiles * SHARED_DOWN_WORKERS
+        with pl.spmd(
+            shared_down_tasks,
             name_hint="sh_down",
             deps=[sh_gate_up_tid],
             allow_early_resolve=True,
         ) as _sh_down_tid:
-            worker = pl.tile.get_block_idx()
-            active_tokens = pl.cast(num_tokens, pl.INDEX)
-            if active_tokens < 0:
-                active_tokens = pl.cast(0, pl.INDEX)
-            if active_tokens > BATCH:
-                active_tokens = pl.cast(BATCH, pl.INDEX)
-
+            task = pl.tile.get_block_idx()
+            mb = task // SHARED_DOWN_WORKERS
+            worker = task % SHARED_DOWN_WORKERS
+            m0 = mb * SHARED_DOWN_M_TILE
             if active_tokens <= 1:
-                if worker == 0:
+                if mb == 0 and worker == 0:
                     for db in pl.range(
                         HIDDEN // SHARED_DOWN_N_CHUNK,
                     ):
                         d0 = db * SHARED_DOWN_N_CHUNK
                         h0 = pl.slice(
                             sh_hidden,
-                            [BATCH, SHARED_SWIGLU_N_CHUNK],
-                            [0, 0],
+                            [SHARED_DOWN_M_TILE, SHARED_SWIGLU_N_CHUNK],
+                            [m0, 0],
                         )
                         wd0 = pl.slice(
                             w_down,
@@ -2351,8 +2440,11 @@ class WholeDecodeStep3p5:
                             n0 = chunk * SHARED_SWIGLU_N_CHUNK
                             hk = pl.slice(
                                 sh_hidden,
-                                [BATCH, SHARED_SWIGLU_N_CHUNK],
-                                [0, n0],
+                                [
+                                    SHARED_DOWN_M_TILE,
+                                    SHARED_SWIGLU_N_CHUNK,
+                                ],
+                                [m0, n0],
                             )
                             wdk = pl.slice(
                                 w_down,
@@ -2366,7 +2458,7 @@ class WholeDecodeStep3p5:
                         sh_y_shard = pl.assemble(
                             sh_y_shard,
                             pl.cast(y_acc, target_type=pl.BF16),
-                            [0, d0],
+                            [m0, d0],
                         )
             else:
                 for db in pl.range(
@@ -2377,8 +2469,8 @@ class WholeDecodeStep3p5:
                     d0 = db * SHARED_DOWN_N_CHUNK
                     h0 = pl.slice(
                         sh_hidden,
-                        [BATCH, SHARED_SWIGLU_N_CHUNK],
-                        [0, 0],
+                        [SHARED_DOWN_M_TILE, SHARED_SWIGLU_N_CHUNK],
+                        [m0, 0],
                     )
                     wd0 = pl.slice(
                         w_down,
@@ -2392,8 +2484,8 @@ class WholeDecodeStep3p5:
                         n0 = chunk * SHARED_SWIGLU_N_CHUNK
                         hk = pl.slice(
                             sh_hidden,
-                            [BATCH, SHARED_SWIGLU_N_CHUNK],
-                            [0, n0],
+                            [SHARED_DOWN_M_TILE, SHARED_SWIGLU_N_CHUNK],
+                            [m0, n0],
                         )
                         wdk = pl.slice(
                             w_down,
@@ -2404,7 +2496,7 @@ class WholeDecodeStep3p5:
                     sh_y_shard = pl.assemble(
                         sh_y_shard,
                         pl.cast(y_acc, target_type=pl.BF16),
-                        [0, d0],
+                        [m0, d0],
                     )
 
         return sh_y_shard
@@ -2413,8 +2505,8 @@ class WholeDecodeStep3p5:
     def expert_shared_step(  # noqa: PLR0913
         self,
         x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         sh_tmp_window: pld.DistributedTensor[
@@ -2616,7 +2708,7 @@ class WholeDecodeStep3p5:
         w_g: pl.Tensor[[HIDDEN, nh_full_pad], pl.BF16],
         gate_r: pl.Tensor[[nh_full_pad, hidden_q_full], pl.BF16],
         post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
-        gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+        gate_w: pl.Tensor[[N_EXPERTS, HIDDEN], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
         w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
@@ -2624,8 +2716,8 @@ class WholeDecodeStep3p5:
         w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
         w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
         w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
-        w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
@@ -2820,7 +2912,7 @@ class WholeDecodeStep3p5:
         w_g: pl.Tensor[[HIDDEN, nh_swa_pad], pl.BF16],
         gate_r: pl.Tensor[[nh_swa_pad, hidden_q_swa], pl.BF16],
         post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
-        gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+        gate_w: pl.Tensor[[N_EXPERTS, HIDDEN], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
         w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
@@ -2828,8 +2920,8 @@ class WholeDecodeStep3p5:
         w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
         w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
         w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
-        w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
@@ -3377,8 +3469,8 @@ class WholeDecodeStep3p5:
     def _expert_shared_local_swiglu16(
         self,
         x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        w_gate: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y_shard: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         num_tokens: pl.Scalar[pl.INT32],
@@ -3397,8 +3489,8 @@ class WholeDecodeStep3p5:
     def expert_shared_step_swiglu16(  # noqa: PLR0913
         self,
         x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         sh_y: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         sh_tmp_window: pld.DistributedTensor[
@@ -3444,7 +3536,7 @@ class WholeDecodeStep3p5:
         w_g: pl.Tensor[[HIDDEN, nh_full_pad], pl.BF16],
         gate_r: pl.Tensor[[nh_full_pad, hidden_q_full], pl.BF16],
         post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
-        gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+        gate_w: pl.Tensor[[N_EXPERTS, HIDDEN], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
         w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
@@ -3452,8 +3544,8 @@ class WholeDecodeStep3p5:
         w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
         w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
         w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
-        w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
@@ -3640,7 +3732,7 @@ class WholeDecodeStep3p5:
         w_g: pl.Tensor[[HIDDEN, nh_swa_pad], pl.BF16],
         gate_r: pl.Tensor[[nh_swa_pad, hidden_q_swa], pl.BF16],
         post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
-        gate_w: pl.Tensor[[HIDDEN, N_EXPERTS], pl.FP32],
+        gate_w: pl.Tensor[[N_EXPERTS, HIDDEN], pl.FP32],
         router_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
         w_gate_r: pl.Tensor[[n_local_experts, HIDDEN, inter], pl.INT8],
         w_gate_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
@@ -3648,8 +3740,8 @@ class WholeDecodeStep3p5:
         w_up_r_scale: pl.Tensor[[n_local_experts, inter], pl.FP32],
         w_down_r: pl.Tensor[[n_local_experts, inter, HIDDEN], pl.INT8],
         w_down_r_scale: pl.Tensor[[n_local_experts, HIDDEN], pl.FP32],
-        w_gate_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
-        w_up_s: pl.Tensor[[HIDDEN, sh_inter_local], pl.BF16],
+        w_gate_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
+        w_up_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
@@ -3852,7 +3944,7 @@ class WholeDecodeStep3p5:
         moe_swa_gate_r: pl.Tensor[[NUM_SWA_MOE_LAYERS * nh_swa_pad, hidden_q_swa], pl.BF16],
         # shared MoE weights (all 40 layers share the same shared-expert weights;
         # step3p5 shared expert is replicated, not per-layer — pass once, no stack)
-        moe_gate_w: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * HIDDEN, N_EXPERTS], pl.FP32],
+        moe_gate_w: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * N_EXPERTS, HIDDEN], pl.FP32],
         moe_router_bias: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * N_EXPERTS], pl.FP32],
         moe_w_gate_r: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * n_local_experts * HIDDEN, inter], pl.INT8],
         moe_w_gate_r_scale: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * n_local_experts, inter], pl.FP32],
@@ -3860,8 +3952,8 @@ class WholeDecodeStep3p5:
         moe_w_up_r_scale: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * n_local_experts, inter], pl.FP32],
         moe_w_down_r: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * n_local_experts * inter, HIDDEN], pl.INT8],
         moe_w_down_r_scale: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * n_local_experts, HIDDEN], pl.FP32],
-        moe_w_gate_s: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * HIDDEN, sh_inter_local], pl.BF16],
-        moe_w_up_s: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * HIDDEN, sh_inter_local], pl.BF16],
+        moe_w_gate_s: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * sh_inter_local, HIDDEN], pl.BF16],
+        moe_w_up_s: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * sh_inter_local, HIDDEN], pl.BF16],
         moe_w_down_s: pl.Tensor[[NUM_MOE_LAYERS_TOTAL * sh_inter_local, HIDDEN], pl.BF16],
         seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
         block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
@@ -4053,8 +4145,9 @@ class WholeDecodeStep3p5:
             norm_layer_idx = pl.cast(phys_layer, pl.INT32)
             # MoE weight/window offset = layer_idx * slot (0-indexed into the
             # 40-layer stacks).
-            moe_w_off = layer_idx * HIDDEN
+            moe_gate_off = layer_idx * N_EXPERTS
             moe_bias_off = layer_idx * N_EXPERTS
+            moe_sh_gate_off = layer_idx * sh_inter_local
             moe_r_off = layer_idx * (n_local_experts * HIDDEN)
             moe_r_down_off = layer_idx * (n_local_experts * inter)
             moe_r_scale_off = layer_idx * n_local_experts
@@ -4095,7 +4188,7 @@ class WholeDecodeStep3p5:
                     pl.slice(moe_full_w_g, [HIDDEN, nh_full_pad], [fa_w_off, 0]),
                     pl.slice(moe_full_gate_r, [nh_full_pad, hidden_q_full], [fa_gate_r_off, 0]),
                     post_rms,
-                    pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off, 0]),
+                    pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [moe_gate_off, 0]),
                     pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off]),
                     pl.reshape(
                         pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
@@ -4112,8 +4205,8 @@ class WholeDecodeStep3p5:
                         [n_local_experts, inter, HIDDEN],
                     ),
                     pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off, 0]),
-                    pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
-                    pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
+                    pl.slice(moe_w_gate_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off, 0]),
+                    pl.slice(moe_w_up_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off, 0]),
                     pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
                     h_moe,
                     resid_hold_moe,
@@ -4164,7 +4257,7 @@ class WholeDecodeStep3p5:
                     pl.slice(moe_swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off, 0]),
                     pl.slice(moe_swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off, 0]),
                     post_rms,
-                    pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off, 0]),
+                    pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [moe_gate_off, 0]),
                     pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off]),
                     pl.reshape(
                         pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off, 0]),
@@ -4181,8 +4274,8 @@ class WholeDecodeStep3p5:
                         [n_local_experts, inter, HIDDEN],
                     ),
                     pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off, 0]),
-                    pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
-                    pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off, 0]),
+                    pl.slice(moe_w_gate_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off, 0]),
+                    pl.slice(moe_w_up_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off, 0]),
                     pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
                     h_moe,
                     resid_hold_moe,
@@ -4217,7 +4310,8 @@ class WholeDecodeStep3p5:
         swa_w_off_43 = 32 * HIDDEN
         swa_wo_off_43 = 32 * hidden_q_swa
         swa_gate_r_off_43 = 32 * nh_swa_pad
-        moe_w_off_43 = 40 * HIDDEN
+        moe_gate_off_43 = 40 * N_EXPERTS
+        moe_sh_gate_off_43 = 40 * sh_inter_local
         moe_bias_off_43 = 40 * N_EXPERTS
         moe_r_off_43 = 40 * (n_local_experts * HIDDEN)
         moe_r_scale_off_43 = 40 * n_local_experts
@@ -4246,7 +4340,7 @@ class WholeDecodeStep3p5:
             pl.slice(swa_w_g, [HIDDEN, nh_swa_pad], [swa_w_off_43, 0]),
             pl.slice(swa_gate_r, [nh_swa_pad, hidden_q_swa], [swa_gate_r_off_43, 0]),
             post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off_43, 0]),
+            pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [moe_gate_off_43, 0]),
             pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off_43]),
             pl.reshape(
                 pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off_43, 0]),
@@ -4263,8 +4357,8 @@ class WholeDecodeStep3p5:
                 [n_local_experts, inter, HIDDEN],
             ),
             pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off_43, 0]),
-            pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off_43, 0]),
-            pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off_43, 0]),
+            pl.slice(moe_w_gate_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off_43, 0]),
+            pl.slice(moe_w_up_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off_43, 0]),
             pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off_43, 0]),
             h_layer_43,
             resid_hold_layer_43,
@@ -4292,7 +4386,8 @@ class WholeDecodeStep3p5:
         full_w_off_44 = 11 * HIDDEN
         full_wo_off_44 = 11 * hidden_q_full
         full_gate_r_off_44 = 11 * nh_full_pad
-        moe_w_off_44 = 41 * HIDDEN
+        moe_gate_off_44 = 41 * N_EXPERTS
+        moe_sh_gate_off_44 = 41 * sh_inter_local
         moe_bias_off_44 = 41 * N_EXPERTS
         moe_r_off_44 = 41 * (n_local_experts * HIDDEN)
         moe_r_scale_off_44 = 41 * n_local_experts
@@ -4321,7 +4416,7 @@ class WholeDecodeStep3p5:
             pl.slice(full_w_g, [HIDDEN, nh_full_pad], [full_w_off_44, 0]),
             pl.slice(full_gate_r, [nh_full_pad, hidden_q_full], [full_gate_r_off_44, 0]),
             post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [moe_w_off_44, 0]),
+            pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [moe_gate_off_44, 0]),
             pl.slice(moe_router_bias, [N_EXPERTS], [moe_bias_off_44]),
             pl.reshape(
                 pl.slice(moe_w_gate_r, [n_local_experts * HIDDEN, inter], [moe_r_off_44, 0]),
@@ -4338,8 +4433,8 @@ class WholeDecodeStep3p5:
                 [n_local_experts, inter, HIDDEN],
             ),
             pl.slice(moe_w_down_r_scale, [n_local_experts, HIDDEN], [moe_r_scale_off_44, 0]),
-            pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [moe_w_off_44, 0]),
-            pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [moe_w_off_44, 0]),
+            pl.slice(moe_w_gate_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off_44, 0]),
+            pl.slice(moe_w_up_s, [sh_inter_local, HIDDEN], [moe_sh_gate_off_44, 0]),
             pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off_44, 0]),
             next_hidden_out,
             resid_hold_layer_44,
@@ -4402,7 +4497,7 @@ class WholeDecodeStep3p5:
         moe_swa_wo: pl.Tensor[[tp_size, NUM_SWA_MOE_LAYERS, hidden_q_swa, HIDDEN], pl.BF16],
         moe_swa_w_g: pl.Tensor[[tp_size, NUM_SWA_MOE_LAYERS, HIDDEN, nh_swa_pad], pl.BF16],
         moe_swa_gate_r: pl.Tensor[[tp_size, NUM_SWA_MOE_LAYERS, nh_swa_pad, hidden_q_swa], pl.BF16],
-        moe_gate_w: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, HIDDEN, N_EXPERTS], pl.FP32],
+        moe_gate_w: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, N_EXPERTS, HIDDEN], pl.FP32],
         moe_router_bias: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, N_EXPERTS], pl.FP32],
         moe_w_gate_r: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, n_local_experts, HIDDEN, inter], pl.INT8],
         moe_w_gate_r_scale: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, n_local_experts, inter], pl.FP32],
@@ -4410,8 +4505,8 @@ class WholeDecodeStep3p5:
         moe_w_up_r_scale: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, n_local_experts, inter], pl.FP32],
         moe_w_down_r: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, n_local_experts, inter, HIDDEN], pl.INT8],
         moe_w_down_r_scale: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, n_local_experts, HIDDEN], pl.FP32],
-        moe_w_gate_s: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, HIDDEN, sh_inter_local], pl.BF16],
-        moe_w_up_s: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, HIDDEN, sh_inter_local], pl.BF16],
+        moe_w_gate_s: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, sh_inter_local, HIDDEN], pl.BF16],
+        moe_w_up_s: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, sh_inter_local, HIDDEN], pl.BF16],
         moe_w_down_s: pl.Tensor[[tp_size, NUM_MOE_LAYERS_TOTAL, sh_inter_local, HIDDEN], pl.BF16],
         seq_lens: pl.Tensor[[tp_size, USER_BATCH_DYN], pl.INT32],
         block_table: pl.Tensor[[tp_size, BLOCK_TABLE_FLAT_DYN], pl.INT32],
@@ -4487,7 +4582,7 @@ class WholeDecodeStep3p5:
                 pl.reshape(moe_swa_wo[r], [NUM_SWA_MOE_LAYERS * hidden_q_swa, HIDDEN]),
                 pl.reshape(moe_swa_w_g[r], [NUM_SWA_MOE_LAYERS * HIDDEN, nh_swa_pad]),
                 pl.reshape(moe_swa_gate_r[r], [NUM_SWA_MOE_LAYERS * nh_swa_pad, hidden_q_swa]),
-                pl.reshape(moe_gate_w[r], [NUM_MOE_LAYERS_TOTAL * HIDDEN, N_EXPERTS]),
+                pl.reshape(moe_gate_w[r], [NUM_MOE_LAYERS_TOTAL * N_EXPERTS, HIDDEN]),
                 pl.reshape(moe_router_bias[r], [NUM_MOE_LAYERS_TOTAL * N_EXPERTS]),
                 pl.reshape(moe_w_gate_r[r], [NUM_MOE_LAYERS_TOTAL * n_local_experts * HIDDEN, inter]),
                 pl.reshape(moe_w_gate_r_scale[r], [NUM_MOE_LAYERS_TOTAL * n_local_experts, inter]),
@@ -4495,8 +4590,8 @@ class WholeDecodeStep3p5:
                 pl.reshape(moe_w_up_r_scale[r], [NUM_MOE_LAYERS_TOTAL * n_local_experts, inter]),
                 pl.reshape(moe_w_down_r[r], [NUM_MOE_LAYERS_TOTAL * n_local_experts * inter, HIDDEN]),
                 pl.reshape(moe_w_down_r_scale[r], [NUM_MOE_LAYERS_TOTAL * n_local_experts, HIDDEN]),
-                pl.reshape(moe_w_gate_s[r], [NUM_MOE_LAYERS_TOTAL * HIDDEN, sh_inter_local]),
-                pl.reshape(moe_w_up_s[r], [NUM_MOE_LAYERS_TOTAL * HIDDEN, sh_inter_local]),
+                pl.reshape(moe_w_gate_s[r], [NUM_MOE_LAYERS_TOTAL * sh_inter_local, HIDDEN]),
+                pl.reshape(moe_w_up_s[r], [NUM_MOE_LAYERS_TOTAL * sh_inter_local, HIDDEN]),
                 pl.reshape(moe_w_down_s[r], [NUM_MOE_LAYERS_TOTAL * sh_inter_local, HIDDEN]),
                 seq_lens[r],
                 block_table[r],

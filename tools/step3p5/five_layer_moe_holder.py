@@ -358,7 +358,7 @@ class FiveLayerMoeHolder(WholeDecodeHolder):
             weight(keys.KEY_DENSE_DOWN),
         ]
         args += [
-            weight_slots(keys.KEY_MOE_GATE_W, _MOE_SLOTS),
+            weight_slots(keys.KEY_MOE_GATE_W_NK, _MOE_SLOTS),
             weight_slots(keys.KEY_MOE_ROUTER_BIAS, _MOE_SLOTS),
             weight_slots(keys.KEY_MOE_W_GATE_R, _MOE_SLOTS),
             weight_slots(keys.KEY_MOE_W_GATE_R_SCALE, _MOE_SLOTS),
@@ -366,8 +366,8 @@ class FiveLayerMoeHolder(WholeDecodeHolder):
             weight_slots(keys.KEY_MOE_W_UP_R_SCALE, _MOE_SLOTS),
             weight_slots(keys.KEY_MOE_W_DOWN_R, _MOE_SLOTS),
             weight_slots(keys.KEY_MOE_W_DOWN_R_SCALE, _MOE_SLOTS),
-            weight_slots(keys.KEY_MOE_W_GATE_S, _MOE_SLOTS),
-            weight_slots(keys.KEY_MOE_W_UP_S, _MOE_SLOTS),
+            weight_slots(keys.KEY_MOE_W_GATE_S_NK, _MOE_SLOTS),
+            weight_slots(keys.KEY_MOE_W_UP_S_NK, _MOE_SLOTS),
             weight_slots(keys.KEY_MOE_W_DOWN_S, _MOE_SLOTS),
         ]
         args += [

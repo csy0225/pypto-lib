@@ -99,6 +99,12 @@ canonical ABI 必须 fail-closed；禁止 vanilla、per-layer 或 silent fallbac
 - routed input 和 clamped SwiGLU 中间激活使用 per-token INT8
   quant/requant；
 - shared expert 保持 BF16；
+- hidden-only decode 的 router、shared gate 和 shared up 权重保持 checkpoint
+  原生 `[N, K]` layout，并以 `b_trans=True` 执行；
+- native decode ABI 使用 `moe_gate_w_nk`、`moe_w_gate_s_nk` 和
+  `moe_w_up_s_nk`，同一个 bundle 不得同时保存 legacy/native 两套 layout；
+- default/prefill loader 仍保持 legacy layout，只有 production hidden-only
+  decode 显式选择 native contract；
 - 禁止 BF16 dequant/fallback；
 - RMSNorm EPS 为 `1e-5`；
 - router bias 按 vLLM 的 BF16 round 语义对齐。
@@ -142,12 +148,28 @@ Let:
 
 ```text
 T = clamp(num_tokens, 0, 16)
+M = ceil(T / 16)
 R = T * TOPK
 A = number of local experts that receive at least one route on this rank
 E = n_local_experts = 36
 ```
 
-The current task grids are:
+Router and shared-expert compute scale with active M tiles rather than a fixed
+chip-wide task count:
+
+| Compute stage | Runtime grid |
+|---|---:|
+| router active-row xg precompute | `T` |
+| router expert fanout | `M * 18` |
+| shared gate / up / activation | `M * 5` each |
+| shared down workers | `M * 2` |
+
+Cube still executes its minimum 16-row tile for BS1; this is dynamic task
+ownership, not a separate GEMV specialization. The layout, dependency, and
+critical-path rationale is recorded in
+[moe-layout-and-critical-path.md](moe-layout-and-critical-path.md).
+
+The current communication task grids are:
 
 | Swimlane task | Data grid | Function |
 |---|---:|---|
@@ -461,6 +483,18 @@ whole-net performance A/B was run for this admission, so these numbers must
 not be reported as a speedup or regression percentage. The five-layer runs
 establish numerical non-regression relative to the stated base; they do not
 replace the independent live-oracle gate.
+
+### 7.3 Native-layout router and shared-expert admission
+
+The August 2026 decode MoE change keeps router/shared gate/up weights in
+checkpoint-native `[N, K]`, uses runtime-BS task grids, and runs shared gate and
+up independently. Matched BS1/context-65536 whole-net A/B/A measured a P50
+change from a 29.5815 ms baseline midpoint to 29.326 ms (`-0.2555 ms`,
+`-0.86%`) with identical hidden hashes and token output across all arms.
+
+The detailed layout ledger, local kernel metrics, critical-path correction,
+vLLM-Ascend comparison, validation gates, and future skill-extraction workflow
+are in [moe-layout-and-critical-path.md](moe-layout-and-critical-path.md).
 
 ## 8. 已证实的精度根因
 

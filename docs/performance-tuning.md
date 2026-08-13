@@ -50,6 +50,30 @@ Look for these shapes on the swimlane that indicate a problem:
 | Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | Merge into a mixed kernel (item 2c) |
 | Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 5) |
 
+### Prove the critical path before extrapolating
+
+A long task is not automatically on the model critical path. For every
+parallel branch, identify its first common consumer or completion barrier and
+compare branch endpoints there. Comparing a shared branch with an intermediate
+routed task, such as dispatch-gather, can incorrectly label hidden work as
+critical when routed expert compute continues afterward.
+
+Report three numbers separately:
+
+1. the target task duration;
+2. the complete dependency span, including new prerequisites and scheduling
+   gaps; and
+3. matched end-to-end A/B/A latency.
+
+Do not multiply a local kernel reduction by the layer count unless the task is
+proven to determine the join in both traces. Freeze the same parent and
+candidate sources and bracket the candidate with the same baseline; unrelated
+Git revisions and single absolute runs are not valid performance comparisons.
+
+For a worked example covering native weight layout, dynamic BS grids, parallel
+shared gate/up, and the difference between local and whole-network gains, see
+[Step3p5 MoE layout and critical-path optimization record](step3p5/moe-layout-and-critical-path.md).
+
 ### Tuning rules
 
 #### 1. Use `pl.range` vs. `pl.parallel` correctly

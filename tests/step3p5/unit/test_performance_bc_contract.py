@@ -1784,7 +1784,7 @@ def test_adaptive_grid_planners_cover_every_active_tile_once() -> None:
         assert len(shared_down) == len(set(shared_down))
 
 
-def test_moe_norm_quant_uses_full_eight_row_blocks() -> None:
+def test_moe_norm_quant_uses_one_dynamic_worker_per_active_row() -> None:
     source, tree = _parse(_CANONICAL)
     function = _method(tree, "_norm_quant_moe_input")
     body = _segment(source, function)
@@ -1800,58 +1800,49 @@ def test_moe_norm_quant_uses_full_eight_row_blocks() -> None:
                 constants[node.targets[0].id] = ast.literal_eval(node.value)
             except (ValueError, TypeError):
                 pass
-    assert constants["MOE_NORM_TOKEN_TILE"] == 8
     assert constants["MOE_NORM_SCALAR_PAD"] == 8
-    assert "assert BATCH % MOE_NORM_TOKEN_TILE == 0" in source
-    assert "MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE" in source
+    assert "MOE_NORM_TOKEN_TILE" not in constants
+    assert "MOE_NORM_BLOCKS" not in source
 
-    assert any(
-        ast.unparse(decorator)
-        == "pl.function(type=pl.FunctionType.Inline)"
-        for decorator in function.decorator_list
-    )
-    spmd_loops = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.For)
-        and isinstance(node.iter, ast.Call)
-        and _call_path(node.iter) == "pl.spmd"
-    ]
-    assert len(spmd_loops) == 1
-    spmd_call = spmd_loops[0].iter
-    assert ast.unparse(spmd_call.args[0]) == "MOE_NORM_BLOCKS"
+    norm = _task_scope(function, "norm_quant_moe_input")
+    norm_call = norm.items[0].context_expr
+    assert isinstance(norm_call, ast.Call)
+    assert [ast.unparse(arg) for arg in norm_call.args] == ["active_tokens"]
     assert {
         keyword.arg: ast.literal_eval(keyword.value)
-        for keyword in spmd_call.keywords
-    } == {"name_hint": "norm_quant_moe_input"}
+        for keyword in norm_call.keywords
+    } == {
+        "name_hint": "norm_quant_moe_input",
+        "allow_early_resolve": True,
+    }
+    assert "token = pl.tile.get_block_idx()" in body
 
-    scalar_full_calls = [
-        call
-        for call in ast.walk(function)
-        if isinstance(call, ast.Call)
-        and _call_path(call) == "pl.full"
-        and call.args
-        and ast.unparse(call.args[0])
-        == "[MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD]"
-    ]
-    assert len(scalar_full_calls) == 3
-    assert body.count("[MOE_NORM_TOKEN_TILE, K_CHUNK]") == 2
+    # The eight rows are reduction lanes only, not eight logical token rows.
+    assert "[MOE_NORM_SCALAR_PAD, K_CHUNK]" in body
+    assert "pl.assemble(sq_carrier, raw_sq, [0, 0])" in body
+    assert "K_CHUNK // MOE_NORM_SCALAR_PAD" in body
+    assert "pl.gather(amax_reduce, dim=-1, index=reduce_index)" in body
     assert "valid_shape=" not in body
+
+    # Preserve the original single producer and exact conversion sequence.
+    assert 'name_hint="dispatch_amax"' not in source
+    assert 'name_hint="dispatch_quant"' not in source
     assert "target_type=pl.BF16" in body
-    assert "target_type=pl.INT32,\n                    mode=\"rint\"" in body
-    assert "target_type=pl.FP16, mode=\"round\"" in body
-    assert "target_type=pl.INT8, mode=\"trunc\"" in body
+    assert "target_type=pl.INT32" in body
+    assert 'target_type=pl.FP16, mode="round"' in body
+    assert 'target_type=pl.INT8, mode="trunc"' in body
+    assert "x_scale_out" in body
 
 
-def test_moe_norm_quant_grid_covers_supported_storage_batches() -> None:
+def test_moe_norm_quant_dynamic_grid_covers_only_active_rows() -> None:
     for storage_batch in (16, 32, 48):
-        written_rows = {
-            token_block * 8 + token_idx
-            for token_block in range(storage_batch // 8)
-            for token_idx in range(8)
-        }
-        assert written_rows == set(range(storage_batch))
-
+        for active_tokens in (0, 1, 2, 7, 16):
+            if active_tokens > storage_batch:
+                continue
+            workers = active_tokens
+            written_rows = set(range(workers))
+            assert written_rows == set(range(active_tokens))
+            assert not (written_rows & set(range(active_tokens, storage_batch)))
 
 def test_shared_two_stage_schedule_is_bf16_exact() -> None:
     import torch

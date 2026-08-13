@@ -19,6 +19,7 @@ Task mapping:
 - Precision debugging: `.claude/skills/bisect-precision/SKILL.md`
 - Performance profiling: `.claude/skills/incore-profiling/SKILL.md`
 - Cube tile tuning: `.claude/skills/cube-tile-tuning/SKILL.md`
+- MoE critical-path tuning: `.claude/skills/tune-moe-critical-path/SKILL.md`
 - Commit workflow: `.claude/skills/git-commit/SKILL.md`
 - PR workflow: `.claude/skills/github-pr/SKILL.md`
 - PR review fixes: `.claude/skills/fix-pr/SKILL.md`

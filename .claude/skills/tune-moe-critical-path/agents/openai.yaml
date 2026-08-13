@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tune MoE Critical Paths"
+  short_description: "Audit MoE layouts, dependencies, and active grids"
+  default_prompt: "Use $tune-moe-critical-path to optimize this MoE decode path without breaking layout, dependency, reduction, or precision contracts."

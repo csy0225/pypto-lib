@@ -163,13 +163,9 @@ ROUTER_GATE_N_CHUNK = 16
 assert BATCH % ROUTER_GATE_M_TILE == 0
 ROUTER_FP32_NEG_INF = -3.4028235e38
 ROUTER_SCALE = 3.0  # MOE_ROUTER_SCALING_FACTOR
-# Eight rows are the smallest backend-safe FP32 scalar store tile. Split the
-# configured decode storage into disjoint token workers without duplicating
-# any norm/quant work.
-MOE_NORM_TOKEN_TILE = 8
+# Eight lanes are the smallest backend-safe FP32 scalar reduction carrier.
+# This is physical alignment only; logical norm/quant workers follow active BS.
 MOE_NORM_SCALAR_PAD = 8
-assert BATCH % MOE_NORM_TOKEN_TILE == 0
-MOE_NORM_BLOCKS = BATCH // MOE_NORM_TOKEN_TILE
 
 # Routed-expert kernel constants — mirrors expert_routed.py / moe.ROUTED_*.
 # Keep independent matmul and activation tiles so the cube task grain can be
@@ -1195,7 +1191,7 @@ class WholeDecodeStep3p5:
         )
         return expert_indices, expert_weights
 
-    # ---------- Stage 2: V4-Flash norm/quant + expert-lane dispatch ----------
+    # ---------- Stage 2: active-row norm/quant + expert-lane dispatch ----------
     @pl.function(type=pl.FunctionType.Inline)
     def _norm_quant_moe_input(
         self,
@@ -1215,56 +1211,35 @@ class WholeDecodeStep3p5:
         pl.Tensor[[BATCH, HIDDEN], pl.INT8],
         pl.Tensor[[BATCH, DISPATCH_SCALE_COLS], pl.FP32],
     ]:
-        """V4-style deferred RMSNorm and INT8 producer.
+        """Keep the original single producer wave, but process active rows only.
 
-        The first pass forms ``xg = resid * (gamma + 1)`` while reducing both
-        ``sum(resid**2)`` and ``amax(xg)``.  The current backend recomputes xg
-        chunk-wise in the second pass, which emits the BF16
-        normalized value needed by the step3p5 BF16 shared expert and the
-        mathematically equivalent INT8 payload ``quant(xg)``.  Its dequant
-        scale carries the deferred positive RMS factor:
-        ``inv_rms * amax(xg) / 127``.
+        One runtime token maps to one worker. The eight-lane RMS/amax carriers
+        preserve backend alignment and the validated reduction/rounding order;
+        they do not represent eight logical rows. This keeps the original
+        dispatch ABI and dependency DAG while avoiding BS=1 work on 16 rows.
         """
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > BATCH:
             active_tokens = pl.cast(BATCH, pl.INDEX)
-        # Match V4-Flash's physical gate-tile contract: norm/quant/gate work on
-        # complete 16-row cube tiles, while routing, dispatch and observable
-        # outputs remain bounded by the logical active_tokens prefix.
-        active_gate_tiles = (active_tokens + 15) // 16
-        active_gate_tokens = active_gate_tiles * 16
-        if active_gate_tokens > BATCH:
-            active_gate_tokens = pl.cast(BATCH, pl.INDEX)
 
-        for token_block in pl.spmd(
-            MOE_NORM_BLOCKS,
+        with pl.spmd(
+            active_tokens,
             name_hint="norm_quant_moe_input",
-        ):
-            token0 = token_block * MOE_NORM_TOKEN_TILE
-            sq_sum = pl.row_sum(
-                pl.full(
-                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
-                    dtype=pl.FP32,
-                    value=0.0,
-                ),
+            allow_early_resolve=True,
+        ) as _norm_quant_moe_input_tid:
+            token = pl.tile.get_block_idx()
+            sq_sum = pl.full(
+                [1, MOE_NORM_SCALAR_PAD], dtype=pl.FP32, value=0.0,
             )
-            xg_amax = pl.row_max(
-                pl.full(
-                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
-                    dtype=pl.FP32,
-                    value=1e-4,
-                ),
+            amax_lanes = pl.full(
+                [1, MOE_NORM_SCALAR_PAD], dtype=pl.FP32, value=1e-4,
             )
             for kb in pl.range(HIDDEN // K_CHUNK):
                 k0 = kb * K_CHUNK
                 raw = pl.cast(
-                    pl.slice(
-                        resid,
-                        [MOE_NORM_TOKEN_TILE, K_CHUNK],
-                        [token0, k0],
-                    ),
+                    pl.slice(resid, [1, K_CHUNK], [token, k0]),
                     target_type=pl.FP32,
                 )
                 gamma = pl.slice(
@@ -1272,47 +1247,101 @@ class WholeDecodeStep3p5:
                     [1, K_CHUNK],
                     [norm_layer_idx, k0],
                 )
-                xg = pl.col_expand_mul(
-                    raw, pl.add(gamma, 1.0),
+                xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
+
+                raw_sq = pl.mul(raw, raw)
+                sq_carrier = pl.full(
+                    [MOE_NORM_SCALAR_PAD, K_CHUNK],
+                    dtype=pl.FP32,
+                    value=0.0,
                 )
+                sq_carrier = pl.assemble(sq_carrier, raw_sq, [0, 0])
                 sq_sum = pl.add(
                     sq_sum,
-                    pl.row_sum(pl.mul(raw, raw)),
+                    pl.reshape(
+                        pl.row_sum(sq_carrier),
+                        [1, MOE_NORM_SCALAR_PAD],
+                    ),
                 )
-                xg_amax = pl.maximum(
-                    xg_amax,
-                    pl.row_max(pl.maximum(xg, pl.neg(xg))),
+                xg_abs_blocks = pl.reshape(
+                    pl.maximum(xg, pl.neg(xg)),
+                    [
+                        MOE_NORM_SCALAR_PAD,
+                        K_CHUNK // MOE_NORM_SCALAR_PAD,
+                    ],
+                )
+                amax_lanes = pl.maximum(
+                    amax_lanes,
+                    pl.reshape(
+                        pl.row_max(xg_abs_blocks),
+                        [1, MOE_NORM_SCALAR_PAD],
+                    ),
                 )
 
-            inv_rms = pl.recip(
+            # Reduce the eight amax lanes without introducing an unaligned
+            # 1x1 FP32 tile. Max is exact, and lane 0 carries the scalar.
+            reduce_index = pl.create_tensor(
+                [1, MOE_NORM_SCALAR_PAD], dtype=pl.INT32,
+            )
+            amax_reduce = pl.create_tensor(
+                [1, MOE_NORM_SCALAR_PAD], dtype=pl.FP32,
+            )
+            amax_reduce[:, :] = amax_lanes
+            for lane in pl.range(4):
+                pl.write(
+                    reduce_index, [0, lane], pl.cast(lane + 4, pl.INT32),
+                )
+                pl.write(
+                    reduce_index, [0, lane + 4], pl.cast(lane, pl.INT32),
+                )
+            amax_reduce[:, :] = pl.maximum(
+                amax_reduce[:, :],
+                pl.gather(amax_reduce, dim=-1, index=reduce_index),
+            )
+            for lane in pl.range(MOE_NORM_SCALAR_PAD):
+                shifted = lane + 2
+                if shifted >= MOE_NORM_SCALAR_PAD:
+                    shifted = shifted - MOE_NORM_SCALAR_PAD
+                pl.write(
+                    reduce_index, [0, lane], pl.cast(shifted, pl.INT32),
+                )
+            amax_reduce[:, :] = pl.maximum(
+                amax_reduce[:, :],
+                pl.gather(amax_reduce, dim=-1, index=reduce_index),
+            )
+            for lane in pl.range(MOE_NORM_SCALAR_PAD):
+                shifted = lane + 1
+                if shifted >= MOE_NORM_SCALAR_PAD:
+                    shifted = shifted - MOE_NORM_SCALAR_PAD
+                pl.write(
+                    reduce_index, [0, lane], pl.cast(shifted, pl.INT32),
+                )
+            amax_reduce[:, :] = pl.maximum(
+                amax_reduce[:, :],
+                pl.gather(amax_reduce, dim=-1, index=reduce_index),
+            )
+
+            inv_rms_lanes = pl.recip(
                 pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
             )
-            inv_rms_out[
-                token0 : token0 + MOE_NORM_TOKEN_TILE, 0:1
-            ] = inv_rms
-            quant_numerator = pl.row_max(
-                pl.full(
-                    [MOE_NORM_TOKEN_TILE, MOE_NORM_SCALAR_PAD],
-                    dtype=pl.FP32,
-                    value=127.0,
-                ),
+            inv_rms_scalar = pl.read(inv_rms_lanes, [0, 0])
+            quant_numerator = pl.full(
+                [1, MOE_NORM_SCALAR_PAD], dtype=pl.FP32, value=127.0,
             )
-            quant_mul = pl.div(quant_numerator, xg_amax)
-            dequant_scale = pl.mul(
-                inv_rms, pl.mul(xg_amax, 1.0 / 127.0),
+            quant_mul_lanes = pl.div(quant_numerator, amax_reduce)
+            quant_mul = pl.read(quant_mul_lanes, [0, 0])
+            scale_lanes = pl.mul(
+                inv_rms_lanes, pl.mul(amax_reduce, 1.0 / 127.0),
             )
-            x_scale_out[
-                token0 : token0 + MOE_NORM_TOKEN_TILE, 0:1
-            ] = dequant_scale
+            pl.write(inv_rms_out, [token, 0], inv_rms_scalar)
+            pl.write(
+                x_scale_out, [token, 0], pl.read(scale_lanes, [0, 0]),
+            )
 
             for kb2 in pl.range(HIDDEN // K_CHUNK):
                 k0 = kb2 * K_CHUNK
                 raw = pl.cast(
-                    pl.slice(
-                        resid,
-                        [MOE_NORM_TOKEN_TILE, K_CHUNK],
-                        [token0, k0],
-                    ),
+                    pl.slice(resid, [1, K_CHUNK], [token, k0]),
                     target_type=pl.FP32,
                 )
                 gamma = pl.slice(
@@ -1320,18 +1349,14 @@ class WholeDecodeStep3p5:
                     [1, K_CHUNK],
                     [norm_layer_idx, k0],
                 )
-                # Current backend UB cannot retain the FP32 xg tile across
-                # both passes, so recompute it in the emission pass.
-                xg = pl.col_expand_mul(
-                    raw, pl.add(gamma, 1.0),
-                )
-                normed = pl.row_expand_mul(xg, inv_rms)
+                xg = pl.col_expand_mul(raw, pl.add(gamma, 1.0))
                 post_norm_out[
-                    token0 : token0 + MOE_NORM_TOKEN_TILE,
-                    k0 : k0 + K_CHUNK,
-                ] = pl.cast(normed, target_type=pl.BF16)
+                    token : token + 1, k0 : k0 + K_CHUNK,
+                ] = pl.cast(
+                    pl.mul(xg, inv_rms_scalar), target_type=pl.BF16,
+                )
                 qi32 = pl.cast(
-                    pl.row_expand_mul(xg, quant_mul),
+                    pl.mul(xg, quant_mul),
                     target_type=pl.INT32,
                     mode="rint",
                 )
@@ -1339,11 +1364,8 @@ class WholeDecodeStep3p5:
                     qi32, target_type=pl.FP16, mode="round",
                 )
                 x_i8_out[
-                    token0 : token0 + MOE_NORM_TOKEN_TILE,
-                    k0 : k0 + K_CHUNK,
-                ] = pl.cast(
-                    qf16, target_type=pl.INT8, mode="trunc",
-                )
+                    token : token + 1, k0 : k0 + K_CHUNK,
+                ] = pl.cast(qf16, target_type=pl.INT8, mode="trunc")
         return post_norm_out, inv_rms_out, x_i8_out, x_scale_out
 
     # ---------- Stage 2: dispatch (V4-Flash expert-lane PUSH + gather) ----------

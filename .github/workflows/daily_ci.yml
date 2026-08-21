@@ -5,59 +5,67 @@ on:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
 
+# Every job only reads the repo (checkouts use persist-credentials: false, the
+# artifact up/download steps use the run-scoped runtime token, the summary
+# writes $GITHUB_STEP_SUMMARY), so the token needs nothing beyond contents:read.
+permissions:
+  contents: read
+
 jobs:
   model-tests-sim:
-    # Simulator job: no device needed, so it runs on the CPU runner inside the
-    # ci-py310 container (mirrors pypto's codegen-tests setup, registry on port
-    # 5001). pypto/ptoas/pto-isa are installed by the setup-sim-job composite,
-    # exactly like the on-device a2a3 job — only the runner label and the lack of
-    # Ascend host env differ.
+    # Simulator job: no device needed, so it runs on the CPU runner — but on the
+    # host, through the same setup-ci-job composite as the a2a3 device job (same
+    # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
+    # the only difference: no npu-smi check and no Ascend env, which the simulator
+    # does not use.
     runs-on: [self-hosted, linux, arm64, cpu]
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         platform: [a2a3sim, a5sim]
+    defaults:
+      run:
+        working-directory: checkout
     env:
-      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /root/.cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the host-side a2a3 job (ci-runner) via the ci-cache mount;
-      # 000 keeps every cache file group/world-writable so root (this container)
-      # and ci-runner can both update and LRU-evict each other's entries.
+      # Shared with the a2a3 job; 000 keeps cache files mutually writable. Both
+      # jobs now run as ci-runner (no container root), but the dir still holds
+      # root-owned entries from the container era, so keep the umask.
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
       CCACHE_UMASK: '000'
-      PIP_CACHE_DIR: /root/.cache/pip
-    container:
-      image: localhost:5001/ci-py310:latest
-      # GitHub Actions containers do not inherit the host's large /dev/shm; they
-      # use Docker's 64MB default. Distributed model kernels call torch
-      # share_memory_() and overflow it. --shm-size gives each container its own
-      # tmpfs (sized on demand, not pre-allocated), avoiding the --ipc=host name
-      # clashes between the concurrent cpu-1..4 runners.
-      options: >-
-        --shm-size=128g
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-sim:/root/.cache/pip
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src-${{ matrix.platform }}:/opt/pypto-src
 
     steps:
-      - name: Checkout pypto-lib
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves sibling
+        # subdir checkouts on this persistent runner untouched).
         uses: actions/checkout@v4
         with:
+          sparse-checkout: .github/actions
+          clean: false
           persist-credentials: false
 
-      - name: Setup simulator job
-        uses: ./.github/actions/setup-sim-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'false'
+          build-namespace: ${{ matrix.platform }}
+          pip-cache-name: pip-sim
+          toolchain: bundle
 
       - name: Run model tests (${{ matrix.platform }})
+        id: sweep
         shell: bash
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}/checkout
           PTO2_RING_DEP_POOL: 16384
           PTO2_RING_TASK_WINDOW: 16384
           PTO2_RING_HEAP: 1073741824
@@ -72,6 +80,7 @@ jobs:
           # own fd-captured loop, then restores.
           PYPTO_RUNTIME_LOG: error
         run: |
+          source activate.sh
           : > results.tsv
           failed=()
           run_case() {
@@ -89,7 +98,8 @@ jobs:
           # Run every model file once with no extra args. Files marked
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
-          for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
+          for f in $(find models -name '*.py' ! -name '*_draft.py' \
+              ! -path 'models/deepseek_v4_pro/*' | sort); do
             # Shared modules (config.py, helper libs) have no __main__ guard —
             # they are imported by kernels, not run. Running them import-exits 0
             # and shows a misleading pass, so drop them from the report entirely
@@ -117,49 +127,58 @@ jobs:
         run: rm -rf build_output
 
       - name: Upload results artifact
-        if: always()
+        # Not a bare always(): on this persistent runner a results.tsv from a
+        # previous run survives in the checkout dir, so if the job dies before
+        # the sweep (setup failure, checkout failure), an unconditional upload
+        # re-publishes the LEFTOVER table and the summary renders days-old
+        # results as if they were tonight's — with the ":warning: No results
+        # artifact" branch silently defeated. Gate on the sweep step having
+        # actually started: it truncates results.tsv first thing, so anything
+        # it uploads (even from a failed or cancelled sweep) is from this run.
+        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.platform }}
-          path: results.tsv
+          # upload-artifact resolves `path` against $GITHUB_WORKSPACE and ignores
+          # defaults.run.working-directory, so name the checkout dir explicitly.
+          path: checkout/results.tsv
 
   model-tests-a2a3:
-    # No container: multi-card kernels use HCCL, which needs a host-only env
-    # (set_env.sh, HCCL plugin paths) — in docker the chip child silent-crashes
-    # in comm_init. So this job runs directly on the host like pypto's
-    # dist-system-tests. It holds NO card: every model run is wrapped in
-    # `task-submit --device "$DEVICE_ID"` (mechanism B), which borrows a card
-    # (or an N-card set for the multi-card `# ci: devices=N` files) from the
-    # host-level device queue and passes the lent set as $TASK_DEVICE. The
-    # backend controls whether DEVICE_ID is `auto` or a fixed card id. Checkout /
-    # install happen under ./dist-checkout to avoid colliding with any
-    # container-owned workspace left on the shared runner.
+    # Runs directly on the host like pypto's dist-system-tests — multi-card
+    # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
+    # paths); under docker the chip child silent-crashes in comm_init. It holds
+    # NO card: every model run is wrapped in `task-submit --device "$DEVICE_ID"`
+    # (mechanism B), which borrows a card (or an N-card set for the multi-card
+    # `# ci: devices=N` files) from the host-level device queue and passes the
+    # lent set as $TASK_DEVICE. The backend controls whether DEVICE_ID is `auto`
+    # or a fixed card id. Checkout / install happen under ./checkout rather
+    # than at the workspace root, so the root holds only the sparsely-fetched
+    # action defs and any second repo a job needs sits beside this one.
     runs-on: [self-hosted, linux, arm64, npu]
-    timeout-minutes: 60
+    # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
+    # --max-time 900 run), or the job dies before task-submit's own timeout can
+    # ever fire — and the first queued case would eat the whole job budget.
+    timeout-minutes: 120
     defaults:
       run:
-        working-directory: dist-checkout
+        working-directory: checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
-      PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
-      PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container-side sim job (root) via the same ci-cache dir;
-      # 000 keeps cache files mutually writable across root and ci-runner.
+      # Shared with the sim job via the same ci-cache dir; 000 keeps cache files
+      # mutually writable. Both jobs now run as ci-runner, but the dir still holds
+      # root-owned entries from the container era, so keep the umask.
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: unlike ccache, pip has no shared-umask knob, so a shared
-      # pip cache would leave files owned by whichever job wrote first and block
-      # the other. The sim job uses ci-cache/pip-sim (see its bind mount).
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-a2a3
 
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./dist-checkout — sparse-fetch just
+        # but this job checks the repo out into ./checkout — sparse-fetch just
         # the action defs at the workspace root first (clean: false leaves sibling
         # subdir checkouts on this persistent runner untouched).
         uses: actions/checkout@v4
@@ -168,13 +187,17 @@ jobs:
           clean: false
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
-          checkout-path: dist-checkout
+          checkout-path: checkout
+          needs-device: 'true'
           build-namespace: a2a3-daily
+          pip-cache-name: pip-a2a3
+          toolchain: bundle
 
       - name: Run model tests (a2a3, via task-submit)
+        id: sweep
         shell: bash
         env:
           PYPTO_LOG_LEVEL: error
@@ -193,20 +216,14 @@ jobs:
           set +e
           : > results.tsv
           failed=()
-          # Perf number per case, from the headline `effective_us` line: L2
-          # reports the mean Effective window; L3 (multi-card) reports the min —
-          # the fastest round (best-of-N), which filters out cross-rank scheduling
-          # jitter since each round is already a max across ranks. L3 is detected
-          # by the `l3=1` / `l3_resident=1` marker its benchmark emits. The
-          # per-rank breakdown lines use an `eff_us` token (not `effective_us`),
-          # so neither grep ever matches them.
+          # Perf number per case is the `effective_us (...) mean=` benchmark line:
+          # the multi-round mean of the Effective window. L2 is each round's window;
+          # L3 (multi-card) is the per-round max across ranks (slowest rank bounds
+          # the round), or the pooled per-dispatch mean when per-round segmentation
+          # falls back to flattened. A case becomes `-` only when no timing line was
+          # emitted (e.g. the run failed or the runtime lacks SIMPLER_PROFILING).
           extract_perf() {
-            local out; out=$(cat)
-            if printf '%s' "$out" | grep -qE 'l3=1|l3_resident=1'; then
-              printf '%s' "$out" | grep -oP 'effective_us .*min=\K[0-9.]+' | tail -1
-            else
-              printf '%s' "$out" | grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
-            fi
+            grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
           }
           run_case() {
             local file="$1" label="$2"; shift 2
@@ -222,8 +239,8 @@ jobs:
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
-            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 1800 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
+            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
             rc=$?
             printf '%s\n' "$out"
             perf=$(printf '%s\n' "$out" | extract_perf)
@@ -238,7 +255,8 @@ jobs:
             echo "::endgroup::"
           }
           # Run every model file once at its default world size (ep2 / 2-card).
-          for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
+          for f in $(find models -name '*.py' ! -name '*_draft.py' \
+              ! -path 'models/deepseek_v4_pro/*' | sort); do
             # Skip shared modules with no __main__ guard (config.py, helper libs):
             # they are imported, not run, so they don't belong in the report.
             if ! grep -q '__main__' "$f"; then
@@ -249,10 +267,10 @@ jobs:
           # Higher world sizes (ep4/ep8) are added manually as dedicated wraps
           # below — run_case borrows the marker's 2 cards, so ep4/ep8 need their
           # own --device-num (card pool must provide that many cards), e.g.:
-          #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 1800 --max-time 900 \
-          #     --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && \
-          #       PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout \
-          #       python models/deepseek/v4/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
+          #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 3600 --max-time 900 \
+          #     --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && \
+          #       PYTHONPATH=$GITHUB_WORKSPACE/checkout \
+          #       python models/deepseek_v4_flash_mtp/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
@@ -264,23 +282,484 @@ jobs:
         if: always()
         uses: ./.github/actions/kill-orphaned-tasks
         with:
-          checkout-path: dist-checkout
+          checkout-path: checkout
 
       - name: Clean up build artifacts
         if: always()
-        working-directory: dist-checkout
+        working-directory: checkout
         run: rm -rf build_output
 
       - name: Upload results artifact
-        if: always()
+        # Gated on the sweep having started — see the sim job's upload step
+        # for why a bare always() re-publishes a previous run's leftover
+        # results.tsv when the job dies in setup.
+        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: results-a2a3
-          path: dist-checkout/results.tsv
+          path: checkout/results.tsv
+
+  model-tests-a5:
+    # Report-only. A measured sweep puts V4-Pro at 13/35 on A5: 13 cases die
+    # with `sync_stream_pair: aclrtSync` device faults, 2 with `rtMalloc failed:
+    # 207001`, 7 on numerics. Those are pypto/device-side rather than defects in
+    # this repo's kernels, so gating on them would paint the workflow red every
+    # night — which is exactly what has made model-tests-sim's daily failure
+    # invisible. The V4-Pro table is published either way, so the coverage is
+    # real even though the check does not block. Flip this off once the A5
+    # blockers land and the sweep is green.
+    continue-on-error: true
+    # Real Ascend 950 (A5) device job — the dedicated daily coverage of the
+    # DeepSeek V4-Pro variant (the Pro preset in models/deepseek_v4_pro/). Mirrors
+    # model-tests-a2a3 but runs -p a5 on the npu-a5 self-hosted runner and
+    # sweeps ONLY Pro: Pro is excluded from the a2a3/a2a3sim/a5sim
+    # sweeps above (it is the A5-targeted variant, so running it on 910B
+    # would be duplicate cost against the wrong backend). It goes through
+    # the same setup-ci-job as the other device jobs (needs-device:true);
+    # the A5 host's own runner .env supplies its CANN_ROOT / cache roots, so
+    # no A5-specific path is named here. NOTE: until the npu-a5 runner is
+    # registered this job stays queued; the summary job does not depend on
+    # it, so the existing daily report keeps producing and the A5 table
+    # fills in once it runs.
+    runs-on: [self-hosted, linux, arm64, npu-a5]
+    # Pro is roughly half the a2a3 sweep (no qwen3 / v3_2 / Flash), so
+    # 120 min is generous; keep parity with the other device job's ceiling.
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Point git at the runner's live proxy
+        # The A5 host's git carries a file-scope http(s).proxy that has gone
+        # stale (a dead local forwarder — every nightly since 2026-08-07 died
+        # in the checkout below with "Failed to connect to 127.0.0.1 port
+        # 7890"), and file-scope git config beats the proxy environment. So
+        # git dials the dead port while the runner service and curl use the
+        # live proxy from the runner's own environment ("Runner is running
+        # behind proxy server ..." in Set up job). Re-point git at that same
+        # live proxy for this job only: GIT_CONFIG_* is command-scope config,
+        # which outranks every config file and touches no host state — when
+        # the host's git config is repaired this becomes a harmless no-op, as
+        # it already is on runners with no proxy in their environment.
+        # Runs before the checkout, so it must not assume ./checkout exists.
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          live="${https_proxy:-${HTTPS_PROXY:-}}"
+          if [ -n "$live" ]; then
+            {
+              echo "GIT_CONFIG_COUNT=2"
+              echo "GIT_CONFIG_KEY_0=http.proxy"
+              echo "GIT_CONFIG_VALUE_0=$live"
+              echo "GIT_CONFIG_KEY_1=https.proxy"
+              echo "GIT_CONFIG_VALUE_1=$live"
+            } >> "$GITHUB_ENV"
+            echo "git proxy pinned to the runner's live proxy for this job"
+          else
+            echo "no proxy in the runner environment — leaving git alone"
+          fi
+
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves
+        # sibling subdir checkouts on this persistent runner untouched).
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: a5-daily
+          pip-cache-name: pip-a5
+          toolchain: bundle
+
+      - name: Run V4-Pro tests (a5, via task-submit)
+        id: sweep
+        shell: bash
+        env:
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
+          # Quiet simpler's runtime logger — see the sim job for the full note.
+          PYPTO_RUNTIME_LOG: error
+          PYPTO_BENCH: '1'
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
+        run: |
+          source activate.sh
+          set +e
+          : > results.tsv
+          failed=()
+          # Perf number per case is the `effective_us (...) mean=` benchmark line
+          # (same rule as the a2a3 job): the multi-round mean of the Effective
+          # window. L2 is each round's window; L3 (multi-card) is the per-round
+          # max across ranks, or the pooled per-dispatch mean when per-round
+          # segmentation falls back to flattened.
+          extract_perf() {
+            grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
+          }
+          run_case() {
+            local file="$1" label="$2"; shift 2
+            echo "::group::${label}"
+            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
+            # the top; borrow that many cards with --device-num N (defaults to
+            # single-card). $TASK_DEVICE is the lent set (single id, or
+            # comma-separated for N>1) and is passed straight to -d.
+            local ndev devnum_flag out rc perf
+            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
+            ndev=${ndev:-1}
+            devnum_flag=""
+            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
+            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && DEEPSEEK_V4_VARIANT=pro PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 -d \$TASK_DEVICE $*" 2>&1 )
+            rc=$?
+            printf '%s\n' "$out"
+            perf=$(printf '%s\n' "$out" | extract_perf)
+            perf=${perf:--}
+            if [ "$rc" -ne 0 ]; then
+              failed+=("$label")
+              echo "::error file=${file}::FAIL (${label})"
+              printf '%s\tfail\t%s\n' "$label" "$perf" >> results.tsv
+            else
+              printf '%s\tpass\t%s\n' "$label" "$perf" >> results.tsv
+            fi
+            echo "::endgroup::"
+          }
+          # Sweep ONLY the V4-Pro variant — its dedicated A5 daily set.
+          for f in $(find models/deepseek_v4_pro -name '*.py' ! -name '*_draft.py' \
+              ! -name 'synthetic_token_loop.py' | sort); do
+            # Skip shared modules with no __main__ guard (config.py, helper
+            # libs): they are imported, not run.
+            if ! grep -q '__main__' "$f"; then
+              continue
+            fi
+            run_case "$f" "$f"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Failed cases (${#failed[@]}):"
+            printf '  - %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All V4-Pro A5 tests passed."
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        working-directory: checkout
+        run: rm -rf build_output
+
+      - name: Upload results artifact
+        # Gated on the sweep having started — see the sim job's upload step
+        # for the full note. This job is where the bare always() actually
+        # bit: every nightly from 2026-08-07 to 2026-08-11 died in checkout
+        # (dead git proxy, fixed by this job's first step) yet re-uploaded a
+        # byte-identical results-a5 leftover from the 08-05 sweep, so the
+        # summary kept presenting six-day-old V4-Pro numbers as current.
+        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-a5
+          path: checkout/results.tsv
+
+  e2e-flash-a5:
+    name: DeepSeek-V4-Flash EP8 end-to-end (a5)
+    # Report-only, like model-tests-a5: the 8-card SDMA/AICPU path on the A5 host
+    # has had platform-side outages (every >=2-card program dying with 507015 /
+    # 507018 while single-card canaries stay green), and a red nightly from a
+    # sick host teaches nothing. The prompt and the generated text are published
+    # in the summary either way, so a reviewer can tell "ran and said ' Paris'"
+    # from "ran and babbled" from "did not run" at a glance.
+    continue-on-error: true
+    # Real-weight DeepSeek-V4-Flash token generation on 8 Ascend 950 cards: the
+    # models/deepseek_v4_pro drivers with the Flash config (--variant flash),
+    # EP8/TP2, one prefill plus 32 greedy decode steps, driven by
+    # synthetic_token_loop.py exactly as docs/models/deepseek_v4_pro.md
+    # ("End-to-end token generation") documents, including its two EP8
+    # workaround flags (--prefill-tokens 16 --prefill-no-retire). It is the only
+    # nightly that exercises the full prompt -> tokens -> text path on real
+    # weights; model-tests-a5 covers the operators one by one on synthetic data.
+    runs-on: [self-hosted, linux, arm64, npu-a5]
+    # Compile (~5 min) + resident weight upload (~8 min for 335 GB of INT8 shards)
+    # + 33 forward passes fit in ~15 min once the cards are lent; the ceiling
+    # must still exceed task-submit's own worst case (--timeout 5400 queue wait +
+    # --max-time 2400 run), or the job dies before task-submit can report.
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+      # The prompt is the one the real-weight validation was brought up on; its
+      # greedy continuation on this checkpoint starts with " Paris".
+      E2E_PROMPT: The capital of France is
+      E2E_DECODE_STEPS: '32'
+
+    steps:
+      - name: Point git at the runner's live proxy
+        # Same workaround as model-tests-a5 (stale file-scope git proxy on the
+        # A5 host); command-scope config, no host state touched.
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          live="${https_proxy:-${HTTPS_PROXY:-}}"
+          if [ -n "$live" ]; then
+            {
+              echo "GIT_CONFIG_COUNT=2"
+              echo "GIT_CONFIG_KEY_0=http.proxy"
+              echo "GIT_CONFIG_VALUE_0=$live"
+              echo "GIT_CONFIG_KEY_1=https.proxy"
+              echo "GIT_CONFIG_VALUE_1=$live"
+            } >> "$GITHUB_ENV"
+            echo "git proxy pinned to the runner's live proxy for this job"
+          else
+            echo "no proxy in the runner environment — leaving git alone"
+          fi
+
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          # Own pypto build tree: this job must never share one with the
+          # model-tests-a5 sweep (see build-namespace in the action).
+          build-namespace: a5-e2e
+          pip-cache-name: pip-a5
+          toolchain: bundle
+
+      - name: Resolve the Flash checkpoint and its converted weight cache
+        id: weights
+        shell: bash
+        run: |
+          # The host describes where its data lives through the runner's .env,
+          # the same way PYPTO_QWEN3_MODEL_DIR / PYPTO_DSV4_MODEL_DIR already do
+          # for the serving tests:
+          #   PYPTO_DSV4_FLASH_CKPT_DIR     HF DeepSeek-V4-Flash checkpoint
+          #                                 (model.safetensors.index.json + tokenizer.json)
+          #   PYPTO_DSV4_FLASH_WEIGHTS_DIR  weights_flash.py .pt cache for ep8/tp2
+          #                                 (optional; default = a sibling of the
+          #                                 checkpoint, built here if missing)
+          # The fallback is the checkpoint the npu-a5 host already carries, so the
+          # job works before the runner's .env learns the variable. No checkpoint
+          # at all is a skip, reported as such — never a silent pass or a fail.
+          ckpt="${PYPTO_DSV4_FLASH_CKPT_DIR:-/home/pyptouser/models/DeepSeek-V4-Flash-0731}"
+          if [ ! -f "$ckpt/model.safetensors.index.json" ] || [ ! -f "$ckpt/tokenizer.json" ]; then
+            echo "::warning::no DeepSeek-V4-Flash checkpoint at '$ckpt' (set PYPTO_DSV4_FLASH_CKPT_DIR in the runner's .env) — skipping the end-to-end run"
+            python3 - "$ckpt" <<'EOF'
+          import json, sys
+          json.dump({"status": "skipped",
+                     "note": f"no DeepSeek-V4-Flash checkpoint at {sys.argv[1]} "
+                             "(set PYPTO_DSV4_FLASH_CKPT_DIR in the runner's .env)"},
+                    open("e2e.json", "w"), indent=1)
+          EOF
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The cache is ~335 GB of per-rank INT8 shards and takes ~25 min to
+          # build from the FP8/FP4 checkpoint; it is keyed on (variant, ep, tp)
+          # only, so it is built once per host and shared by every nightly.
+          # Lookup order: the runner's .env, then the host-wide cache next to the
+          # checkpoint (read-only for the runner user is fine), then this
+          # runner's own CI_CACHE_ROOT where the job may build it.
+          # lm_head_weight.pt is the last tensor the converter writes, so its
+          # presence is the "conversion finished" marker.
+          shared="$(dirname "$ckpt")/pypto-weights-cache/flash_ep8_tp2"
+          own="$CI_CACHE_ROOT/dsv4-flash-weights/flash_ep8_tp2"
+          if [ -n "${PYPTO_DSV4_FLASH_WEIGHTS_DIR:-}" ]; then
+            weights="$PYPTO_DSV4_FLASH_WEIGHTS_DIR"
+          elif [ -f "$shared/lm_head_weight.pt" ]; then
+            weights="$shared"
+          else
+            weights="$own"
+          fi
+          if [ ! -f "$weights/lm_head_weight.pt" ]; then
+            echo "no weight cache at $weights — converting the checkpoint (one-time, ~25 min)"
+            source activate.sh
+            mkdir -p "$weights"
+            PYTHONPATH="$GITHUB_WORKSPACE/checkout" python models/deepseek_v4_pro/utils/weights_flash.py \
+              --variant flash --ep 8 --tp 2 --ckpt "$ckpt" --out "$weights"
+          fi
+          echo "checkpoint: $ckpt"
+          echo "weights:    $weights"
+          {
+            echo "ckpt=$ckpt"
+            echo "weights=$weights"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install the checkpoint tokenizer
+        # synthetic_token_loop.py encodes --prompt and detokenizes the sampled
+        # ids with HuggingFace `tokenizers` (tokenizer.json from the checkpoint);
+        # it is not a pypto-lib dependency otherwise, so setup-ci-job's venv
+        # does not carry it. Without it the loop exits right after taking the
+        # eight cards ("--prompt/--prompt-file need the `tokenizers` package").
+        if: ${{ steps.weights.outputs.skip != 'true' }}
+        shell: bash
+        run: |
+          source activate.sh
+          python -c 'import tokenizers' 2>/dev/null || pip install 'tokenizers>=0.15'
+          python -c 'import tokenizers; print("tokenizers", tokenizers.__version__)'
+
+      - name: Run the EP8 token loop (a5, 8 cards via task-submit)
+        id: loop
+        if: ${{ steps.weights.outputs.skip != 'true' }}
+        shell: bash
+        env:
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
+          PYPTO_RUNTIME_LOG: error
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
+          CKPT: ${{ steps.weights.outputs.ckpt }}
+          WEIGHTS: ${{ steps.weights.outputs.weights }}
+        run: |
+          source activate.sh
+          set +e
+          # Eight cards at once: the per-repo whitelist caps smaller borrows, so
+          # lift it the way task-submit documents for daily CI (--ignore-whitelist;
+          # the host blacklist still applies). $TASK_DEVICE is the lent set and
+          # goes straight to -d; it must stay single-quoted so it expands only
+          # after task-submit assigns the cards.
+          task-submit --device auto --device-num 8 --ignore-whitelist --timeout 5400 --max-time 2400 \
+            --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout \
+              python models/deepseek_v4_pro/synthetic_token_loop.py --variant flash --ep 8 --tp 2 \
+                -d \$TASK_DEVICE --prefill-tokens 16 --prefill-no-retire \
+                --weights '$WEIGHTS' --tokenizer '$CKPT/tokenizer.json' \
+                --prompt '$E2E_PROMPT' --decode-steps $E2E_DECODE_STEPS" 2>&1 | tee e2e.log
+          rc=${PIPESTATUS[0]}
+          # Distil the run into e2e.json for the summary job: status, the prompt,
+          # the generated text (the loop prints it as a Python repr), the step
+          # count actually decoded, and the first device/runtime error line if
+          # the run died. Everything else stays in e2e.log (uploaded alongside).
+          python3 - "$rc" "$E2E_PROMPT" "$E2E_DECODE_STEPS" "$CKPT/tokenizer.json" <<'EOF'
+          import ast, json, re, sys
+          rc, prompt, steps, tok_path = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+          log = open("e2e.log", errors="replace").read()
+          def last(pattern):
+              hits = re.findall(pattern, log, re.M)
+              return hits[-1] if hits else None
+          # Every forward pass logs the token each rank sampled; rank 0's sequence
+          # is the partial continuation even when the loop dies mid-way (the
+          # typical failure is non-finite logits on one rank a few steps in), so
+          # the summary can show " Paris." and "died at decode step 1" rather
+          # than nothing. Detokenized here because only this venv has tokenizers.
+          sampled = re.findall(r"^\[SESSION\] (prefill|decode\[\d+\]@\d+): sampled=\[([^\]]*)\]", log, re.M)
+          partial_ids = [int(v.split(",")[0]) for _, v in sampled if v.strip()]
+          decode_lines = sum(1 for k, _ in sampled if k.startswith("decode"))
+          partial_text = None
+          if partial_ids:
+              try:
+                  from tokenizers import Tokenizer
+                  partial_text = Tokenizer.from_file(tok_path).decode(partial_ids, skip_special_tokens=False)
+              except Exception as exc:  # noqa: BLE001 - best effort, the ids are still reported
+                  partial_text = f"<detokenization failed: {exc}>"
+          text_repr = last(r"^\[SESSION\] generated text: (.*)$")
+          text = None
+          if text_repr is not None:
+              try:
+                  text = ast.literal_eval(text_repr.strip())
+              except (ValueError, SyntaxError):
+                  text = text_repr.strip()
+          ids = last(r"^\[SESSION\] generated ids: (\[.*\])$")
+          eos = last(r"^\[SESSION\] eos at decode step (\d+)$")
+          passed = bool(last(r"^\[SESSION\] PASS: EP8 .* token loop completed$")) and rc == 0
+          error = last(r"^(?:RuntimeError|ValueError|TimeoutError|OSError|AssertionError)[^\n]*$") \
+              or last(r"^\S*\[ERROR\][^\n]*$") or last(r"^.*(?:507\d{3}|SCHEDULER_TIMEOUT|non-finite|NaN)[^\n]*$")
+          if error is None and rc != 0:
+              # No recognisable traceback or device error: the program printed a
+              # plain one-line complaint (a missing package, a bad argument) and
+              # exited. Take the last non-boilerplate line before task-submit's
+              # own verdict so the summary shows the cause instead of "exit code 1".
+              tail = [l for l in log.splitlines()
+                      if l.strip() and not l.startswith(("[npu-lock]", "===", "[SESSION]", "提示", "任务", "等待"))
+                      and "[STRACE]" not in l and "[TIMING]" not in l]
+              if tail:
+                  error = tail[-1].strip()[:300]
+          n_ids = len(ast.literal_eval(ids)) if ids else None
+          json.dump({
+              "status": "pass" if passed else "fail",
+              "exit_code": rc,
+              "prompt": prompt,
+              "decode_steps_requested": steps,
+              "decode_steps_done": (int(eos) if eos else (n_ids if n_ids is not None else decode_lines)),
+              "eos_step": int(eos) if eos else None,
+              "generated_text": text,
+              "generated_ids": ids,
+              "generated_text_partial": None if text is not None else partial_text,
+              "generated_ids_partial": None if text is not None else partial_ids,
+              "error": None if passed else (error or f"exit code {rc}, see e2e.log"),
+          }, open("e2e.json", "w"), indent=1, ensure_ascii=False)
+          print(json.dumps(json.load(open("e2e.json")), indent=1, ensure_ascii=False))
+          EOF
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::EP8 DeepSeek-V4-Flash token loop failed (exit $rc) — see e2e.log in the results-e2e-a5 artifact"
+            exit 1
+          fi
+          echo "EP8 DeepSeek-V4-Flash token loop passed."
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        working-directory: checkout
+        run: rm -rf build_output
+
+      - name: Upload results artifact
+        # Gated on the resolve step having run (it writes e2e.json first thing on
+        # a skip), for the same leftover-table reason as the other device jobs.
+        if: ${{ always() && steps.weights.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-e2e-a5
+          path: |
+            checkout/e2e.json
+            checkout/e2e.log
+          if-no-files-found: warn
 
   summary:
     name: Aggregate results summary
-    needs: [model-tests-sim, model-tests-a2a3]
+    # model-tests-a5 is a real dependency: it is the longest job (the V4-Pro
+    # sweep ran 65 min against the others' ~40), so without it here the summary
+    # is built before results-a5 exists and the A5 column is empty every time.
+    # `always()` keeps the summary running when any sweep fails.
+    needs: [model-tests-sim, model-tests-a2a3, model-tests-a5, e2e-flash-a5]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -294,32 +773,130 @@ jobs:
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import pathlib
 
-          PLATFORMS = ["a2a3", "a2a3sim", "a5sim"]
+          # Two tables, not one matrix: model-tests-a5 sweeps only
+          # models/deepseek_v4_pro sweep and the other three jobs exclude it, so the
+          # case sets are disjoint. A single table makes every row half filler —
+          # 35 Pro rows blank under a2a3/sim, 48 others blank under a5.
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
+          ROOT = pathlib.Path("results")
 
-          results = {p: {} for p in PLATFORMS}
-          perf = {}  # case -> a2a3 effective (us): L2 mean, L3 min — see extract_perf
-          root = pathlib.Path("results")
-          for p in PLATFORMS:
-              tsv = root / f"results-{p}" / "results.tsv"
+          def load(platform):
+              """(status, perf) per case, or (None, None) if the job wrote nothing."""
+              tsv = ROOT / f"results-{platform}" / "results.tsv"
               if not tsv.exists():
-                  continue
+                  return None, None
+              status, perf = {}, {}
               for line in tsv.read_text().splitlines():
                   if not line.strip():
                       continue
                   parts = line.split("\t")
-                  case, status = parts[0], parts[1]
-                  results[p][case] = status
-                  if p == "a2a3" and len(parts) >= 3 and parts[2] not in ("", "-"):
-                      perf[case] = parts[2]
+                  status[parts[0]] = parts[1]
+                  if len(parts) >= 3 and parts[2] not in ("", "-"):
+                      perf[parts[0]] = parts[2]
+              return status, perf
 
-          all_cases = sorted({c for p in PLATFORMS for c in results[p]})
+          def no_artifact(platforms):
+              names = ", ".join(f"`{p}`" for p in platforms)
+              return (
+                  f":warning: No results artifact from {names} — the sweep died "
+                  "before writing one, most likely in setup: a sweep that merely "
+                  "fails cases still uploads its table."
+              )
+
+          def table(title, platforms, timed):
+              """`timed` is the platform whose effective_us column is shown."""
+              data = {p: load(p) for p in platforms}
+              present = [p for p in platforms if data[p][0] is not None]
+              missing = [p for p in platforms if data[p][0] is None]
+              print(f"### {title}")
+              print()
+              if not present:
+                  print(no_artifact(missing))
+                  print()
+                  return
+              header = ["Case"]
+              for p in platforms:
+                  header.append(p)
+                  if p == timed:
+                      header.append(f"{p} effective (us)")
+              print("| " + " | ".join(header) + " |")
+              print("| " + " | ".join("---" for _ in header) + " |")
+              perf = data[timed][1] or {}
+              for case in sorted({c for p in present for c in data[p][0]}):
+                  row = [f"`{case}`"]
+                  for p in platforms:
+                      row.append(ICON.get((data[p][0] or {}).get(case, "missing"), "?"))
+                      if p == timed:
+                          row.append(perf.get(case, "-"))
+                  print("| " + " | ".join(row) + " |")
+              print()
+              print("Passed: " + ", ".join(
+                  f"**{p}** {sum(1 for v in data[p][0].values() if v == 'pass')}"
+                  f"/{len(data[p][0])}" for p in present))
+              if missing:
+                  print()
+                  print(no_artifact(missing) + " Those columns read all `-`.")
+              print()
+
+          def e2e(title, name):
+              """The DeepSeek-V4-Flash EP8 token loop: one run, shown as prompt -> text.
+
+              The job writes e2e.json (status/prompt/generated_text/...) so the
+              reviewer sees the actual continuation every day, not just a tick:
+              a run that completes but babbles is the failure mode worth catching.
+              """
+              print(f"### {title}")
+              print()
+              path = ROOT / f"results-{name}" / "e2e.json"
+              if not path.exists():
+                  print(no_artifact([name]))
+                  print()
+                  return
+              import json
+              r = json.loads(path.read_text())
+              status = r.get("status", "missing")
+              icon = {"pass": ":white_check_mark: pass", "fail": ":x: fail",
+                      "skipped": ":heavy_minus_sign: skipped"}.get(status, f"? {status}")
+              print(f"**Status:** {icon}")
+              if status == "skipped":
+                  print()
+                  print(r.get("note", ""))
+                  print()
+                  return
+              done = r.get("decode_steps_done")
+              req = r.get("decode_steps_requested")
+              eos = r.get("eos_step")
+              steps = f"{done}/{req} decode steps" if done is not None else f"{req} decode steps requested"
+              if eos is not None:
+                  steps += f" (eos at step {eos})"
+              print(f" · EP8/TP2, real weights, {steps}")
+              print()
+              print("| | |")
+              print("|---|---|")
+              print(f"| Prompt | `{r.get('prompt', '')}` |")
+              def cell(value):
+                  # One table cell wrapped in a code span: a pipe or newline would
+                  # break the row and a backtick would end the span early.
+                  return str(value).replace("|", "\\|").replace("\n", "⏎ ").replace("`", "'")
+              text = r.get("generated_text")
+              partial = r.get("generated_text_partial")
+              if text is not None:
+                  print(f"| Generated text | `{cell(text)}` |")
+              elif partial:
+                  n = r.get("decode_steps_done") or 0
+                  print(f"| Generated text (partial: prefill + {n} decode step(s) before the failure) | `{cell(partial)}` |")
+              else:
+                  print("| Generated text | _(none — the loop did not sample a single token)_ |")
+              if r.get("error"):
+                  err = str(r["error"]).replace("|", "\\|")
+                  print(f"| Error | `{err}` |")
+              print()
+              print("Full log: `e2e.log` in the `results-e2e-a5` artifact of this run.")
+              print()
 
           print("## Daily CI Model Test Results")
           print()
-          print("| Case | a2a3 | a2a3 effective (us) | a2a3sim | a5sim |")
-          print("| ---- | --- | --- | --- | --- |")
-          for case in all_cases:
-              cells = [ICON.get(results[p].get(case, "missing"), "?") for p in PLATFORMS]
-              print(f"| `{case}` | {cells[0]} | {perf.get(case, '-')} | {cells[1]} | {cells[2]} |")
+          table("a2a3 and simulators", ["a2a3", "a2a3sim", "a5sim"], "a2a3")
+          table("a5 (DeepSeek V4-Pro)", ["a5"], "a5")
+          e2e("a5 DeepSeek-V4-Flash EP8 end-to-end token generation (real weights)", "e2e-a5")
           EOF

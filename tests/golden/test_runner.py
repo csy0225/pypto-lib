@@ -25,8 +25,15 @@ from golden import ScalarSpec, TensorSpec, run
 from golden.runner import (
     RunResult,
     _backend_for_platform,
+    _bench_loop_sizes,
     _format_stale_paths,
     _maybe_reload_l3,
+    _report_effective,
+    _report_l3_detail,
+    _report_l3_per_rank,
+    _report_raw_samples,
+    _resident_loop_sizes,
+    _run_benchmark_l3,
     _run_l3_resident,
     _save_tensors,
     _setup_runtime_dir,
@@ -760,6 +767,44 @@ class TestScalarMixedSpecs:
         assert isinstance(observed_alpha["scalar"], ctypes.c_float)
         assert observed_alpha["scalar"].value == pytest.approx(10.0)
 
+    def test_custom_comparator_receives_cached_scalar(self, mixed_specs, tmp_path):
+        """Validation exposes the replayed scalar, not the spec default."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        cache = tmp_path / "cache"
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        y_golden = torch.tensor([11.0, 12.0, 13.0, 14.0])
+        _save_tensors(cache / "in", {"x": x})
+        _save_tensors(cache / "out", {"y": y_golden})
+        _save_tensors(
+            cache / "in",
+            {"alpha": torch.tensor(10.0, dtype=torch.float32)},
+        )
+        captured: dict[str, torch.Tensor] = {}
+
+        def fake_execute(_work_dir, args, **_kwargs):
+            args[2][:] = args[0] + args[1].value
+
+        def compare(actual, expected, *, inputs, **_kwargs):
+            captured["alpha"] = inputs["alpha"]
+            return torch.equal(actual, expected), ""
+
+        compile_p, exec_p = _patch_compile_and_execute(
+            compiled_dir,
+            fake_execute=fake_execute,
+        )
+        with compile_p, exec_p:
+            result = run(
+                program=object(),
+                specs=mixed_specs,
+                golden_data=str(cache),
+                compare_fn={"y": compare},
+            )
+
+        assert result.passed, f"unexpected failure: {result.error}"
+        assert captured["alpha"].ndim == 0
+        assert captured["alpha"].item() == pytest.approx(10.0)
+
     def test_missing_scalar_pt_in_cache_fails(self, mixed_specs, tmp_path):
         """golden_data with a ScalarSpec must include {name}.pt — missing it
         should produce a ``missing files`` error."""
@@ -953,6 +998,37 @@ class TestConfigForwarding:
         assert captured["platform"] == "a2a3sim"
         assert captured["device_id"] == 3
         assert captured["pto_isa_commit"] == "deadbeef"
+
+    def test_dump_args_forwarded_as_dfx_option(self, three_kinds_specs, tmp_path):
+        """enable_dump_args is bundled into the execute_compiled DFX options."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        captured: dict = {}
+        dfx = object()
+        dfx_opts = MagicMock(return_value=dfx)
+        runner_mod = types.ModuleType("pypto.runtime.runner")
+        runner_mod._DfxOpts = dfx_opts
+
+        def fake_execute(_work_dir, _tensors, **kwargs):
+            captured.update(kwargs)
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
+        with (
+            compile_p,
+            exec_p,
+            patch.dict(sys.modules, {"pypto.runtime.runner": runner_mod}),
+        ):
+            r = run(
+                program=object(),
+                specs=three_kinds_specs,
+                runtime_cfg=dict(enable_dump_args=2),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        dfx_opts.assert_called_once_with(enable_dump_args=2)
+        assert captured["dfx"] is dfx
+        assert "enable_dump_args" not in captured
 
 
 def _set_mtime(path: Path, mtime: float) -> None:
@@ -1210,6 +1286,48 @@ class TestShareInPlace:
         assert tensors["a"] is a
 
 
+def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatch):
+    """L3 benchmark rounds retain CommDomains and rely on kernel-side signal clears."""
+    call = {}
+
+    def _benchmark(compiled, args, **kwargs):
+        call["compiled"] = compiled
+        call["args"] = args
+        call["kwargs"] = kwargs
+        return None
+
+    fake_runtime = types.ModuleType("pypto.runtime")
+    fake_runtime.benchmark = _benchmark
+    compiled = object()
+    tensors = {"x": torch.zeros(1)}
+    monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: ["ORDERED"])
+    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+
+    with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
+        result = _run_benchmark_l3(
+            compiled,
+            [],
+            tensors,
+            {},
+            {"platform": "a2a3"},
+            rounds=7,
+            warmup=2,
+        )
+
+    assert result is None
+    assert call == {
+        "compiled": compiled,
+        "args": ["ORDERED"],
+        "kwargs": {
+            "rounds": 7,
+            "warmup": 2,
+            "config": "RUNCFG",
+            "persistent": True,
+            "reset_persistent_windows": False,
+        },
+    }
+
+
 class TestResidentPath:
     """resident specs route through the L3 prepare() worker."""
 
@@ -1239,6 +1357,108 @@ class TestResidentPath:
 
         assert r.passed, f"unexpected failure: {r.error}"
         l3res.assert_called_once()
+
+    def test_resident_benchmark_reuses_handle_and_persistent_windows(
+        self, monkeypatch
+    ):
+        """The resident L3 benchmark reuses one handle in persistent mode."""
+        import golden.runner as R
+
+        calls = {"prepare": None, "events": []}
+        state_handle = object()
+        initial_state = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        state_spec = TensorSpec(
+            "state", [2, 4], torch.float32, init_value=initial_state,
+            is_output=True, resident="stacked",
+        )
+        state_init = state_spec.create_tensor()
+
+        class _FakeRT:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def alloc_stacked_tensor(self, host, worker_ids=None):
+                assert worker_ids is None
+                assert torch.equal(host, state_init)
+                calls["events"].append(("alloc", state_handle))
+                return state_handle
+
+            def free_stacked_tensor(self, handle):
+                assert handle is state_handle
+                calls["events"].append(("free", handle))
+
+            def __call__(self, *args, config=None):
+                assert config == "RUNCFG"
+                assert len(args) == 1
+                calls["events"].append(("dispatch", args[0]))
+
+        class _FakeDCP:
+            def prepare(self, *args, **kwargs):
+                calls["prepare"] = (args, kwargs)
+                return _FakeRT()
+
+        class _Capture:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                self.path.touch()
+                return None
+
+            def __exit__(self, *_a):
+                return False
+
+        fake_dcp = types.ModuleType("pypto.ir.distributed_compiled_program")
+        fake_dcp.DistributedCompiledProgram = _FakeDCP
+        fake_bench = types.ModuleType("pypto.runtime.bench")
+        fake_bench._STRACE_LOG_LEVEL = "v9"
+        fake_bench._capture_fd_stderr = _Capture
+        fake_bench._parse_stats_from_strace = lambda *_a, **_k: types.SimpleNamespace(
+            host_wall_us=[]
+        )
+        fake_log = types.ModuleType("pypto.runtime.log_config")
+        fake_log.configure_log = lambda _level: None
+        fake_log.current_level = lambda: "v0"
+
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "3")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "2")
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["state"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
+        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+
+        with patch.dict(
+            sys.modules,
+            {
+                "pypto.ir.distributed_compiled_program": fake_dcp,
+                "pypto.runtime.bench": fake_bench,
+                "pypto.runtime.log_config": fake_log,
+            },
+        ):
+            result = R._run_l3_resident(
+                compiled=_FakeDCP(),
+                tensor_specs=[state_spec],
+                tensors={"state": state_init},
+                scalar_specs_eff={},
+                runtime_cfg={"platform": "a2a3"},
+                golden_outputs=None,
+                rtol=1e-5,
+                atol=1e-5,
+                compare_fn={},
+            )
+
+        assert result is None
+        assert calls["prepare"] == (
+            ("RUNCFG",),
+            {"persistent": True, "reset_persistent_windows": False},
+        )
+        assert [kind for kind, _ in calls["events"]] == [
+            "alloc", "dispatch", "dispatch", "dispatch", "dispatch", "dispatch", "free",
+        ]
+        assert all(handle is state_handle for _, handle in calls["events"])
 
     @staticmethod
     def _fake_dcp_module():
@@ -1312,6 +1532,7 @@ class TestResidentPath:
         tensors = {"w": torch.ones(2, 4)}
         # Avoid real pypto.runtime / backend by stubbing the metadata + config helpers.
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["w"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
         with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
@@ -1331,6 +1552,91 @@ class TestResidentPath:
         assert calls["dispatched"] == 1
         assert calls["stacked"] == [((2, 4), None)]  # identity worker_ids
         assert calls["freed"] == 1
+
+    def test_run_l3_resident_pure_out_stacked_skips_zero_upload(self, monkeypatch):
+        """A write-only stacked resident uses empty per-rank allocations."""
+        import golden.runner as R
+
+        calls = {
+            "alloc": [],
+            "stacked": [],
+            "uploaded": 0,
+            "freed": 0,
+            "dispatched": 0,
+        }
+
+        class _FakeStackedDeviceTensor:
+            def __init__(self, shards, full_shape, worker_ids):
+                calls["stacked"].append(
+                    (len(shards), tuple(full_shape), tuple(worker_ids))
+                )
+
+        class _FakeRT:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def alloc_stacked_tensor(self, _host, worker_ids=None):
+                calls["uploaded"] += 1
+                raise AssertionError("pure Out must not upload its host placeholder")
+
+            def alloc_tensor(self, shape, dtype, *, init=None, worker_id=0):
+                calls["alloc"].append((tuple(shape), dtype, init, worker_id))
+                return types.SimpleNamespace(worker_id=worker_id)
+
+            def free_stacked_tensor(self, _h):
+                calls["freed"] += 1
+
+            def free_tensor(self, _h, *, worker_id=0):
+                raise AssertionError(f"successful stacked handle must be freed as a stack: {worker_id}")
+
+            def __call__(self, *_args, config=None):
+                calls["dispatched"] += 1
+
+        class _FakeDCP:
+            def prepare(self):
+                return _FakeRT()
+
+        fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
+        fake_mod.DistributedCompiledProgram = _FakeDCP
+        fake_runtime = types.ModuleType("pypto.runtime")
+        fake_runtime.StackedDeviceTensor = _FakeStackedDeviceTensor
+
+        specs = [TensorSpec("y", [2, 4], torch.float32, is_output=True, resident="stacked")]
+        tensors = {"y": torch.zeros(2, 4)}
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["y"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: {"y"})
+        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+
+        with patch.dict(
+            sys.modules,
+            {
+                "pypto.ir.distributed_compiled_program": fake_mod,
+                "pypto.runtime": fake_runtime,
+            },
+        ):
+            R._run_l3_resident(
+                compiled=_FakeDCP(),
+                tensor_specs=specs,
+                tensors=tensors,
+                scalar_specs_eff={},
+                runtime_cfg={"platform": "a2a3"},
+                golden_outputs=None,
+                rtol=1e-5,
+                atol=1e-5,
+                compare_fn={},
+            )
+
+        assert calls["uploaded"] == 0
+        assert calls["dispatched"] == 1
+        assert calls["freed"] == 1
+        assert calls["stacked"] == [(2, (2, 4), (0, 1))]
+        assert calls["alloc"] == [
+            ((4,), torch.float32, None, 0),
+            ((4,), torch.float32, None, 1),
+        ]
 
     def test_run_l3_resident_output_reads_back(self, monkeypatch):
         """A resident+is_output spec (state buffer) is read back via copy_stacked_from
@@ -1376,9 +1682,18 @@ class TestResidentPath:
         golden = {"kv": torch.full((2, 4), 7.0)}
 
         monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["kv"])
+        monkeypatch.setattr(R, "_l3_pure_out_names", lambda _c: set())
         monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
 
-        def _fake_validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn):
+        def _fake_validate(
+            tensor_specs,
+            tensors,
+            golden_outputs,
+            rtol,
+            atol,
+            compare_fn,
+            scalar_specs_eff=None,
+        ):
             calls["validated_value"] = tensors["kv"].clone()
 
         monkeypatch.setattr(R, "_validate", _fake_validate)
@@ -1419,6 +1734,164 @@ class TestResidentPath:
                     atol=1e-5,
                     compare_fn={},
                 )
+
+
+class _FakeInv:
+    """Stand-in for a runtime ``TraceInvocation`` — only what the reporters read."""
+
+    def __init__(self, pid: int, inv: int, effective_us: float):
+        self.pid = pid
+        self.inv = inv
+        self.effective_us = effective_us
+
+
+class _FakeStats:
+    """Stand-in for ``BenchmarkStats`` — only what the reporters read.
+
+    Keeps the unit tests off the installed runtime (the CPU-only job runs with
+    conftest's stub ``pypto``).
+    """
+
+    rounds, warmup, fallback_flattened, all_zero_device = 2, 1, False, False
+    # Tuples, not lists: class-level state shared across tests must not be mutable.
+    host_wall_us = (300.0, 310.0)
+    invocations = (_FakeInv(11, 1, 100.44), _FakeInv(10, 0, 50.0),
+                   _FakeInv(10, 1, 51.0), _FakeInv(11, 0, 99.0))
+    rounds_dispatches = ({10: [], 11: []}, {10: [], 11: []})
+
+    def per_rank(self, _metric="device"):
+        return {10: [50.0, 51.0], 11: [99.0, 100.4]}
+
+    def per_round(self, metric="device"):
+        return [400.0, 410.0] if metric == "union" else [99.0, 100.4]
+
+    def per_dispatch(self, _metric="device"):
+        # One dispatch per rank per round, so it agrees with per_rank above and
+        # the per-dispatch report has nothing to un-fuse.
+        return {(10, 0): [50.0, 51.0], (11, 0): [99.0, 100.4]}
+
+    def dispatch_tasks(self):
+        return {(10, 0): "decode_orch", (11, 0): "decode_orch"}
+
+
+class _FakeMultiDispatchStats(_FakeStats):
+    """``_FakeStats`` where rank 10 dispatches twice per round.
+
+    This is the shape ``per_rank`` fuses: rank 10's 20+30 and 21+30 are what its
+    per-rank line reports as 50.0 / 51.0.
+    """
+
+    def per_dispatch(self, _metric="device"):
+        return {(10, 0): [20.0, 21.0], (10, 1): [30.0, 30.0], (11, 0): [99.0, 100.4]}
+
+    def dispatch_tasks(self):
+        return {(10, 0): "prefill_orch", (10, 1): "decode_orch", (11, 0): "decode_orch"}
+
+
+class TestBenchLoopSizes:
+    """``PYPTO_BENCH_ROUNDS`` / ``PYPTO_BENCH_WARMUP`` override the defaults.
+
+    conftest's autouse ``_isolate_bench_env`` clears the knobs before each test.
+    """
+
+    def test_defaults_when_unset(self):
+        """Daily CI sets neither, so its perf baseline must stay 100/5."""
+        assert _bench_loop_sizes() == (100, 5)
+
+    def test_env_overrides_both(self, monkeypatch):
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "10")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "0")
+        assert _bench_loop_sizes() == (10, 0)
+
+    def test_invalid_value_warns_and_falls_back(self, monkeypatch, capsys):
+        """A mistyped knob must not fail an otherwise good run."""
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "abc")
+        assert _bench_loop_sizes() == (100, 5)
+        assert "ignoring PYPTO_BENCH_ROUNDS" in capsys.readouterr().out
+
+    def test_resident_clamps_warmup_to_one(self, monkeypatch):
+        """The resident path burns warmup[0] on validation, so warmup=0 would
+        emit rounds+1 dispatches against a declared rounds+0 and lose per-round
+        segmentation."""
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "7")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "0")
+        assert _resident_loop_sizes() == (7, 1)
+
+
+class TestBenchReports:
+    """The ``[RUN]`` benchmark report lines."""
+
+    def test_raw_samples_off_by_default(self, capsys):
+        _report_raw_samples(_FakeStats())
+        assert capsys.readouterr().out == ""
+
+    def test_raw_samples_lists_every_dispatch_per_rank(self, monkeypatch, capsys):
+        monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
+        _report_raw_samples(_FakeStats())
+        lines = capsys.readouterr().out.splitlines()
+        assert "raw samples: ranks=2 rounds=2 warmup=1" in lines[0]
+        # One line per rank, ranks sorted, samples in inv order (not emission order).
+        assert "rank 10 raw n=2 eff_us=[50.0, 51.0]" in lines[1]
+        assert "rank 11 raw n=2 eff_us=[99.0, 100.4]" in lines[2]
+
+    def test_per_rank_omits_slots_when_one_dispatch_per_rank(self, capsys):
+        """Nothing is fused, so slot lines would only restate the rank lines."""
+        _report_l3_per_rank(_FakeStats())
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        assert "rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0" in lines[0]
+        assert "rank 11: eff_us min=99.0 median=99.7 mean=99.7 max=100.4" in lines[1]
+        assert len(lines) == 2
+        assert "slot" not in out
+
+    def test_per_rank_nests_a_ranks_fused_dispatches(self, capsys):
+        """Rank 10's summed 50.0/51.0 is broken back into its two dispatches.
+
+        Slot lines follow their own rank line (not a separate block) and are
+        indented one level deeper, so the breakdown reads as a tree.
+        """
+        _report_l3_per_rank(_FakeMultiDispatchStats())
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == [
+            "[RUN]     rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0",
+            "[RUN]       slot 0 (prefill_orch): eff_us min=20.0 median=20.5 mean=20.5 max=21.0",
+            "[RUN]       slot 1 (decode_orch): eff_us min=30.0 median=30.0 mean=30.0 max=30.0",
+            "[RUN]     rank 11: eff_us min=99.0 median=99.7 mean=99.7 max=100.4",
+            "[RUN]       slot 0 (decode_orch): eff_us min=99.0 median=99.7 mean=99.7 max=100.4",
+        ]
+
+    def test_per_rank_tolerates_older_pypto(self, capsys):
+        """An installed pypto without ``per_dispatch`` still gets the rank lines."""
+
+        class _NoPerDispatch:
+            def per_rank(self, _metric="device"):
+                return {10: [50.0]}
+
+        _report_l3_per_rank(_NoPerDispatch())
+        out = capsys.readouterr().out
+        assert "rank 10: eff_us min=50.0" in out
+        assert "slot" not in out
+
+    def test_report_lines_stay_ci_safe(self, monkeypatch, capsys):
+        """Daily CI greps ``effective_us .*mean=`` and takes the last match, so
+        exactly one line may match it; device_wall is no longer reported at all.
+        See .github/workflows/daily_ci.yml.
+        """
+        import re
+
+        monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
+        # The multi-dispatch fake exercises every reporter, including the nested
+        # per-dispatch slot lines, against the single-match contract.
+        stats = _FakeMultiDispatchStats()
+        _report_effective(stats)
+        _report_l3_per_rank(stats)
+        _report_raw_samples(stats)
+        _report_l3_detail(stats, _FakeCompiled(Path("/x/moe_ep2_20260722_101010")), resident=True)
+        out = capsys.readouterr().out
+        assert re.findall(r"effective_us .*mean=([0-9.]+)", out) == ["99.7"]  # mean of [99.0, 100.4]
+        assert "device_wall" not in out
+        assert "rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0" in out
+        assert "slot 1 (decode_orch): eff_us" in out
 
 
 if __name__ == "__main__":

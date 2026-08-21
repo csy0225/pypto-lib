@@ -21,6 +21,7 @@ develop-eggs/
 # Project build artifacts
 build_output/
 pa_build/
+site/
 
 # Virtual environments
 .env/
@@ -28,6 +29,9 @@ pa_build/
 env/
 venv/
 ENV/
+
+# CI-generated g++-15 / gcc-15 shims, written next to the per-job venv
+toolchain-bin/
 
 # Testing / coverage / type-checking caches
 .pytest_cache/
@@ -59,4 +63,7 @@ Thumbs.db
 *.log
 
 # Project-specific
+KNOWN_PYPTO_ISSUES.md*
+KNOWN_PYPTO_ISSUES/
+# Retained so a developer's pre-rename local log stays ignored
 KNOWN_ISSUES.md

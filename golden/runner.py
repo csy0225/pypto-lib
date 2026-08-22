@@ -116,8 +116,8 @@ def _backend_for_platform(platform: str) -> Any:
 
 
 _DFX_FLAG_KEYS = (
-    "enable_l2_swimlane",
-    "enable_dump_tensor",
+    "enable_chip_swimlane",
+    "enable_dump_args",
     "enable_pmu",
     "enable_dep_gen",
     "enable_scope_stats",
@@ -127,7 +127,7 @@ _DFX_FLAG_KEYS = (
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
 
-    The four DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
+    The five DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
     keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
     on unknown keys rather than us silently dropping them.
     """
@@ -249,6 +249,7 @@ def _prepare_inputs(
     data_dir: Path | None,
     work_dir: Path,
     save_data: bool = True,
+    need_snapshot: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec], dict[str, torch.Tensor]]:
     """Build inputs for the runtime stage.
 
@@ -258,18 +259,22 @@ def _prepare_inputs(
     when *save_data* is True, persist into ``{work_dir}/data/in/``. Set
     *save_data* False to skip the on-disk ``.pt`` snapshot (validation still
     works via the in-memory ``input_snapshot``); useful when inputs are large
-    (e.g. full-model weights) and golden replay is not needed.
+    (e.g. full-model weights) and golden replay is not needed. Set
+    *need_snapshot* False as well (no ``golden_fn``) to skip the in-memory
+    input clone entirely — halves peak host RAM on full-model-weight runs.
 
     Raises ``ValueError`` on missing files or scalar dtype mismatch.
     """
     if data_dir is None:
         tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
         scalar_specs_eff = {s.name: s for s in scalar_specs}
-        input_snapshot = {
-            spec.name: tensors[spec.name].clone()
-            for spec in tensor_specs
-            if not spec.is_output or spec.init_value is not None
-        }
+        input_snapshot = {}
+        if need_snapshot or save_data:
+            input_snapshot = {
+                spec.name: tensors[spec.name].clone()
+                for spec in tensor_specs
+                if not spec.is_output or spec.init_value is not None
+            }
         if save_data:
             in_dir = work_dir / "data" / "in"
             _save_tensors(in_dir, input_snapshot)
@@ -340,10 +345,12 @@ def _is_l3(compiled: Any) -> bool:
     return isinstance(compiled, DistributedCompiledProgram)
 
 
-# Fixed benchmark loop sizes — enough rounds to stabilise the median without
-# bloating daily-CI wall time (each round is a sub-ms register-once dispatch).
-_BENCH_ROUNDS = 100
-_BENCH_WARMUP = 5
+# Default benchmark loop sizes shared by L2 and L3, overridable per run via
+# PYPTO_BENCH_ROUNDS / PYPTO_BENCH_WARMUP (see :func:`_bench_loop_sizes`). Daily
+# CI pins the perf baseline by leaving both unset. L3 differs only in its
+# aggregation: each round contributes the fastest valid rank's Effective time.
+_BENCH_ROUNDS_DEFAULT = 100
+_BENCH_WARMUP_DEFAULT = 5
 
 
 def _bench_enabled() -> bool:
@@ -352,11 +359,80 @@ def _bench_enabled() -> bool:
     Benchmarking is entirely env-driven so no model file needs a ``--benchmark``
     flag and ``run_jit`` needs no extra parameters: daily CI's a2a3 job sets
     ``PYPTO_BENCH=1`` and every ``run_jit`` call then times the kernel over
-    :data:`_BENCH_ROUNDS` rounds (:data:`_BENCH_WARMUP` warmup, discarded).
+    :func:`_bench_loop_sizes` rounds (warmup discarded).
     """
     import os
 
     return os.environ.get("PYPTO_BENCH", "").strip() not in ("", "0", "false", "False")
+
+
+def _bench_env_int(name: str, default: int, minimum: int) -> int:
+    """Read env var *name* as an int >= *minimum*, falling back to *default*.
+
+    A malformed or out-of-range value warns and uses the default rather than
+    raising: a mistyped tuning knob must not fail an otherwise good run.
+    """
+    import os
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = minimum - 1
+    if value < minimum:
+        print(
+            f"[RUN]   ignoring {name}={raw!r} (want an integer >= {minimum}); "
+            f"using {default}",
+            flush=True,
+        )
+        return default
+    return value
+
+
+def _bench_loop_sizes() -> tuple[int, int]:
+    """``(rounds, warmup)`` for this run, from the env or the defaults.
+
+    Overriding matters because one size does not fit every kernel: the
+    100-round default is ~0.1 s of device time for a decode step but minutes for
+    a long prefill or a multi-card L3 run, and while iterating on a kernel a
+    handful of rounds is usually enough. Both are read per run (not cached), so
+    a sweep can vary them between :func:`run_jit` calls in one process.
+
+    Daily CI sets neither, so its numbers stay comparable across runs. Warmup is
+    allowed to be 0; rounds must be at least 1.
+    """
+    return (
+        _bench_env_int("PYPTO_BENCH_ROUNDS", _BENCH_ROUNDS_DEFAULT, 1),
+        _bench_env_int("PYPTO_BENCH_WARMUP", _BENCH_WARMUP_DEFAULT, 0),
+    )
+
+
+def _resident_loop_sizes() -> tuple[int, int]:
+    """:func:`_bench_loop_sizes` with ``warmup`` forced to at least 1.
+
+    The resident L3 path spends its first warmup launch on the validation
+    dispatch, so unlike ``benchmark()``'s own loops it cannot honour
+    ``warmup=0``: that would emit ``rounds + 1`` dispatches per rank against a
+    declared ``rounds + 0``, which no longer segments evenly and drops the whole
+    run into the flatten fallback.
+    """
+    rounds, warmup = _bench_loop_sizes()
+    return rounds, max(warmup, 1)
+
+
+def _bench_raw_enabled() -> bool:
+    """True when ``PYPTO_BENCH_RAW`` is set truthy.
+
+    Opt-in companion to :func:`_bench_enabled`, off by default (the raw dump is
+    one line per rank holding every sample). Turn it on when a summary looks
+    suspicious — start-up drift, a bimodal rank, one card lagging — and the
+    individual samples are needed to see the shape.
+    """
+    import os
+
+    return os.environ.get("PYPTO_BENCH_RAW", "").strip() not in ("", "0", "false", "False")
 
 
 def _run_benchmark(
@@ -372,8 +448,8 @@ def _run_benchmark(
 
     L2 single-chip only: delegates to :func:`pypto.runtime.benchmark`, which
     opens one :class:`~pypto.runtime.ChipWorker`, registers *compiled* once, and
-    reads each launch's on-NPU ``device_wall_us`` from the runtime's
-    ``[STRACE]`` markers (simpler PR #1177). Args are reordered to the
+    reads each launch's on-NPU span tree from the runtime's ``[STRACE]``
+    markers (simpler PR #1177). Args are reordered to the
     orchestration parameter order exactly as :func:`_execute_via_runner` does.
     Returns the :class:`~pypto.runtime.BenchmarkStats`, or ``None`` when the
     runtime emits no markers (built without ``SIMPLER_PROFILING``).
@@ -401,11 +477,16 @@ def _run_benchmark(
     if stats is None:
         return None
     _report_effective(stats)
+    _report_raw_samples(stats)
     return stats
 
 
 def _report_effective(stats: Any) -> None:
-    """Print the ``effective_us (...)`` perf line the daily-CI collector greps.
+    """Print the max-rank ``effective_us (...)`` summary.
+
+    Daily CI consumes this line for both L2 and L3. For L3 it is the per-round
+    max across ranks (slowest rank bounds the round); the flatten fallback pools
+    every rank's per-dispatch samples into the same window.
 
     The Effective window is the framework's post-graph-build execution window
     (``orch``∪``sched``, the old device-log "Total"), surfaced directly by
@@ -417,7 +498,7 @@ def _report_effective(stats: Any) -> None:
     """
     if stats.all_zero_device:
         print(
-            "[RUN]   effective_us unavailable: device_wall all 0 "
+            "[RUN]   effective_us unavailable: no device-domain spans "
             "(sim platform or non-profiling build)",
             flush=True,
         )
@@ -434,14 +515,43 @@ def _report_effective(stats: Any) -> None:
         print("[RUN]   effective_us unavailable: no orch/sched spans captured", flush=True)
 
 
+def _report_raw_samples(stats: Any) -> None:
+    """Print every measured dispatch's raw Effective sample, per rank.
+
+    No-op unless :func:`_bench_raw_enabled` (``PYPTO_BENCH_RAW``). Reads
+    :attr:`BenchmarkStats.invocations` — the flat per-dispatch list — rather than
+    the per-round grid, so it works for L2 (one rank, one dispatch per round),
+    for L3, and for the L3 flatten fallback where ``per_rank`` returns ``{}`` and
+    the summary lines are the least trustworthy.
+
+    Samples are in ``inv`` order (warmup already dropped), so the sequence shows
+    drift directly. The lines use a ``raw`` token and ``eff_us``, never
+    ``effective_us``, so the Daily-CI collector's match cannot select them.
+    """
+    if not _bench_raw_enabled() or not stats.invocations:
+        return
+    by_pid: dict[int, list[Any]] = {}
+    for iv in sorted(stats.invocations, key=lambda i: (i.pid, i.inv)):
+        by_pid.setdefault(iv.pid, []).append(iv)
+    head = (
+        f"[RUN]   raw samples: ranks={len(by_pid)} rounds={stats.rounds} warmup={stats.warmup}"
+    )
+    if stats.fallback_flattened:
+        head += " fallback_flattened=1"
+    print(head, flush=True)
+    for pid in sorted(by_pid):
+        eff = [round(iv.effective_us, 1) for iv in by_pid[pid]]
+        print(f"[RUN]     rank {pid} raw n={len(eff)} eff_us={eff}", flush=True)
+
+
 def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
     """Print an L3 context line complementing :func:`_report_effective`.
 
-    Surfaces the L3-only aggregates the new ``BenchmarkStats`` exposes: per-round
-    device wall (max across ranks), the cross-rank host-timeline ``union`` window,
-    and the host wall — plus the rank count and a ``fallback_flattened`` note when
-    per-round segmentation was not possible. The ``kernel=`` / ``l3_resident=1``
-    tokens are preserved for dashboards that grep them.
+    Surfaces the L3-only aggregates the new ``BenchmarkStats`` exposes: the
+    cross-rank host-timeline ``union`` window and the host wall — plus the rank
+    count and a ``fallback_flattened`` note when per-round segmentation was not
+    possible. The ``kernel=`` / ``l3_resident=1`` tokens are preserved for
+    dashboards that grep them.
     """
     import re
 
@@ -454,8 +564,6 @@ def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
         f"rounds={stats.rounds}",
         f"ranks={n_ranks}",
     ]
-    if stats.device_wall_us and any(stats.device_wall_us):
-        parts.append(f"device_wall_mean_us={statistics.fmean(stats.device_wall_us):.0f}")
     union = stats.per_round("union")
     if union:
         parts.append(f"host_union_mean_us={statistics.fmean(union):.0f}")
@@ -466,34 +574,83 @@ def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
     print(" ".join(parts), flush=True)
 
 
+def _print_eff_summary(label: str, samples: Any, *, indent: int) -> None:
+    """Print one ``eff_us`` min/median/mean/max line for *samples*, or ``(no timing)``.
+
+    Zero samples are dropped first (a round with no orch/sched span reads 0).
+    *indent* is the space count after the ``[RUN]`` tag, which is how the
+    per-dispatch lines nest under their rank.
+
+    The line uses an ``eff_us`` token, never ``effective_us``, so the Daily-CI
+    collector's ``effective_us`` match cannot select it.
+    """
+    eff = [e for e in samples if e > 0.0]
+    pad = " " * indent
+    if not eff:
+        print(f"[RUN]{pad}{label}: (no timing)", flush=True)
+        return
+    print(
+        f"[RUN]{pad}{label}: eff_us min={min(eff):.1f} "
+        f"median={statistics.median(eff):.1f} "
+        f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}",
+        flush=True,
+    )
+
+
+def _per_dispatch_effective(stats: Any) -> dict[tuple[int, int], list[float]]:
+    """``{(pid, slot): [per-round Effective ...]}``, or ``{}`` when not worth printing.
+
+    ``slot`` is the dispatch's position within its rank's round, so slot ``s`` is
+    the same dispatch in every round and nothing is summed — unlike ``per_rank``.
+
+    Returns ``{}`` when the breakdown would add nothing: the installed pypto
+    predates ``per_dispatch``, there is no dispatch grid (L2 / flatten fallback),
+    or no rank issues more than one dispatch per round (every slot line would
+    just restate its rank line).
+    """
+    per_dispatch_fn = getattr(stats, "per_dispatch", None)
+    if per_dispatch_fn is None:
+        return {}  # installed pypto predates the per-dispatch view
+    per_dispatch = per_dispatch_fn("effective")
+    if not per_dispatch:
+        return {}
+    if len(per_dispatch) <= len({pid for pid, _slot in per_dispatch}):
+        return {}  # at most one dispatch per rank: nothing the rank lines fuse
+    return per_dispatch
+
+
 def _report_l3_per_rank(stats: Any) -> None:
-    """Print each rank's Effective / device-wall summary for an L3 run.
+    """Print each rank's Effective summary for an L3 run, with its dispatches.
 
-    Uses ``BenchmarkStats.per_rank(...)`` — ``{pid: [per-round ...]}`` where each
-    round entry is that rank's summed dispatch metric — to surface the cross-card
-    imbalance the headline (per-round max across ranks) hides. No-op for L2 and the
-    flatten fallback (``per_rank`` returns ``{}``).
+    Uses ``BenchmarkStats.per_rank("effective")`` — ``{pid: [per-round ...]}``
+    where each round entry is that rank's summed dispatch Effective window — to
+    surface the cross-card imbalance the headline (per-round max across ranks)
+    hides. No-op for L2 and the flatten fallback (``per_rank`` returns ``{}``).
 
-    The per-rank lines deliberately use an ``eff_us`` token, *not* ``effective_us``,
-    so the daily-CI perf grep (which keys on ``effective_us ... max=``) matches only
-    the single headline line from :func:`_report_effective`, never these.
+    Because a rank entry **sums** that card's dispatches (a card runs them
+    serially), one nested ``slot`` line per dispatch follows each rank line,
+    read from ``per_dispatch`` and labelled with the orchestration function
+    ``dispatch_tasks()`` names. Those appear only when some rank dispatches more
+    than once per round (see :func:`_per_dispatch_effective`); then every rank's
+    dispatches are listed, so single-dispatch ranks show one slot line restating
+    their rank line and the block stays a complete table.
+
+    All lines use an ``eff_us`` token, so the Daily-CI collector's
+    ``effective_us`` match never selects them.
     """
     rank_eff = stats.per_rank("effective")
     if not rank_eff:
         return
-    rank_dev = stats.per_rank("device")
+    tasks = getattr(stats, "dispatch_tasks", dict)() or {}
+    by_rank: dict[int, list[tuple[int, str, list[float]]]] = {}
+    for key, samples in _per_dispatch_effective(stats).items():
+        pid, slot = key
+        by_rank.setdefault(pid, []).append((slot, tasks.get(key, ""), samples))
     for pid in sorted(rank_eff):
-        eff = [e for e in rank_eff[pid] if e > 0.0]
-        dev = [d for d in rank_dev.get(pid, []) if d > 0.0]
-        cols: list[str] = []
-        if eff:
-            cols.append(
-                f"eff_us min={min(eff):.1f} median={statistics.median(eff):.1f} "
-                f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}"
-            )
-        if dev:
-            cols.append(f"device_wall_us mean={statistics.fmean(dev):.1f} max={max(dev):.1f}")
-        print(f"[RUN]     rank {pid}: {'  '.join(cols) if cols else '(no timing)'}", flush=True)
+        _print_eff_summary(f"rank {pid}", rank_eff[pid], indent=5)
+        for slot, task, samples in sorted(by_rank.get(pid, []), key=lambda entry: entry[0]):
+            label = f"slot {slot}" + (f" ({task})" if task else "")
+            _print_eff_summary(label, samples, indent=7)
 
 
 def _l3_ordered_args(
@@ -552,6 +709,8 @@ def _run_benchmark_l3(
                 compiled, ordered,
                 rounds=rounds, warmup=warmup,
                 config=_l3_run_config(runtime_cfg),
+                persistent=True,
+                reset_persistent_windows=False,
             )
         except RuntimeError as e:
             # No [STRACE] markers: runtime not built with SIMPLER_PROFILING.
@@ -561,6 +720,7 @@ def _run_benchmark_l3(
         return None
     _report_effective(stats)
     _report_l3_per_rank(stats)
+    _report_raw_samples(stats)
     _report_l3_detail(stats, compiled, resident=False)
     return stats
 
@@ -608,10 +768,57 @@ def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
         tensors[name] = t.cpu().contiguous().share_memory_()
 
 
+def _strip_ssa_suffix(name: str) -> str:
+    """Strip only a terminal ``__ssa_vN`` suffix from a compiled parameter name."""
+    base, marker, version = name.rpartition("__ssa_v")
+    return base if marker and version.isdigit() else name
+
+
 def _l3_ordered_names(compiled: Any) -> list[str]:
     """Parameter names in orchestration order (SSA suffix ``orig__ssa_vN`` -> ``orig``)."""
     param_infos, _, _ = compiled._get_metadata()
-    return [p.name.split("__ssa_")[0] for p in param_infos]
+    return [_strip_ssa_suffix(p.name) for p in param_infos]
+
+
+def _l3_pure_out_names(compiled: Any) -> set[str]:
+    """Names of write-only L3 parameters that need no resident initialization."""
+    from pypto.ir import ParamDirection
+
+    param_infos, _, _ = compiled._get_metadata()
+    normalized_names = [_strip_ssa_suffix(p.name) for p in param_infos]
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ValueError("compiled L3 parameters collide after stripping SSA suffixes")
+    return {
+        name
+        for name, p in zip(normalized_names, param_infos, strict=True)
+        if p.direction == ParamDirection.Out
+    }
+
+
+def _alloc_empty_stacked_tensor(rt: Any, spec: TensorSpec) -> Any:
+    """Allocate one uninitialized shard per rank for a pure ``Out`` resident."""
+    from pypto.runtime import StackedDeviceTensor
+
+    shape = tuple(spec.shape)
+    if len(shape) < 2 or shape[0] < 1:
+        raise ValueError(
+            f"TensorSpec {spec.name!r}: resident=\"stacked\" needs shape [B, *tail], got {shape}"
+        )
+    worker_ids = tuple(range(int(shape[0])))
+    shards = []
+    try:
+        for wid in worker_ids:
+            shards.append(
+                rt.alloc_tensor(shape[1:], spec.dtype, init=None, worker_id=wid)
+            )
+        return StackedDeviceTensor(shards, shape, worker_ids)
+    except Exception:
+        for shard, wid in zip(shards, worker_ids, strict=False):
+            try:
+                rt.free_tensor(shard, worker_id=wid)
+            except Exception:  # noqa: BLE001 - preserve the allocation/construction error
+                pass
+        raise
 
 
 def _l3_run_config(runtime_cfg: dict[str, Any]) -> Any:
@@ -682,16 +889,15 @@ def _run_l3_resident(
 
     Routes through :meth:`DistributedCompiledProgram.prepare` — the only path
     that can build worker-resident :class:`~pypto.runtime.DeviceTensor` buffers.
-    Each resident spec is uploaded once via ``rt.alloc_tensor(init=...)`` and
-    reused across the validation dispatch and every benchmark round, so its
-    weight is never re-uploaded (H2D) or read back (D2H); per-call IO stays
-    shared-memory host tensors reused in place. A resident spec that is also an
-    output is a read-write state buffer (e.g. a KV cache): uploaded once as its
-    initial state, updated in place on-device, and read back once before
-    validation via :func:`_readback_resident_outputs`.
+    Each resident input / ``InOut`` spec is uploaded once via
+    ``rt.alloc_tensor(init=...)`` and reused across the validation dispatch and
+    every benchmark round. A pure ``Out`` resident is allocated uninitialized,
+    because its host tensor is only an output destination and uploading its
+    zero-filled placeholder would be wasted work. Resident outputs are read back
+    once before golden validation via :func:`_readback_resident_outputs`.
 
     When :func:`_bench_enabled` (``PYPTO_BENCH``), the resident weights are reused
-    for :data:`_BENCH_ROUNDS` timed rounds. This cannot go through
+    for :func:`_bench_loop_sizes` timed rounds. This cannot go through
     :func:`pypto.runtime.benchmark` — that owns its own ``prepare()``, and a
     resident buffer allocated on our worker is invisible to a second, separately
     forked one — so it mirrors ``benchmark``'s L3 path by hand: raise the runtime
@@ -722,6 +928,7 @@ def _run_l3_resident(
     _share_in_place(tensors)
 
     ordered_names = _l3_ordered_names(compiled)
+    pure_out_names = _l3_pure_out_names(compiled)
     run_config = _l3_run_config(runtime_cfg)
     resident_specs = [s for s in tensor_specs if s.is_resident]
     bench = _bench_enabled()
@@ -739,7 +946,18 @@ def _run_l3_resident(
         The upload / free bracket the dispatch so the resident buffers exist for
         every launch and are always released — even if *dispatch_fn* raises.
         """
-        with compiled.prepare() as rt:
+        # Benchmarks model serving's steady-state dispatch: retain CommDomains
+        # across rounds and let kernels clear their own signal windows. Keep the
+        # ordinary validation path one-shot.
+        if bench:
+            prepared = compiled.prepare(
+                run_config,
+                persistent=True,
+                reset_persistent_windows=False,
+            )
+        else:
+            prepared = compiled.prepare()
+        with prepared as rt:
             # (name, handle, is_stacked, worker_id) — is_stacked picks the matching
             # free below; worker_id is the card a whole-tensor buffer was allocated on.
             resident_handles: list[tuple[str, Any, bool, int]] = []
@@ -747,21 +965,25 @@ def _run_l3_resident(
                 for s in resident_specs:
                     if s.resident == "stacked":
                         # Leading-dim sharded: shard i of a [world_size, *tail] weight
-                        # uploaded to card i (identity worker_ids), matching a
+                        # placed on card i (identity worker_ids), matching a
                         # ``for r: child(x[r], device=r)`` orchestrator.
-                        if not hasattr(rt, "alloc_stacked_tensor"):
+                        if s.name in pure_out_names:
+                            handle = _alloc_empty_stacked_tensor(rt, s)
+                        elif not hasattr(rt, "alloc_stacked_tensor"):
                             raise ValueError(
                                 f"TensorSpec {s.name!r}: resident=\"stacked\" needs a pypto runtime "
                                 f"exposing DistributedWorker.alloc_stacked_tensor; this runtime lacks it."
                             )
-                        handle = rt.alloc_stacked_tensor(tensors[s.name])
+                        else:
+                            handle = rt.alloc_stacked_tensor(tensors[s.name])
                         resident_handles.append((s.name, handle, True, 0))
                     else:
                         # Whole-tensor resident on a single card: resident is the int
                         # worker id (0, 1, ...) the consuming kernel is dispatched to.
                         wid = int(s.resident)
+                        init = None if s.name in pure_out_names else tensors[s.name]
                         handle = rt.alloc_tensor(
-                            tuple(s.shape), s.dtype, init=tensors[s.name], worker_id=wid
+                            tuple(s.shape), s.dtype, init=init, worker_id=wid
                         )
                         resident_handles.append((s.name, handle, False, wid))
                 resident_args = {name: handle for name, handle, _, _ in resident_handles}
@@ -795,7 +1017,15 @@ def _run_l3_resident(
         # its handles are still live — so _validate compares what the kernel
         # actually produced (one end-of-run D2H, not a per-dispatch one).
         _readback_resident_outputs(rt, resident_specs, resident_handles, tensors)
-        _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+        _validate(
+            tensor_specs,
+            tensors,
+            golden_outputs,
+            rtol,
+            atol,
+            compare_fn,
+            scalar_specs_eff,
+        )
 
     # Non-benchmark: one validation dispatch, no capture.
     if not bench:
@@ -820,6 +1050,8 @@ def _run_l3_resident(
     )
     from pypto.runtime.log_config import configure_log, current_level  # noqa: PLC0415
 
+    rounds, warmup = _resident_loop_sizes()
+
     def _bench_dispatch(rt: Any, ordered: list[Any], resident_handles: list) -> None:
         # warmup[0] doubles as the validation dispatch: run once, validate its
         # output (a correctness gate — propagates), then complete warmup + rounds.
@@ -829,9 +1061,9 @@ def _run_l3_resident(
         rt(*ordered, config=run_config)
         _validate_once(rt, resident_handles)
         try:
-            for _ in range(_BENCH_WARMUP - 1):
+            for _ in range(warmup - 1):
                 rt(*ordered, config=run_config)
-            for _ in range(_BENCH_ROUNDS):
+            for _ in range(rounds):
                 rt(*ordered, config=run_config)
         except Exception as e:  # noqa: BLE001 — benchmark rounds are never a correctness gate
             print(f"[RUN] benchmark rounds interrupted: {type(e).__name__}: {e}", flush=True)
@@ -856,7 +1088,7 @@ def _run_l3_resident(
         configure_log(prior_level)
 
     stats = _parse_stats_from_strace(
-        log_text, rounds=_BENCH_ROUNDS, warmup=_BENCH_WARMUP, distributed=True
+        log_text, rounds=rounds, warmup=warmup, distributed=True
     )
     if not stats.host_wall_us:
         print(
@@ -867,6 +1099,7 @@ def _run_l3_resident(
         return None
     _report_effective(stats)
     _report_l3_per_rank(stats)
+    _report_raw_samples(stats)
     _report_l3_detail(stats, compiled, resident=True)
     return stats
 
@@ -953,14 +1186,28 @@ def _validate(
     rtol: float,
     atol: float,
     compare_fn: dict[str, Callable],
+    scalar_specs_eff: dict[str, ScalarSpec] | None = None,
 ) -> None:
     """Compare device outputs against *golden_outputs*. Raises ``AssertionError``."""
     with _Stage("validate"):
         device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
-        input_tensors = {spec.name: tensors[spec.name] for spec in tensor_specs if not spec.is_output}
+        validation_inputs = {
+            spec.name: tensors[spec.name]
+            for spec in tensor_specs
+            if not spec.is_output
+        }
+        validation_inputs.update(
+            {
+                name: spec.value
+                for name, spec in (scalar_specs_eff or {}).items()
+            }
+        )
         validate_golden(
             device_outputs, golden_outputs,
-            rtol=rtol, atol=atol, compare_fn=compare_fn, inputs=input_tensors,
+            rtol=rtol,
+            atol=atol,
+            compare_fn=compare_fn,
+            inputs=validation_inputs,
         )
 
 
@@ -994,7 +1241,7 @@ def run(
             keys raise there.
         runtime_cfg: Kwargs forwarded to
             :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
-            ``enable_l2_swimlane``, ...). Unknown keys raise there, except
+            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
             the harness-only key ``log_level``, which is consumed up-front
             to configure the PyPTO runtime logger via
             :func:`pypto.runtime.log_config.configure_log`.
@@ -1075,6 +1322,7 @@ def run(
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                need_snapshot=golden_fn is not None,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -1118,17 +1366,18 @@ def run(
     # is None) cannot benchmark. Entirely env-gated via PYPTO_BENCH=1 (daily CI).
     bench = None
     if _bench_enabled():
+        rounds, warmup = _bench_loop_sizes()
         if compiled is None:
             print("[RUN]   benchmark skipped: no live CompiledProgram (runtime_dir replay)", flush=True)
         elif _is_l3(compiled):
             bench = _run_benchmark_l3(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
         else:
             bench = _run_benchmark(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
 
     # Validate
@@ -1137,7 +1386,15 @@ def run(
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
         return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
     try:
-        _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+        _validate(
+            tensor_specs,
+            tensors,
+            golden_outputs,
+            rtol,
+            atol,
+            compare_fn,
+            scalar_specs_eff,
+        )
     except AssertionError as e:
         return _fail(str(e))
 
@@ -1179,7 +1436,7 @@ def run_jit(
             ``RunConfig`` is built.
         runtime_cfg: Kwargs forwarded to
             :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
-            ``enable_l2_swimlane``, ...). Unknown keys raise there, except
+            ``enable_chip_swimlane``, ...). Unknown keys raise there, except
             the harness-only key ``log_level``, which is consumed up-front
             to configure the PyPTO runtime logger via
             :func:`pypto.runtime.log_config.configure_log`.
@@ -1264,6 +1521,7 @@ def run_jit(
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
                 specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                need_snapshot=golden_fn is not None,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -1310,17 +1568,18 @@ def run_jit(
     # is None) cannot benchmark. Entirely env-gated via PYPTO_BENCH=1 (daily CI).
     bench = None
     if _bench_enabled():
+        rounds, warmup = _bench_loop_sizes()
         if compiled is None:
             print("[RUN]   benchmark skipped: no live CompiledProgram (runtime_dir replay)", flush=True)
         elif _is_l3(compiled):
             bench = _run_benchmark_l3(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
         else:
             bench = _run_benchmark(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
 
     # Validate
@@ -1329,7 +1588,15 @@ def run_jit(
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
         return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
     try:
-        _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+        _validate(
+            tensor_specs,
+            tensors,
+            golden_outputs,
+            rtol,
+            atol,
+            compare_fn,
+            scalar_specs_eff,
+        )
     except AssertionError as e:
         return _fail(str(e))
 

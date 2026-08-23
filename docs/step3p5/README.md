@@ -243,6 +243,78 @@ request 的 KV 容量，也不是“把有效 batch 固定为 16”的手段。M
 数值正确和无 stall 必须分别通过。`RUN_CLEAN`、一次 token 正确、
 compile-only、P1/P20、随机输入或 BF16 fallback 都不能替代完整准出。
 
+#### Five-layer chip-swimlane gate
+
+The focused L0-L4 DFX gate is launched from the repository root:
+
+```bash
+PYPTO_UPGRADE_WORKSPACE=/path/to/run-root \
+CKPT=/path/to/checkpoint \
+bash deployment/docker/run_swimlane_gate.sh <image-id-or-digest>
+```
+
+A complete capture contains exactly one raw record for every rank:
+
+```text
+dfx_outputs/rank{0..7}/d0/chip_swimlane_records.json
+```
+
+Both `chip_swimlane_records.json` and its top-level
+`chip_swimlane_level` field are runtime-owned schema names.
+
+Candidate publication also requires the exact `recv_meta_sidecar.pt` produced
+by `tests.step3p5.harnesses._stage_five_layer_moe_route`. Supply it through
+`PYPTO_RECV_META_SIDECAR`; task, block, and physical-slice counts are not valid
+route-histogram substitutes. The analyzer checks both the live source hash and
+the sidecar source hash against the selected frozen profile. The current
+`candidate` profile is bound to the complete
+`a17ae27440a4ff0e62f7fe8b6dc2d5548217ef617b0ddbccb927fda648600d01`
+`decode_fwd.py` SHA; matching only the eight-character prefix is rejected.
+
+The candidate expert family is explicitly
+`staged_fused_gate_up`: `expert_gate_up` and `expert_down` must expose AIC
+execution, while `expert_gate_up_act` and `routed_h_quant` must be AIV-only on
+every execution-nonempty rank. Its AIC upper scheduling bounds
+(`p50<=200us`, `p90<=220us`, `p99<=320us`, `max<=500us`) are carried from the
+release-qualified R5 packed-fused analyzer. R5 measured one combined mixed
+stage, so no unsupported lower bound is inferred for a17's separately named
+`expert_gate_up`.
+
+Generate the formal golden and route sidecar from the same immutable final
+image before running the swimlane gate. The formal writer requires
+`--context-len=65536`, a digest-qualified image reference, a non-empty run ID,
+and bit-exact output:
+
+```bash
+PYPTO_IMAGE_DIGEST='registry/image@sha256:<64-hex>' \
+PYPTO_SOURCE_RUN='final-image-formal-bs1-64k' \
+python -m tests.step3p5.harnesses._stage_five_layer_moe \
+  ... --active-batch 1 --context-len 65536 --num-blocks 512 \
+  --write-golden /out/formal-golden
+
+python -m tests.step3p5.harnesses._stage_five_layer_moe_route \
+  ... --active-batch 1 --context-len 65536 --num-blocks 512 \
+  --image-digest 'registry/image@sha256:<64-hex>' \
+  --golden-dir /out/formal-golden
+```
+
+The route reader rejects the golden before device exporters start unless its
+manifest is `step3p5.five-layer-moe-golden.v3`, `bit_exact=true`, bound to the
+same immutable image, and its full decode SHA equals the live route source.
+The analyzer again requires the sidecar route source, formal-golden source,
+live DFX source, and frozen candidate SHA to agree exactly. A golden from an
+older image digest or source tree must not be relabeled or reused.
+
+The gate uses separate dependency-generation and timing submissions. Its
+instrumented makespans explain critical-path composition but are not clean ITL
+measurements; use the independent ITL gate for absolute latency. The analyzer
+requires every executable dependency task to have physical slices or one
+explicit runtime `predicated_skip` event; duplicate, unknown, or conflicting
+skip evidence still fails closed. Dependency-chain, physical-slice, and
+admission contract violations also fail closed. Eight raw records with a
+nonzero process status are
+evidence from a failed gate and must never be relabeled as an RC0 result.
+
 ### 512B control-signal stride 的作用域
 
 DeepSeek v4 的 512B 主要用于 data tile、L2 cache line 和 MTE 性能对齐，

@@ -122,6 +122,7 @@ def _load_golden_contract(
     active_batch: int,
     context_len: int,
     image_digest: str,
+    source_decode_sha256: str,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     """Validate the frozen baseline before starting device exporters."""
     manifest_path = golden_dir / "manifest.json"
@@ -146,6 +147,16 @@ def _load_golden_contract(
         manifest.get("source_decode_fwd_sha256"),
         field="golden.source_decode_fwd_sha256",
     )
+    if manifest.get("bit_exact") is not True:
+        raise ValueError(f"{manifest_path}: golden bit_exact must be true")
+    live_source_decode_sha = _sha256_field(
+        source_decode_sha256,
+        field="live.source_decode_fwd_sha256",
+    )
+    if source_decode_sha != live_source_decode_sha:
+        raise ValueError(
+            f"{manifest_path}: golden decode SHA does not match live source"
+        )
     source_manifest_sha = _sha256_field(
         manifest.get("source_manifest_sha256"),
         field="golden.source_manifest_sha256",
@@ -503,12 +514,18 @@ def main() -> int:
             "--image-digest or PYPTO_IMAGE_DIGEST is required for provenance"
         )
     _image_digest(args.image_digest, field="image_digest")
+    repo_root = Path(__file__).resolve().parents[3]
+    live_decode_sha = formal_stage._source_sha256(
+        repo_root,
+        "models/step3p5/decode_fwd.py",
+    )
     golden_dir = Path(args.golden_dir)
     golden_contract, golden_tensors = _load_golden_contract(
         golden_dir,
         active_batch=args.active_batch,
         context_len=args.context_len,
         image_digest=args.image_digest,
+        source_decode_sha256=live_decode_sha,
     )
     checkpoint = _checkpoint_identity(
         Path(args.ckpt),
@@ -525,7 +542,6 @@ def main() -> int:
     export_args.num_blocks = layout["scheduler_num_blocks"]
     export_args.kv_num_layers = 5
 
-    repo_root = Path(__file__).resolve().parents[3]
     procs = []
     try:
         if not args.reuse_exporters:

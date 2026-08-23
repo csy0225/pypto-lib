@@ -8,11 +8,11 @@
 （不重新 prepare），逐步喂 hidden / attn-meta / KV。
 
 设计边界（对齐 SKILL §H：N=1 单 `@pl.program` 是唯一生产形态）：
-- **resident（bind 一次，不随 step 变）**：全部权重（import_ipc DeviceTensor）、
-  `gate_r_full/swa`（block-diag R 常量）。生产 holder 不绑定 final norm /
-  LM head。
+- **resident（bind 一次，不随 step 变）**：全部权重（import_ipc DeviceTensor）；
+  `PYPTO_H4_RESIDENT` 可把四个 RoPE 表和四个 block-diag gate-R 常量也上传一次。
+  生产 holder 不绑定 final norm / LM head。
 - **per-step handoff（每次 run 前 mutate 这些 share_memory host tensor）**：
-  `current_hidden`、attn-meta（seq_lens/block_table/slot_mapping/rope_*）、
+  `current_hidden`、attn-meta（seq_lens/block_table/slot_mapping）、
   KV（IPC add_inout，attention 原地读写）。
 - **output**：45 层后的 `next_hidden_out`。final RMSNorm、LM head 和 sampling
   全部由 vLLM 完成。
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 
 import torch
@@ -43,6 +44,32 @@ MAIN_PROGRAM = "whole_decode_step3p5"
 # （30 个 MoE-swa 层，跳过 dense L1(slot0)/L2(slot1)/L43(slot32)）。
 _MOE_FULL_SLOTS = tuple(range(1, 11))            # 10 full-MoE attn layers
 _MOE_SWA_SLOTS = tuple(range(2, 32))             # 30 swa-MoE attn layers
+
+# Step-invariant constants that can stay on their consuming workers instead of
+# being staged H2D on every decode step.
+_RESIDENT_ROPE_ARGS = ("rope_cf", "rope_sf", "rope_cs", "rope_ss")
+_RESIDENT_GATE_ARGS = (
+    "gate_r_full",
+    "gate_r_swa",
+    "gate_r_moe_full",
+    "gate_r_moe_swa",
+)
+_RESIDENT_MODES = {
+    "none": (),
+    "rope": _RESIDENT_ROPE_ARGS,
+    "gate": _RESIDENT_GATE_ARGS,
+    "all": _RESIDENT_ROPE_ARGS + _RESIDENT_GATE_ARGS,
+}
+
+
+def _resident_const_args() -> tuple[str, ...]:
+    mode = os.environ.get("PYPTO_H4_RESIDENT", "none").strip().lower()
+    if mode not in _RESIDENT_MODES:
+        raise ValueError(
+            f"PYPTO_H4_RESIDENT={mode!r} invalid; expected one of "
+            f"{sorted(_RESIDENT_MODES)}"
+        )
+    return _RESIDENT_MODES[mode]
 
 
 def _zsh(*shape, dtype=_BF16):
@@ -95,6 +122,7 @@ class WholeDecodeHolder:
 
         # populated by __enter__()
         self._prepare_cm = None
+        self._prepare_entered = False
         self.rt = None
         self._wmaps = None
         self._kv_maps = None
@@ -114,6 +142,8 @@ class WholeDecodeHolder:
         self._next_hidden_out = None
         self._last_run_sec = 0.0
         self._rope_ready = False
+        self._resident_consts = {}
+        self._resident_const_hosts = {}
 
     def _infer_rows_from_map(self) -> None:
         """从 vLLM-owned Main map 推导 physical flat KV rows。
@@ -218,6 +248,18 @@ class WholeDecodeHolder:
 
     def __enter__(self):
         assert self.compiled is not None, "call build() before entering holder"
+        if self._prepare_cm is not None or self.rt is not None:
+            raise RuntimeError(
+                "holder cleanup is incomplete; retry __exit__ before re-entering"
+            )
+        resident_const_names = _resident_const_args()
+        try:
+            return self._enter_impl(resident_const_names)
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def _enter_impl(self, resident_const_names):
         c = self._consts
         tp = self.tp
         HIDDEN, HEAD_DIM, BATCH = c["HIDDEN"], c["HEAD_DIM"], c["BATCH"]
@@ -270,8 +312,7 @@ class WholeDecodeHolder:
         # The runtime clears every retained window before each request, so C1
         # layer-local signal epochs restart at 1 without stale Ge thresholds
         # or repeated HCCL domain allocation/release churn.
-        self._prepare_cm = self.compiled.prepare(persistent=True)
-        self.rt = self._prepare_cm.__enter__()
+        self._prepare_runtime()
         self._wmaps = import_weights_all(self.rt, self.out_dir, tp=tp, dev_offset=self.dev_offset)
 
         if self.kv_ipc:
@@ -309,6 +350,7 @@ class WholeDecodeHolder:
             )
 
         self._initialize_rope_tables()
+        self._resident_consts = self._make_resident_consts(resident_const_names)
 
         # arg order MUST match the compiled program signature (see harness _do_worker)
         def W(key):
@@ -339,6 +381,23 @@ class WholeDecodeHolder:
             flush=True,
         )
         return self
+
+    def _prepare_runtime(self):
+        """Enter the prepared worker under its current context-manager contract.
+
+        ``DistributedCompiledProgram.prepare()`` currently returns a
+        ``DistributedWorker`` whose ``__enter__`` is a non-throwing identity
+        return; construction has already completed setup and owns any failure
+        cleanup. We still journal the CM before entering it so a future
+        partial-enter implementation can be closed/retried explicitly.
+        """
+        prepare_cm = self.compiled.prepare(persistent=True)
+        self._prepare_cm = prepare_cm
+        self._prepare_entered = False
+        runtime = prepare_cm.__enter__()
+        self._prepare_entered = True
+        self.rt = runtime
+        return runtime
 
     def _build_loop_form_args(self, W, Wsub):
         """Canonical loop-form 53-arg host_orch arg-list
@@ -395,10 +454,93 @@ class WholeDecodeHolder:
         return args
 
     def __exit__(self, exc_type, exc, tb):
-        if self._prepare_cm is not None:
-            self._prepare_cm.__exit__(exc_type, exc, tb)
-            self._prepare_cm = None
-            self.rt = None
+        cleanup_error = None
+        runtime = self.rt
+        residents_clean = True
+        if self._resident_consts and runtime is not None:
+            remaining = {}
+            for name, stacked in reversed(tuple(self._resident_consts.items())):
+                try:
+                    runtime.free_stacked_tensor(stacked)
+                except BaseException as err:  # noqa: BLE001
+                    print(
+                        f"[holder] free resident constant {name} failed: {err}",
+                        flush=True,
+                    )
+                    if cleanup_error is None:
+                        cleanup_error = err
+                    remaining[name] = stacked
+                else:
+                    self._restore_resident_host(name)
+            self._resident_consts = remaining
+            residents_clean = not remaining
+        elif self._resident_consts:
+            cleanup_error = RuntimeError(
+                "resident constants remain owned without a prepared runtime"
+            )
+            print(f"[holder] {cleanup_error}", flush=True)
+            residents_clean = False
+        prepare_cm = self._prepare_cm
+        if prepare_cm is None and self.rt is not None:
+            cleanup_error = cleanup_error or RuntimeError(
+                "prepared runtime exists without its context manager"
+            )
+            print(f"[holder] {cleanup_error}", flush=True)
+            residents_clean = False
+        # Keep the prepared worker alive when any resident free failed. The
+        # backend may admit the same free on a later attempt; closing it here
+        # would make that retry impossible. All resident frees were attempted
+        # above, so this remains best-effort without sacrificing retryability.
+        if prepare_cm is not None and residents_clean:
+            try:
+                if self._prepare_entered:
+                    prepare_cm.__exit__(exc_type, exc, tb)
+                else:
+                    close = getattr(prepare_cm, "close", None)
+                    if close is None:
+                        raise RuntimeError(
+                            "prepared context manager failed before __enter__ "
+                            "and exposes no close()"
+                        )
+                    close()
+            except BaseException as err:  # noqa: BLE001
+                print(f"[holder] prepared runtime cleanup failed: {err}", flush=True)
+                if cleanup_error is None:
+                    cleanup_error = err
+            else:
+                self._finalize_closed_state()
+        elif prepare_cm is None and self.rt is None and residents_clean:
+            self._finalize_closed_state()
+
+        if exc_type is None and cleanup_error is not None:
+            raise cleanup_error
+        return False
+
+    def _restore_resident_host(self, name):
+        host_tensor = self._resident_const_hosts.pop(name, None)
+        if host_tensor is not None:
+            setattr(self, name, host_tensor)
+        elif name in _RESIDENT_ROPE_ARGS + _RESIDENT_GATE_ARGS:
+            # A defensive fallback for manually injected/legacy ownership
+            # journals that predate _resident_const_hosts.
+            setattr(self, name, None)
+
+    def _finalize_closed_state(self):
+        """Drop runtime-owned state after the prepared worker is terminally closed."""
+        for name in tuple(self._resident_const_hosts):
+            self._restore_resident_host(name)
+        self._resident_consts = {}
+        self._resident_const_hosts = {}
+        self._prepare_cm = None
+        self._prepare_entered = False
+        self.rt = None
+        self._wmaps = None
+        self._kv_maps = None
+        self.padding_reserve = None
+        self._args_list = None
+        # __enter__ allocates fresh host tables on every lifecycle. A stale
+        # ready bit would skip their rebuild and leave zero-filled RoPE buffers.
+        self._rope_ready = False
 
     # ---- per-step input setters --------------------------------------------
 
@@ -443,6 +585,69 @@ class WholeDecodeHolder:
         if self.num_tokens_per_owner is not None:
             self.num_tokens_per_owner[: self.tp].fill_(self._consts["BATCH"])
 
+    def _make_resident_consts(self, names=None):
+        """Upload selected step-invariant constants once and rebind their args."""
+        if names is None:
+            names = _resident_const_args()
+        if not names:
+            return {}
+        if self.rt is None:
+            raise ValueError("_make_resident_consts requires a prepared rt")
+        if not self._rope_ready:
+            raise ValueError("_make_resident_consts requires filled RoPE tables")
+
+        owned = {}
+        host_tensors = {}
+        bytes_per_rank = 0
+        try:
+            for name in names:
+                host_tensor = getattr(self, name)
+                if not isinstance(host_tensor, torch.Tensor):
+                    raise ValueError(
+                        f"resident constant {name} must be a host tensor, "
+                        f"got {type(host_tensor).__name__}"
+                    )
+                if host_tensor.shape[0] != self.tp:
+                    raise ValueError(
+                        f"resident constant {name} leading dim "
+                        f"{host_tensor.shape[0]} != tp {self.tp}"
+                    )
+                stacked = self.rt.alloc_stacked_tensor(host_tensor)
+                host_tensors[name] = host_tensor
+                owned[name] = stacked
+                self._resident_const_hosts[name] = host_tensor
+                setattr(self, name, stacked)
+                bytes_per_rank += host_tensor[0].numel() * host_tensor.element_size()
+        except BaseException:
+            # Keep failed frees journaled so WholeDecodeHolder.__enter__ can
+            # retry them before tearing down the prepared runtime. The upload
+            # exception remains the one re-raised below; cleanup errors are
+            # deliberately secondary.
+            remaining = {}
+            self._resident_consts = remaining
+            for name, stacked in reversed(tuple(owned.items())):
+                try:
+                    self.rt.free_stacked_tensor(stacked)
+                except BaseException as err:  # noqa: BLE001
+                    print(
+                        f"[holder] rollback resident constant {name} failed: {err}",
+                        flush=True,
+                    )
+                    remaining[name] = stacked
+                finally:
+                    if name not in remaining:
+                        self._resident_const_hosts.pop(name, None)
+                        setattr(self, name, host_tensors[name])
+            raise
+
+        print(
+            f"[holder] resident constants "
+            f"({os.environ.get('PYPTO_H4_RESIDENT', 'none')}): "
+            f"{len(owned)} args, {bytes_per_rank / (1024 * 1024):.2f} MiB/rank",
+            flush=True,
+        )
+        return owned
+
     def set_meta(self, *, seq_lens=None, block_table=None, slot_mapping=None,
                  rope_cf=None, rope_sf=None, rope_cs=None, rope_ss=None):
         """只允许更新诊断 RoPE；paged-KV metadata 必须走 set_live_step。
@@ -457,6 +662,14 @@ class WholeDecodeHolder:
             raise ValueError(
                 "paged-KV metadata must be updated through set_live_step so "
                 "the allocator-owned padding reserve can be validated"
+            )
+        if any(
+            value is not None
+            for value in (rope_cf, rope_sf, rope_cs, rope_ss)
+        ) and any(name in self._resident_consts for name in _RESIDENT_ROPE_ARGS):
+            raise ValueError(
+                "RoPE tables are worker-resident constants; rebuild the holder "
+                "instead of mutating an unbound host copy"
             )
         for dst, src in ((self.rope_cf, rope_cf), (self.rope_sf, rope_sf),
                          (self.rope_cs, rope_cs), (self.rope_ss, rope_ss)):

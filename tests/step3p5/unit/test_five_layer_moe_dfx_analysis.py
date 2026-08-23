@@ -14,6 +14,7 @@ from tools.step3p5.analyze_five_layer_moe_dfx import (
     RankTrace,
     Slice,
     Task,
+    _CHIP_SWIMLANE_RECORDS_NAME,
     _admission_contract,
     _aggregate_findings,
     _arrival_analysis,
@@ -25,9 +26,11 @@ from tools.step3p5.analyze_five_layer_moe_dfx import (
     _external_correctness_contract,
     _find_layer_task_ids,
     _percentile,
+    _predicated_skip_task_ids,
     _raw_swimlane_metadata,
     _route_histogram_contract,
     _routed_slice_profile_contract,
+    _source_identity_contract,
     _source_policy,
     _stage_metrics,
     _task_id_contract,
@@ -225,19 +228,23 @@ def _fake_stage(
 
 def _valid_expert_rank() -> dict:
     stages = {
+        "expert_gate_up": _fake_stage(),
         "expert_gate": _fake_stage(),
         "expert_up": _fake_stage(),
         "expert_down": _fake_stage(),
         "expert_gate_up_act": _fake_stage(resource="aiv"),
+        "routed_h_quant": _fake_stage(resource="aiv"),
     }
     return {
         "layers": {
             "L3": dict(stages),
             "L4": {
+                "expert_gate_up": _fake_stage(),
                 "expert_gate": _fake_stage(),
                 "expert_up": _fake_stage(),
                 "expert_down": _fake_stage(),
                 "expert_gate_up_act": _fake_stage(resource="aiv"),
+                "routed_h_quant": _fake_stage(resource="aiv"),
             },
         }
     }
@@ -416,11 +423,11 @@ def test_clock_alignment_never_infers_a_common_clock_from_terminals() -> None:
 
 
 def test_raw_swimlane_metadata_uses_full_hardware_capacity(tmp_path) -> None:
-    path = tmp_path / "l2_swimlane_records.json"
+    path = tmp_path / _CHIP_SWIMLANE_RECORDS_NAME
     path.write_text(
         json.dumps(
             {
-                "l2_swimlane_level": 4,
+                "chip_swimlane_level": 4,
                 "metadata": {
                     "num_cores": 72,
                     "core_types": ["aic"] * 24 + ["aiv"] * 48,
@@ -433,6 +440,29 @@ def test_raw_swimlane_metadata_uses_full_hardware_capacity(tmp_path) -> None:
     assert level == 4
     assert core_types.count("aic") == 24
     assert core_types.count("aiv") == 48
+
+
+def test_predicated_skip_task_ids_use_explicit_scheduler_evidence() -> None:
+    assert _predicated_skip_task_ids(
+        {
+            "aicpu_scheduler_phases": [
+                [
+                    {"phase": "dispatch", "tasks_processed": 1},
+                    {
+                        "phase": "predicated_skip",
+                        "task_id": 8589934713,
+                    },
+                ],
+                [
+                    {
+                        "phase": "predicated_skip",
+                        "task_id": "8589934714",
+                    },
+                ],
+            ],
+        }
+    ) == ("8589934713", "8589934714")
+    assert _predicated_skip_task_ids({}) == ()
 
 
 def test_stage_metrics_separate_dag_task_span_from_core_slices() -> None:
@@ -556,6 +586,32 @@ def test_percentile_uses_conservative_nearest_rank_for_small_samples() -> None:
         _percentile([], -0.01)
 
 
+def test_source_identity_contract_matches_only_the_selected_policy() -> None:
+    matching = _source_identity_contract(
+        "candidate",
+        (
+            "a17ae27440a4ff0e62f7fe8b6dc2d554"
+            "8217ef617b0ddbccb927fda648600d01"
+        ),
+    )
+    assert matching["available"]
+    assert matching["pass"]
+
+    mismatch = _source_identity_contract(
+        "candidate",
+        "a17ae274" + "0" * 56,
+    )
+    assert mismatch["available"]
+    assert not mismatch["pass"]
+    assert mismatch["expected_decode_sha256_prefix"] == "a17ae274"
+
+    missing = _source_identity_contract("candidate", None)
+    assert not missing["available"]
+    assert missing["pass"] is None
+    with pytest.raises(ValueError, match="lowercase SHA256"):
+        _source_identity_contract("candidate", "not-a-digest")
+
+
 def test_route_histogram_awaits_recv_meta_without_using_task_counts() -> None:
     result = _route_histogram_contract()
     assert not result["L3"]["available"]
@@ -605,6 +661,46 @@ def test_route_histogram_validates_exact_recv_meta_sidecar(tmp_path) -> None:
         ]
         == "observed"
     )
+
+
+def test_route_histogram_sidecar_must_match_source_policy(tmp_path) -> None:
+    payload = _recv_meta_payload()
+    sidecar = tmp_path / "recv_meta.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match source policy"):
+        _route_histogram_contract(sidecar, profile="candidate")
+
+    exact_decode_sha = (
+        "a17ae27440a4ff0e62f7fe8b6dc2d554"
+        "8217ef617b0ddbccb927fda648600d01"
+    )
+    payload["provenance"]["source"]["decode_fwd_sha256"] = exact_decode_sha
+    payload["provenance"]["formal_golden"][
+        "source_decode_fwd_sha256"
+    ] = exact_decode_sha
+    payload["provenance"]["source_manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload["provenance"]["source"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    result = _route_histogram_contract(
+        sidecar,
+        profile="candidate",
+        source_decode_sha256=exact_decode_sha,
+    )
+    assert result["L3"]["provenance"]["source_policy_id"].startswith(
+        "campaign-candidate-"
+    )
+
+    with pytest.raises(ValueError, match="does not match live source"):
+        _route_histogram_contract(
+            sidecar,
+            profile="candidate",
+            source_decode_sha256="0" * 64,
+        )
 
 
 def test_route_histogram_rejects_overlapping_windows_and_bad_derived_count(
@@ -699,6 +795,68 @@ def test_task_id_contract_ignores_only_non_executable_dependency_tasks() -> None
     assert contract["dep_task_ids"] == ["kernel"]
     assert contract["swim_task_ids"] == ["kernel"]
     assert contract["ignored_non_executable_dep_task_ids"] == ["runtime"]
+
+
+def test_task_id_contract_accepts_explicit_predicated_skip() -> None:
+    executed = Task("executed", 0, "one", 1, (1,), False)
+    skipped = Task("skipped", 1, "two", 1, (2,), True)
+    trace = RankTrace(
+        tag="rank0/d0",
+        rank_dir=Path("rank0/d0"),
+        frequency_hz=1_000_000,
+        core_types=["aic"],
+        tasks=[executed, skipped],
+        task_by_id={"executed": executed, "skipped": skipped},
+        slices_by_task={
+            "executed": [Slice(0, "executed", 0, 1, "aic")],
+        },
+        edges=[],
+        critical_path={},
+        predicated_skip_task_ids=("skipped",),
+    )
+
+    contract = _task_id_contract(trace)
+
+    assert contract["pass"]
+    assert contract["missing_on_swim"] == []
+    assert contract["predicated_skip_task_ids"] == ["skipped"]
+    assert contract["predicated_skip_without_physical_slices"] == [
+        "skipped"
+    ]
+
+
+def test_task_id_contract_rejects_invalid_predicated_skip_evidence() -> None:
+    executed = Task("executed", 0, "one", 1, (1,), False)
+    skipped = Task("skipped", 1, "two", 1, (2,), True)
+    trace = RankTrace(
+        tag="rank0/d0",
+        rank_dir=Path("rank0/d0"),
+        frequency_hz=1_000_000,
+        core_types=["aic"],
+        tasks=[executed, skipped],
+        task_by_id={"executed": executed, "skipped": skipped},
+        slices_by_task={
+            "executed": [Slice(0, "executed", 0, 1, "aic")],
+        },
+        edges=[],
+        critical_path={},
+        predicated_skip_task_ids=(
+            "executed",
+            "skipped",
+            "skipped",
+            "unknown",
+        ),
+    )
+
+    contract = _task_id_contract(trace)
+
+    assert not contract["pass"]
+    assert contract["missing_on_swim"] == []
+    assert contract["duplicate_predicated_skip_task_ids"] == ["skipped"]
+    assert contract["unexpected_predicated_skip_task_ids"] == ["unknown"]
+    assert contract["predicated_skip_with_physical_slices"] == ["executed"]
+    with pytest.raises(RuntimeError, match="task-level structural"):
+        _validate_structural_contracts([trace])
 
 
 def test_combine_dependency_contract_accepts_complete_two_layer_chain() -> None:
@@ -809,11 +967,11 @@ def test_combine_dependency_contract_accepts_multiple_one_to_one_chains() -> Non
 @pytest.mark.parametrize(
     ("field", "value", "failed_check"),
     [
-        ("p50_us", 9.0, "p50_ge_10_us"),
-        ("p50_us", 31.0, "p50_le_30_us"),
-        ("p90_us", 31.0, "p90_le_30_us"),
-        ("p99_us", 61.0, "p99_le_60_us"),
-        ("max_us", 101.0, "max_le_100_us"),
+        ("p50_us", 9.0, "p50_ge_limit"),
+        ("p50_us", 31.0, "p50_le_limit"),
+        ("p90_us", 31.0, "p90_le_limit"),
+        ("p99_us", 61.0, "p99_le_limit"),
+        ("max_us", 101.0, "max_le_limit"),
     ],
 )
 @pytest.mark.parametrize(
@@ -830,7 +988,7 @@ def test_expert_release_enforces_every_aic_duration_limit(
     ranks["rank0/d0"]["layers"]["L3"][stage]["resources"]["aic"][
         "duration_distribution"
     ][field] = value
-    contract = _expert_kernel_release_contract(ranks)
+    contract = _expert_kernel_release_contract(ranks, profile="row16")
     assert not contract["duration_pass"]
     gate_error = next(
         error
@@ -840,25 +998,26 @@ def test_expert_release_enforces_every_aic_duration_limit(
     assert failed_check in gate_error["failed_checks"]
 
 
-def test_expert_release_requires_gate_up_down_and_aiv_activation_per_nonempty_rank() -> None:
+def test_expert_release_requires_staged_fused_aic_and_aiv_stages() -> None:
     ranks = {
         "rank0/d0": _valid_expert_rank(),
         "rank1/d0": _valid_expert_rank(),
     }
-    del ranks["rank1/d0"]["layers"]["L3"]["expert_up"]
+    del ranks["rank1/d0"]["layers"]["L3"]["expert_gate_up"]
     del ranks["rank1/d0"]["layers"]["L3"]["expert_gate_up_act"]
+    del ranks["rank1/d0"]["layers"]["L3"]["routed_h_quant"]
     ranks["rank1/d0"]["layers"]["L4"] = {}
     contract = _expert_kernel_release_contract(ranks)
     assert not contract["pass"]
     assert any(
         error["rank"] == "rank1/d0"
-        and error["stage"] == "expert_up"
+        and error["stage"] == "expert_gate_up"
         and error["code"] == "missing_aic_stage"
         for error in contract["duration_errors"]
     )
     assert any(
         error["rank"] == "rank1/d0"
-        and error["code"] == "activation_must_be_aiv_only"
+        and error["code"] == "activation_quant_must_be_aiv_only"
         for error in contract["activation_errors"]
     )
     empty_l4 = contract["coverage"]["L4"]["rank1/d0"]
@@ -866,7 +1025,7 @@ def test_expert_release_requires_gate_up_down_and_aiv_activation_per_nonempty_ra
     assert not empty_l4["route_empty_inferred"]
 
 
-def test_expert_release_accepts_valid_nonempty_rank_and_rejects_aic_activation() -> None:
+def test_expert_release_accepts_valid_nonempty_rank_and_rejects_aic_vector_stage() -> None:
     ranks = {"rank0/d0": _valid_expert_rank()}
     assert _expert_kernel_release_contract(ranks)["pass"]
 
@@ -875,6 +1034,29 @@ def test_expert_release_accepts_valid_nonempty_rank_and_rejects_aic_activation()
     contract = _expert_kernel_release_contract(ranks)
     assert not contract["activation_pass"]
     assert "aic_not_observed" in contract["activation_errors"][0]["failed_checks"]
+
+
+def test_staged_fused_gate_up_uses_only_r5_proven_upper_bounds() -> None:
+    ranks = {"rank0/d0": _valid_expert_rank()}
+    gate_up = ranks["rank0/d0"]["layers"]["L3"]["expert_gate_up"]
+    gate_up["resources"]["aic"]["duration_distribution"]["p50_us"] = 1.0
+    passing = _expert_kernel_release_contract(ranks)
+    assert passing["duration_pass"]
+    assert passing["release_family"] == "staged_fused_gate_up"
+    assert passing["duration_limits_us"] == {
+        "p50_max": 200.0,
+        "p90_max": 220.0,
+        "p99_max": 320.0,
+        "max": 500.0,
+    }
+    assert "R5 packed-fused" in passing["duration_limit_source"]
+
+    gate_up["resources"]["aic"]["duration_distribution"]["p90_us"] = 220.1
+    blocked = _expert_kernel_release_contract(ranks)
+    assert not blocked["duration_pass"]
+    assert blocked["duration_errors"][0]["failed_checks"] == [
+        "p90_le_limit"
+    ]
 
 
 def test_expert_release_rejects_a_layer_with_no_observed_routed_compute() -> None:
@@ -929,13 +1111,11 @@ def test_frozen_source_policies_match_the_actual_campaign_families() -> None:
             "enforce_candidate_release_gate",
         )
     } == {
-        "decode_sha256_prefix": "65b0b8bf",
+        "decode_sha256_prefix": "a17ae274",
         "source_role": "candidate",
-        "storage_family": "row16_graph_wide_gate_up_int32_scratch",
-        "schedule_family": "two_phase_split",
-        "task_partition": (
-            "graph_wide_gate_up_then_aiv_activation_quant_down"
-        ),
+        "storage_family": "row16_staged_fused_gate_up_local_tiles",
+        "schedule_family": "staged_fused_gate_up_then_aiv_act_quant_down",
+        "task_partition": "aic_gate_up_aiv_activation_quant_aic_down",
         "enforce_candidate_release_gate": True,
     }
     compatibility = candidate["origin_main_compatibility_reference"]
@@ -1019,7 +1199,9 @@ def test_baseline_profile_keeps_candidate_split_gate_diagnostic_only() -> None:
         profile="candidate",
     )
     assert candidate["release_enforced"]
-    assert candidate["source_policy"]["schedule_family"] == "two_phase_split"
+    assert candidate["source_policy"]["schedule_family"] == (
+        "staged_fused_gate_up_then_aiv_act_quant_down"
+    )
     candidate_admission = _admission_contract(
         _route_histogram_contract(),
         {"fields": {}},
@@ -1031,7 +1213,6 @@ def test_baseline_profile_keeps_candidate_split_gate_diagnostic_only() -> None:
     assert {
         blocker["code"] for blocker in candidate_admission["blockers"]
     } >= {
-        "expert_aic_duration_release_failed",
         "expert_activation_aiv_release_failed",
     }
 
@@ -1060,7 +1241,7 @@ def test_admission_uses_frozen_policy_as_candidate_enforcement_authority() -> No
     assert admission["expert_release_enforced"]
     assert (
         admission["source_policy"]["storage_family"]
-        == "row16_graph_wide_gate_up_int32_scratch"
+        == "row16_staged_fused_gate_up_local_tiles"
     )
     blocker_codes = {blocker["code"] for blocker in admission["blockers"]}
     assert blocker_codes >= {

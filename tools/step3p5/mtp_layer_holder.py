@@ -90,6 +90,7 @@ class MtpLayerHolder:
         self.compiled = []
         self.build_output_dirs = ()
         self._prepare_cm = None
+        self._prepare_entered = False
         self._runtime = None
         self._cfg = None
         self._K = None
@@ -217,6 +218,19 @@ class MtpLayerHolder:
     def __enter__(self):
         if not self.compiled:
             raise RuntimeError("call build() before entering MTP holder")
+        if self._prepare_cm is not None or self._runtime is not None:
+            raise RuntimeError(
+                "MTP holder cleanup is incomplete; retry __exit__ before re-entering"
+            )
+        try:
+            return self._enter_impl()
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def _enter_impl(self):
+        if not self.compiled:
+            raise RuntimeError("call build() before entering MTP holder")
         c = self._consts
         tp, batch, hidden = self.tp, c["BATCH"], c["HIDDEN"]
         self.previous_hidden = _shared_zeros(tp, batch, hidden)
@@ -265,8 +279,10 @@ class MtpLayerHolder:
 
         self._args = []
         cm = _prepare_selected_programs(self.compiled)
-        runtime = cm.__enter__()
         self._prepare_cm = cm
+        self._prepare_entered = False
+        runtime = cm.__enter__()
+        self._prepare_entered = True
         self._runtime = runtime
         try:
             weight_maps = import_weights_all(
@@ -297,7 +313,6 @@ class MtpLayerHolder:
                 return build_stacked_weight(weight_maps, key)
 
             from pypto.runtime.device_tensor import (  # noqa: PLC0415
-                DeviceTensor,
                 StackedDeviceTensor,
             )
 
@@ -316,9 +331,12 @@ class MtpLayerHolder:
                             f"{key} rank{rank}: cannot reshape "
                             f"{source.shape} to {shape}"
                         )
-                    shards.append(
-                        DeviceTensor(source.data_ptr, tuple(shape), dtype)
-                    )
+                    if source.dtype != dtype:
+                        raise ValueError(
+                            f"{key} rank{rank}: source dtype {source.dtype} "
+                            f"does not match requested dtype {dtype}"
+                        )
+                    shards.append(source.reshape(tuple(shape)))
                 return StackedDeviceTensor(
                     shards,
                     (tp, *tuple(shape)),
@@ -404,9 +422,6 @@ class MtpLayerHolder:
             ]
             self._args = [shared_args for _ in self.compiled]
         except BaseException:
-            cm.__exit__(*sys.exc_info())
-            self._prepare_cm = None
-            self._runtime = None
             raise
         print(
             f"[mtp-holder] resident selected programs={len(self.compiled)} "
@@ -416,10 +431,37 @@ class MtpLayerHolder:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._prepare_cm is not None:
-            self._prepare_cm.__exit__(exc_type, exc, tb)
-        self._prepare_cm = None
-        self._runtime = None
+        cleanup_error = None
+        cm = self._prepare_cm
+        if cm is None and self._runtime is not None:
+            cleanup_error = RuntimeError(
+                "MTP runtime exists without its prepared context manager"
+            )
+        elif cm is not None:
+            try:
+                if self._prepare_entered:
+                    cm.__exit__(exc_type, exc, tb)
+                else:
+                    close = getattr(cm, "close", None)
+                    if close is None:
+                        raise RuntimeError(
+                            "MTP prepared context failed before __enter__ "
+                            "and exposes no close()"
+                        )
+                    close()
+            except BaseException as err:
+                cleanup_error = err
+            else:
+                self._prepare_cm = None
+                self._prepare_entered = False
+                self._runtime = None
+                self._args = []
+                self._current_layer = None
+                self.padding_reserve = None
+
+        if exc_type is None and cleanup_error is not None:
+            raise cleanup_error
+        return False
 
     def set_live_step(
         self,

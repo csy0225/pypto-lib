@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import torch
@@ -224,6 +225,19 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
     def __enter__(self):
         if self.compiled is None:
             raise RuntimeError("call build() before entering the holder")
+        if self._prepare_cm is not None or self.rt is not None:
+            raise RuntimeError(
+                "holder cleanup is incomplete; retry __exit__ before re-entering"
+            )
+        try:
+            return self._enter_impl()
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
+
+    def _enter_impl(self):
+        if self.compiled is None:
+            raise RuntimeError("call build() before entering the holder")
 
         c = self._consts
         tp = self.tp
@@ -311,8 +325,7 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
             import_weights_all,
         )
 
-        self._prepare_cm = self.compiled.prepare(persistent=True)
-        self.rt = self._prepare_cm.__enter__()
+        self._prepare_runtime()
         self._wmaps = import_weights_all(
             self.rt,
             self.out_dir,
@@ -370,7 +383,7 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
                     f"focused weight slots must be contiguous, got {slots}"
                 )
             shards = [
-                self._wmaps[rank].device_tensor(key)[start:stop]
+                self._wmaps[rank].device_tensor_slice(key, start, stop)
                 for rank in range(tp)
             ]
             full_shape = (tp, *tuple(shards[0].shape))

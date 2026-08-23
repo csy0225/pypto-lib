@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from argparse import Namespace
 from pathlib import Path
 
@@ -22,6 +23,19 @@ _PROGRAM = (
 )
 _HOLDER = _ROOT / "tools" / "step3p5" / "five_layer_moe_holder.py"
 _CONFIG = _ROOT / "models" / "step3p5" / "config.py"
+_STAGE = (
+    _ROOT
+    / "tests"
+    / "step3p5"
+    / "harnesses"
+    / "_stage_five_layer_moe.py"
+)
+_SWIMLANE_GATE = (
+    _ROOT
+    / "deployment"
+    / "docker"
+    / "run_swimlane_gate.sh"
+)
 
 
 def _parse(path: Path) -> tuple[str, ast.Module]:
@@ -150,9 +164,12 @@ def test_focused_holder_uses_only_five_kv_and_norm_layers() -> None:
     source, tree = _parse(_HOLDER)
     build = _method(tree, "build")
     build_body = _segment(source, build)
-    enter = _method(tree, "__enter__")
+    wrapper = _method(tree, "__enter__")
+    wrapper_body = _segment(source, wrapper)
+    enter = _method(tree, "_enter_impl")
     body = _segment(source, enter)
 
+    assert "return self._enter_impl()" in wrapper_body
     assert "config.KV_NUM_LAYERS" in build_body
     assert "canonical.LAYER_DYN" in build_body
     assert "focused.LAYER_DYN" in build_body
@@ -188,6 +205,15 @@ def test_focused_holder_uses_only_five_kv_and_norm_layers() -> None:
     assert "LAYER_DYN = _canonical.LAYER_DYN" in program
 
 
+def test_focused_holder_preserves_ipc_provenance_for_weight_slices() -> None:
+    source, tree = _parse(_HOLDER)
+    enter = _method(tree, "_enter_impl")
+    body = _segment(source, enter)
+
+    assert ".device_tensor_slice(key, start, stop)" in body
+    assert ".device_tensor(key)[start:stop]" not in body
+
+
 def test_holder_reuses_prepared_dep_gen_for_swimlane_capture() -> None:
     _, tree = _parse(_HOLDER)
     run = _method(tree, "run")
@@ -203,6 +229,107 @@ def test_holder_reuses_prepared_dep_gen_for_swimlane_capture() -> None:
     assert keywords["enable_dep_gen"] == "dfx == 'dep'"
     assert keywords["enable_l2_swimlane"] == swim_modes
     assert keywords["l2_swimlane_reuse_dep_gen"] == swim_modes
+
+
+def test_dfx_wait_uses_the_runtime_chip_swimlane_artifact_name() -> None:
+    source, tree = _parse(_STAGE)
+    main = _method(tree, "main")
+    body = _segment(source, main)
+
+    assert "PYPTO_RECV_META_SIDECAR" in source
+    assert "source_decode_sha256=" in body
+    assert (
+        "from pypto.runtime.runner import _CHIP_SWIMLANE_RECORDS_NAME"
+        in ast.unparse(main)
+    )
+    assert "_wait_for_artifacts" in body
+    assert "_CHIP_SWIMLANE_RECORDS_NAME" in body
+    assert '"l2_swimlane_records.json"' not in source
+
+
+def test_formal_golden_requires_digest_bound_bit_exact_provenance() -> None:
+    source, tree = _parse(_STAGE)
+    assert "--image-digest" in source
+    assert "--source-run" in source
+    assert "GOLDEN_SCHEMA" in source
+    assert "bit_exact" in source
+
+    # The context-length restriction is enforced at the two validation
+    # boundaries, rather than in ``main`` itself: ``_configure`` rejects a
+    # non-64K producer invocation and ``_write_golden`` revalidates the
+    # workload recorded in the manifest before writing a baseline. Keep the
+    # contract test aligned with those actual guards instead of depending on
+    # an implementation detail of ``main``'s call graph.
+    configure = _segment(source, _method(tree, "_configure"))
+    write_golden = _segment(source, _method(tree, "_write_golden"))
+    assert "args.context_len != 65536" in configure
+    assert "context_len != 65536" in write_golden
+    assert "image_digest=args.image_digest" in source
+    assert "source_run=args.source_run" in source
+
+
+def test_swimlane_gate_uses_official_schema_and_propagates_failure() -> None:
+    source = _SWIMLANE_GATE.read_text(encoding="utf-8")
+
+    assert (
+        "SWIMLANE_RECORDS_NAME=chip_swimlane_records.json"
+        in source
+    )
+    assert '"analyzer_profile":"$PROFILE"' in source
+    assert "PYPTO_RECV_META_SIDECAR" in source
+    assert 'exit "$gate_rc"' in source
+    assert "SWIMLANE_GATE_RC_NONZERO" in source
+    assert "l2_swimlane_records.json" not in source
+
+
+def test_golden_writer_emits_route_compatible_v3_manifest(
+    tmp_path: Path,
+) -> None:
+    from tests.step3p5.harnesses._stage_five_layer_moe_route import (
+        _load_golden_contract,
+    )
+
+    decode_sha = "a" * 64
+    source = {
+        "decode_fwd_sha256": decode_sha,
+        "program_sha256": "b" * 64,
+        "holder_sha256": "c" * 64,
+        "harness_sha256": "d" * 64,
+    }
+    producer = {
+        "workload": {
+            "active_batch": 1,
+            "context_len": 65536,
+        },
+        "source": source,
+    }
+    hidden_l3 = torch.zeros((8, 1, 4096), dtype=torch.bfloat16)
+    hidden_l4 = torch.ones((8, 1, 4096), dtype=torch.bfloat16)
+    image = "image@sha256:" + "e" * 64
+
+    stage._write_golden(
+        tmp_path,
+        hidden_l3=hidden_l3,
+        hidden_l4=hidden_l4,
+        manifest=producer,
+        image_digest=image,
+        source_run="final-image-formal-bs1-64k",
+    )
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["schema"] == "step3p5.five-layer-moe-golden.v3"
+    assert manifest["bit_exact"] is True
+    assert manifest["source_kind"] == "baseline"
+    assert manifest["source_decode_fwd_sha256"] == decode_sha
+    contract, tensors = _load_golden_contract(
+        tmp_path,
+        active_batch=1,
+        context_len=65536,
+        image_digest=image,
+        source_decode_sha256=decode_sha,
+    )
+    assert contract["bit_exact"]
+    assert torch.equal(tensors["hidden_l4"], hidden_l4)
 
 
 def test_64k_workload_is_per_sequence_for_every_required_batch() -> None:

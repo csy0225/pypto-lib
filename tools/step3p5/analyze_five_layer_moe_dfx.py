@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pypto.runtime.runner import _CHIP_SWIMLANE_RECORDS_NAME
+
 
 _LAYER_PREFIX = {
     "L3": "swa_moe_chip_orch_",
@@ -82,11 +84,29 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_PATTERN = re.compile(r".+@sha256:[0-9a-f]{64}")
 _GOLDEN_SCHEMA = "step3p5.five-layer-moe-golden.v3"
 _CHECKPOINT_SCHEMA = "step3p5.checkpoint-identity.v1"
+_BASELINE_DECODE_SHA256 = (
+    "3553664cbe5bba2453b17b992c9c8a5489deb0df8f88b98d4a93a1aa45544ff0"
+)
+_A17_DECODE_SHA256 = (
+    "a17ae27440a4ff0e62f7fe8b6dc2d5548217ef617b0ddbccb927fda648600d01"
+)
+# These are the only upper bounds carried from the release-qualified R5
+# packed-fused analyzer.  R5 had a single mixed fused stage; a17 splits the
+# same work into AIC gate/up, AIV act/quant, and AIC down.  We therefore keep
+# the proven upper scheduling bounds but do not invent a lower bound for the
+# separately named gate/up stage.
+_STAGED_FUSED_DURATION_LIMITS_US = {
+    "p50_max": 200.0,
+    "p90_max": 220.0,
+    "p99_max": 320.0,
+    "max": 500.0,
+}
 _FROZEN_SOURCE_POLICIES = {
     "baseline": {
         "policy_id": "campaign-baseline-56b3d477-row32-fused-v1",
         "frozen_ref": "stepfun/develop@56b3d477",
         "decode_sha256_prefix": "3553664c",
+        "decode_sha256": _BASELINE_DECODE_SHA256,
         "source_role": "baseline",
         "storage_family": "row32_no_graph_wide_gate_up_scratch",
         "schedule_family": "fused_expert_gate_up",
@@ -95,13 +115,20 @@ _FROZEN_SOURCE_POLICIES = {
         "enforce_candidate_release_gate": False,
     },
     "candidate": {
-        "policy_id": "campaign-candidate-65b0b8bf-row16-graph-wide-split-v1",
-        "frozen_ref": "moe-opt policy v1",
-        "decode_sha256_prefix": "65b0b8bf",
+        "policy_id": "campaign-candidate-a17ae274-staged-fused-gate-up-v1",
+        "frozen_ref": "stepfun/develop@69ad31e",
+        "decode_sha256_prefix": "a17ae274",
+        "decode_sha256": _A17_DECODE_SHA256,
         "source_role": "candidate",
-        "storage_family": "row16_graph_wide_gate_up_int32_scratch",
-        "schedule_family": "two_phase_split",
-        "task_partition": "graph_wide_gate_up_then_aiv_activation_quant_down",
+        "storage_family": "row16_staged_fused_gate_up_local_tiles",
+        "schedule_family": "staged_fused_gate_up_then_aiv_act_quant_down",
+        "task_partition": "aic_gate_up_aiv_activation_quant_aic_down",
+        "expert_release_family": "staged_fused_gate_up",
+        "duration_limit_source": (
+            "R5 packed-fused release-qualified upper bounds: "
+            "p50<=200us,p90<=220us,p99<=320us,max<=500us; "
+            "no lower bound is inferred for separately named gate_up."
+        ),
         "experimental": True,
         "enforce_candidate_release_gate": True,
     },
@@ -151,17 +178,26 @@ _ROUTED_PROFILE_STAGES = (
     "expert_gate_up_act",
     "expert_down",
 )
-_EXPERT_AIC_RELEASE_STAGES = (
-    "expert_gate",
-    "expert_up",
-    "expert_down",
-)
+_EXPERT_AIC_RELEASE_STAGES = {
+    "staged_fused_gate_up": (
+        "expert_gate_up",
+        "expert_down",
+    ),
+    "split": (
+        "expert_gate",
+        "expert_up",
+        "expert_down",
+    ),
+}
 _EXPERT_DURATION_LIMITS_US = {
-    "p50_min": 10.0,
-    "p50_max": 30.0,
-    "p90_max": 30.0,
-    "p99_max": 60.0,
-    "max": 100.0,
+    "staged_fused_gate_up": _STAGED_FUSED_DURATION_LIMITS_US,
+    "split": {
+        "p50_min": 10.0,
+        "p50_max": 30.0,
+        "p90_max": 30.0,
+        "p99_max": 60.0,
+        "max": 100.0,
+    },
 }
 _DIAGNOSTIC_STAGE_RESOURCES = {
     "expert_gate_up": "aic",
@@ -243,6 +279,7 @@ class RankTrace:
     edges: list[dict[str, Any]]
     critical_path: dict[str, Any]
     swimlane_level: int | None = None
+    predicated_skip_task_ids: tuple[str, ...] = ()
 
     @property
     def all_slices(self) -> list[Slice]:
@@ -278,6 +315,13 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--top", type=int, default=30)
+    parser.add_argument(
+        "--source-decode-sha256",
+        help=(
+            "exact models/step3p5/decode_fwd.py SHA256 for source-policy "
+            "validation"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -308,6 +352,45 @@ def _source_policy(profile: str | None) -> dict[str, Any]:
         "origin_main_compatibility_reference": (
             dict(_ORIGIN_MAIN_COMPATIBILITY_REFERENCE)
         ),
+    }
+
+
+def _source_identity_contract(
+    profile: str | None,
+    source_decode_sha256: str | None,
+) -> dict[str, Any]:
+    """Match explicit source provenance to the selected frozen policy."""
+    policy = _source_policy(profile)
+    expected_prefix = str(policy["decode_sha256_prefix"])
+    expected_sha256 = policy.get("decode_sha256")
+    if source_decode_sha256 is None:
+        return {
+            "available": False,
+            "pass": None,
+            "actual_decode_sha256": None,
+            "expected_decode_sha256_prefix": expected_prefix,
+            "expected_decode_sha256": expected_sha256,
+            "policy_id": policy["policy_id"],
+        }
+    if not _SHA256_PATTERN.fullmatch(source_decode_sha256):
+        raise ValueError("source_decode_sha256 must be a lowercase SHA256")
+    if not isinstance(expected_sha256, str):
+        return {
+            "available": True,
+            "pass": False,
+            "actual_decode_sha256": source_decode_sha256,
+            "expected_decode_sha256_prefix": expected_prefix,
+            "expected_decode_sha256": None,
+            "policy_id": policy["policy_id"],
+            "reason": "selected source policy has no exact SHA256",
+        }
+    return {
+        "available": True,
+        "pass": source_decode_sha256 == expected_sha256,
+        "actual_decode_sha256": source_decode_sha256,
+        "expected_decode_sha256_prefix": expected_prefix,
+        "expected_decode_sha256": expected_sha256,
+        "policy_id": policy["policy_id"],
     }
 
 
@@ -428,11 +511,11 @@ def _raw_swimlane_metadata(swim_path: Path) -> tuple[int, list[str]]:
     if not isinstance(metadata, dict):
         raise ValueError(f"{swim_path}: missing metadata object")
     try:
-        level = int(raw["l2_swimlane_level"])
+        level = int(raw["chip_swimlane_level"])
         num_cores = int(metadata["num_cores"])
         core_types = [str(value) for value in metadata["core_types"]]
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"{swim_path}: invalid l2 swimlane metadata") from exc
+        raise ValueError(f"{swim_path}: invalid chip swimlane metadata") from exc
     if num_cores != len(core_types):
         raise ValueError(f"{swim_path}: num_cores={num_cores} but core_types={len(core_types)}")
     if core_types != _EXPECTED_CORE_TYPES:
@@ -444,10 +527,20 @@ def _raw_swimlane_metadata(swim_path: Path) -> tuple[int, list[str]]:
     return level, core_types
 
 
+def _predicated_skip_task_ids(swim: dict[str, Any]) -> tuple[str, ...]:
+    """Return task IDs with explicit runtime predicate-retirement evidence."""
+    return tuple(
+        str(event["task_id"])
+        for lane in swim.get("aicpu_scheduler_phases", [])
+        for event in lane
+        if event.get("phase") == "predicated_skip"
+    )
+
+
 def _load_rank(rank_dir: Path, dfx_root: Path) -> RankTrace | None:
     deps_path = rank_dir / "deps.json"
     names_path = rank_dir / "name_map.json"
-    swim_path = rank_dir / "l2_swimlane_records.json"
+    swim_path = rank_dir / _CHIP_SWIMLANE_RECORDS_NAME
     if not (deps_path.exists() and names_path.exists() and swim_path.exists()):
         return None
 
@@ -512,6 +605,7 @@ def _load_rank(rank_dir: Path, dfx_root: Path) -> RankTrace | None:
         edges=list(deps.get("edges", [])),
         critical_path=_parse_critical_path(rank_dir / "critical_path_report.md"),
         swimlane_level=swimlane_level,
+        predicated_skip_task_ids=_predicated_skip_task_ids(swim),
     )
 
 
@@ -618,9 +712,38 @@ def _task_id_contract(trace: RankTrace) -> dict[str, Any]:
             or item.resource != trace.core_types[item.core]
         )
     ]
-    missing_on_swim = sorted(dep_id_set - swim_id_set)
+    predicated_skip_counts = collections.Counter(
+        trace.predicated_skip_task_ids
+    )
+    predicated_skip_id_set = set(predicated_skip_counts)
+    duplicate_predicated_skip_task_ids = sorted(
+        task_id
+        for task_id, count in predicated_skip_counts.items()
+        if count > 1
+    )
+    missing_physical_ids = dep_id_set - swim_id_set
+    predicated_skip_without_physical_slices = sorted(
+        missing_physical_ids & predicated_skip_id_set
+    )
+    missing_on_swim = sorted(
+        missing_physical_ids - predicated_skip_id_set
+    )
     unknown_on_swim = sorted(swim_id_set - dep_id_set)
-    exact = not (duplicate_dep_ids or invalid_physical_slices or missing_on_swim or unknown_on_swim)
+    unexpected_predicated_skip_task_ids = sorted(
+        predicated_skip_id_set - dep_id_set
+    )
+    predicated_skip_with_physical_slices = sorted(
+        predicated_skip_id_set & swim_id_set
+    )
+    exact = not (
+        duplicate_dep_ids
+        or invalid_physical_slices
+        or missing_on_swim
+        or unknown_on_swim
+        or duplicate_predicated_skip_task_ids
+        or unexpected_predicated_skip_task_ids
+        or predicated_skip_with_physical_slices
+    )
     return {
         "pass": exact,
         "all_dep_task_count": len(all_dep_ids),
@@ -634,11 +757,26 @@ def _task_id_contract(trace: RankTrace) -> dict[str, Any]:
         "invalid_physical_slices": invalid_physical_slices,
         "missing_on_swim": missing_on_swim,
         "unknown_on_swim": unknown_on_swim,
+        "predicated_skip_task_ids": sorted(predicated_skip_id_set),
+        "predicated_skip_without_physical_slices": (
+            predicated_skip_without_physical_slices
+        ),
+        "duplicate_predicated_skip_task_ids": (
+            duplicate_predicated_skip_task_ids
+        ),
+        "unexpected_predicated_skip_task_ids": (
+            unexpected_predicated_skip_task_ids
+        ),
+        "predicated_skip_with_physical_slices": (
+            predicated_skip_with_physical_slices
+        ),
         "interpretation": (
             "Every executable dependency task must have at least one physical "
-            "swim slice, and every swim task ID must resolve to exactly one "
-            "executable dependency task. Runtime/creator-only dependency "
-            "records are listed separately and are not required to execute."
+            "swim slice or one explicit predicated_skip scheduler event. Every "
+            "physical and skipped task ID must resolve to exactly one "
+            "executable dependency task, and a skipped task cannot also have "
+            "physical slices. Runtime/creator-only dependency records are "
+            "listed separately and are not required to execute."
         ),
     }
 
@@ -1037,6 +1175,15 @@ def _validate_structural_contracts(
                     "unknown_on_swim": contract["unknown_on_swim"],
                     "duplicate_dep_task_ids": (contract["duplicate_dep_task_ids"]),
                     "invalid_physical_slices": (contract["invalid_physical_slices"][:8]),
+                    "duplicate_predicated_skip_task_ids": (
+                        contract["duplicate_predicated_skip_task_ids"]
+                    ),
+                    "unexpected_predicated_skip_task_ids": (
+                        contract["unexpected_predicated_skip_task_ids"]
+                    ),
+                    "predicated_skip_with_physical_slices": (
+                        contract["predicated_skip_with_physical_slices"]
+                    ),
                 }
             )
     for rank, contract in combine.items():
@@ -1426,7 +1573,7 @@ def _rank_metrics(trace: RankTrace) -> dict[str, Any]:
             )
     return {
         "hardware_capacity": {
-            "source": "raw l2_swimlane_records.json metadata.core_types",
+            "source": f"raw {_CHIP_SWIMLANE_RECORDS_NAME} metadata.core_types",
             "swimlane_level": trace.swimlane_level,
             "num_cores": len(trace.core_types),
             "aic": trace.core_types.count("aic"),
@@ -1740,6 +1887,10 @@ def _validated_sidecar_provenance(
         "source_manifest_sha256",
     ):
         _require_sha256(golden.get(field), f"recv_meta formal_golden.{field}")
+    if golden["source_decode_fwd_sha256"] != source["decode_fwd_sha256"]:
+        raise ValueError(
+            "recv_meta formal_golden decode SHA does not match route source"
+        )
     golden_files = golden.get("files")
     if not isinstance(golden_files, dict) or set(golden_files) != {
         "hidden_l3.pt",
@@ -1752,6 +1903,8 @@ def _validated_sidecar_provenance(
         "image_digest": image_digest,
         "checkpoint_identity_sha256": identity_sha256,
         "source_manifest_sha256": source_manifest_sha256,
+        "decode_fwd_sha256": source["decode_fwd_sha256"],
+        "source": dict(source),
         "input_contract_sha256": input_contract_sha256,
         "golden_manifest_sha256": golden["manifest_sha256"],
         "active_batch": active_batch,
@@ -1759,7 +1912,12 @@ def _validated_sidecar_provenance(
     }
 
 
-def _validated_route_histogram(path: Path) -> dict[str, Any]:
+def _validated_route_histogram(
+    path: Path,
+    *,
+    profile: str | None = None,
+    source_decode_sha256: str | None = None,
+) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"recv_meta sidecar does not exist: {path}")
     payload = _load_recv_meta_payload(path)
@@ -1779,6 +1937,36 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
             f"got {payload.get('axes')!r}"
         )
     provenance = _validated_sidecar_provenance(payload)
+    if profile is not None:
+        policy = _source_policy(profile)
+        policy_id = str(policy["policy_id"])
+        expected_prefix = str(policy["decode_sha256_prefix"])
+        actual_decode = str(provenance["decode_fwd_sha256"])
+        expected_decode = policy.get("decode_sha256")
+        if not isinstance(expected_decode, str):
+            raise ValueError(
+                f"{path}: source policy {policy_id} has no exact decode SHA"
+            )
+        if actual_decode != expected_decode:
+            raise ValueError(
+                f"{path}: recv_meta decode_fwd_sha256={actual_decode} does "
+                f"not match source policy {policy_id} "
+                f"expected={expected_decode}"
+            )
+        if (
+            source_decode_sha256 is not None
+            and actual_decode != source_decode_sha256
+        ):
+            raise ValueError(
+                f"{path}: recv_meta decode_fwd_sha256={actual_decode} does "
+                f"not match live source_decode_sha256={source_decode_sha256}"
+            )
+        provenance = {
+            **provenance,
+            "source_policy_id": policy_id,
+            "source_policy_decode_sha256_prefix": expected_prefix,
+            "source_policy_decode_sha256": expected_decode,
+        }
 
     recv_shape, recv_meta, recv_dtype = _nested_values(
         payload.get("recv_meta"),
@@ -2023,6 +2211,9 @@ def _validated_route_histogram(path: Path) -> dict[str, Any]:
 
 def _route_histogram_contract(
     recv_meta_sidecar: Path | None = None,
+    *,
+    profile: str | None = None,
+    source_decode_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Load exact recv_meta or declare an analyzer-only limitation.
 
@@ -2030,7 +2221,11 @@ def _route_histogram_contract(
     publication readiness in NOT_EVALUABLE state.
     """
     if recv_meta_sidecar is not None:
-        return _validated_route_histogram(Path(recv_meta_sidecar))
+        return _validated_route_histogram(
+            Path(recv_meta_sidecar),
+            profile=profile,
+            source_decode_sha256=source_decode_sha256,
+        )
     return {
         layer: {
             "available": False,
@@ -2278,6 +2473,14 @@ def _expert_kernel_release_contract(
     """Apply the per-nonempty-rank expert grain and activation release gates."""
     resolved_profile = _resolve_profile(profile)
     policy = _source_policy(resolved_profile)
+    release_family = str(policy.get("expert_release_family", "split"))
+    if release_family not in _EXPERT_AIC_RELEASE_STAGES:
+        raise ValueError(
+            f"unsupported expert release family {release_family!r} "
+            f"for profile {resolved_profile!r}"
+        )
+    required_aic_stages = _EXPERT_AIC_RELEASE_STAGES[release_family]
+    duration_limits = _EXPERT_DURATION_LIMITS_US[release_family]
     coverage: dict[str, Any] = {layer: {} for layer in _LAYER_PREFIX}
     coverage_errors: list[dict[str, Any]] = []
     duration_errors: list[dict[str, Any]] = []
@@ -2320,7 +2523,7 @@ def _expert_kernel_release_contract(
                 coverage[layer][rank] = rank_coverage
                 continue
 
-            for stage in _EXPERT_AIC_RELEASE_STAGES:
+            for stage in required_aic_stages:
                 stage_data = stages.get(stage)
                 resource = (
                     stage_data.get("resources", {}).get("aic", {})
@@ -2335,27 +2538,28 @@ def _expert_kernel_release_contract(
                     "max_us": distribution.get("max_us"),
                 }
                 checks = {
-                    "p50_ge_10_us": (
+                    "p50_le_limit": (
                         values["p50_us"] is not None
-                        and values["p50_us"] >= _EXPERT_DURATION_LIMITS_US["p50_min"]
+                        and values["p50_us"] <= duration_limits["p50_max"]
                     ),
-                    "p50_le_30_us": (
-                        values["p50_us"] is not None
-                        and values["p50_us"] <= _EXPERT_DURATION_LIMITS_US["p50_max"]
-                    ),
-                    "p90_le_30_us": (
+                    "p90_le_limit": (
                         values["p90_us"] is not None
-                        and values["p90_us"] <= _EXPERT_DURATION_LIMITS_US["p90_max"]
+                        and values["p90_us"] <= duration_limits["p90_max"]
                     ),
-                    "p99_le_60_us": (
+                    "p99_le_limit": (
                         values["p99_us"] is not None
-                        and values["p99_us"] <= _EXPERT_DURATION_LIMITS_US["p99_max"]
+                        and values["p99_us"] <= duration_limits["p99_max"]
                     ),
-                    "max_le_100_us": (
+                    "max_le_limit": (
                         values["max_us"] is not None
-                        and values["max_us"] <= _EXPERT_DURATION_LIMITS_US["max"]
+                        and values["max_us"] <= duration_limits["max"]
                     ),
                 }
+                if "p50_min" in duration_limits:
+                    checks["p50_ge_limit"] = (
+                        values["p50_us"] is not None
+                        and values["p50_us"] >= duration_limits["p50_min"]
+                    )
                 stage_pass = bool(resource.get("available")) and all(checks.values())
                 rank_coverage["aic_duration_stages"][stage] = {
                     "present": stage_data is not None,
@@ -2386,41 +2590,69 @@ def _expert_kernel_release_contract(
                         }
                     )
 
-            activation = stages.get("expert_gate_up_act")
-            activation_resources = activation.get("resources", {}) if activation else {}
-            activation_aic = activation_resources.get("aic", {})
-            activation_aiv = activation_resources.get("aiv", {})
-            activation_checks = {
-                "stage_present": activation is not None,
-                "aiv_observed": (
-                    bool(activation_aiv.get("available"))
-                    and int(activation_aiv.get("observed_slices", 0)) > 0
-                ),
-                "aic_not_observed": int(activation_aic.get("observed_slices", 0)) == 0,
-            }
-            activation_pass = all(activation_checks.values())
+            activation_checks: dict[str, bool] = {}
+            activation_errors_for_rank: list[dict[str, Any]] = []
+            activation_stage_data: dict[str, dict[str, int]] = {}
+            for activation_stage in (
+                "expert_gate_up_act",
+                "routed_h_quant",
+            ):
+                activation = stages.get(activation_stage)
+                activation_resources = (
+                    activation.get("resources", {}) if activation else {}
+                )
+                activation_aic = activation_resources.get("aic", {})
+                activation_aiv = activation_resources.get("aiv", {})
+                stage_checks = {
+                    "stage_present": activation is not None,
+                    "aiv_observed": (
+                        bool(activation_aiv.get("available"))
+                        and int(activation_aiv.get("observed_slices", 0)) > 0
+                    ),
+                    "aic_not_observed": (
+                        int(activation_aic.get("observed_slices", 0)) == 0
+                    ),
+                }
+                activation_checks[activation_stage] = all(
+                    stage_checks.values()
+                )
+                activation_stage_data[activation_stage] = {
+                    "aic_observed_slices": int(
+                        activation_aic.get("observed_slices", 0)
+                    ),
+                    "aiv_observed_slices": int(
+                        activation_aiv.get("observed_slices", 0)
+                    ),
+                }
+                if not activation_checks[activation_stage]:
+                    activation_errors_for_rank.append(
+                        {
+                            "stage": activation_stage,
+                            "failed_checks": [
+                                name
+                                for name, passed in stage_checks.items()
+                                if not passed
+                            ],
+                        }
+                    )
+            activation_pass = not activation_errors_for_rank
             rank_coverage["activation_aiv"] = {
                 "applicable": True,
                 "pass": activation_pass,
                 "checks": activation_checks,
-                "aic_observed_slices": int(activation_aic.get("observed_slices", 0)),
-                "aiv_observed_slices": int(activation_aiv.get("observed_slices", 0)),
+                "stages": activation_stage_data,
                 "profile_path": (
                     f"ranks.{rank}.layers.{layer}.expert_gate_up_act.resources.aiv"
                 ),
             }
-            if not activation_pass:
+            for activation_error in activation_errors_for_rank:
                 activation_errors.append(
                     {
                         "rank": rank,
                         "layer": layer,
-                        "stage": "expert_gate_up_act",
-                        "code": "activation_must_be_aiv_only",
-                        "failed_checks": [
-                            name
-                            for name, passed in activation_checks.items()
-                            if not passed
-                        ],
+                        "stage": activation_error["stage"],
+                        "code": "activation_quant_must_be_aiv_only",
+                        "failed_checks": activation_error["failed_checks"],
                     }
                 )
             rank_coverage["interpretation"] = (
@@ -2471,25 +2703,23 @@ def _expert_kernel_release_contract(
         "profile": resolved_profile,
         "source_policy": policy,
         "release_enforced": release_enforced,
-        "required_aic_stages": list(_EXPERT_AIC_RELEASE_STAGES),
-        "duration_limits_us": dict(_EXPERT_DURATION_LIMITS_US),
+        "release_family": release_family,
+        "required_aic_stages": list(required_aic_stages),
+        "duration_limits_us": dict(duration_limits),
+        "duration_limit_source": policy.get("duration_limit_source"),
         "coverage": coverage,
         "coverage_errors": coverage_errors,
         "duration_errors": duration_errors,
         "activation_errors": activation_errors,
         "interpretation": (
-            "The frozen campaign baseline is stepfun/develop@56b3d477 with "
-            "decode SHA prefix 3553664c: row32, fused expert_gate_up, no "
-            "graph-wide gate/up scratch, and tile-local activation/quant/down. "
-            "It records candidate-shaped diagnostics, but the candidate "
-            "release gate is NOT_APPLICABLE. The frozen candidate has decode "
-            "SHA prefix 65b0b8bf: row16, graph-wide gate/up INT32 scratch, and "
-            "a two-phase split. Every candidate execution-nonempty rank must "
-            "expose separate gate, up, and down AIC stages with p50 10-30us, "
-            "p90<=30us, p99<=60us, and max<=100us; activation must be present "
-            "and AIV-only. origin/main@1f48761c is retained only as a legal "
-            "graph-wide V4 compatibility reference, not as campaign baseline. "
-            "No source family is inferred from task names."
+            "The a17ae274 frozen candidate is selected by exact source SHA, "
+            "not by task-name inference. Its staged_fused_gate_up family "
+            "requires AIC gate_up/down coverage and AIV-only activation and "
+            "quant coverage on every execution-nonempty rank. R5's "
+            "release-qualified packed-fused upper scheduling bounds are "
+            "carried as p50<=200us, p90<=220us, p99<=320us, max<=500us; "
+            "a lower bound is intentionally not applied to separately named "
+            "gate_up because R5 measured one combined stage."
         ),
     }
 
@@ -3625,9 +3855,25 @@ def analyze(
     top: int = 30,
     recv_meta_sidecar: Path | None = None,
     profile: str | None = None,
+    source_decode_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Analyze one compiled L0-L4 DFX directory and write JSON/Markdown."""
     resolved_profile = _resolve_profile(profile)
+    source_identity = _source_identity_contract(
+        resolved_profile,
+        source_decode_sha256,
+    )
+    if (
+        source_identity["pass"] is not True
+        and _source_policy(resolved_profile)["enforce_candidate_release_gate"]
+    ):
+        raise RuntimeError(
+            "source policy identity unavailable or mismatched: "
+            f"actual={source_identity['actual_decode_sha256']} "
+            f"policy={source_identity['policy_id']} "
+            "expected="
+            f"{source_identity['expected_decode_sha256']}"
+        )
     dfx_root = build_dir / "dfx_outputs"
     if not dfx_root.exists():
         raise FileNotFoundError(f"no dfx_outputs under {build_dir}")
@@ -3661,7 +3907,7 @@ def analyze(
 
     traces = [
         trace
-        for path in sorted(dfx_root.rglob("l2_swimlane_records.json"))
+        for path in sorted(dfx_root.rglob(_CHIP_SWIMLANE_RECORDS_NAME))
         if (trace := _load_rank(path.parent, dfx_root)) is not None
     ]
     if len(traces) != _EXPECTED_RANKS:
@@ -3704,7 +3950,11 @@ def analyze(
     reference_rank = min(ranks, key=lambda tag: ranks[tag]["makespan_us"])
     clock_alignment = _clock_alignment(traces)
     arrivals = _arrival_analysis(traces, ranks, clock_alignment)
-    route_histogram = _route_histogram_contract(recv_meta_sidecar)
+    route_histogram = _route_histogram_contract(
+        recv_meta_sidecar,
+        profile=resolved_profile,
+        source_decode_sha256=source_decode_sha256,
+    )
     routed_slice_profiles = _routed_slice_profile_contract(ranks)
     if not routed_slice_profiles["pass"]:
         raise RuntimeError(
@@ -3728,6 +3978,7 @@ def analyze(
         "dfx_root": str(dfx_root),
         "profile": resolved_profile,
         "source_policy": _source_policy(resolved_profile),
+        "source_identity_contract": source_identity,
         "recv_meta_sidecar": (
             str(recv_meta_sidecar) if recv_meta_sidecar is not None else None
         ),
@@ -3790,6 +4041,7 @@ def main() -> int:
             Path(args.recv_meta_sidecar) if args.recv_meta_sidecar else None
         ),
         profile=args.profile,
+        source_decode_sha256=args.source_decode_sha256,
     )
     return 0
 

@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import statistics
 import time
 from pathlib import Path
@@ -19,6 +20,8 @@ TP = 8
 BATCH = 16
 HIDDEN = 4096
 BLOCK_SIZE = 128
+GOLDEN_SCHEMA = "step3p5.five-layer-moe-golden.v3"
+IMAGE_DIGEST_PATTERN = re.compile(r".+@sha256:[0-9a-f]{64}")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -49,9 +52,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-exporters", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument(
+        "--recv-meta-sidecar",
+        default=os.environ.get("PYPTO_RECV_META_SIDECAR", ""),
+    )
+    parser.add_argument(
         "--write-golden",
         default="",
         help="write hidden_l3.pt, hidden_l4.pt, and provenance to this directory",
+    )
+    parser.add_argument(
+        "--image-digest",
+        default=os.environ.get("PYPTO_IMAGE_DIGEST", ""),
+        help="immutable producer image digest required by --write-golden",
+    )
+    parser.add_argument(
+        "--source-run",
+        default=os.environ.get("PYPTO_SOURCE_RUN", ""),
+        help="immutable run identifier required by --write-golden",
     )
     parser.add_argument(
         "--golden-dir",
@@ -72,7 +89,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dfx",
         action="store_true",
-        help="capture separate warm dep_gen and l2_swimlane iterations",
+        help="capture separate warm dep_gen and chip-swimlane iterations",
     )
     parser.add_argument("--pmu", action="store_true")
     return parser.parse_args()
@@ -96,6 +113,34 @@ def _sha256(path: Path) -> str:
 def _source_sha256(root: Path, relative: str) -> str:
     path = root / relative
     return _sha256(path) if path.exists() else ""
+
+
+def _json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _require_sha256(value: object, *, field: str) -> str:
+    if not (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field} must be a lowercase SHA256 digest")
+    return value
+
+
+def _image_digest(value: object, *, field: str) -> str:
+    if not (
+        isinstance(value, str)
+        and IMAGE_DIGEST_PATTERN.fullmatch(value)
+    ):
+        raise ValueError(f"{field} must be an immutable image digest")
+    return value
 
 
 def _input_token_ids(args: argparse.Namespace) -> list[int]:
@@ -266,7 +311,32 @@ def _write_golden(
     hidden_l3: torch.Tensor,
     hidden_l4: torch.Tensor,
     manifest: dict[str, object],
+    image_digest: str,
+    source_run: str,
 ) -> None:
+    _image_digest(image_digest, field="golden.image_ref")
+    if not source_run:
+        raise ValueError("golden.source_run must be non-empty")
+    workload = manifest.get("workload")
+    if not isinstance(workload, dict):
+        raise ValueError("golden producer workload is missing")
+    active_batch = workload.get("active_batch")
+    context_len = workload.get("context_len")
+    if type(active_batch) is not int or not 1 <= active_batch <= BATCH:
+        raise ValueError("golden active_batch is invalid")
+    if context_len != 65536:
+        raise ValueError("golden context_len must be 65536 per sequence")
+    source = manifest.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("golden producer source manifest is missing")
+    for field in (
+        "decode_fwd_sha256",
+        "program_sha256",
+        "holder_sha256",
+        "harness_sha256",
+    ):
+        _require_sha256(source.get(field), field=f"golden.source.{field}")
+
     if golden_dir.exists() and any(golden_dir.iterdir()):
         raise FileExistsError(f"refusing to overwrite golden directory {golden_dir}")
     golden_dir.mkdir(parents=True, exist_ok=True)
@@ -278,10 +348,20 @@ def _write_golden(
         "hidden_l3.pt": _sha256(l3_path),
         "hidden_l4.pt": _sha256(l4_path),
     }
-    manifest = dict(manifest)
-    manifest["files"] = hashes
+    golden_manifest = {
+        "schema": GOLDEN_SCHEMA,
+        "source_run": source_run,
+        "source_kind": "baseline",
+        "source_decode_fwd_sha256": source["decode_fwd_sha256"],
+        "source_manifest_sha256": _json_sha256(source),
+        "active_batch": active_batch,
+        "context_len_per_sequence": context_len,
+        "image_ref": image_digest,
+        "files": hashes,
+        "bit_exact": True,
+    }
     (golden_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        json.dumps(golden_manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     (golden_dir / "sha256.txt").write_text(
@@ -301,6 +381,14 @@ def _configure(args: argparse.Namespace) -> dict[str, int]:
         raise ValueError(
             "--dfx and --pmu must use separate processes/output directories"
         )
+    if args.write_golden:
+        _image_digest(args.image_digest, field="--image-digest")
+        if not args.source_run:
+            raise ValueError("--source-run or PYPTO_SOURCE_RUN is required")
+        if args.context_len != 65536:
+            raise ValueError("--write-golden requires --context-len=65536")
+        if args.allow_tolerance:
+            raise ValueError("--write-golden requires bit-exact outputs")
     _input_token_ids(args)
     layout = _workload_layout(args)
 
@@ -346,11 +434,22 @@ def _wait_for_artifacts(
     )
 
 
-def _postprocess_dfx(build_dir: Path, out: Path) -> None:
+def _postprocess_dfx(
+    build_dir: Path,
+    out: Path,
+    *,
+    source_decode_sha256: str,
+    recv_meta_sidecar: Path | None,
+) -> None:
     from tools.step3p5.analyze_five_layer_moe_dfx import analyze
 
     dfx_out = out / "dfx_analysis"
-    analyze(build_dir, dfx_out)
+    analyze(
+        build_dir,
+        dfx_out,
+        recv_meta_sidecar=recv_meta_sidecar,
+        source_decode_sha256=source_decode_sha256,
+    )
 
 
 def main() -> int:
@@ -587,9 +686,15 @@ def main() -> int:
                     hidden_l3=hidden_l3,
                     hidden_l4=hidden_l4,
                     manifest=manifest,
+                    image_digest=args.image_digest,
+                    source_run=args.source_run,
                 )
 
             if args.dfx:
+                from pypto.runtime.runner import (  # noqa: PLC0415
+                    _CHIP_SWIMLANE_RECORDS_NAME,
+                )
+
                 # Keep dep generation and swimlane capture on separate warm
                 # submissions, with an unprofiled separator in between.
                 for _ in range(2):
@@ -616,7 +721,7 @@ def main() -> int:
                     )
                 swim_hashes = _wait_for_artifacts(
                     Path(holder.compiled.output_dir),
-                    "l2_swimlane_records.json",
+                    _CHIP_SWIMLANE_RECORDS_NAME,
                 )
                 (out / "dfx_protocol_report.json").write_text(
                     json.dumps(
@@ -643,7 +748,19 @@ def main() -> int:
             main_stage._stop_exporters(out, procs)
 
     if args.dfx:
-        _postprocess_dfx(Path(holder.compiled.output_dir), out)
+        _postprocess_dfx(
+            Path(holder.compiled.output_dir),
+            out,
+            source_decode_sha256=_source_sha256(
+                repo_root,
+                "models/step3p5/decode_fwd.py",
+            ),
+            recv_meta_sidecar=(
+                Path(args.recv_meta_sidecar)
+                if args.recv_meta_sidecar
+                else None
+            ),
+        )
     print(
         json.dumps(
             {

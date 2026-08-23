@@ -256,6 +256,20 @@ def test_host_and_holder_expose_both_route_snapshots() -> None:
     assert '"local_expert_count": local_expert_count' in holder
 
 
+def test_route_holder_preserves_ipc_provenance_for_weight_slices() -> None:
+    source, tree = _parse(_HOLDER)
+    wrapper = _method(tree, "__enter__")
+    wrapper_body = ast.get_source_segment(source, wrapper)
+    assert wrapper_body is not None
+    assert "return self._enter_impl()" in wrapper_body
+    enter = _method(tree, "_enter_impl")
+    body = ast.get_source_segment(source, enter)
+    assert body is not None
+
+    assert ".device_tensor_slice(key, start, stop)" in body
+    assert ".device_tensor(key)[start:stop]" not in body
+
+
 def test_route_output_assembly_is_exact_and_device_ordered() -> None:
     l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
     l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
@@ -332,6 +346,25 @@ def test_route_sidecar_rejects_incomplete_publication_provenance(
         _route_histogram_contract(sidecar)
 
 
+def test_route_sidecar_rejects_golden_source_sha_mismatch(
+    tmp_path: Path,
+) -> None:
+    recv_meta = torch.zeros((8, 2, 8, 40), dtype=torch.int32)
+    local_expert_count = torch.zeros((8, 2, 36), dtype=torch.int32)
+    provenance = _fake_provenance()
+    provenance["formal_golden"]["source_decode_fwd_sha256"] = "0" * 64
+    payload = _sidecar_payload(
+        recv_meta_device=recv_meta,
+        local_expert_count_device=local_expert_count,
+        provenance=provenance,
+        window_id_prefix="route-test",
+    )
+    sidecar = tmp_path / "recv_meta_sidecar.pt"
+    torch.save(payload, sidecar)
+    with pytest.raises(ValueError, match="does not match route source"):
+        _route_histogram_contract(sidecar)
+
+
 def test_golden_contract_is_validated_before_device_use(
     tmp_path: Path,
 ) -> None:
@@ -353,6 +386,7 @@ def test_golden_contract_is_validated_before_device_use(
         "context_len_per_sequence": 65536,
         "image_ref": _IMAGE,
         "files": files,
+        "bit_exact": True,
     }
     (tmp_path / "manifest.json").write_text(
         json.dumps(manifest),
@@ -364,6 +398,7 @@ def test_golden_contract_is_validated_before_device_use(
         active_batch=1,
         context_len=65536,
         image_digest=_IMAGE,
+        source_decode_sha256="1" * 64,
     )
 
     assert contract["source_kind"] == "baseline"
@@ -381,6 +416,61 @@ def test_golden_contract_is_validated_before_device_use(
             active_batch=1,
             context_len=65536,
             image_digest=_IMAGE,
+            source_decode_sha256="1" * 64,
+        )
+
+    manifest["files"]["hidden_l4.pt"] = hashlib.sha256(
+        (tmp_path / "hidden_l4.pt").read_bytes()
+    ).hexdigest()
+    manifest["source_decode_fwd_sha256"] = "0" * 64
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match live source"):
+        _load_golden_contract(
+            tmp_path,
+            active_batch=1,
+            context_len=65536,
+            image_digest=_IMAGE,
+            source_decode_sha256="1" * 64,
+        )
+
+
+def test_golden_contract_requires_explicit_bit_exact_manifest(
+    tmp_path: Path,
+) -> None:
+    hidden = torch.zeros((8, 1, 4096), dtype=torch.bfloat16)
+    for name in ("hidden_l3.pt", "hidden_l4.pt"):
+        torch.save(hidden, tmp_path / name)
+    files = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in ("hidden_l3.pt", "hidden_l4.pt")
+    }
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "step3p5.five-layer-moe-golden.v3",
+                "source_run": "formal-bs1-64k",
+                "source_kind": "baseline",
+                "source_decode_fwd_sha256": "1" * 64,
+                "source_manifest_sha256": "2" * 64,
+                "active_batch": 1,
+                "context_len_per_sequence": 65536,
+                "image_ref": _IMAGE,
+                "files": files,
+                "bit_exact": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="bit_exact must be true"):
+        _load_golden_contract(
+            tmp_path,
+            active_batch=1,
+            context_len=65536,
+            image_digest=_IMAGE,
+            source_decode_sha256="1" * 64,
         )
 
 

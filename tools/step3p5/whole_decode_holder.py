@@ -325,7 +325,9 @@ class WholeDecodeHolder:
             """
             from pypto.runtime.device_tensor import StackedDeviceTensor  # noqa: PLC0415
             start, stop = slots[0], slots[-1] + 1
-            shards = [self._wmaps[r].device_tensor(key)[start:stop] for r in range(tp)]
+            shards = [
+                self._wmaps[r].device_tensor_slice(key, start, stop) for r in range(tp)
+            ]
             full = (tp, *tuple(shards[0].shape))
             return StackedDeviceTensor(shards, full, list(range(tp)))
 

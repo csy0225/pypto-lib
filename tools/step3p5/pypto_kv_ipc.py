@@ -350,9 +350,13 @@ class KvIpcMap:
         pool_map: Mapping[str, Any],
         *,
         expected_num_layers: int = _NUM_LAYERS,
+        runtime: Any = None,
+        worker_id: int = 0,
     ) -> None:
         self.peer_base = int(peer_base)
         self.pool_map = dict(pool_map)
+        self._runtime = runtime
+        self._worker_id = int(worker_id)
         self.summary = validate_pool_map(
             pool_map,
             expected_num_layers=expected_num_layers,
@@ -368,12 +372,32 @@ class KvIpcMap:
         pool_map: Mapping[str, Any],
         *,
         expected_num_layers: int = _NUM_LAYERS,
+        runtime: Any = None,
+        worker_id: int = 0,
     ) -> "KvIpcMap":
         return cls(
             peer_base,
             pool_map,
             expected_num_layers=expected_num_layers,
+            runtime=runtime,
+            worker_id=worker_id,
         )
+
+    def _imported_tensor(self, offset: int, shape, dtype):
+        """Wrap one pool slice as a DeviceTensor that public dispatch accepts.
+
+        Dispatch derives its wire descriptor from an owner ``Buffer`` whose base is
+        the argument's own address, so an interior view of the imported pool needs a
+        Buffer of its own; ``imported_tensor`` mints and registers it. Without a
+        runtime (offline map inspection) this falls back to a raw-pointer handle,
+        which is rejected at dispatch rather than silently mis-dispatched.
+        """
+        from pypto.runtime.device_tensor import DeviceTensor  # noqa: PLC0415
+
+        ptr = self.peer_base + int(offset)
+        if self._runtime is None:
+            return DeviceTensor(ptr, shape, dtype)
+        return self._runtime.imported_tensor(ptr, shape, dtype, worker_id=self._worker_id)
 
     def _entry(self, layer_idx: int, which: str) -> KvEntry:
         try:
@@ -390,14 +414,9 @@ class KvIpcMap:
 
     def kv_device_tensor(self, layer_idx: int, which: str):
         import torch  # noqa: PLC0415
-        from pypto.runtime.device_tensor import DeviceTensor  # noqa: PLC0415
 
         entry = self._entry(layer_idx, which)
-        return DeviceTensor(
-            self.peer_base + entry.offset,
-            entry.flat_shape,
-            torch.bfloat16,
-        )
+        return self._imported_tensor(entry.offset, entry.flat_shape, torch.bfloat16)
 
     def kv_pair(self, layer_idx: int):
         return self.kv_device_tensor(layer_idx, "K"), self.kv_device_tensor(layer_idx, "V")
@@ -418,10 +437,9 @@ class KvIpcMap:
 
     def section_device_tensor(self, which: str):
         import torch  # noqa: PLC0415
-        from pypto.runtime.device_tensor import DeviceTensor  # noqa: PLC0415
 
         offset, shape, _ = self.section_spec(which)
-        return DeviceTensor(self.peer_base + offset, shape, torch.bfloat16)
+        return self._imported_tensor(offset, shape, torch.bfloat16)
 
 
 def import_kv_all(
@@ -503,6 +521,8 @@ def import_kv_all(
             vas[dev_offset + rank],
             maps_json[rank],
             expected_num_layers=expected_num_layers,
+            runtime=rt,
+            worker_id=rank,
         )
         for rank in range(tp)
     ]

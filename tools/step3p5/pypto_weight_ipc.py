@@ -922,10 +922,35 @@ class WeightIpcMap:
     offset from the map JSON as a zero-copy ``DeviceTensor``.
     """
 
-    def __init__(self, peer_base: int, pool_map: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        peer_base: int,
+        pool_map: Dict[str, Any],
+        *,
+        runtime: Any = None,
+        worker_id: int = 0,
+    ) -> None:
         self.peer_base = int(peer_base)
         self.pool_map = pool_map
         self._map = pool_map["map"]
+        self._runtime = runtime
+        self._worker_id = int(worker_id)
+
+    def _imported_tensor(self, offset: int, shape, dtype):
+        """Wrap one pool slice as a DeviceTensor that public dispatch accepts.
+
+        Dispatch derives its wire descriptor from an owner ``Buffer`` whose base is
+        the argument's own address, so an interior view of the imported pool needs a
+        Buffer of its own; ``imported_tensor`` mints and registers it. Without a
+        runtime (offline map inspection) this falls back to a raw-pointer handle,
+        which is rejected at dispatch rather than silently mis-dispatched.
+        """
+        from pypto.runtime.device_tensor import DeviceTensor  # noqa: PLC0415
+
+        ptr = self.peer_base + int(offset)
+        if self._runtime is None:
+            return DeviceTensor(ptr, shape, dtype)
+        return self._runtime.imported_tensor(ptr, shape, dtype, worker_id=self._worker_id)
 
     @classmethod
     def from_files(cls, key_path: str, map_path: str, *, rt, worker_id: int = 0) -> "WeightIpcMap":
@@ -945,7 +970,7 @@ class WeightIpcMap:
             f"keys={len(pool_map['map'])} pool_GiB={pool_map['pool_bytes']/2**30:.2f}",
             flush=True,
         )
-        return cls(peer_base, pool_map)
+        return cls(peer_base, pool_map, runtime=rt, worker_id=worker_id)
 
     def device_tensor(self, key: str):
         """Build the zero-copy DeviceTensor for one bundle key.
@@ -954,7 +979,6 @@ class WeightIpcMap:
         ``peer_base + offset`` with the key's shape/dtype — pass it directly
         as the kernel arg in place of a torch.Tensor (no H2D/D2H).
         """
-        from pypto.runtime.device_tensor import DeviceTensor  # noqa: PLC0415
         if key not in self._map:
             raise KeyError(
                 f"weight-ipc map missing key={key!r} "
@@ -964,7 +988,18 @@ class WeightIpcMap:
         offset = int(entry["offset"])
         shape = tuple(int(s) for s in entry["shape"])
         dtype = _torch_dtype(entry["dtype"])
-        return DeviceTensor(self.peer_base + offset, shape, dtype)
+        return self._imported_tensor(offset, shape, dtype)
+
+    def device_tensor_slice(self, key: str, start: int, stop: int):
+        """Leading-dim sub-view ``[start:stop]`` of one bundle key, zero-copy.
+
+        ``DeviceTensor.__getitem__`` gives the right address and shape but no owner
+        Buffer, and a sub-view's address differs from the pool base, so it cannot
+        borrow the parent's. Re-mint provenance here rather than at the call site,
+        so callers never have to know the dispatch guard exists.
+        """
+        sub = self.device_tensor(key)[int(start):int(stop)]
+        return self._imported_tensor(sub.data_ptr - self.peer_base, sub.shape, sub.dtype)
 
     def bundle(self) -> Dict[str, Any]:
         """Build the full {key: DeviceTensor} dict for the whole-decode program.
@@ -1032,7 +1067,10 @@ def import_weights_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> Lis
         + str([hex(vas[dev_offset + r]) for r in range(tp)]),
         flush=True,
     )
-    return [WeightIpcMap(vas[dev_offset + r], maps_json[r]) for r in range(tp)]
+    return [
+        WeightIpcMap(vas[dev_offset + r], maps_json[r], runtime=rt, worker_id=r)
+        for r in range(tp)
+    ]
 
 
 def build_stacked_weight(weight_maps: List["WeightIpcMap"], key: str):

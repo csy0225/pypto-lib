@@ -265,13 +265,38 @@ def validate_mtp_pool_map(pool_map: Mapping[str, Any]) -> MtpKvMapSummary:
 class MtpKvIpcMap:
     """One rank's validated MTP KV pool."""
 
-    def __init__(self, peer_base: int, pool_map: Mapping[str, Any]):
+    def __init__(
+        self,
+        peer_base: int,
+        pool_map: Mapping[str, Any],
+        *,
+        runtime: Any = None,
+        worker_id: int = 0,
+    ):
         self.peer_base = int(peer_base)
         self.pool_map = dict(pool_map)
         self.summary = validate_mtp_pool_map(pool_map)
         self._entries = {
             (entry.layer_idx, entry.which): entry for entry in self.summary.entries
         }
+        self._runtime = runtime
+        self._worker_id = int(worker_id)
+
+    def _imported_tensor(self, offset: int, shape, dtype):
+        """Wrap one pool slice as a DeviceTensor that public dispatch accepts.
+
+        Dispatch derives its wire descriptor from an owner ``Buffer`` whose base is
+        the argument's own address, so an interior view of the imported pool needs a
+        Buffer of its own; ``imported_tensor`` mints and registers it. Without a
+        runtime (offline map inspection) this falls back to a raw-pointer handle,
+        which is rejected at dispatch rather than silently mis-dispatched.
+        """
+        from pypto.runtime.device_tensor import DeviceTensor  # noqa: PLC0415
+
+        ptr = self.peer_base + int(offset)
+        if self._runtime is None:
+            return DeviceTensor(ptr, shape, dtype)
+        return self._runtime.imported_tensor(ptr, shape, dtype, worker_id=self._worker_id)
 
     def _entry(self, layer_idx: int, which: str) -> MtpKvEntry:
         return self._entries[(int(layer_idx), which)]
@@ -291,10 +316,9 @@ class MtpKvIpcMap:
 
     def section_device_tensor(self, which: str):
         import torch  # noqa: PLC0415
-        from pypto.runtime.device_tensor import DeviceTensor  # noqa: PLC0415
 
         off, shape, _ = self.section_spec(which)
-        return DeviceTensor(self.peer_base + off, shape, torch.bfloat16)
+        return self._imported_tensor(off, shape, torch.bfloat16)
 
 
 def import_mtp_kv_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List[MtpKvIpcMap]:
@@ -349,7 +373,7 @@ def import_mtp_kv_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List
         region_bytes=region_bytes,
     )
     return [
-        MtpKvIpcMap(vas[dev_offset + rank], maps[rank])
+        MtpKvIpcMap(vas[dev_offset + rank], maps[rank], runtime=rt, worker_id=rank)
         for rank in range(tp)
     ]
 

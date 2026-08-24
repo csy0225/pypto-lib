@@ -1201,6 +1201,12 @@ for _name in _REQUIRED_CANONICAL:
         raise RuntimeError(f"canonical program is missing required function {_name}")
     _FUNCTIONS[_name] = _function
 
+_optional = _CANONICAL_PROGRAM.get_function(
+    "tp_all_reduce_residual_bs1"
+)
+if _optional is not None:
+    _FUNCTIONS[_optional.name] = _optional
+
 five_layer_moe_route = ir.Program(
     list(_FUNCTIONS.values()),
     "FiveLayerMoeRoute",

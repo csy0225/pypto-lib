@@ -285,6 +285,34 @@ def test_canonical_moe_helpers_export_count_as_out_tensor() -> None:
         assert "local_expert_count = pl.create_tensor" not in ast.unparse(fn)
 
 
+def test_route_program_registers_optional_fused_all_reduce() -> None:
+    _, tree = _parse(_PROGRAM)
+    symbol = "tp_all_reduce_residual_bs1"
+
+    optional_assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [ast.unparse(target) for target in node.targets] == ["_optional"]
+    ]
+    assert len(optional_assignments) == 1
+    lookup = optional_assignments[0].value
+    assert isinstance(lookup, ast.Call)
+    assert ast.unparse(lookup.func) == "_CANONICAL_PROGRAM.get_function"
+    assert [ast.literal_eval(arg) for arg in lookup.args] == [symbol]
+
+    conditionals = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "_optional is not None"
+    ]
+    assert len(conditionals) == 1
+    assert "_FUNCTIONS[_optional.name] = _optional" in ast.unparse(
+        conditionals[0]
+    )
+
+
 @pytest.mark.parametrize(
     ("remote_count", "explicit_count", "expected_self"),
     [(0, 5, 5), (3, 7, 4), (5, 5, 0)],

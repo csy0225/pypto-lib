@@ -48,6 +48,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
     parser.add_argument("--reuse-exporters", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
+    # Shared formal-stage configuration inspects this field for route runs too.
+    # Route capture never writes a golden; keep the namespace contract explicit.
+    parser.add_argument("--write-golden", default="")
     parser.add_argument(
         "--image-digest",
         default=os.environ.get("PYPTO_IMAGE_DIGEST", ""),

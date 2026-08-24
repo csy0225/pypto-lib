@@ -35,6 +35,7 @@ _PROGRAM = (
     / "harnesses"
     / "_five_layer_moe_route_program.py"
 )
+_DECODE = _ROOT / "models" / "step3p5" / "decode_fwd.py"
 _HOLDER = _ROOT / "tools" / "step3p5" / "five_layer_moe_route_holder.py"
 _STAGE = (
     _ROOT
@@ -192,13 +193,21 @@ def test_l3_snapshot_fences_reused_metadata_before_l4() -> None:
         < snapshots[1].lineno
     )
 
-    assert ast.unparse(snapshots[0].args[0]) == "moe_recv_meta"
-    assert ast.unparse(snapshots[0].args[1]) == "hidden_l3_raw"
-    assert ast.unparse(snapshots[0].args[2]) == "recv_meta_l3"
-    assert ast.unparse(snapshots[0].args[3]) == "hidden_l3"
+    assert [ast.unparse(arg) for arg in snapshots[0].args] == [
+        "moe_recv_meta",
+        "my_rank",
+        "hidden_l3_raw",
+        "recv_meta_l3",
+        "hidden_l3",
+    ]
     assert ast.unparse(l4_call[0].args[0]) == "hidden_l3"
-    assert ast.unparse(snapshots[1].args[0]) == "moe_recv_meta"
-    assert ast.unparse(snapshots[1].args[1]) == "hidden_l4_raw"
+    assert [ast.unparse(arg) for arg in snapshots[1].args] == [
+        "moe_recv_meta",
+        "my_rank",
+        "hidden_l4_raw",
+        "recv_meta_l4",
+        "hidden_l4",
+    ]
 
     returned = [
         node
@@ -229,6 +238,8 @@ def test_snapshot_is_one_incore_body_without_nested_task_scope() -> None:
     body = ast.unparse(snapshot)
     assert "[n_ranks, n_local_experts_pad]" in body
     assert "SNAPSHOT_HIDDEN_CHUNK" in body
+    assert "n_local_experts, n_local_experts_pad" in body
+    assert "pl.cast(0, pl.INT32)" in body
 
 
 def test_host_and_holder_expose_both_route_snapshots() -> None:
@@ -239,7 +250,14 @@ def test_host_and_holder_expose_both_route_snapshots() -> None:
         for arg in host.args.args
         if arg.annotation is not None
     }
-    for name in ("hidden_l3", "hidden_l4", "recv_meta_l3", "recv_meta_l4"):
+    for name in (
+        "hidden_l3",
+        "hidden_l4",
+        "local_expert_count_l3",
+        "local_expert_count_l4",
+        "recv_meta_l3",
+        "recv_meta_l4",
+    ):
         assert annotations[name].startswith("pl.Out[")
 
     route_calls = _calls(host, "five_layer_route_chip_orch")
@@ -254,6 +272,72 @@ def test_host_and_holder_expose_both_route_snapshots() -> None:
     assert "focused.five_layer_moe_route" in holder
     assert '"recv_meta": recv_meta' in holder
     assert '"local_expert_count": local_expert_count' in holder
+
+
+def test_canonical_moe_helpers_export_count_as_out_tensor() -> None:
+    _, tree = _parse(_DECODE)
+    for name in ("full_moe_chip_orch", "swa_moe_chip_orch"):
+        fn = _method(tree, name)
+        args = [arg.arg for arg in fn.args.args]
+        index = args.index("local_expert_count")
+        annotation = ast.unparse(fn.args.args[index].annotation)
+        assert annotation.startswith("pl.Out[")
+        assert "local_expert_count = pl.create_tensor" not in ast.unparse(fn)
+
+
+@pytest.mark.parametrize(
+    ("remote_count", "explicit_count", "expected_self"),
+    [(0, 5, 5), (3, 7, 4), (5, 5, 0)],
+)
+def test_explicit_counts_reconstruct_unpublished_self_rows(
+    remote_count: int,
+    explicit_count: int,
+    expected_self: int,
+) -> None:
+    l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    count_l3 = torch.zeros((8, 36), dtype=torch.int32)
+    count_l4 = torch.zeros((8, 36), dtype=torch.int32)
+    rank = 3
+    expert = 4
+    l3[rank, 0, expert] = remote_count
+    l4[rank, 2, expert] = remote_count
+    count_l3[rank, expert] = explicit_count
+    count_l4[rank, expert] = explicit_count
+
+    recv_meta, counts = assemble_route_outputs(
+        l3,
+        l4,
+        local_expert_count_l3=count_l3,
+        local_expert_count_l4=count_l4,
+    )
+
+    assert int(recv_meta[rank, 0, rank, expert]) == expected_self
+    assert int(recv_meta[rank, 1, rank, expert]) == expected_self
+    assert torch.equal(counts[:, 0], count_l3)
+    assert torch.equal(counts[:, 1], count_l4)
+    assert torch.equal(
+        recv_meta[:, :, :, :36].sum(dim=2, dtype=torch.int64),
+        counts.to(torch.int64),
+    )
+    assert not bool(torch.any(recv_meta[:, :, :, 36:]))
+
+
+def test_explicit_count_reconstruction_rejects_remote_excess() -> None:
+    l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    count_l3 = torch.zeros((8, 36), dtype=torch.int32)
+    count_l4 = torch.zeros((8, 36), dtype=torch.int32)
+    l3[0, 1, 0] = 2
+    count_l3[0, 0] = 1
+
+    with pytest.raises(ValueError, match="smaller than published remote"):
+        assemble_route_outputs(
+            l3,
+            l4,
+            local_expert_count_l3=count_l3,
+            local_expert_count_l4=count_l4,
+        )
 
 
 def test_route_holder_preserves_ipc_provenance_for_weight_slices() -> None:

@@ -90,6 +90,7 @@ class FiveLayerMoeRouteInstrumented:
         recv_meta: pld.DistributedTensor[
             [n_ranks, n_local_experts_pad], pl.INT32
         ],
+        my_rank: pl.Scalar[pl.INT32],
         hidden_in: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         recv_meta_out: pl.Out[
             pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32]
@@ -104,6 +105,19 @@ class FiveLayerMoeRouteInstrumented:
             [0, 0],
             [n_ranks, n_local_experts_pad],
         )
+        # Self-target stores have no peer notification/fence.  Keep that row
+        # deterministic and reconstruct it from explicit dispatch counts.
+        for expert in pl.range(n_local_experts):
+            pl.tile.write(
+                meta_tile,
+                [my_rank, expert],
+                pl.cast(0, pl.INT32),
+            )
+        for src in pl.range(n_ranks):
+            for expert in pl.range(
+                n_local_experts, n_local_experts_pad
+            ):
+                pl.tile.write(meta_tile, [src, expert], pl.cast(0, pl.INT32))
         pl.store(meta_tile, [0, 0], recv_meta_out)
         for k0 in pl.range(0, HIDDEN, SNAPSHOT_HIDDEN_CHUNK):
             hidden_tile = pl.load(
@@ -215,6 +229,12 @@ class FiveLayerMoeRouteInstrumented:
         ],
         hidden_l3: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         hidden_l4: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+        local_expert_count_l3: pl.Out[
+            pl.Tensor[[n_local_experts], pl.INT32]
+        ],
+        local_expert_count_l4: pl.Out[
+            pl.Tensor[[n_local_experts], pl.INT32]
+        ],
         recv_meta_l3: pl.Out[
             pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32]
         ],
@@ -543,6 +563,7 @@ class FiveLayerMoeRouteInstrumented:
             pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [0, 0]),
             hidden_l3_raw,
             resid_l3,
+            local_expert_count_l3,
             pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [0, 0]),
             pl.slice(
                 moe_attn_signal_stack,
@@ -571,6 +592,7 @@ class FiveLayerMoeRouteInstrumented:
         )
         recv_meta_l3, hidden_l3 = self.snapshot_recv_meta_and_hidden(
             moe_recv_meta,
+            my_rank,
             hidden_l3_raw,
             recv_meta_l3,
             hidden_l3,
@@ -672,6 +694,7 @@ class FiveLayerMoeRouteInstrumented:
             ),
             hidden_l4_raw,
             resid_l4,
+            local_expert_count_l4,
             pl.slice(
                 moe_attn_tmp_stack,
                 [BATCH, HIDDEN],
@@ -704,6 +727,7 @@ class FiveLayerMoeRouteInstrumented:
         )
         recv_meta_l4, hidden_l4 = self.snapshot_recv_meta_and_hidden(
             moe_recv_meta,
+            my_rank,
             hidden_l4_raw,
             recv_meta_l4,
             hidden_l4,
@@ -867,6 +891,12 @@ class FiveLayerMoeRouteInstrumented:
         ],
         hidden_l4: pl.Out[
             pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
+        ],
+        local_expert_count_l3: pl.Out[
+            pl.Tensor[[tp_size, n_local_experts], pl.INT32]
+        ],
+        local_expert_count_l4: pl.Out[
+            pl.Tensor[[tp_size, n_local_experts], pl.INT32]
         ],
         recv_meta_l3: pl.Out[
             pl.Tensor[
@@ -1053,6 +1083,8 @@ class FiveLayerMoeRouteInstrumented:
                 v_cache[rank],
                 hidden_l3[rank],
                 hidden_l4[rank],
+                local_expert_count_l3[rank],
+                local_expert_count_l4[rank],
                 recv_meta_l3[rank],
                 recv_meta_l4[rank],
                 pld.window(

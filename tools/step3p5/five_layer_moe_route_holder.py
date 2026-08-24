@@ -31,8 +31,10 @@ def assemble_route_outputs(
     tp: int = 8,
     n_local_experts: int = 36,
     n_local_experts_pad: int = 40,
+    local_expert_count_l3: torch.Tensor | None = None,
+    local_expert_count_l4: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Validate device snapshots and derive exact per-rank expert counts."""
+    """Validate snapshots and reconstruct unpublished self-route rows."""
     expected = (tp, tp, n_local_experts_pad)
     for layer, tensor in (("L3", recv_meta_l3), ("L4", recv_meta_l4)):
         if tuple(tensor.shape) != expected:
@@ -53,13 +55,72 @@ def assemble_route_outputs(
             )
 
     recv_meta = torch.stack((recv_meta_l3, recv_meta_l4), dim=1)
-    counts_i64 = recv_meta[:, :, :, :n_local_experts].sum(
+    if (local_expert_count_l3 is None) != (local_expert_count_l4 is None):
+        raise ValueError(
+            "L3/L4 explicit local expert counts must be supplied together"
+        )
+    if local_expert_count_l3 is None:
+        counts_i64 = recv_meta[:, :, :, :n_local_experts].sum(
+            dim=2,
+            dtype=torch.int64,
+        )
+        if bool(torch.any(counts_i64 > torch.iinfo(_I32).max)):
+            raise OverflowError("local expert count exceeds INT32")
+        return recv_meta, counts_i64.to(_I32)
+
+    assert local_expert_count_l4 is not None
+    explicit = (local_expert_count_l3, local_expert_count_l4)
+    expected_count_shape = (tp, n_local_experts)
+    for layer, tensor in zip(("L3", "L4"), explicit, strict=True):
+        if tuple(tensor.shape) != expected_count_shape:
+            raise ValueError(
+                f"{layer} local_expert_count shape={tuple(tensor.shape)}, "
+                f"expected={expected_count_shape}"
+            )
+        if tensor.dtype != _I32:
+            raise ValueError(
+                f"{layer} local_expert_count dtype={tensor.dtype}, "
+                f"expected={_I32}"
+            )
+        if bool(torch.any(tensor < 0)):
+            raise ValueError(
+                f"{layer} local_expert_count contains negative counts"
+            )
+
+    explicit_counts = torch.stack(explicit, dim=1)
+    explicit_i64 = explicit_counts.to(torch.int64)
+    recv_i64 = recv_meta[:, :, :, :n_local_experts].to(torch.int64)
+    for rank in range(tp):
+        remote_sum = recv_i64[rank].sum(dim=1) - recv_i64[rank, :, rank]
+        self_rows = explicit_i64[rank] - remote_sum
+        if bool(torch.any(self_rows < 0)):
+            layer, expert = torch.nonzero(
+                self_rows < 0,
+                as_tuple=False,
+            )[0].tolist()
+            raise ValueError(
+                "explicit dispatch count is smaller than published remote "
+                f"routes at rank={rank}, layer={layer}, expert={expert}"
+            )
+        recv_meta[rank, :, rank, :n_local_experts] = self_rows.to(_I32)
+    recv_meta[:, :, :, n_local_experts:] = 0
+
+    derived_i64 = recv_meta[:, :, :, :n_local_experts].sum(
         dim=2,
         dtype=torch.int64,
     )
-    if bool(torch.any(counts_i64 > torch.iinfo(_I32).max)):
+    if bool(torch.any(derived_i64 > torch.iinfo(_I32).max)):
         raise OverflowError("local expert count exceeds INT32")
-    return recv_meta, counts_i64.to(_I32)
+    if not torch.equal(derived_i64, explicit_i64):
+        mismatch = torch.nonzero(
+            derived_i64 != explicit_i64,
+            as_tuple=False,
+        )[0].tolist()
+        raise ValueError(
+            "explicit dispatch counts disagree with reconstructed recv_meta "
+            f"at index={mismatch}"
+        )
+    return recv_meta, explicit_counts
 
 
 class FiveLayerMoeRouteHolder(WholeDecodeHolder):
@@ -84,6 +145,8 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
         self.program_name = "five_layer_moe_route"
         self._hidden_l3_out = None
         self._hidden_l4_out = None
+        self._local_expert_count_l3_out = None
+        self._local_expert_count_l4_out = None
         self._recv_meta_l3_out = None
         self._recv_meta_l4_out = None
 
@@ -307,6 +370,16 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
         self.v_cache = _zsh(tp, kvc, head_dim)
         self._hidden_l3_out = _zsh(tp, batch, hidden)
         self._hidden_l4_out = _zsh(tp, batch, hidden)
+        self._local_expert_count_l3_out = _zsh(
+            tp,
+            self._focused.n_local_experts,
+            dtype=_I32,
+        )
+        self._local_expert_count_l4_out = _zsh(
+            tp,
+            self._focused.n_local_experts,
+            dtype=_I32,
+        )
         self._recv_meta_l3_out = _zsh(
             tp,
             tp,
@@ -447,6 +520,8 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
             self.v_cache,
             self._hidden_l3_out,
             self._hidden_l4_out,
+            self._local_expert_count_l3_out,
+            self._local_expert_count_l4_out,
             self._recv_meta_l3_out,
             self._recv_meta_l4_out,
             self.num_tokens_per_owner,
@@ -491,6 +566,8 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
         recv_meta, local_expert_count = assemble_route_outputs(
             self._recv_meta_l3_out,
             self._recv_meta_l4_out,
+            local_expert_count_l3=self._local_expert_count_l3_out,
+            local_expert_count_l4=self._local_expert_count_l4_out,
             tp=self.tp,
             n_local_experts=self._focused.n_local_experts,
             n_local_experts_pad=self._focused.n_local_experts_pad,

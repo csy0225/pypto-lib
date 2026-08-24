@@ -2721,6 +2721,9 @@ class WholeDecodeStep3p5:
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+        local_expert_count: pl.Out[
+            pl.Tensor[[n_local_experts], pl.INT32]
+        ],
         attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
         attn_signal_window: pld.DistributedTensor[[COMM_SIGNAL_STRIDE_I32, 1], pl.INT32],
         recv_meta: pld.DistributedTensor[
@@ -2812,9 +2815,6 @@ class WholeDecodeStep3p5:
             [local_recv_max], dtype=pl.INT32,
         )
         local_expert_offset = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
-        )
-        local_expert_count = pl.create_tensor(
             [n_local_experts], dtype=pl.INT32,
         )
         (
@@ -2925,6 +2925,9 @@ class WholeDecodeStep3p5:
         w_down_s: pl.Tensor[[sh_inter_local, HIDDEN], pl.BF16],
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+        local_expert_count: pl.Out[
+            pl.Tensor[[n_local_experts], pl.INT32]
+        ],
         attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
         attn_signal_window: pld.DistributedTensor[[COMM_SIGNAL_STRIDE_I32, 1], pl.INT32],
         recv_meta: pld.DistributedTensor[
@@ -3015,9 +3018,6 @@ class WholeDecodeStep3p5:
             [local_recv_max], dtype=pl.INT32,
         )
         local_expert_offset = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
-        )
-        local_expert_count = pl.create_tensor(
             [n_local_experts], dtype=pl.INT32,
         )
         (
@@ -4161,6 +4161,9 @@ class WholeDecodeStep3p5:
             moe_epoch = pl.cast(layer_idx + 1, pl.INT32)
             h_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             resid_hold_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+            local_expert_count_moe = pl.create_tensor(
+                [n_local_experts], dtype=pl.INT32,
+            )
             # full_moe at layer_idx % 4 == 1 (physical 4,8,12,...). full_idx =
             # (layer_idx - 1) // 4 maps {1,5,9,...} -> {0,1,2,...,9}.
             # swa_idx = layer_idx - full_count_so_far; computed inside branch.
@@ -4210,6 +4213,7 @@ class WholeDecodeStep3p5:
                     pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
                     h_moe,
                     resid_hold_moe,
+                    local_expert_count_moe,
                     pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
                     pl.slice(moe_attn_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], [moe_sig_off, 0]),
                     pl.slice(moe_recv_meta_stack, [n_ranks, n_local_experts_pad], [0, 0]),
@@ -4279,6 +4283,7 @@ class WholeDecodeStep3p5:
                     pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [moe_sh_down_off, 0]),
                     h_moe,
                     resid_hold_moe,
+                    local_expert_count_moe,
                     pl.slice(moe_attn_tmp_stack, [BATCH, HIDDEN], [moe_win_off, 0]),
                     pl.slice(moe_attn_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], [moe_sig_off, 0]),
                     pl.slice(moe_recv_meta_stack, [n_ranks, n_local_experts_pad], [0, 0]),

@@ -590,8 +590,8 @@ def test_source_identity_contract_matches_only_the_selected_policy() -> None:
     matching = _source_identity_contract(
         "candidate",
         (
-            "a17ae27440a4ff0e62f7fe8b6dc2d554"
-            "8217ef617b0ddbccb927fda648600d01"
+            "671a5df8a07e09303c398871fd1772f306b2998e"
+            "a3e8168048588de6cc3fa323"
         ),
     )
     assert matching["available"]
@@ -599,11 +599,11 @@ def test_source_identity_contract_matches_only_the_selected_policy() -> None:
 
     mismatch = _source_identity_contract(
         "candidate",
-        "a17ae274" + "0" * 56,
+        "671a5df8" + "0" * 56,
     )
     assert mismatch["available"]
     assert not mismatch["pass"]
-    assert mismatch["expected_decode_sha256_prefix"] == "a17ae274"
+    assert mismatch["expected_decode_sha256_prefix"] == "671a5df8"
 
     missing = _source_identity_contract("candidate", None)
     assert not missing["available"]
@@ -671,8 +671,8 @@ def test_route_histogram_sidecar_must_match_source_policy(tmp_path) -> None:
         _route_histogram_contract(sidecar, profile="candidate")
 
     exact_decode_sha = (
-        "a17ae27440a4ff0e62f7fe8b6dc2d554"
-        "8217ef617b0ddbccb927fda648600d01"
+        "671a5df8a07e09303c398871fd1772f306b2998e"
+        "a3e8168048588de6cc3fa323"
     )
     payload["provenance"]["source"]["decode_fwd_sha256"] = exact_decode_sha
     payload["provenance"]["formal_golden"][
@@ -1111,7 +1111,7 @@ def test_frozen_source_policies_match_the_actual_campaign_families() -> None:
             "enforce_candidate_release_gate",
         )
     } == {
-        "decode_sha256_prefix": "a17ae274",
+        "decode_sha256_prefix": "671a5df8",
         "source_role": "candidate",
         "storage_family": "row16_staged_fused_gate_up_local_tiles",
         "schedule_family": "staged_fused_gate_up_then_aiv_act_quant_down",

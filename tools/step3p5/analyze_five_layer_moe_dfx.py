@@ -87,11 +87,16 @@ _CHECKPOINT_SCHEMA = "step3p5.checkpoint-identity.v1"
 _BASELINE_DECODE_SHA256 = (
     "3553664cbe5bba2453b17b992c9c8a5489deb0df8f88b98d4a93a1aa45544ff0"
 )
-_A17_DECODE_SHA256 = (
-    "a17ae27440a4ff0e62f7fe8b6dc2d5548217ef617b0ddbccb927fda648600d01"
+# The route-sidecar release adds the explicit L3/L4 route-count outputs used by
+# the formal route gate.  Its decode source is intentionally frozen separately
+# from the earlier a17 candidate so a DFX capture cannot silently mix source
+# generations.
+_R6_ROUTE_DECODE_SHA256 = (
+    "671a5df8a07e09303c398871fd1772f306b2998ea3e8168048588de6cc3fa323"
 )
 # These are the only upper bounds carried from the release-qualified R5
-# packed-fused analyzer.  R5 had a single mixed fused stage; a17 splits the
+# packed-fused analyzer.  R5 had a single mixed fused stage; the route-sidecar
+# candidate splits the
 # same work into AIC gate/up, AIV act/quant, and AIC down.  We therefore keep
 # the proven upper scheduling bounds but do not invent a lower bound for the
 # separately named gate/up stage.
@@ -115,10 +120,10 @@ _FROZEN_SOURCE_POLICIES = {
         "enforce_candidate_release_gate": False,
     },
     "candidate": {
-        "policy_id": "campaign-candidate-a17ae274-staged-fused-gate-up-v1",
-        "frozen_ref": "stepfun/develop@69ad31e",
-        "decode_sha256_prefix": "a17ae274",
-        "decode_sha256": _A17_DECODE_SHA256,
+        "policy_id": "campaign-candidate-671a5df8-route-sidecar-staged-fused-v1",
+        "frozen_ref": "stepfun/develop@22492c2",
+        "decode_sha256_prefix": "671a5df8",
+        "decode_sha256": _R6_ROUTE_DECODE_SHA256,
         "source_role": "candidate",
         "storage_family": "row16_staged_fused_gate_up_local_tiles",
         "schedule_family": "staged_fused_gate_up_then_aiv_act_quant_down",
@@ -2712,7 +2717,7 @@ def _expert_kernel_release_contract(
         "duration_errors": duration_errors,
         "activation_errors": activation_errors,
         "interpretation": (
-            "The a17ae274 frozen candidate is selected by exact source SHA, "
+            "The 671a5df8 route-sidecar candidate is selected by exact source SHA, "
             "not by task-name inference. Its staged_fused_gate_up family "
             "requires AIC gate_up/down coverage and AIV-only activation and "
             "quant coverage on every execution-nonempty rank. R5's "

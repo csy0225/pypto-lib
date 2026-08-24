@@ -58,8 +58,8 @@ KEY+MAP SCHEMA
 
 The ``map`` keys are exactly the ``models.step3p5.weight_loader.KEY_*``
 constants so the worker can hand the whole-decode program the same names it
-already expects. ``KEY_MOE_GATE_W`` and ``KEY_MOE_ROUTER_BIAS`` are fp32;
-every other key is bf16 (see ``weight_loader._fp32_keys``).
+already expects. Router gate matrices (legacy or explicit ``*_NK`` key)
+and ``KEY_MOE_ROUTER_BIAS`` are FP32; every other unquantized key is BF16.
 
 PADDING / ALIGNMENT
 -------------------
@@ -117,8 +117,8 @@ _H2D = 1                           # ACL_MEMCPY_HOST_TO_DEVICE
 _ALIGN = 512                       # per-weight byte alignment inside the pool
 
 # Bundle keys that are FP32 (everything else is BF16).
-# Mirrors weight_loader.py fp32_keys = {KEY_MOE_GATE_W, KEY_MOE_ROUTER_BIAS}.
-_FP32_KEYS = {"moe_gate_w", "moe_router_bias"}
+# Mirrors the legacy and checkpoint-native router keys in weight_loader.py.
+_FP32_KEYS = {"moe_gate_w", "moe_gate_w_nk", "moe_router_bias"}
 
 
 def _dtype_for(key: str) -> str:
@@ -160,7 +160,9 @@ _ROUTED_FP32_SCALE_KEYS = (
     "moe_w_down_r_scale",
 )
 # Router gate matrix + bias are FP32 regardless of routed quantization.
-_ROUTER_FP32_KEYS = ("moe_gate_w", "moe_router_bias")
+_ROUTER_FP32_KEYS = (
+    "moe_gate_w", "moe_gate_w_nk", "moe_router_bias",
+)
 
 
 def _prod(shape) -> int:
@@ -574,13 +576,21 @@ def _prepare_checkpoint_bundle(
     import torch  # noqa: PLC0415
 
     bundle = load_step3p5_weights_for_rank(
-        ckpt_dir, rank, tp_world_size, int8_routed=int8_routed,
+        ckpt_dir,
+        rank,
+        tp_world_size,
+        int8_routed=int8_routed,
+        decode_native_moe=production_hidden_only,
     )
-    verify_bundle_shapes(bundle, tp_world_size)
+    verify_bundle_shapes(
+        bundle,
+        tp_world_size,
+        decode_native_moe=production_hidden_only,
+    )
     # The whole_decode host_orch expects FP32 for the norm weights + final_norm
     # (matching the dummy device harness), but weight_loader stores norms as bf16.
     # Zero-copy IPC cannot cast at read time, so materialize FP32 bytes here so the
-    # exported pool + map dtype are FP32 (moe_gate_w/moe_router_bias already FP32).
+    # exported pool + map dtype are FP32 (router weights are already FP32).
     _PROG_FP32 = (
         "input_rms_weight",
         "post_attn_rms_weight",
@@ -701,7 +711,6 @@ def export_mtp_hidden_weights_from_checkpoint(
     import torch  # noqa: PLC0415
     from models.step3p5 import weight_loader as keys  # noqa: PLC0415
     from models.step3p5.config import (  # noqa: PLC0415
-        HEAD_DIM,
         HIDDEN,
         INTERMEDIATE,
         NUM_HEADS_SWA,

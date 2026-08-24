@@ -133,6 +133,7 @@ from .config import (
     ROPE_SCALING,
     ROPE_SEQ_DYN,
     ROTARY_HALF_FULL,
+    TP_ALL_REDUCE_CHUNK,
     TP_WORLD_SIZE,
     USER_BATCH_DYN,
     is_full_attention,
@@ -1498,44 +1499,80 @@ def attention_full(
     # peers); skip the function call entirely so the orchestration codegen
     # does not emit a stale SSA rename for the (now-empty) ring body.
     if TP_WORLD_SIZE > 1:
-        partial_attn_proj = self.tp_all_reduce(
-            partial_attn_proj,
-            tmp_window,
-            signal_window,
-            num_tokens,
-            my_rank,
-        )
+        if num_tokens == 1:
+            resid1_out = self.tp_all_reduce_residual_bs1(
+                partial_attn_proj,
+                resid1_out,
+                tmp_window,
+                signal_window,
+                my_rank,
+            )
+        else:
+            partial_attn_proj = self.tp_all_reduce(
+                partial_attn_proj,
+                tmp_window,
+                signal_window,
+                num_tokens,
+                my_rank,
+            )
 
-    # ----- Scope 3.c — residual add (post-all-reduce). -----
-    # ``current_hidden`` is replicated across TP ranks, so each rank adds
-    # the same residual to the same reduced sum — every rank ends up with
-    # the same ``resid1_out``.
-    for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
-        for ob in pl.spmd(
-            HIDDEN // FULL_ATTN_OUT_PROJ_VEC_N_CHUNK,
-            name_hint="full_out_resid_add",
-        ):
-            o0 = ob * FULL_ATTN_OUT_PROJ_VEC_N_CHUNK
-            reduced = pl.cast(
-                pl.slice(
-                    partial_attn_proj,
-                    [BATCH_TILE, FULL_ATTN_OUT_PROJ_VEC_N_CHUNK],
-                    [b0, o0],
-                ),
-                target_type=pl.FP32,
-            )
-            resid = pl.cast(
-                pl.slice(
+            for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
+                for ob in pl.spmd(
+                    HIDDEN // FULL_ATTN_OUT_PROJ_VEC_N_CHUNK,
+                    name_hint="full_out_resid_add",
+                ):
+                    o0 = ob * FULL_ATTN_OUT_PROJ_VEC_N_CHUNK
+                    reduced = pl.cast(
+                        pl.slice(
+                            partial_attn_proj,
+                            [BATCH_TILE, FULL_ATTN_OUT_PROJ_VEC_N_CHUNK],
+                            [b0, o0],
+                        ),
+                        target_type=pl.FP32,
+                    )
+                    resid = pl.cast(
+                        pl.slice(
+                            resid1_out,
+                            [BATCH_TILE, FULL_ATTN_OUT_PROJ_VEC_N_CHUNK],
+                            [b0, o0],
+                        ),
+                        target_type=pl.FP32,
+                    )
+                    resid_sum = pl.add(reduced, resid)
+                    resid1_out = pl.assemble(
+                        resid1_out,
+                        pl.cast(resid_sum, target_type=pl.BF16),
+                        [b0, o0],
+                    )
+    else:
+        for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
+            for ob in pl.spmd(
+                HIDDEN // FULL_ATTN_OUT_PROJ_VEC_N_CHUNK,
+                name_hint="full_out_resid_add",
+            ):
+                o0 = ob * FULL_ATTN_OUT_PROJ_VEC_N_CHUNK
+                reduced = pl.cast(
+                    pl.slice(
+                        partial_attn_proj,
+                        [BATCH_TILE, FULL_ATTN_OUT_PROJ_VEC_N_CHUNK],
+                        [b0, o0],
+                    ),
+                    target_type=pl.FP32,
+                )
+                resid = pl.cast(
+                    pl.slice(
+                        resid1_out,
+                        [BATCH_TILE, FULL_ATTN_OUT_PROJ_VEC_N_CHUNK],
+                        [b0, o0],
+                    ),
+                    target_type=pl.FP32,
+                )
+                resid_sum = pl.add(reduced, resid)
+                resid1_out = pl.assemble(
                     resid1_out,
-                    [BATCH_TILE, FULL_ATTN_OUT_PROJ_VEC_N_CHUNK],
+                    pl.cast(resid_sum, target_type=pl.BF16),
                     [b0, o0],
-                ),
-                target_type=pl.FP32,
-            )
-            resid_sum = pl.add(reduced, resid)
-            resid1_out = pl.assemble(
-                resid1_out, pl.cast(resid_sum, target_type=pl.BF16), [b0, o0],
-            )
+                )
 
     return resid1_out
 
@@ -1621,6 +1658,105 @@ def _build_tp_attention_full_program(tp_size: int = TP_WORLD_SIZE):
                     [0, k0], local,
                 )
             return local
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def tp_all_reduce_residual_bs1(
+            self,
+            local: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            residual_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+            tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
+            signal_window: pld.DistributedTensor[[tp_size, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+            group_size = tp_size
+
+            # Self-target TPUT drains before the publication wave (PTOAS#872).
+            pld.tensor.put(
+                dst=tmp_window,
+                peer=my_rank,
+                src=local,
+                dst_offsets=[0, 0],
+                src_offsets=[0, 0],
+                shape=[1, HIDDEN],
+                chunk_rows=1,
+                chunk_cols=TP_ALL_REDUCE_CHUNK,
+            )
+
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=1, cmp=pld.WaitCmp.Ge,
+                    )
+
+            own_row = pl.load(tmp_window, [0, 0], [1, HIDDEN])
+            row_acc = pl.mul(
+                pl.cast(own_row, target_type=pl.FP32),
+                0.0,
+            )
+            for peer in pl.range(group_size):
+                if peer == my_rank:
+                    row_acc = pl.add(
+                        row_acc,
+                        pl.cast(own_row, target_type=pl.FP32),
+                    )
+                else:
+                    remote_row = pld.tile.remote_load(
+                        tmp_window,
+                        peer=peer,
+                        offsets=[0, 0],
+                        shape=[1, HIDDEN],
+                    )
+                    row_acc = pl.add(
+                        row_acc,
+                        pl.cast(remote_row, target_type=pl.FP32),
+                    )
+            reduced_bf16 = pl.cast(row_acc, target_type=pl.BF16)
+            pl.store(reduced_bf16, [0, 0], local)
+
+            # Close the peer-read lifetime before the local residual epilogue.
+            for peer in pl.range(group_size):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=signal_window, peer=peer,
+                        offsets=[my_rank, 0], value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(group_size):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=signal_window, offsets=[src, 0],
+                        expected=2, cmp=pld.WaitCmp.Ge,
+                    )
+
+            for k0 in pl.range(0, HIDDEN, TP_ALL_REDUCE_CHUNK):
+                reduced_chunk = pl.load(
+                    local,
+                    [0, k0],
+                    [1, TP_ALL_REDUCE_CHUNK],
+                )
+                residual_chunk = pl.load(
+                    residual_out,
+                    [0, k0],
+                    [1, TP_ALL_REDUCE_CHUNK],
+                )
+                residual_sum = pl.add(
+                    pl.cast(reduced_chunk, target_type=pl.FP32),
+                    pl.cast(residual_chunk, target_type=pl.FP32),
+                )
+                pl.store(
+                    pl.cast(residual_sum, target_type=pl.BF16),
+                    [0, k0],
+                    residual_out,
+                )
+            return residual_out
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_orch(  # noqa: PLR0913

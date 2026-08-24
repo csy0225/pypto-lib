@@ -126,7 +126,7 @@ class FiveLayerMoeFocused:
             [N_DENSE_FIVE * INTER_LOCAL, HIDDEN], pl.BF16
         ],
         moe_gate_w: pl.Tensor[
-            [N_MOE_FIVE * HIDDEN, N_EXPERTS], pl.FP32
+            [N_MOE_FIVE * N_EXPERTS, HIDDEN], pl.FP32
         ],
         moe_router_bias: pl.Tensor[
             [N_MOE_FIVE * N_EXPERTS], pl.FP32
@@ -150,10 +150,10 @@ class FiveLayerMoeFocused:
             [N_MOE_FIVE * n_local_experts, HIDDEN], pl.FP32
         ],
         moe_w_gate_s: pl.Tensor[
-            [N_MOE_FIVE * HIDDEN, sh_inter_local], pl.BF16
+            [N_MOE_FIVE * sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_up_s: pl.Tensor[
-            [N_MOE_FIVE * HIDDEN, sh_inter_local], pl.BF16
+            [N_MOE_FIVE * sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_down_s: pl.Tensor[
             [N_MOE_FIVE * sh_inter_local, HIDDEN], pl.BF16
@@ -454,7 +454,7 @@ class FiveLayerMoeFocused:
                 [2 * nh_swa_pad, 0],
             ),
             post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [0, 0]),
+            pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [0, 0]),
             pl.slice(moe_router_bias, [N_EXPERTS], [0]),
             pl.reshape(
                 pl.slice(
@@ -495,8 +495,8 @@ class FiveLayerMoeFocused:
                 [n_local_experts, HIDDEN],
                 [0, 0],
             ),
-            pl.slice(moe_w_gate_s, [HIDDEN, sh_inter_local], [0, 0]),
-            pl.slice(moe_w_up_s, [HIDDEN, sh_inter_local], [0, 0]),
+            pl.slice(moe_w_gate_s, [sh_inter_local, HIDDEN], [0, 0]),
+            pl.slice(moe_w_up_s, [sh_inter_local, HIDDEN], [0, 0]),
             pl.slice(moe_w_down_s, [sh_inter_local, HIDDEN], [0, 0]),
             hidden_l3,
             resid_l3,
@@ -564,7 +564,7 @@ class FiveLayerMoeFocused:
                 [nh_full_pad, 0],
             ),
             post_rms,
-            pl.slice(moe_gate_w, [HIDDEN, N_EXPERTS], [HIDDEN, 0]),
+            pl.slice(moe_gate_w, [N_EXPERTS, HIDDEN], [N_EXPERTS, 0]),
             pl.slice(moe_router_bias, [N_EXPERTS], [N_EXPERTS]),
             pl.reshape(
                 pl.slice(
@@ -607,13 +607,13 @@ class FiveLayerMoeFocused:
             ),
             pl.slice(
                 moe_w_gate_s,
-                [HIDDEN, sh_inter_local],
-                [HIDDEN, 0],
+                [sh_inter_local, HIDDEN],
+                [sh_inter_local, 0],
             ),
             pl.slice(
                 moe_w_up_s,
-                [HIDDEN, sh_inter_local],
-                [HIDDEN, 0],
+                [sh_inter_local, HIDDEN],
+                [sh_inter_local, 0],
             ),
             pl.slice(
                 moe_w_down_s,
@@ -722,7 +722,7 @@ class FiveLayerMoeFocused:
             [tp_size, N_DENSE_FIVE, INTER_LOCAL, HIDDEN], pl.BF16
         ],
         moe_gate_w: pl.Tensor[
-            [tp_size, N_MOE_FIVE, HIDDEN, N_EXPERTS], pl.FP32
+            [tp_size, N_MOE_FIVE, N_EXPERTS, HIDDEN], pl.FP32
         ],
         moe_router_bias: pl.Tensor[
             [tp_size, N_MOE_FIVE, N_EXPERTS], pl.FP32
@@ -767,10 +767,10 @@ class FiveLayerMoeFocused:
             [tp_size, N_MOE_FIVE, n_local_experts, HIDDEN], pl.FP32
         ],
         moe_w_gate_s: pl.Tensor[
-            [tp_size, N_MOE_FIVE, HIDDEN, sh_inter_local], pl.BF16
+            [tp_size, N_MOE_FIVE, sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_up_s: pl.Tensor[
-            [tp_size, N_MOE_FIVE, HIDDEN, sh_inter_local], pl.BF16
+            [tp_size, N_MOE_FIVE, sh_inter_local, HIDDEN], pl.BF16
         ],
         moe_w_down_s: pl.Tensor[
             [tp_size, N_MOE_FIVE, sh_inter_local, HIDDEN], pl.BF16
@@ -934,7 +934,7 @@ class FiveLayerMoeFocused:
                 ),
                 pl.reshape(
                     moe_gate_w[rank],
-                    [N_MOE_FIVE * HIDDEN, N_EXPERTS],
+                    [N_MOE_FIVE * N_EXPERTS, HIDDEN],
                 ),
                 pl.reshape(
                     moe_router_bias[rank],
@@ -966,11 +966,11 @@ class FiveLayerMoeFocused:
                 ),
                 pl.reshape(
                     moe_w_gate_s[rank],
-                    [N_MOE_FIVE * HIDDEN, sh_inter_local],
+                    [N_MOE_FIVE * sh_inter_local, HIDDEN],
                 ),
                 pl.reshape(
                     moe_w_up_s[rank],
-                    [N_MOE_FIVE * HIDDEN, sh_inter_local],
+                    [N_MOE_FIVE * sh_inter_local, HIDDEN],
                 ),
                 pl.reshape(
                     moe_w_down_s[rank],
@@ -1100,6 +1100,12 @@ for _name in _REQUIRED_CANONICAL:
     if _function is None:
         raise RuntimeError(f"canonical program is missing required function {_name}")
     _FUNCTIONS[_name] = _function
+
+_optional = _CANONICAL_PROGRAM.get_function(
+    "tp_all_reduce_residual_bs1"
+)
+if _optional is not None:
+    _FUNCTIONS[_optional.name] = _optional
 
 five_layer_moe = ir.Program(
     list(_FUNCTIONS.values()),

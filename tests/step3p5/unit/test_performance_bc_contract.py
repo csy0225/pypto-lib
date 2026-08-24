@@ -726,39 +726,255 @@ def test_two_layer_tp_all_reduce_matches_canonical() -> None:
     )
 
 
+
+def test_two_layer_tp_all_reduce_residual_bs1_matches_canonical() -> None:
+    _, canonical_tree = _parse(_CANONICAL)
+    _, two_layer_tree = _parse(_TWO_LAYER_PROGRAM)
+    canonical = _method(canonical_tree, "tp_all_reduce_residual_bs1")
+    two_layer = _method(two_layer_tree, "tp_all_reduce_residual_bs1")
+    assert ast.dump(canonical, include_attributes=False) == ast.dump(
+        two_layer,
+        include_attributes=False,
+    )
+
+
+def test_tp_all_reduce_residual_bs1_keeps_protocol_and_rounding_seams() -> None:
+    source, tree = _parse(_CANONICAL)
+    method = _method(tree, "tp_all_reduce_residual_bs1")
+    body = _segment(source, method)
+    normalized = ast.unparse(method)
+
+    assert [arg.arg for arg in method.args.args] == [
+        "self",
+        "local",
+        "residual_out",
+        "tmp_window",
+        "signal_window",
+        "my_rank",
+    ]
+    assert "active_rows" not in body
+    assert "shape=[1, HIDDEN]" in body
+    assert "chunk_rows=1" in body
+    assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
+    assert "for peer in pl.range(group_size):" in body
+    assert "pl.parallel(group_size)" not in body
+    assert "pl.spmd(group_size)" not in body
+
+    calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)]
+    call_paths = [_call_path(call) for call in calls]
+    assert call_paths.count("pld.tensor.put") == 1
+    assert call_paths.count("pld.tile.remote_load") == 1
+    assert call_paths.count("pld.tile.remote_store") == 0
+    assert call_paths.count("pld.system.notify") == 2
+    assert call_paths.count("pld.system.wait") == 2
+
+    waits = [call for call in calls if _call_path(call) == "pld.system.wait"]
+    assert [
+        ast.literal_eval(
+            next(
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg == "expected"
+            ),
+        )
+        for call in waits
+    ] == [1, 2]
+    for call in calls:
+        if _call_path(call) == "pld.system.notify":
+            keywords = {
+                keyword.arg: ast.unparse(keyword.value)
+                for keyword in call.keywords
+            }
+            assert keywords["offsets"] == "[my_rank, 0]"
+            assert keywords["op"] == "pld.NotifyOp.AtomicAdd"
+        elif _call_path(call) == "pld.system.wait":
+            keywords = {
+                keyword.arg: ast.unparse(keyword.value)
+                for keyword in call.keywords
+            }
+            assert keywords["offsets"] == "[src, 0]"
+
+    reduced_cast = normalized.index(
+        "reduced_bf16 = pl.cast(row_acc, target_type=pl.BF16)",
+    )
+    reduced_store = normalized.index(
+        "pl.store(reduced_bf16, [0, 0], local)",
+    )
+    completion_wait = normalized.index("expected=2")
+    residual_reload = normalized.index(
+        "reduced_chunk = pl.load(local, [0, k0], "
+        "[1, TP_ALL_REDUCE_CHUNK])",
+    )
+    assert reduced_cast < reduced_store < completion_wait < residual_reload
+    assert (
+        "for k0 in pl.range(0, HIDDEN, TP_ALL_REDUCE_CHUNK)"
+        in normalized
+    )
+    assert (
+        "residual_sum = pl.add("
+        "pl.cast(reduced_chunk, target_type=pl.FP32), "
+        "pl.cast(residual_chunk, target_type=pl.FP32))"
+        in normalized
+    )
+    residual_sum = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "residual_sum"
+    )
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "row_acc"
+        for node in ast.walk(residual_sum.value)
+    )
+    assert (
+        "pl.store(pl.cast(residual_sum, target_type=pl.BF16), "
+        "[0, k0], residual_out)"
+        in normalized
+    )
+    assert normalized.rstrip().endswith("return residual_out")
+
+
+def test_attention_bs1_fuses_collective_with_residual_only_on_tp_path() -> None:
+    for path, function_name, residual_hint in (
+        (_FULL_ATTN, "attention_full", "full_out_resid_add"),
+        (_SWA_ATTN, "attention_swa", "swa_out_resid_add"),
+    ):
+        source, tree = _parse(path)
+        function = _method(tree, function_name)
+        outer = next(
+            node
+            for node in function.body
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "TP_WORLD_SIZE > 1"
+        )
+        assert len(outer.body) == 1
+        fused_branch = outer.body[0]
+        assert isinstance(fused_branch, ast.If)
+        assert ast.unparse(fused_branch.test) == "num_tokens == 1"
+
+        fused_calls = _method_calls(fused_branch, "tp_all_reduce_residual_bs1")
+        assert len(fused_calls) == 1
+        assert [ast.unparse(arg) for arg in fused_calls[0].args] == [
+            "partial_attn_proj",
+            "resid1_out",
+            "tmp_window",
+            "signal_window",
+            "my_rank",
+        ]
+        assert len(fused_branch.body) == 1
+        fused_assign = fused_branch.body[0]
+        assert isinstance(fused_assign, ast.Assign)
+        assert ast.unparse(fused_assign.targets[0]) == "resid1_out"
+
+        generic_calls = _method_calls(fused_branch, "tp_all_reduce")
+        assert len(generic_calls) == 1
+        assert [ast.unparse(arg) for arg in generic_calls[0].args][-2:] == [
+            "num_tokens",
+            "my_rank",
+        ]
+        generic_source = ast.unparse(
+            ast.Module(body=fused_branch.orelse, type_ignores=[]),
+        )
+        tp1_source = ast.unparse(
+            ast.Module(body=outer.orelse, type_ignores=[]),
+        )
+        assert residual_hint in generic_source
+        assert residual_hint in tp1_source
+        assert residual_hint not in ast.unparse(
+            ast.Module(body=fused_branch.body, type_ignores=[]),
+        )
+        function_source = _segment(source, function)
+        assert function_source.count(
+            "self.tp_all_reduce_residual_bs1("
+        ) == 1
+        assert function_source.count("self.tp_all_reduce(") == 1
+        assert function_source.count(f'name_hint="{residual_hint}"') == 2
+        assert isinstance(function.body[-1], ast.Return)
+        assert ast.unparse(function.body[-1].value) == "resid1_out"
+
+
+def test_attention_bs1_fused_helper_resolves_in_all_inline_callers() -> None:
+    probe = (
+        _ROOT
+        / "tests"
+        / "step3p5"
+        / "probes"
+        / "_probe_single_layer_inline.py"
+    )
+    for path, signal_rows in (
+        (_FULL_ATTN, "tp_size"),
+        (_SWA_ATTN, "tp_size"),
+        (_MTP_HIDDEN, "tp_size"),
+        (probe, "tp"),
+    ):
+        source, tree = _parse(path)
+        method = _method(tree, "tp_all_reduce_residual_bs1")
+        annotations = {
+            arg.arg: ast.unparse(arg.annotation)
+            for arg in method.args.args
+            if arg.annotation is not None
+        }
+        assert signal_rows in annotations["signal_window"]
+        assert [arg.arg for arg in method.args.args][-5:] == [
+            "local",
+            "residual_out",
+            "tmp_window",
+            "signal_window",
+            "my_rank",
+        ]
+        if path == _MTP_HIDDEN:
+            assert "self.tp_all_reduce_residual_bs1(" not in source
+
+    dense_path = _ROOT / "models" / "step3p5" / "dense_mlp.py"
+    assert "tp_all_reduce_residual_bs1" not in dense_path.read_text(
+        encoding="utf-8",
+    )
+
+
 def test_tp_all_reduce_selects_smallmesh_and_keeps_push_gather_fallback() -> None:
     source, tree = _parse(_CANONICAL)
     method = _method(tree, "tp_all_reduce")
     body = _segment(source, method)
+    normalized = ast.unparse(method)
     assert [arg.arg for arg in method.args.args][-2:] == [
         "active_rows_i32",
         "my_rank",
     ]
     assert "if active_rows == 1:" in body
-    assert body.count("pld.tensor.put(") == 2
+    assert body.count("pld.tensor.put(") == 6
     assert "peer=my_rank" in body
     assert "shape=[1, HIDDEN]" in body
     assert "chunk_rows=1" in body
+    for rows in (2, 4, 8, 16):
+        assert f"active_rows <= {rows}" in body
+        assert f"shape=[{rows}, HIDDEN]" in body
+        assert f"chunk_rows={rows}" in body
     assert "for dst in pl.range(group_size):" in body
     assert "pld.tile.remote_store(" in body
     assert "for ar_b0 in pl.range(0, BATCH, BATCH_TILE):" in body
-    assert "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)" in body
+    assert (
+        "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)"
+        in normalized
+    )
     assert "pl.store(reduced_tile, [ar_b0, owned_base], local)" not in body
     assert "chunk_rows=BATCH_TILE" in body
     assert "chunk_cols=TP_ALL_REDUCE_CHUNK" in body
-    assert "shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]" in body
-    assert "ar_copy_tiles = (BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)" in body
+    assert "ar_copy_tiles = (" in body
+    assert "(BATCH // BATCH_TILE) * (HIDDEN // ar_chunk)" in body
     for expected in (1, 2, 3):
         assert f"expected={expected}" in body
 
 
-def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
+def test_tp_all_reduce_uses_only_static_bucket_transfers() -> None:
     source, tree = _parse(_CANONICAL)
     method = _method(tree, "tp_all_reduce")
     body = _segment(source, method)
 
     assert "active_rows = pl.cast(active_rows_i32, pl.INDEX)" in body
     assert "if active_rows > BATCH:" in body
+    assert "if active_rows < 1:" in body
     assert "active_rows = pl.cast(BATCH, pl.INDEX)" in body
     assert "pl.set_validshape(" not in body
     assert "valid_shapes=" not in body
@@ -776,13 +992,14 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
     assert "TP_ALL_REDUCE_OWNED_CHUNK = HIDDEN // TP_WORLD_SIZE" in source
     assert "owned_base = my_rank * TP_ALL_REDUCE_OWNED_CHUNK" in fallback_source
     assert "reduced_tile = pl.cast(acc, target_type=pl.BF16)" in fallback_source
-    assert "shape=[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]" in body
-    assert "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)" in body
+    assert (
+        "pl.store(reduced_tile, [ar_b0, owned_base], tmp_window)"
+        in fallback_source
+    )
     assert "[BATCH_TILE, ar_chunk]" in fallback_source
 
-    # Both branches retain fully static transfer shapes. The selector scalar is
-    # used only to choose the 1-row one-shot mesh; the safety fallback transfers
-    # the complete capacity exactly as the baseline implementation did.
+    # Every selected transfer extent is a literal static bucket. Runtime active
+    # rows only select a branch; they never enter a tile or remote shape.
     put_calls = [
         call
         for call in ast.walk(method)
@@ -790,14 +1007,20 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "put"
     ]
-    assert len(put_calls) == 2
+    assert len(put_calls) == 6
     put_shapes = {
         ast.unparse(keyword.value)
         for call in put_calls
         for keyword in call.keywords
         if keyword.arg == "shape"
     }
-    assert put_shapes == {"[1, HIDDEN]"}
+    assert put_shapes == {
+        "[1, HIDDEN]",
+        "[2, HIDDEN]",
+        "[4, HIDDEN]",
+        "[8, HIDDEN]",
+        "[16, HIDDEN]",
+    }
     assert any(
         "shape" not in {keyword.arg for keyword in call.keywords}
         for call in put_calls
@@ -810,7 +1033,7 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "remote_load"
     ]
-    assert len(remote_loads) == 2
+    assert len(remote_loads) == 6
     remote_shapes = {
         ast.unparse(keyword.value)
         for call in remote_loads
@@ -819,8 +1042,32 @@ def test_tp_all_reduce_keeps_static_fallback_transfers() -> None:
     }
     assert remote_shapes == {
         "[1, HIDDEN]",
+        "[2, TP_ALL_REDUCE_OWNED_CHUNK]",
+        "[4, TP_ALL_REDUCE_OWNED_CHUNK]",
+        "[8, TP_ALL_REDUCE_OWNED_CHUNK]",
+        "[16, TP_ALL_REDUCE_OWNED_CHUNK]",
         "[BATCH_TILE, TP_ALL_REDUCE_OWNED_CHUNK]",
     }
+    all_static_shapes = put_shapes | remote_shapes
+    assert all(
+        "active_rows" not in shape and "bucket_rows" not in shape
+        for shape in all_static_shapes
+    )
+
+    local_load_shapes = {
+        ast.unparse(keyword.value)
+        for call in ast.walk(method)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "load"
+        for keyword in call.keywords
+        if keyword.arg == "shape"
+    }
+    # pl.load carries shape positionally; guard the final-copy buckets in the
+    # normalized fallback source instead.
+    assert not local_load_shapes
+    for rows in (2, 4, 8, 16):
+        assert f"[{rows}, ar_chunk]" in fallback_source
 
 
 def test_tp_all_reduce_smallmesh_keeps_peer_order_and_two_wave_lifetime() -> None:
@@ -854,10 +1101,32 @@ def test_tp_all_reduce_keeps_reduce_scatter_accumulate_serial() -> None:
     # loop kind is not consumed here), and the onephase_par microbenchmark
     # measured parallel re-reduction as slower.
     source, tree = _parse(_CANONICAL)
-    body = _segment(source, _method(tree, "tp_all_reduce"))
+    method = _method(tree, "tp_all_reduce")
+    body = _segment(source, method)
+    normalized = ast.unparse(method)
     assert "for peer in pl.range(group_size):" in body
-    assert "acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)" in body
-    assert body.count("reduced_tile = pl.cast(acc, target_type=pl.BF16)") == 1
+    for suffix in ("2", "4", "8", "16"):
+        assert (
+            f"acc_{suffix} = pl.mul("
+            f"pl.cast(own_tile_{suffix}, target_type=pl.FP32), 0.0)"
+            in normalized
+        )
+    assert (
+        "acc = pl.mul(pl.cast(own_tile, target_type=pl.FP32), 0.0)"
+        in normalized
+    )
+    reduced_casts = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id.startswith("reduced_tile")
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "cast"
+    ]
+    assert len(reduced_casts) == 5
     assert "pl.set_validshape(" not in body
     assert "pl.parallel(group_size)" not in body
 
@@ -1019,7 +1288,38 @@ def test_c3_expert_storage_keeps_fixed_v4_lane_bases() -> None:
     assert "pl.read(local_expert_offset, [e])" not in combine
 
 
-def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
+def test_router_grid_and_postprocess_scale_with_active_batch() -> None:
+    source, tree = _parse(_CANONICAL)
+    gate = _method(tree, "_gate")
+    gate_source = _segment(source, gate)
+    assert "active_tokens = pl.cast(num_tokens, pl.INDEX)" in gate_source
+    assert "active_gate_tiles = (" in gate_source
+    assert "active_tokens + ROUTER_GATE_M_TILE - 1" in gate_source
+    assert ") // ROUTER_GATE_M_TILE" in gate_source
+    assert "gate_n_blocks = N_EXPERTS // ROUTER_GATE_N_CHUNK" in gate_source
+    assert 'name_hint="gate_init"' not in gate_source
+
+    xg = _task_scope(gate, "gate_xg_precompute")
+    fanout = _task_scope(gate, "gate_expert_fanout")
+    xg_call = xg.items[0].context_expr
+    fanout_call = fanout.items[0].context_expr
+    assert isinstance(xg_call, ast.Call)
+    assert isinstance(fanout_call, ast.Call)
+    assert [ast.unparse(arg) for arg in xg_call.args] == ["active_tokens"]
+    assert [ast.unparse(arg) for arg in fanout_call.args] == [
+        "active_gate_tiles * gate_n_blocks"
+    ]
+    fanout_source = _segment(source, fanout)
+    assert "deps=[gate_xg_tid]" in fanout_source
+    assert "b_trans=True" in fanout_source
+
+    topk = _task_scope(gate, "gate_topk")
+    topk_source = _segment(source, topk)
+    assert "for tt in pl.range(active_tokens):" in topk_source
+    assert "[1, ROUTER_SCORE_PAD]" in topk_source
+
+
+def test_shared_mlp_scales_projection_and_down_grids_with_active_batch() -> None:
     source, tree = _parse(_CANONICAL)
     helper = _method(tree, "_expert_shared_local")
     helper_source = _segment(source, helper)
@@ -1037,40 +1337,55 @@ def test_shared_mlp_adapts_down_ownership_without_dynamic_grid() -> None:
         "[BATCH, sh_inter_local], dtype=pl.BF16, manual_dep=True"
         in helper_source
     )
+    assert "active_shared_tiles = (" in helper_source
+    assert "active_tokens + SHARED_GATE_M_TILE - 1" in helper_source
+    assert ") // SHARED_GATE_M_TILE" in helper_source
+    assert "shared_mm_tasks = active_shared_tiles * shared_n_blocks" in helper_source
+    assert "active_down_tiles = (" in helper_source
+    assert "active_tokens + SHARED_DOWN_M_TILE - 1" in helper_source
+    assert ") // SHARED_DOWN_M_TILE" in helper_source
+    assert "shared_down_tasks = active_down_tiles * SHARED_DOWN_WORKERS" in helper_source
 
-    gate = _task_scope(helper, "sh_gate_up_act")
+    gate_mm = _task_scope(helper, "sh_gate_mm")
+    up_mm = _task_scope(helper, "sh_up_mm")
+    act = _task_scope(helper, "sh_gate_up_act")
     down = _task_scope(helper, "sh_down")
-    for scope, blocks in (
-        (gate, "SHARED_GATE_UP_ACT_BLOCKS"),
-        (down, "SHARED_DOWN_WORKERS"),
-    ):
+    for scope in (gate_mm, up_mm, act):
         call = scope.items[0].context_expr
         assert isinstance(call, ast.Call)
         assert _call_path(call) == "pl.spmd"
-        assert [ast.unparse(arg) for arg in call.args] == [blocks]
+        assert [ast.unparse(arg) for arg in call.args] == ["shared_mm_tasks"]
+    down_call = down.items[0].context_expr
+    assert isinstance(down_call, ast.Call)
+    assert _call_path(down_call) == "pl.spmd"
+    assert [ast.unparse(arg) for arg in down_call.args] == [
+        "shared_down_tasks"
+    ]
 
-    gate_source = _segment(source, gate)
-    assert (
-        "for chunk in pl.range(\n"
-        "                worker,\n"
-        "                SHARED_GATE_UP_ACT_CHUNKS,\n"
-        "                SHARED_GATE_UP_ACT_BLOCKS,"
-    ) in gate_source
-    assert "sh_hidden[" in gate_source
-    assert "pl.cast(gated, target_type=pl.BF16)" in gate_source
+    for scope in (gate_mm, up_mm):
+        mm_source = _segment(source, scope)
+        assert "b_trans=True" in mm_source
+        assert "task = pl.tile.get_block_idx()" in mm_source
+        assert "mb = task // shared_n_blocks" in mm_source
+        assert "chunk = task % shared_n_blocks" in mm_source
+
+    act_source = _segment(source, act)
+    assert "deps=[sh_gate_tid, sh_up_tid]" in act_source
+    assert "sh_hidden[" in act_source
+    assert "pl.cast(gated, target_type=pl.BF16)" in act_source
 
     down_source = _segment(source, down)
     assert "deps=[sh_gate_up_tid]" in down_source
-    assert "active_tokens = pl.cast(num_tokens, pl.INDEX)" in down_source
+    assert "task = pl.tile.get_block_idx()" in down_source
+    assert "mb = task // SHARED_DOWN_WORKERS" in down_source
+    assert "worker = task % SHARED_DOWN_WORKERS" in down_source
+    assert "m0 = mb * SHARED_DOWN_M_TILE" in down_source
     assert "if active_tokens <= 1:" in down_source
-    assert "if worker == 0:" in down_source
+    assert "if mb == 0 and worker == 0:" in down_source
     assert "HIDDEN // SHARED_DOWN_N_CHUNK" in down_source
-    assert (
-        "worker,\n"
-        "                    HIDDEN // SHARED_DOWN_N_CHUNK,\n"
-        "                    SHARED_DOWN_WORKERS,"
-        in down_source
-    )
+    assert "[SHARED_DOWN_M_TILE, SHARED_SWIGLU_N_CHUNK]" in down_source
+    assert "[m0, d0]" in down_source
+    assert "SHARED_DOWN_WORKERS" in down_source
     assert down_source.count("sh_hidden,") == 4
 
     generic_call = _method_calls(

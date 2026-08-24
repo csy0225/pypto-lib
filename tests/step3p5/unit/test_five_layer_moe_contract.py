@@ -417,3 +417,43 @@ def test_focused_program_reuses_canonical_compute_functions() -> None:
     }
     assert focused_methods == {"five_layer_chip_orch", "five_layer_host_orch"}
     assert not required.intersection(focused_methods)
+
+
+def test_focused_program_registers_optional_fused_all_reduce_before_build() -> None:
+    _, tree = _parse(_PROGRAM)
+    symbol = "tp_all_reduce_residual_bs1"
+
+    optional_assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [ast.unparse(target) for target in node.targets] == ["_optional"]
+    ]
+    assert len(optional_assignments) == 1
+    lookup = optional_assignments[0].value
+    assert isinstance(lookup, ast.Call)
+    assert ast.unparse(lookup.func) == "_CANONICAL_PROGRAM.get_function"
+    assert [ast.literal_eval(arg) for arg in lookup.args] == [symbol]
+    assert lookup.keywords == []
+
+    conditionals = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "_optional is not None"
+    ]
+    assert len(conditionals) == 1
+    conditional = conditionals[0]
+    assert [ast.unparse(node) for node in conditional.body] == [
+        "_FUNCTIONS[_optional.name] = _optional"
+    ]
+    assert conditional.orelse == []
+
+    program_build = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(ast.unparse(target) == "five_layer_moe" for target in node.targets)
+    )
+    assert tree.body.index(optional_assignments[0]) < tree.body.index(conditional)
+    assert tree.body.index(conditional) < tree.body.index(program_build)

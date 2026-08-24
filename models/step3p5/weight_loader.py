@@ -164,6 +164,7 @@ KEY_DENSE_UP = "dense_w_up"
 KEY_DENSE_DOWN = "dense_w_down"
 
 KEY_MOE_GATE_W = "moe_gate_w"
+KEY_MOE_GATE_W_NK = "moe_gate_w_nk"
 KEY_MOE_ROUTER_BIAS = "moe_router_bias"
 KEY_MOE_W_GATE_R = "moe_w_gate_r"
 KEY_MOE_W_UP_R = "moe_w_up_r"
@@ -175,7 +176,9 @@ KEY_MOE_W_GATE_R_SCALE = "moe_w_gate_r_scale"
 KEY_MOE_W_UP_R_SCALE = "moe_w_up_r_scale"
 KEY_MOE_W_DOWN_R_SCALE = "moe_w_down_r_scale"
 KEY_MOE_W_GATE_S = "moe_w_gate_s"
+KEY_MOE_W_GATE_S_NK = "moe_w_gate_s_nk"
 KEY_MOE_W_UP_S = "moe_w_up_s"
+KEY_MOE_W_UP_S_NK = "moe_w_up_s_nk"
 KEY_MOE_W_DOWN_S = "moe_w_down_s"
 
 KEY_MTP_ENORM = "mtp_enorm_weight"
@@ -201,7 +204,11 @@ KEY_MTP_DENSE_DOWN = "mtp_dense_w_down"
 # Expected per-rank bundle shape table — single source of truth.
 # Used by both ``verify_bundle_shapes`` and the bundle constructor.
 # =============================================================================
-def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, ...]]:
+def expected_shapes(
+    tp_world_size: int = TP_WORLD_SIZE,
+    *,
+    decode_native_moe: bool = False,
+) -> dict[str, tuple[int, ...]]:
     """Per-rank expected shape for every bundle key."""
     num_heads_full_local = NUM_HEADS_FULL // tp_world_size
     num_heads_swa_local = NUM_HEADS_SWA // tp_world_size
@@ -220,7 +227,7 @@ def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, 
     kv_hidden_local = kv_heads_local * HEAD_DIM
     hidden_local = HIDDEN // tp_world_size
 
-    return {
+    shapes = {
         # Replicated
         KEY_EMBED: (VOCAB, HIDDEN),
         KEY_FINAL_NORM: (HIDDEN,),
@@ -282,6 +289,20 @@ def expected_shapes(tp_world_size: int = TP_WORLD_SIZE) -> dict[str, tuple[int, 
         KEY_MTP_DENSE_UP: (NUM_MTP, HIDDEN, intermediate_local),
         KEY_MTP_DENSE_DOWN: (NUM_MTP, intermediate_local, HIDDEN),
     }
+    if decode_native_moe:
+        shapes.pop(KEY_MOE_GATE_W)
+        shapes.pop(KEY_MOE_W_GATE_S)
+        shapes.pop(KEY_MOE_W_UP_S)
+        shapes[KEY_MOE_GATE_W_NK] = (
+            NUM_MOE_LAYERS, MOE_NUM_EXPERTS, HIDDEN,
+        )
+        shapes[KEY_MOE_W_GATE_S_NK] = (
+            NUM_MOE_LAYERS, share_expert_dim_local, HIDDEN,
+        )
+        shapes[KEY_MOE_W_UP_S_NK] = (
+            NUM_MOE_LAYERS, share_expert_dim_local, HIDDEN,
+        )
+    return shapes
 
 
 # =============================================================================
@@ -611,6 +632,15 @@ def _slice_mlp_col(
     return _to_bf16(out.transpose(0, 1).contiguous())          # [HIDDEN, DIM_LOCAL]
 
 
+def _slice_mlp_col_native(
+    w_full: "torch.Tensor", rank: int, dim_local: int,
+) -> "torch.Tensor":
+    """Keep a TP column slice in checkpoint-native ``[N, K]`` layout."""
+    lo = rank * dim_local
+    hi = lo + dim_local
+    return _to_bf16(w_full[lo:hi, :].contiguous())
+
+
 def _slice_mlp_row(
     w_full: "torch.Tensor", rank: int, dim_local: int,
 ) -> "torch.Tensor":
@@ -664,6 +694,7 @@ def load_step3p5_weights_for_rank(
     tp_world_size: int = TP_WORLD_SIZE,
     *,
     int8_routed: bool = False,
+    decode_native_moe: bool = False,
 ) -> dict[str, "torch.Tensor"]:
     """Construct rank ``rank``'s weight bundle from the HF safetensors ckpt.
 
@@ -675,7 +706,9 @@ def load_step3p5_weights_for_rank(
 
     Returns a flat dict of named ``torch.Tensor``s. Caller stacks them
     along a leading rank axis when constructing a full 8-rank decode
-    invocation (see the hidden-only Main/MTP holders).
+    invocation (see the hidden-only Main/MTP holders). When
+    ``decode_native_moe`` is true, router and shared gate/up matrices use
+    explicit checkpoint-native ``[N, K]`` keys for b_trans matmuls.
     """
     if not 0 <= rank < tp_world_size:
         raise ValueError(
@@ -846,13 +879,17 @@ def load_step3p5_weights_for_rank(
 
         for li in MOE_LAYER_INDICES:
             moe = _hf_moe_keys(li)
-            # gate matmul is stored as ``[NUM_EXPERTS, HIDDEN]`` and is
-            # used in FP32; we transpose to ``[HIDDEN, NUM_EXPERTS]`` to
-            # match the gate kernel's signature.
             gate_w = _to_fp32(cache.get(moe["gate_w"]))
-            if gate_w.shape[0] == MOE_NUM_EXPERTS and gate_w.shape[1] == HIDDEN:
-                gate_w = gate_w.transpose(0, 1).contiguous()
-            gate_w_rows.append(gate_w)
+            if gate_w.shape == (HIDDEN, MOE_NUM_EXPERTS):
+                gate_w = gate_w.transpose(0, 1)
+            if gate_w.shape != (MOE_NUM_EXPERTS, HIDDEN):
+                raise ValueError(
+                    f"unexpected gate weight shape {tuple(gate_w.shape)}"
+                )
+            if decode_native_moe:
+                gate_w_rows.append(gate_w.contiguous())
+            else:
+                gate_w_rows.append(gate_w.transpose(0, 1).contiguous())
             router_bias_rows.append(_to_fp32(cache.get(moe["router_bias"])))
 
             # Routed experts.
@@ -918,17 +955,21 @@ def load_step3p5_weights_for_rank(
                 routed_down_rows.append(_to_bf16(_transpose_routed_block(down_slab)))
 
             # Shared expert: TP-sliced like dense MLP.
-            share_gate_rows.append(_slice_mlp_col(
+            slice_shared = (
+                _slice_mlp_col_native if decode_native_moe else _slice_mlp_col
+            )
+            share_gate_rows.append(slice_shared(
                 cache.get(moe["share_gate"]), rank, share_expert_dim_local,
             ))
-            share_up_rows.append(_slice_mlp_col(
+            share_up_rows.append(slice_shared(
                 cache.get(moe["share_up"]), rank, share_expert_dim_local,
             ))
             share_down_rows.append(_slice_mlp_row(
                 cache.get(moe["share_down"]), rank, share_expert_dim_local,
             ))
 
-        bundle[KEY_MOE_GATE_W] = torch.stack(gate_w_rows, dim=0)
+        gate_key = KEY_MOE_GATE_W_NK if decode_native_moe else KEY_MOE_GATE_W
+        bundle[gate_key] = torch.stack(gate_w_rows, dim=0)
         bundle[KEY_MOE_ROUTER_BIAS] = torch.stack(router_bias_rows, dim=0)
         if int8_routed:
             bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows_i8, dim=0)
@@ -944,8 +985,14 @@ def load_step3p5_weights_for_rank(
             bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows, dim=0)
             bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows, dim=0)
             bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows, dim=0)
-        bundle[KEY_MOE_W_GATE_S] = torch.stack(share_gate_rows, dim=0)
-        bundle[KEY_MOE_W_UP_S] = torch.stack(share_up_rows, dim=0)
+        share_gate_key = (
+            KEY_MOE_W_GATE_S_NK if decode_native_moe else KEY_MOE_W_GATE_S
+        )
+        share_up_key = (
+            KEY_MOE_W_UP_S_NK if decode_native_moe else KEY_MOE_W_UP_S
+        )
+        bundle[share_gate_key] = torch.stack(share_gate_rows, dim=0)
+        bundle[share_up_key] = torch.stack(share_up_rows, dim=0)
         bundle[KEY_MOE_W_DOWN_S] = torch.stack(share_down_rows, dim=0)
 
         # ── MTP layers (45..47). ────────────────────────────────────────
@@ -1044,6 +1091,8 @@ def load_step3p5_weights_for_rank(
 def verify_bundle_shapes(
     bundle: dict[str, "torch.Tensor"],
     tp_world_size: int = TP_WORLD_SIZE,
+    *,
+    decode_native_moe: bool = False,
 ) -> None:
     """Assert every expected key is present with the right shape.
 
@@ -1051,7 +1100,9 @@ def verify_bundle_shapes(
     table in ``expected_shapes``. Does not check dtypes (the loader
     promotes/demotes via ``_to_bf16`` / ``_to_fp32`` already).
     """
-    expected = expected_shapes(tp_world_size)
+    expected = expected_shapes(
+        tp_world_size, decode_native_moe=decode_native_moe,
+    )
     missing = sorted(set(expected) - set(bundle))
     extra = sorted(set(bundle) - set(expected))
     if missing:
@@ -1128,6 +1179,8 @@ COMPACT_DEFAULTS: dict[str, int] = {
 def build_compact_shape_table(
     tp_world_size: int = TP_WORLD_SIZE,
     overrides: dict[str, int] | None = None,
+    *,
+    decode_native_moe: bool = False,
 ) -> dict[str, tuple[int, ...]]:
     """Construct a shape table with scaled-down axes for smoke testing.
 
@@ -1164,7 +1217,7 @@ def build_compact_shape_table(
     H_LOCAL = H // tp_world_size
     V_LOCAL = V // tp_world_size
 
-    return {
+    shapes = {
         KEY_EMBED: (V, H),
         KEY_FINAL_NORM: (H,),
         KEY_INPUT_RMS: (L, H),
@@ -1211,6 +1264,14 @@ def build_compact_shape_table(
         KEY_MTP_DENSE_UP: (MTP, H, I_LOCAL),
         KEY_MTP_DENSE_DOWN: (MTP, I_LOCAL, H),
     }
+    if decode_native_moe:
+        shapes.pop(KEY_MOE_GATE_W)
+        shapes.pop(KEY_MOE_W_GATE_S)
+        shapes.pop(KEY_MOE_W_UP_S)
+        shapes[KEY_MOE_GATE_W_NK] = (LM, EXP, H)
+        shapes[KEY_MOE_W_GATE_S_NK] = (LM, I_LOCAL, H)
+        shapes[KEY_MOE_W_UP_S_NK] = (LM, I_LOCAL, H)
+    return shapes
 
 
 def build_synthetic_bundle(
@@ -1218,6 +1279,8 @@ def build_synthetic_bundle(
     tp_world_size: int = TP_WORLD_SIZE,
     seed: int = 0,
     shape_overrides: dict[str, tuple[int, ...]] | None = None,
+    *,
+    decode_native_moe: bool = False,
 ) -> dict[str, "torch.Tensor"]:
     """Build a per-rank bundle filled with deterministic random values.
 
@@ -1227,10 +1290,14 @@ def build_synthetic_bundle(
     """
     import torch  # noqa: PLC0415
 
-    shapes = shape_overrides or expected_shapes(tp_world_size)
+    shapes = shape_overrides or expected_shapes(
+        tp_world_size, decode_native_moe=decode_native_moe,
+    )
     gen = torch.Generator().manual_seed(seed * 8191 + rank * 17)
     bundle: dict[str, torch.Tensor] = {}
-    fp32_keys = {KEY_MOE_GATE_W, KEY_MOE_ROUTER_BIAS}
+    fp32_keys = {
+        KEY_MOE_GATE_W, KEY_MOE_GATE_W_NK, KEY_MOE_ROUTER_BIAS,
+    }
     for key, shape in shapes.items():
         dtype = torch.float32 if key in fp32_keys else torch.bfloat16
         t = (torch.rand(*shape, generator=gen, dtype=torch.float32) - 0.5) * 0.1
@@ -1269,12 +1336,15 @@ __all__ = [
     "KEY_DENSE_UP",
     "KEY_DENSE_DOWN",
     "KEY_MOE_GATE_W",
+    "KEY_MOE_GATE_W_NK",
     "KEY_MOE_ROUTER_BIAS",
     "KEY_MOE_W_GATE_R",
     "KEY_MOE_W_UP_R",
     "KEY_MOE_W_DOWN_R",
     "KEY_MOE_W_GATE_S",
+    "KEY_MOE_W_GATE_S_NK",
     "KEY_MOE_W_UP_S",
+    "KEY_MOE_W_UP_S_NK",
     "KEY_MOE_W_DOWN_S",
     "KEY_MTP_ENORM",
     "KEY_MTP_HNORM",

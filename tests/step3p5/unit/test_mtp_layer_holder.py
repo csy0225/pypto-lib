@@ -103,6 +103,27 @@ def test_mtp_weight_reshape_preserves_ipc_provenance() -> None:
     assert "DeviceTensor(source.data_ptr" not in body
 
 
+@pytest.mark.parametrize(
+    "device_ids",
+    ([], [0, 2], [1, 0], [0, 0]),
+)
+def test_mtp_holder_rejects_nonconsecutive_logical_rank_mapping(
+    device_ids,
+) -> None:
+    with pytest.raises(ValueError, match="device_ids|logical ranks"):
+        MtpLayerHolder(device_ids, "/tmp/out", "/tmp/ckpt")
+
+
+def test_mtp_holder_accepts_consecutive_nonzero_device_range() -> None:
+    holder = MtpLayerHolder(
+        list(range(8, 16)),
+        "/tmp/out",
+        "/tmp/ckpt",
+    )
+    assert holder.device_ids == list(range(8, 16))
+    assert holder.dev_offset == 8
+
+
 class _CleanupSignal(BaseException):
     pass
 

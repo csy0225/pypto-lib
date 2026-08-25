@@ -11,6 +11,11 @@ from pathlib import Path
 import torch
 
 from tests.step3p5.harnesses import _stage_five_layer_moe as stage
+from tools.step3p5.five_layer_moe_golden_contract import (
+    LEGACY_PROTOCOL_PROFILE,
+    LOCAL_OWNER_PROTOCOL_PROFILE,
+    golden_protocol_fields,
+)
 
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -21,6 +26,7 @@ _PROGRAM = (
     / "harnesses"
     / "_five_layer_moe_program.py"
 )
+_CANONICAL = _ROOT / "models" / "step3p5" / "decode_fwd.py"
 _HOLDER = _ROOT / "tools" / "step3p5" / "five_layer_moe_holder.py"
 _CONFIG = _ROOT / "models" / "step3p5" / "config.py"
 _STAGE = (
@@ -75,6 +81,24 @@ def _calls(function: ast.FunctionDef, name: str) -> list[ast.Call]:
     ]
 
 
+def _bind_positional_call(
+    call: ast.Call,
+    function: ast.FunctionDef,
+) -> dict[str, str]:
+    """Bind a focused call to the canonical callee's formal parameter names."""
+    assert not call.keywords
+    parameters = [
+        arg.arg
+        for arg in function.args.args
+        if arg.arg != "self"
+    ]
+    assert len(call.args) == len(parameters)
+    return {
+        parameter: ast.unparse(argument)
+        for parameter, argument in zip(parameters, call.args, strict=True)
+    }
+
+
 def test_focused_graph_is_exactly_l0_through_l4() -> None:
     source, tree = _parse(_PROGRAM)
     function = _method(tree, "five_layer_chip_orch")
@@ -116,15 +140,19 @@ def test_l4_consumes_the_actual_l3_output_and_both_are_host_outputs() -> None:
         assert annotations["hidden_l4"].startswith("pl.Out[")
 
 
-def test_layer_slots_indices_and_epochs_match_canonical_l0_l4() -> None:
+def test_layer_slots_and_indices_match_canonical_l0_l4() -> None:
     _, tree = _parse(_PROGRAM)
+    _, canonical_tree = _parse(_CANONICAL)
     function = _method(tree, "five_layer_chip_orch")
 
     calls = []
     for node in ast.walk(function):
         if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
             continue
-        target = ast.unparse(node.targets[0])
+        target_node = node.targets[0]
+        if isinstance(target_node, ast.Tuple):
+            target_node = target_node.elts[0]
+        target = ast.unparse(target_node)
         name = _call_name(node.value)
         if target in {"h0", "h1", "h2", "hidden_l3", "hidden_l4"}:
             calls.append((target, name, node.value))
@@ -136,21 +164,71 @@ def test_layer_slots_indices_and_epochs_match_canonical_l0_l4() -> None:
     assert by_target["hidden_l3"][0] == "swa_moe_chip_orch"
     assert by_target["hidden_l4"][0] == "full_moe_chip_orch"
 
-    assert [ast.unparse(arg) for arg in by_target["h0"][1].args[-5:]] == [
-        "0", "0", "0", "num_tokens", "my_rank",
-    ]
-    assert [ast.unparse(arg) for arg in by_target["h1"][1].args[-5:]] == [
-        "1", "0", "0", "num_tokens", "my_rank",
-    ]
-    assert [ast.unparse(arg) for arg in by_target["h2"][1].args[-5:]] == [
-        "2", "0", "0", "num_tokens", "my_rank",
-    ]
-    assert [ast.unparse(arg) for arg in by_target["hidden_l3"][1].args[-5:]] == [
-        "3", "0", "num_tokens", "my_rank", "1",
-    ]
-    assert [ast.unparse(arg) for arg in by_target["hidden_l4"][1].args[-5:]] == [
-        "4", "0", "num_tokens", "my_rank", "2",
-    ]
+    bound = {
+        target: _bind_positional_call(
+            call,
+            _method(canonical_tree, callee),
+        )
+        for target, (callee, call) in by_target.items()
+    }
+    expected_indices = {
+        "h0": {
+            "norm_layer_idx": "0",
+            "attn_layer_idx": "0",
+            "mlp_layer_idx": "0",
+            "num_tokens": "num_tokens",
+            "my_rank": "my_rank",
+        },
+        "h1": {
+            "norm_layer_idx": "1",
+            "attn_layer_idx": "0",
+            "mlp_layer_idx": "0",
+            "num_tokens": "num_tokens",
+            "my_rank": "my_rank",
+        },
+        "h2": {
+            "norm_layer_idx": "2",
+            "attn_layer_idx": "0",
+            "mlp_layer_idx": "0",
+            "num_tokens": "num_tokens",
+            "my_rank": "my_rank",
+        },
+        "hidden_l3": {
+            "norm_layer_idx": "3",
+            "attn_layer_idx": "0",
+            "num_tokens": "num_tokens",
+            "my_rank": "my_rank",
+        },
+        "hidden_l4": {
+            "norm_layer_idx": "4",
+            "attn_layer_idx": "0",
+            "num_tokens": "num_tokens",
+            "my_rank": "my_rank",
+        },
+    }
+    for target, expected in expected_indices.items():
+        assert {
+            parameter: bound[target][parameter]
+            for parameter in expected
+        } == expected
+
+    # The slim local-EP ABI keeps only the shared-output collective windows.
+    # It no longer carries the legacy routed EP windows or an MoE epoch.
+    for target in ("hidden_l3", "hidden_l4"):
+        assert "moe_epoch" not in bound[target]
+    assert bound["hidden_l3"]["sh_tmp_window"] == (
+        "pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [0, 0])"
+    )
+    assert bound["hidden_l3"]["sh_signal_window"] == (
+        "pl.slice(moe_sh_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], [0, 0])"
+    )
+    assert bound["hidden_l4"]["sh_tmp_window"] == (
+        "pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [BATCH, 0])"
+    )
+    assert bound["hidden_l4"]["sh_signal_window"] == (
+        "pl.slice(moe_sh_signal_stack, [COMM_SIGNAL_STRIDE_I32, 1], "
+        "[COMM_SIGNAL_STRIDE_I32, 0])"
+    )
 
     holder = _HOLDER.read_text(encoding="utf-8")
     assert "_FULL_SLOTS = (0, 1)  # L0, L4" in holder
@@ -252,7 +330,7 @@ def test_formal_golden_requires_digest_bound_bit_exact_provenance() -> None:
     assert "--image-digest" in source
     assert "--source-run" in source
     assert "GOLDEN_SCHEMA" in source
-    assert "bit_exact" in source
+    assert "golden_protocol_fields" in source
 
     # The context-length restriction is enforced at the two validation
     # boundaries, rather than in ``main`` itself: ``_configure`` rejects a
@@ -264,8 +342,13 @@ def test_formal_golden_requires_digest_bound_bit_exact_provenance() -> None:
     write_golden = _segment(source, _method(tree, "_write_golden"))
     assert "args.context_len != 65536" in configure
     assert "context_len != 65536" in write_golden
+    assert "protocol_fields = golden_protocol_fields(protocol_profile)" in (
+        write_golden
+    )
+    assert "**protocol_fields" in write_golden
     assert "image_digest=args.image_digest" in source
     assert "source_run=args.source_run" in source
+    assert "protocol_profile=LOCAL_OWNER_PROTOCOL_PROFILE" in source
 
 
 def test_swimlane_gate_uses_official_schema_and_propagates_failure() -> None:
@@ -290,11 +373,15 @@ def test_golden_writer_emits_route_compatible_v3_manifest(
     )
 
     decode_sha = "a" * 64
+    protocol = golden_protocol_fields(LEGACY_PROTOCOL_PROFILE)
     source = {
         "decode_fwd_sha256": decode_sha,
         "program_sha256": "b" * 64,
         "holder_sha256": "c" * 64,
         "harness_sha256": "d" * 64,
+        "moe_protocol_contract_sha256": "f" * 64,
+        "declared_moe_protocol_profile": protocol["protocol_profile"],
+        "declared_moe_protocol_contract": protocol,
     }
     producer = {
         "workload": {
@@ -320,6 +407,12 @@ def test_golden_writer_emits_route_compatible_v3_manifest(
     assert manifest["schema"] == "step3p5.five-layer-moe-golden.v3"
     assert manifest["bit_exact"] is True
     assert manifest["source_kind"] == "baseline"
+    assert manifest["protocol_profile"] == "legacy_distributed_ep"
+    assert manifest["numeric_contract"] == {
+        "name": "legacy_baseline_bit_exact_v1",
+        "comparison": "bit_exact_to_protocol_golden",
+        "bit_exact": True,
+    }
     assert manifest["source_decode_fwd_sha256"] == decode_sha
     contract, tensors = _load_golden_contract(
         tmp_path,
@@ -329,7 +422,68 @@ def test_golden_writer_emits_route_compatible_v3_manifest(
         source_decode_sha256=decode_sha,
     )
     assert contract["bit_exact"]
+    assert contract["protocol_profile"] == "legacy_distributed_ep"
     assert torch.equal(tensors["hidden_l4"], hidden_l4)
+
+
+def test_local_ep_golden_writer_emits_explicit_numeric_contract(
+    tmp_path: Path,
+) -> None:
+    from tests.step3p5.harnesses._stage_five_layer_moe_route import (
+        _load_golden_contract,
+    )
+
+    decode_sha = "a" * 64
+    protocol = golden_protocol_fields(LOCAL_OWNER_PROTOCOL_PROFILE)
+    producer = {
+        "workload": {
+            "active_batch": 1,
+            "context_len": 65536,
+        },
+        "source": {
+            "decode_fwd_sha256": decode_sha,
+            "program_sha256": "b" * 64,
+            "holder_sha256": "c" * 64,
+            "harness_sha256": "d" * 64,
+            "moe_protocol_contract_sha256": "f" * 64,
+            "declared_moe_protocol_profile": protocol[
+                "protocol_profile"
+            ],
+            "declared_moe_protocol_contract": protocol,
+        },
+    }
+    hidden = torch.zeros((8, 1, 4096), dtype=torch.bfloat16)
+    image = "image@sha256:" + "e" * 64
+
+    stage._write_golden(
+        tmp_path,
+        hidden_l3=hidden,
+        hidden_l4=hidden,
+        manifest=producer,
+        image_digest=image,
+        source_run="local-ep-formal-bs1-64k",
+        protocol_profile="replicated_input_local_owner",
+    )
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["source_kind"] == "local-ep"
+    assert manifest["protocol_profile"] == "replicated_input_local_owner"
+    assert len(manifest["source_protocol_binding_sha256"]) == 64
+    assert manifest["numeric_contract"] == {
+        "name": "local_owner_partial_tp_all_reduce_bf16_v1",
+        "comparison": "bit_exact_to_protocol_golden",
+        "bit_exact": True,
+    }
+    contract, _ = _load_golden_contract(
+        tmp_path,
+        active_batch=1,
+        context_len=65536,
+        image_digest=image,
+        source_decode_sha256=decode_sha,
+        expected_protocol_profile="replicated_input_local_owner",
+    )
+    assert contract["source_kind"] == "local-ep"
+    assert contract["numeric_contract"] == manifest["numeric_contract"]
 
 
 def test_64k_workload_is_per_sequence_for_every_required_batch() -> None:

@@ -18,13 +18,18 @@ from tools.step3p5.analyze_five_layer_moe_dfx import (
     _admission_contract,
     _aggregate_findings,
     _arrival_analysis,
+    _arrival_pairs,
     _clock_alignment,
     _combine_dependency_contract,
+    _diagnostic_stage_resources,
     _duration_distribution,
     _execution_limit_classification,
     _expert_kernel_release_contract,
     _external_correctness_contract,
     _find_layer_task_ids,
+    _local_ep_dependency_contract,
+    _local_ep_route_execution_contract,
+    _markdown_stage_order,
     _percentile,
     _predicated_skip_task_ids,
     _raw_swimlane_metadata,
@@ -35,6 +40,8 @@ from tools.step3p5.analyze_five_layer_moe_dfx import (
     _source_policy,
     _stage_metrics,
     _task_id_contract,
+    _timing_evidence_contract,
+    _timing_profile_stages,
     _task_timing_evidence,
     _validate_structural_contracts,
 )
@@ -249,6 +256,133 @@ def _packed_nz_trace(*, skip_l4: bool = False) -> RankTrace:
     )
 
 
+def _local_ep_trace(
+    *,
+    skip_layer: str | None = None,
+) -> RankTrace:
+    specs = (
+        ("l3-shared", "swa_moe_chip_orch_sh_down", (1, 2, -1)),
+        (
+            "l3-pack",
+            "swa_moe_chip_orch_local_route_pack",
+            (-1, 3, -1),
+        ),
+        (
+            "l3-fused",
+            "routed_nz_gmm1_swiglu_quant_aic",
+            (4, 5, 5),
+        ),
+        ("l3-down", "routed_nz_down_aic", (6, 7, 7)),
+        (
+            "l3-combine",
+            "swa_moe_chip_orch_local_combine_reduce",
+            (-1, 8, -1),
+        ),
+        ("l3-ar", "tp_all_reduce", (-1, 9, -1)),
+        (
+            "l3-residual",
+            "swa_moe_chip_orch_moe_residual_add",
+            (-1, 10, -1),
+        ),
+        ("l4-shared", "sh_down", (11, 12, -1)),
+        ("l4-pack", "local_route_pack", (-1, 13, -1)),
+        (
+            "l4-fused",
+            "routed_nz_gmm1_swiglu_quant_aic",
+            (14, 15, 15),
+        ),
+        ("l4-down", "routed_nz_down_aic", (16, 17, 17)),
+        ("l4-combine", "local_combine_reduce", (-1, 18, -1)),
+        ("l4-ar", "tp_all_reduce", (-1, 19, -1)),
+        ("l4-residual", "moe_residual_add", (-1, 20, -1)),
+    )
+    tasks = [
+        Task(
+            task_id=task_id,
+            order=order,
+            name=name,
+            block_num=1,
+            kernel_ids=kernel_ids,
+            early_dispatch=True,
+        )
+        for order, (task_id, name, kernel_ids) in enumerate(specs)
+    ]
+    skipped = (
+        {f"{skip_layer.lower()}-fused", f"{skip_layer.lower()}-down"}
+        if skip_layer is not None
+        else set()
+    )
+    slices_by_task = {
+        task.task_id: [
+            Slice(
+                core=0 if task.kernel_ids[0] >= 0 else 24,
+                task_id=task.task_id,
+                start=task.order * 100,
+                end=task.order * 100 + 10,
+                resource=(
+                    "aic" if task.kernel_ids[0] >= 0 else "aiv"
+                ),
+            )
+        ]
+        for task in tasks
+        if task.task_id not in skipped
+    }
+    edges = []
+    for layer in ("l3", "l4"):
+        edges.extend(
+            [
+                {
+                    "pred": f"{layer}-pack",
+                    "succ": f"{layer}-fused",
+                    "source": "explicit",
+                },
+                {
+                    "pred": f"{layer}-fused",
+                    "succ": f"{layer}-down",
+                    "source": "explicit",
+                },
+                {
+                    "pred": f"{layer}-pack",
+                    "succ": f"{layer}-combine",
+                    "source": "explicit",
+                },
+                {
+                    "pred": f"{layer}-down",
+                    "succ": f"{layer}-combine",
+                    "source": "explicit",
+                },
+                {
+                    "pred": f"{layer}-shared",
+                    "succ": f"{layer}-combine",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-combine",
+                    "succ": f"{layer}-ar",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-ar",
+                    "succ": f"{layer}-residual",
+                    "source": "tensormap",
+                },
+            ]
+        )
+    return RankTrace(
+        tag="rank0/d0",
+        rank_dir=Path("rank0/d0"),
+        frequency_hz=1_000_000,
+        core_types=["aic"] * 24 + ["aiv"] * 48,
+        tasks=tasks,
+        task_by_id={task.task_id: task for task in tasks},
+        slices_by_task=slices_by_task,
+        edges=edges,
+        critical_path={},
+        swimlane_level=4,
+        predicated_skip_task_ids=tuple(sorted(skipped)),
+    )
+
+
 def _fake_resource(
     *,
     p50_us: float = 20.0,
@@ -370,31 +504,22 @@ def _valid_expert_rank() -> dict:
     }
 
 
-def _recv_meta_payload() -> dict:
-    recv_meta = [
+def _local_owner_payload() -> dict:
+    owner_route_counts = [
         [
-            [[0 for _field in range(40)] for _src in range(8)]
-            for _dst in range(8)
+            [[0 for _field in range(40)] for _route_owner in range(8)]
+            for _owner in range(8)
         ]
         for _layer in range(2)
     ]
-    for src in range(8):
-        recv_meta[0][2][src][src] = 8
-        recv_meta[1][2][src][src] = 8
-
-    recv_meta[0][2][0][0] = 6
-    recv_meta[0][2][1][1] = 5
-    recv_meta[1][2][6][6] = 4
-    recv_meta[0][0][0][0] = 2
-    recv_meta[0][0][1][0] = 3
-    recv_meta[1][7][6][35] = 4
+    owner_route_counts[0][0][0][0] = 5
+    owner_route_counts[0][2][2][2] = 3
+    owner_route_counts[1][2][2][6] = 4
+    owner_route_counts[1][7][7][35] = 4
     local_expert_count = [
         [
-            [
-                sum(recv_meta[layer][dst][src][expert] for src in range(8))
-                for expert in range(36)
-            ]
-            for dst in range(8)
+            owner_route_counts[layer][owner][owner][:36]
+            for owner in range(8)
         ]
         for layer in range(2)
     ]
@@ -442,30 +567,35 @@ def _recv_meta_payload() -> dict:
         return hashlib.sha256(payload).hexdigest()
 
     return {
-        "schema": "step3p5.five-layer-moe-recv-meta.v1",
+        "schema": "step3p5.five-layer-moe-local-routes.v2",
         "layers": ["L3", "L4"],
-        "axes": ["layer", "dst_rank", "src_rank", "local_expert_pad"],
-        "recv_meta": recv_meta,
+        "axes": [
+            "layer",
+            "owner_rank",
+            "route_owner_rank",
+            "local_expert_pad",
+        ],
+        "owner_route_counts": owner_route_counts,
         "local_expert_count": local_expert_count,
-        "window_provenance": [
+        "snapshot_provenance": [
             {
                 "layer": "L3",
-                "window_id": "recv-meta-l3",
+                "snapshot_id": "local-owner-routes-l3",
                 "shape": [8, 40],
                 "dtype": "int32",
                 "byte_size": 1280,
-                "source_window": "moe_recv_meta",
-                "source_window_reused": True,
+                "source_tensor": "local_expert_count",
+                "source_protocol": "replicated_input_local_owner",
                 "capture_point": "after_l3_before_l4",
             },
             {
                 "layer": "L4",
-                "window_id": "recv-meta-l4",
+                "snapshot_id": "local-owner-routes-l4",
                 "shape": [8, 40],
                 "dtype": "int32",
                 "byte_size": 1280,
-                "source_window": "moe_recv_meta",
-                "source_window_reused": True,
+                "source_tensor": "local_expert_count",
+                "source_protocol": "replicated_input_local_owner",
                 "capture_point": "after_l4",
             },
         ],
@@ -725,6 +855,384 @@ def test_packed_nz_mapping_rejects_a_broken_dependency_chain() -> None:
         _find_layer_task_ids(trace, "L4")
 
 
+def test_local_ep_external_tasks_are_mapped_by_pack_combine_window() -> None:
+    trace = _local_ep_trace()
+
+    l3 = _find_layer_task_ids(trace, "L3", "local-ep")
+    l4 = _find_layer_task_ids(trace, "L4", "local-ep")
+
+    assert l3["local_route_pack"] == ["l3-pack"]
+    assert l3["expert_gate_up"] == ["l3-fused"]
+    assert l3["expert_down"] == ["l3-down"]
+    assert l3["local_combine_reduce"] == ["l3-combine"]
+    assert l3["moe_all_reduce"] == ["l3-ar"]
+    assert l3["moe_residual_add"] == ["l3-residual"]
+    assert l4["local_route_pack"] == ["l4-pack"]
+    assert l4["expert_gate_up"] == ["l4-fused"]
+    assert l4["expert_down"] == ["l4-down"]
+    assert l4["local_combine_reduce"] == ["l4-combine"]
+    assert l4["moe_all_reduce"] == ["l4-ar"]
+    assert l4["moe_residual_add"] == ["l4-residual"]
+
+    metrics = _rank_metrics(trace, "local-ep")["layers"]
+    assert metrics["L3"]["local_route_pack"]["task_ids"] == ["l3-pack"]
+    assert metrics["L3"]["moe_all_reduce"]["task_ids"] == ["l3-ar"]
+    assert metrics["L4"]["local_combine_reduce"]["task_ids"] == [
+        "l4-combine"
+    ]
+
+
+def test_local_ep_dependency_contract_accepts_complete_two_layer_chain() -> None:
+    trace = _local_ep_trace()
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert contract["pass"]
+    assert _validate_structural_contracts(
+        [trace],
+        "local-ep",
+    )["pass"]
+    for layer in ("L3", "L4"):
+        layer_contract = contract["layers"][layer]
+        assert layer_contract["pass"]
+        assert layer_contract["task_order"]["pass"]
+        assert all(
+            edge["pass"]
+            for edge in layer_contract["required_edges"].values()
+        )
+        assert all(
+            item["pass"]
+            for item in layer_contract["execution"].values()
+        )
+
+
+def test_local_ep_dependency_contract_allows_wider_pack_grid() -> None:
+    trace = _local_ep_trace()
+    original = trace.task_by_id["l3-pack"]
+    wide_pack = Task(
+        task_id=original.task_id,
+        order=original.order,
+        name=original.name,
+        block_num=36,
+        kernel_ids=original.kernel_ids,
+        early_dispatch=original.early_dispatch,
+    )
+    trace.tasks = [
+        wide_pack if task.task_id == wide_pack.task_id else task
+        for task in trace.tasks
+    ]
+    trace.task_by_id[wide_pack.task_id] = wide_pack
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert contract["pass"]
+    l3_pack = contract["layers"]["L3"]["execution"][
+        "local_route_pack"
+    ]
+    assert l3_pack["pass"]
+    assert l3_pack["task_count"] == 1
+    assert trace.task_by_id["l3-pack"].block_num == 36
+
+
+def test_local_ep_dependency_contract_rejects_orphan_pack_producer() -> None:
+    trace = _local_ep_trace()
+    extra_pack = Task(
+        task_id="l3-pack-wide",
+        order=1,
+        name="swa_moe_chip_orch_local_route_pack",
+        block_num=36,
+        kernel_ids=(-1, 21, -1),
+        early_dispatch=True,
+    )
+    trace.tasks.append(extra_pack)
+    trace.task_by_id[extra_pack.task_id] = extra_pack
+    trace.slices_by_task[extra_pack.task_id] = [
+        Slice(24, extra_pack.task_id, 100, 110, "aiv")
+    ]
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert not contract["pass"]
+    required_edges = contract["layers"]["L3"]["required_edges"]
+    assert not required_edges["pack_to_expert_explicit"]["pass"]
+    assert not required_edges["pack_to_combine_explicit"]["pass"]
+    assert (
+        required_edges["pack_to_expert_explicit"][
+            "matches_by_pred_task"
+        ][extra_pack.task_id]
+        == []
+    )
+
+
+def test_local_ep_dependency_contract_accepts_connected_pack_producers() -> None:
+    trace = _local_ep_trace()
+    extra_pack = Task(
+        task_id="l3-pack-wide",
+        order=1,
+        name="swa_moe_chip_orch_local_route_pack",
+        block_num=36,
+        kernel_ids=(-1, 21, -1),
+        early_dispatch=True,
+    )
+    trace.tasks.append(extra_pack)
+    trace.task_by_id[extra_pack.task_id] = extra_pack
+    trace.slices_by_task[extra_pack.task_id] = [
+        Slice(24, extra_pack.task_id, 100, 110, "aiv")
+    ]
+    trace.edges.extend(
+        [
+            {
+                "pred": extra_pack.task_id,
+                "succ": "l3-fused",
+                "source": "explicit",
+            },
+            {
+                "pred": extra_pack.task_id,
+                "succ": "l3-combine",
+                "source": "explicit",
+            },
+        ]
+    )
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert contract["pass"]
+    assert contract["layers"]["L3"]["stage_task_counts"][
+        "local_route_pack"
+    ] == 2
+
+
+@pytest.mark.parametrize(
+    ("pred", "succ", "edge_name"),
+    [
+        ("l4-pack", "l4-fused", "pack_to_expert_explicit"),
+        ("l4-fused", "l4-down", "expert_to_down_explicit"),
+        ("l4-pack", "l4-combine", "pack_to_combine_explicit"),
+        ("l4-down", "l4-combine", "down_to_combine_explicit"),
+        (
+            "l4-shared",
+            "l4-combine",
+            "shared_down_to_combine_data",
+        ),
+        ("l4-combine", "l4-ar", "combine_to_all_reduce_data"),
+        ("l4-ar", "l4-residual", "all_reduce_to_residual_data"),
+    ],
+)
+def test_local_ep_dependency_contract_rejects_missing_required_edges(
+    pred: str,
+    succ: str,
+    edge_name: str,
+) -> None:
+    trace = _local_ep_trace()
+    trace.edges = [
+        edge
+        for edge in trace.edges
+        if not (
+            edge["pred"] == pred
+            and edge["succ"] == succ
+        )
+    ]
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert not contract["pass"]
+    assert not contract["layers"]["L4"]["required_edges"][edge_name]["pass"]
+    with pytest.raises(RuntimeError, match="local_ep_dependency"):
+        _validate_structural_contracts([trace], "local-ep")
+
+
+def test_local_ep_zero_route_allows_only_expert_predicate_skips() -> None:
+    trace = _local_ep_trace(skip_layer="L4")
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert contract["pass"]
+    l4_execution = contract["layers"]["L4"]["execution"]
+    assert l4_execution["expert_gate_up"]["predicated_skip"]
+    assert l4_execution["expert_down"]["predicated_skip"]
+    for stage in (
+        "local_route_pack",
+        "local_combine_reduce",
+        "moe_all_reduce",
+        "moe_residual_add",
+    ):
+        assert l4_execution[stage]["has_physical_slices"]
+        assert not l4_execution[stage]["predicated_skip"]
+
+    trace.slices_by_task["l4-combine"] = []
+    trace.predicated_skip_task_ids += ("l4-combine",)
+    rejected = _local_ep_dependency_contract(trace)
+    assert not rejected["pass"]
+    assert not rejected["layers"]["L4"]["execution"][
+        "local_combine_reduce"
+    ]["pass"]
+
+
+def test_local_ep_route_execution_matches_zero_and_nonzero_routes() -> None:
+    trace = _local_ep_trace(skip_layer="L4")
+    structural = {
+        "local_ep_dependency": {
+            "rank0/d0": _local_ep_dependency_contract(trace),
+        }
+    }
+    route_histogram = {
+        "L3": {
+            "available": True,
+            "histogram": {
+                "rank0/d0": [1] + [0] * 35,
+            },
+        },
+        "L4": {
+            "available": True,
+            "histogram": {
+                "rank0/d0": [0] * 36,
+            },
+        },
+    }
+
+    contract = _local_ep_route_execution_contract(
+        structural,
+        route_histogram,
+        "local-ep",
+    )
+
+    assert contract["available"]
+    assert contract["pass"]
+    assert contract["layers"]["L3"]["ranks"]["rank0/d0"][
+        "expected_expert_state"
+    ] == "executed"
+    assert contract["layers"]["L4"]["ranks"]["rank0/d0"][
+        "expected_expert_state"
+    ] == "predicated_skip"
+    for layer in ("L3", "L4"):
+        rank = contract["layers"][layer]["ranks"]["rank0/d0"]
+        assert all(
+            stage["pass"]
+            for stage in rank["expert_stages"].values()
+        )
+        assert all(
+            stage["pass"]
+            for stage in rank["mandatory_stages"].values()
+        )
+
+
+@pytest.mark.parametrize(
+    ("skip_layer", "l4_route_total", "expected_state"),
+    [
+        (None, 0, "predicated_skip"),
+        ("L4", 1, "executed"),
+    ],
+)
+def test_local_ep_route_execution_rejects_route_state_mismatch(
+    skip_layer: str | None,
+    l4_route_total: int,
+    expected_state: str,
+) -> None:
+    trace = _local_ep_trace(skip_layer=skip_layer)
+    structural = {
+        "local_ep_dependency": {
+            "rank0/d0": _local_ep_dependency_contract(trace),
+        }
+    }
+    route_histogram = {
+        "L3": {
+            "available": True,
+            "histogram": {
+                "rank0/d0": [1] + [0] * 35,
+            },
+        },
+        "L4": {
+            "available": True,
+            "histogram": {
+                "rank0/d0": [l4_route_total] + [0] * 35,
+            },
+        },
+    }
+
+    contract = _local_ep_route_execution_contract(
+        structural,
+        route_histogram,
+        "local-ep",
+    )
+
+    assert contract["available"]
+    assert not contract["pass"]
+    rank = contract["layers"]["L4"]["ranks"]["rank0/d0"]
+    assert rank["expected_expert_state"] == expected_state
+    assert {
+        error["stage"]
+        for error in rank["errors"]
+        if error["code"] == "expert_execution_route_mismatch"
+    } == {"expert_gate_up", "expert_down"}
+
+
+def test_local_ep_route_execution_requires_mandatory_stages() -> None:
+    trace = _local_ep_trace(skip_layer="L4")
+    trace.slices_by_task["l4-ar"] = []
+    trace.predicated_skip_task_ids += ("l4-ar",)
+    structural = {
+        "local_ep_dependency": {
+            "rank0/d0": _local_ep_dependency_contract(trace),
+        }
+    }
+    route_histogram = {
+        layer: {
+            "available": True,
+            "histogram": {
+                "rank0/d0": (
+                    [1] + [0] * 35
+                    if layer == "L3"
+                    else [0] * 36
+                ),
+            },
+        }
+        for layer in ("L3", "L4")
+    }
+
+    contract = _local_ep_route_execution_contract(
+        structural,
+        route_histogram,
+        "local-ep",
+    )
+
+    assert not contract["pass"]
+    errors = contract["layers"]["L4"]["ranks"]["rank0/d0"]["errors"]
+    assert any(
+        error["code"] == "mandatory_stage_not_executed"
+        and error["stage"] == "moe_all_reduce"
+        for error in errors
+    )
+
+
+def test_local_ep_route_execution_waits_for_exact_route_evidence() -> None:
+    contract = _local_ep_route_execution_contract(
+        {"local_ep_dependency": {}},
+        _route_histogram_contract(),
+        "local-ep",
+    )
+
+    assert contract["applicable"]
+    assert not contract["available"]
+    assert contract["pass"] is None
+
+
+def test_local_ep_swim_envelope_overlap_is_diagnostic() -> None:
+    trace = _local_ep_trace()
+    trace.slices_by_task["l4-fused"] = [
+        Slice(0, "l4-fused", 920, 1110, "aic")
+    ]
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert contract["pass"]
+    edge = contract["layers"]["L4"]["local_swim_order"]["edges"][
+        "expert_to_down_explicit"
+    ]
+    assert edge["pass"]
+    assert edge["envelopes_overlap"]
+    assert "allow_early_resolve" in edge["semantics"]
+
+
 def test_duration_distribution_uses_closed_10_to_30_us_gate() -> None:
     distribution = _duration_distribution([9.999, 10.0, 30.0, 30.001])
     assert distribution["min_us"] == 9.999
@@ -788,13 +1296,30 @@ def test_source_identity_contract_matches_only_the_selected_policy() -> None:
     assert packed["pass"]
     assert packed["policy_id"].startswith("release-packed-nz-")
 
+    local_ep_sha256 = (
+        "26c1b06d739c8d32c04c455c23854c4e"
+        "45436049fc60e9496a64df895712a85e"
+    )
+    local_ep = _source_identity_contract("local-ep", local_ep_sha256)
+    assert local_ep["available"]
+    assert local_ep["pass"]
+    assert local_ep["policy_id"].startswith("release-local-ep-")
 
-def test_route_histogram_awaits_recv_meta_without_using_task_counts() -> None:
+    local_ep_mismatch = _source_identity_contract(
+        "local-ep",
+        "0" * 64,
+    )
+    assert local_ep_mismatch["available"]
+    assert not local_ep_mismatch["pass"]
+    assert local_ep_mismatch["expected_decode_sha256"] == local_ep_sha256
+
+
+def test_route_histogram_awaits_local_owner_sidecar_without_task_counts() -> None:
     result = _route_histogram_contract()
     assert not result["L3"]["available"]
     assert not result["L3"]["blocking"]
     assert not result["L3"]["release_gate"]
-    assert result["L3"]["expected_sidecar"] == "recv_meta"
+    assert result["L3"]["expected_sidecar"] == "local_owner_route_counts"
     assert not result["L3"]["proxy_fallback_allowed"]
     assert result["L3"]["histogram"] is None
     assert result["L3"]["publication_evidence_required"]
@@ -803,23 +1328,40 @@ def test_route_histogram_awaits_recv_meta_without_using_task_counts() -> None:
     assert "task count" in " ".join(result["L3"]["rejected_proxies"])
 
 
-def test_route_histogram_validates_exact_recv_meta_sidecar(tmp_path) -> None:
-    sidecar = tmp_path / "recv_meta.json"
-    sidecar.write_text(json.dumps(_recv_meta_payload()), encoding="utf-8")
+def test_route_histogram_validates_exact_local_owner_sidecar(tmp_path) -> None:
+    sidecar = tmp_path / "local_owner_routes.json"
+    sidecar.write_text(json.dumps(_local_owner_payload()), encoding="utf-8")
     result = _route_histogram_contract(sidecar)
     assert result["L3"]["available"]
     assert result["L3"]["histogram"]["rank0/d0"][0] == 5
     assert result["L3"]["total_routed_tokens_by_rank"]["rank0/d0"] == 5
     assert result["L4"]["histogram"]["rank7/d0"][35] == 4
-    assert result["L4"]["window_independence_validated"]
+    assert result["L4"]["snapshot_independence_validated"]
     assert result["L3"]["publication_evidence_ready"]
     assert not result["L3"]["proxy_fallback_allowed"]
     assert result["L3"]["route_totals_validated"]
-    assert result["L3"]["per_layer_per_source"] == [8] * 8
-    assert result["L4"]["per_layer_per_source"] == [8] * 8
-    assert result["L3"]["expected_per_source"] == 8
-    assert result["L3"]["global_per_layer"] == [64, 64]
-    assert result["L4"]["expected_global_per_layer"] == 64
+    assert result["L3"]["per_layer_per_owner"] == [
+        5, 0, 3, 0, 0, 0, 0, 0
+    ]
+    assert result["L4"]["per_layer_per_owner"] == [
+        0, 0, 4, 0, 0, 0, 0, 4
+    ]
+    assert result["L3"]["global_per_layer"] == [8, 8]
+    assert result["L4"]["expected_global_per_layer"] == 8
+    assert result["L3"]["owner_rows_diagonal"]
+    assert (
+        result["L3"]["provenance"]["protocol_profile"]
+        == "legacy_distributed_ep"
+    )
+    assert result["L3"]["provenance"]["numeric_contract"] == {
+        "name": "legacy_baseline_bit_exact_v1",
+        "comparison": "bit_exact_to_protocol_golden",
+        "bit_exact": True,
+    }
+    assert (
+        result["L3"]["snapshot_provenance"]["source_tensor"]
+        == "local_expert_count"
+    )
 
     ranks = {
         "rank0/d0": {"layers": {"L3": {}, "L4": {}}},
@@ -841,8 +1383,8 @@ def test_route_histogram_validates_exact_recv_meta_sidecar(tmp_path) -> None:
 
 
 def test_route_histogram_sidecar_must_match_source_policy(tmp_path) -> None:
-    payload = _recv_meta_payload()
-    sidecar = tmp_path / "recv_meta.json"
+    payload = _local_owner_payload()
+    sidecar = tmp_path / "local_owner_routes.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="does not match source policy"):
         _route_histogram_contract(sidecar, profile="candidate")
@@ -883,7 +1425,7 @@ def test_route_histogram_sidecar_must_match_source_policy(tmp_path) -> None:
 def test_route_histogram_accepts_exact_packed_nz_source_policy(
     tmp_path,
 ) -> None:
-    payload = _recv_meta_payload()
+    payload = _local_owner_payload()
     packed_sha256 = (
         "da36c09dc275838ee364f76342d74717338ef313"
         "d912ba2b372808530489dd14"
@@ -899,7 +1441,7 @@ def test_route_histogram_accepts_exact_packed_nz_source_policy(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-    sidecar = tmp_path / "packed-nz-recv-meta.json"
+    sidecar = tmp_path / "packed-nz-local-owner-routes.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
 
     result = _route_histogram_contract(
@@ -914,47 +1456,147 @@ def test_route_histogram_accepts_exact_packed_nz_source_policy(
     )
 
 
-def test_route_histogram_rejects_overlapping_windows_and_bad_derived_count(
+def test_route_histogram_accepts_exact_local_ep_source_policy(
     tmp_path,
 ) -> None:
-    payload = _recv_meta_payload()
-    payload["window_provenance"][1]["window_id"] = "recv-meta-l3"
+    payload = _local_owner_payload()
+    local_ep_sha256 = (
+        "26c1b06d739c8d32c04c455c23854c4e"
+        "45436049fc60e9496a64df895712a85e"
+    )
+    payload["provenance"]["source"]["decode_fwd_sha256"] = (
+        local_ep_sha256
+    )
+    payload["provenance"]["formal_golden"][
+        "source_decode_fwd_sha256"
+    ] = local_ep_sha256
+    payload["provenance"]["formal_golden"].update(
+        {
+            "source_run": "local-ep-r10-formal-bs1-64k",
+            "source_kind": "local-ep",
+            "protocol_profile": "replicated_input_local_owner",
+            "numeric_contract": {
+                "name": "local_owner_partial_tp_all_reduce_bf16_v1",
+                "comparison": "bit_exact_to_protocol_golden",
+                "bit_exact": True,
+            },
+        }
+    )
+    payload["provenance"]["source_manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload["provenance"]["source"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    sidecar = tmp_path / "local-ep-local-owner-routes.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _route_histogram_contract(
+        sidecar,
+        profile="local-ep",
+        source_decode_sha256=local_ep_sha256,
+    )
+
+    assert result["L3"]["available"]
+    assert result["L3"]["provenance"]["source_policy_id"].startswith(
+        "release-local-ep-"
+    )
+    assert result["L3"]["provenance"]["source_kind"] == "local-ep"
+    assert (
+        result["L3"]["provenance"]["protocol_profile"]
+        == "replicated_input_local_owner"
+    )
+    assert result["L3"]["provenance"]["numeric_contract"] == {
+        "name": "local_owner_partial_tp_all_reduce_bf16_v1",
+        "comparison": "bit_exact_to_protocol_golden",
+        "bit_exact": True,
+    }
+
+
+def test_local_ep_profile_rejects_legacy_or_malformed_protocol_golden(
+    tmp_path,
+) -> None:
+    sidecar = tmp_path / "local-ep-golden-contract.json"
+    payload = _local_owner_payload()
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match expected"):
+        _route_histogram_contract(sidecar, profile="local-ep")
+
+    formal_golden = payload["provenance"]["formal_golden"]
+    formal_golden.update(
+        {
+            "source_kind": "local-ep",
+            "protocol_profile": "replicated_input_local_owner",
+        }
+    )
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="declare protocol_profile and numeric_contract together",
+    ):
+        _route_histogram_contract(sidecar, profile="local-ep")
+
+    formal_golden["numeric_contract"] = {
+        "name": "local_owner_partial_tp_all_reduce_bf16_v1",
+        "comparison": "bit_exact_to_legacy_baseline",
+        "bit_exact": True,
+    }
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="numeric_contract.comparison"):
+        _route_histogram_contract(sidecar, profile="local-ep")
+
+
+def test_route_histogram_rejects_invalid_local_owner_evidence(
+    tmp_path,
+) -> None:
+    payload = _local_owner_payload()
+    payload["snapshot_provenance"][1]["snapshot_id"] = (
+        "local-owner-routes-l3"
+    )
     sidecar = tmp_path / "overlap.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="distinct recv_meta"):
+    with pytest.raises(ValueError, match="distinct route snapshot IDs"):
         _route_histogram_contract(sidecar)
 
-    payload = _recv_meta_payload()
+    payload = _local_owner_payload()
     payload["local_expert_count"][0][0][0] += 1
     sidecar = tmp_path / "bad-count.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="sum_src"):
+    with pytest.raises(ValueError, match="diagonal owner route row"):
         _route_histogram_contract(sidecar)
 
-    payload = _recv_meta_payload()
-    payload["recv_meta"][0][0][0][0] += 1
+    payload = _local_owner_payload()
+    payload["owner_route_counts"][0][0][0][0] += 1
     payload["local_expert_count"][0][0][0] += 1
     sidecar = tmp_path / "bad-route-total.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="route totals invalid"):
         _route_histogram_contract(sidecar)
 
-    payload = _recv_meta_payload()
-    payload["recv_meta"][0][0][0][0] += 1
-    payload["recv_meta"][0][0][1][0] -= 1
-    sidecar = tmp_path / "bad-source-total.json"
+    payload = _local_owner_payload()
+    payload["owner_route_counts"][0][0][1][0] = 1
+    sidecar = tmp_path / "off-owner-row.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="per layer/source must equal"):
+    with pytest.raises(ValueError, match="must be diagonal"):
         _route_histogram_contract(sidecar)
 
-    payload = _recv_meta_payload()
-    payload["window_provenance"][0]["source_window_reused"] = False
-    sidecar = tmp_path / "forged-window.json"
+    payload = _local_owner_payload()
+    payload["snapshot_provenance"][0]["source_tensor"] = "moe_recv_meta"
+    sidecar = tmp_path / "forged-source-tensor.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="source_window_reused"):
+    with pytest.raises(ValueError, match="source_tensor"):
         _route_histogram_contract(sidecar)
 
-    payload = _recv_meta_payload()
+    payload = _local_owner_payload()
+    payload["snapshot_provenance"][0]["source_protocol"] = "source_rank_ep"
+    sidecar = tmp_path / "forged-source-protocol.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="source_protocol"):
+        _route_histogram_contract(sidecar)
+
+    payload = _local_owner_payload()
     del payload["provenance"]["formal_golden"]
     sidecar = tmp_path / "missing-golden.json"
     sidecar.write_text(json.dumps(payload), encoding="utf-8")
@@ -1540,14 +2182,84 @@ def test_execution_limit_classification_keeps_four_causes_distinct() -> None:
     assert up["scheduler_packing"]["classification"] == "suspected"
 
 
+def test_local_ep_profile_selects_local_topology_diagnostics() -> None:
+    assert _arrival_pairs("local-ep") == (
+        (
+            "moe_collective",
+            "local_combine_reduce",
+            "moe_all_reduce",
+        ),
+    )
+    assert set(_diagnostic_stage_resources("local-ep")) == {
+        "local_route_pack",
+        "expert_gate_up",
+        "expert_down",
+        "local_combine_reduce",
+        "moe_all_reduce",
+    }
+    timing_stages = _timing_profile_stages("local-ep")
+    assert "local_route_pack" in timing_stages
+    assert "local_combine_reduce" in timing_stages
+    assert "moe_all_reduce" in timing_stages
+    assert "dispatch_wait" not in timing_stages
+    markdown_stages = _markdown_stage_order("local-ep")
+    assert "local_route_pack" in markdown_stages
+    assert "local_combine_reduce" in markdown_stages
+    assert "moe_all_reduce" in markdown_stages
+    assert "dispatch_wait" not in markdown_stages
+    assert "combine_wait" not in markdown_stages
+
+    legacy_timing_stages = _timing_profile_stages("candidate")
+    assert "combine_wait" in legacy_timing_stages
+    assert "local_combine_reduce" not in legacy_timing_stages
+
+
+def test_local_ep_execution_limit_uses_local_collective_stages() -> None:
+    ranks = {
+        "rank0/d0": {
+            "layers": {
+                "L3": {
+                    "local_route_pack": _fake_stage(resource="aiv"),
+                    "local_combine_reduce": _fake_stage(resource="aiv"),
+                    "moe_all_reduce": _fake_stage(resource="aiv"),
+                },
+                "L4": {},
+            }
+        }
+    }
+
+    result = _execution_limit_classification(
+        ranks,
+        _route_histogram_contract(),
+        "local-ep",
+    )
+
+    stages = result["coverage"]["L3"]["rank0/d0"]["stages"]
+    assert set(stages) == set(_diagnostic_stage_resources("local-ep"))
+    assert stages["local_route_pack"]["execution_observed"]
+    assert stages["local_combine_reduce"]["execution_observed"]
+    assert stages["moe_all_reduce"]["execution_observed"]
+    assert "combine_wait" not in stages
+
+
 def test_hidden_bit_exact_is_explicitly_owned_by_the_outer_gate() -> None:
     contract = _external_correctness_contract()["hidden_state_bit_exact"]
     assert not contract["enforced_here"]
     assert contract["required_artifacts"] == ["hidden_l3.pt", "hidden_l4.pt"]
-    assert "bit-exact" in contract["comparison"]
+    assert "protocol-specific" in contract["comparison"]
+    assert contract["required_manifest_fields"] == [
+        "source_kind",
+        "bit_exact",
+    ]
+    assert contract["local_ep_required_manifest_fields"] == [
+        "source_kind",
+        "protocol_profile",
+        "numeric_contract",
+        "bit_exact",
+    ]
 
 
-def test_candidate_analyzer_passes_without_recv_meta_but_release_is_not_evaluable() -> None:
+def test_candidate_without_local_owner_routes_is_not_evaluable() -> None:
     route_histogram = _route_histogram_contract()
     timing_evidence = {
         "fields": {
@@ -1591,11 +2303,11 @@ def test_candidate_analyzer_passes_without_recv_meta_but_release_is_not_evaluabl
     assert not readiness["publication_allowed"]
 
 
-def test_candidate_with_recv_meta_is_pending_only_the_external_hidden_gate(
+def test_candidate_with_local_owner_routes_is_pending_external_hidden_gate(
     tmp_path,
 ) -> None:
-    sidecar = tmp_path / "recv_meta.json"
-    sidecar.write_text(json.dumps(_recv_meta_payload()), encoding="utf-8")
+    sidecar = tmp_path / "local_owner_routes.json"
+    sidecar.write_text(json.dumps(_local_owner_payload()), encoding="utf-8")
     admission = _admission_contract(
         _route_histogram_contract(sidecar),
         {"fields": {}},
@@ -1702,6 +2414,47 @@ def test_arrival_analysis_disables_cross_rank_subtraction_without_anchor() -> No
     assert combine["earliest_producer_rank"] is None
     assert combine["latest_producer_rank"] is None
     assert all("remote_arrival_after_wait_start_us" not in waiter for waiter in combine["wait_ranks"])
+
+
+def test_local_ep_arrival_reports_only_moe_collective() -> None:
+    traces = [_local_ep_trace(), _local_ep_trace()]
+    traces[1].tag = "rank1/d0"
+    traces[1].rank_dir = Path("rank1/d0")
+    ranks = {
+        trace.tag: _rank_metrics(trace, "local-ep")
+        for trace in traces
+    }
+
+    result = _arrival_analysis(
+        traces,
+        ranks,
+        _clock_alignment(traces),
+        "local-ep",
+    )
+
+    for layer in ("L3", "L4"):
+        assert set(result[layer]) == {"moe_collective"}
+        collective = result[layer]["moe_collective"]
+        assert collective["producer_stage"] == "local_combine_reduce"
+        assert collective["consumer_stage"] == "moe_all_reduce"
+        assert collective["consumer_ranks"] == collective["wait_ranks"]
+        assert len(collective["consumer_ranks"]) == 2
+        assert all(
+            consumer["has_producer_dependency"]
+            for consumer in collective["consumer_ranks"]
+        )
+        assert all(
+            consumer["producer_dependency_sources"] == ["tensormap"]
+            for consumer in collective["consumer_ranks"]
+        )
+
+    timing = _timing_evidence_contract(ranks, "local-ep")
+    assert timing["profiled_stages"] == list(
+        _timing_profile_stages("local-ep")
+    )
+    assert "local_route_pack" in timing["profiled_stages"]
+    assert "moe_all_reduce" in timing["profiled_stages"]
+    assert "combine_wait" not in timing["profiled_stages"]
 
 
 def test_findings_accept_noncomparable_producer_skew() -> None:

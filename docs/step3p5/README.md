@@ -128,21 +128,25 @@ current_hidden[valid_tokens:16] = 0
 num_tokens_per_owner[0:tp] = valid_tokens
 ```
 
-当前 G1 实现已让 gate、dispatch、routed combine 等 MoE row-wise 阶段只处理
+当前 G1 实现已让 gate、local route pack、routed combine 等 MoE row-wise 阶段只处理
 前 `valid_tokens` 行；但 attention、dense/TP scratch 和部分固定 tile 仍保留
 `[16, ...]` storage/compute 形状。尤其 inactive row 当前仍可能执行 attention
 的 KV write，所以 padding metadata 不能省略，也不能指向 scheduler 正在管理
 的 block。sidecar 最终只返回输出的前 `valid_tokens` 行。
 
-#### V4-Flash runtime-active MoE scheduling
+#### Replicated-input local-owner MoE scheduling
 
-The physical EP lane ABI remains fixed at 36 local experts per rank. Runtime
-scheduling changes only the number of data workers issued for the current
-decode step; it does not change buffer shapes, route IDs, expert-lane bases,
-or the epoch wait contract.
+Each MoE layer starts after attention has already reduced the TP partials.
+Every TP rank therefore has the same complete hidden state and runs the same
+router. The decode graph does not copy that activation through an EP dispatch
+exchange. Each rank keeps only routes whose global expert belongs to its
+contiguous 36-expert shard:
 
-This is a token-major hybrid scheduler over the V4-Flash-compatible fixed-lane
-ABI, not a claim of task-for-task equivalence with DeepSeek V4-Flash.
+```text
+owner(eid) = eid // 36
+local_e    = eid - owner(eid) * 36
+out_row    = local_e * 128 + cursor[local_e]
+```
 
 Let:
 
@@ -153,6 +157,11 @@ R = T * TOPK
 A = number of local experts that receive at least one route on this rank
 E = n_local_experts = 36
 ```
+
+The 128-row slab for each local expert is the worst-case `16 * TOPK` route
+capacity. It preserves the packed-NZ external-kernel ABI while ensuring each
+`(token, topk-slot)` route maps to exactly one owner row. Non-owner ranks leave
+that route's `local_route_row` entry at `-1`.
 
 Router and shared-expert compute scale with active M tiles rather than a fixed
 chip-wide task count:
@@ -169,37 +178,49 @@ ownership, not a separate GEMV specialization. The layout, dependency, and
 critical-path rationale is recorded in
 [moe-layout-and-critical-path.md](moe-layout-and-critical-path.md).
 
-The current communication task grids are:
+The active per-rank MoE chain is:
 
-| Swimlane task | Data grid | Function |
+| Swimlane task | Runtime shape | Function |
 |---|---:|---|
-| `dispatch_count_publish` | one control task | Assign a dense slot for each `(destination rank, local expert)` route and publish per-expert counts. |
-| `dispatch_push` | `clamp(T, 1, E)` | One token worker owns all `TOPK` routes for its strided token set and writes the V4-Flash `[expert, source, slot]` lanes. |
-| `dispatch_meta` | one control task | Collect peer counts and build `[total_routes, A, active_expert_ids...]`. |
-| `dispatch_gather` | `clamp(R, 1, E)` with `total_routes > 0` predicate | Distribute the scan of all 36 fixed expert lanes across route-sized workers. This stage does not yet consume the compact active-expert list. |
-| routed expert kernels | `ceil(local_expert_count[e] / RECV_TILE)` data tiles per expert | Keep the existing count-bounded expert compute; a zero-count expert emits no routed compute tile. |
-| `combine_scatter` | `clamp(A, 1, E)` with `total_routes > 0` predicate | Consume the compact active-expert list and return only experts that received routes. |
-| `combine_reduce` | fixed storage grid of 16 | Reduce `shared + TOPK routed` in FP32 only for `t < T`; inactive rows preserve the shared result. |
+| `local_route_pack` | owner-local pack task/grid | Initialize route sentinels, filter owner-local routes, pack local rows, and build the compact active-expert plan. |
+| `routed_nz_gmm1_swiglu_quant` | fixed mixed grid | Compute gate/up, activation, and requantization for the active local experts and rows. |
+| `routed_nz_down` | 23 workers at BS1, 22 otherwise | Compute the owner-local weighted routed partial. |
+| `local_combine_reduce` | fixed storage grid of 16 | Add the TP-sharded shared partial and this rank's routed rows in FP32. |
+| `tp_all_reduce` | one TP collective | Sum every rank's shared and routed partial into the complete MoE output. |
+| `moe_residual_add` | one control task | Add the replicated post-attention residual after the collective. |
 
-An empty receive rank therefore retires the `dispatch_gather` and
-`combine_scatter` data grids through scheduler predicates, and its zero expert
-counts emit no routed-expert data tiles. The shared-expert branch, local token
-push, metadata, publication, wait, combine-reduce, and epoch-control tasks
-remain present where required. An empty receive rank is therefore not
-removed from the collective graph.
-
-Payload and combine completion signals preserve the fixed V4-Flash credit
-contract:
+The layer invariant is:
 
 ```text
-credits produced by each non-empty grid = E
-wait threshold at epoch k               = k * E
+rank_partial = shared_tp_partial + sum(owner-local routed outputs)
+moe_output   = TP_AllReduce(rank_partial)
+next_hidden  = post_attention_residual + moe_output
 ```
 
-Each emitted block contributes one credit and block 0 supplies the unused
-`E - emitted_blocks` credits. If `combine_scatter` is predicated away,
-`combine_wait` publishes all `E` credits. Consequently, reducing the data grid
-cannot satisfy a wait before every emitted payload producer has completed.
+A rank with no routed rows still computes its shared TP partial and executes
+`local_combine_reduce`, `tp_all_reduce`, and `moe_residual_add`. All ranks
+therefore enter the same final collective even under maximally skewed routing.
+The old EP payload/meta/combine windows, completion credits, and `moe_epoch`
+are not part of the canonical decode ABI.
+
+This protocol is scoped to the canonical hidden-only decode graph
+(`WholeDecodeStep3p5`) and the focused five-layer programs composed from it.
+Prefill, the standalone `EpTpMoE` path, and `_compile_moe.py` retain their
+existing distributed-EP behavior and are not covered by this contract.
+
+The local-owner numerical contract is also distinct from the legacy r10
+distributed-EP reduction tree. Each rank casts its local shared+routed partial
+to BF16 before the final TP all-reduce, so a legacy golden is not a bit-exact
+oracle for this graph even though the mathematical sum is equivalent. Formal
+goldens for this path must declare:
+
+```text
+source_kind = local-ep
+protocol_profile = replicated_input_local_owner
+numeric_contract.name = local_owner_partial_tp_all_reduce_bf16_v1
+numeric_contract.comparison = bit_exact_to_protocol_golden
+numeric_contract.bit_exact = true
+```
 
 #### KV ownership 与物理布局
 
@@ -284,23 +305,19 @@ dfx_outputs/rank{0..7}/d0/chip_swimlane_records.json
 Both `chip_swimlane_records.json` and its top-level
 `chip_swimlane_level` field are runtime-owned schema names.
 
-Candidate publication also requires the exact `recv_meta_sidecar.pt` produced
+Candidate publication also requires the exact local-route sidecar produced
 by `tests.step3p5.harnesses._stage_five_layer_moe_route`. Supply it through
 `PYPTO_RECV_META_SIDECAR`; task, block, and physical-slice counts are not valid
 route-histogram substitutes. The analyzer checks both the live source hash and
-the sidecar source hash against the selected frozen profile. The current
-`candidate` profile is bound to the complete
-`a17ae27440a4ff0e62f7fe8b6dc2d5548217ef617b0ddbccb927fda648600d01`
-`decode_fwd.py` SHA; matching only the eight-character prefix is rejected.
+the sidecar source hash against the selected frozen profile. The active
+`local-ep` profile is bound to the complete `decode_fwd.py` SHA in the analyzer
+policy; matching only an abbreviated prefix is rejected.
 
-The candidate expert family is explicitly
-`staged_fused_gate_up`: `expert_gate_up` and `expert_down` must expose AIC
-execution, while `expert_gate_up_act` and `routed_h_quant` must be AIV-only on
-every execution-nonempty rank. Its AIC upper scheduling bounds
-(`p50<=200us`, `p90<=220us`, `p99<=320us`, `max<=500us`) are carried from the
-release-qualified R5 packed-fused analyzer. R5 measured one combined mixed
-stage, so no unsupported lower bound is inferred for a17's separately named
-`expert_gate_up`.
+The active expert family is `packed_nz_mixed`. DFX maps the two layer-local
+external tasks through the `local_route_pack .. local_combine_reduce` window
+and validates the chain through the per-layer MoE `tp_all_reduce` and residual
+task. The analyzer does not require or infer the retired dispatch/combine wait
+stages for this profile.
 
 Generate the formal golden and route sidecar from the same immutable final
 image before running the swimlane gate. The formal writer requires
@@ -324,7 +341,7 @@ The route reader rejects the golden before device exporters start unless its
 manifest is `step3p5.five-layer-moe-golden.v3`, `bit_exact=true`, bound to the
 same immutable image, and its full decode SHA equals the live route source.
 The analyzer again requires the sidecar route source, formal-golden source,
-live DFX source, and frozen candidate SHA to agree exactly. A golden from an
+live DFX source, and frozen `local-ep` SHA to agree exactly. A golden from an
 older image digest or source tree must not be relabeled or reused.
 
 The gate uses separate dependency-generation and timing submissions. Its
@@ -344,8 +361,8 @@ DeepSeek v4 的 512B 主要用于 data tile、L2 cache line 和 MTE 性能对齐
 control signal slot 做 512B 物理 stride 隔离：
 
 1. 被 `notify` / `wait` / `AtomicAdd` 使用；
-2. 多个 layer/slot 位于同一个 backing buffer，或同一个 slot 跨
-   `moe_epoch` 复用。
+2. 多个 layer/slot 位于同一个 backing buffer，或同一个 slot 跨 repeated
+   collective invocation 复用。
 
 这些 slot 使用：
 
@@ -531,7 +548,10 @@ step 127 / 128 / 255:             PASS
 实现。2026-07-27 的清理进一步删除了 retired unroll source、rollback
 selector 和自定义 Main 入口；后续实现与验收统一以 canonical 为 base。
 
-### 7.2 V4-Flash active-route MoE admission
+### 7.2 Historical V4-Flash active-route MoE admission
+
+This section records the superseded push/gather implementation and its
+admission evidence. It is not the active canonical decode protocol.
 
 The runtime-active dispatch/combine rewrite was integrated into
 `stepfun/develop` as a fast-forward change:

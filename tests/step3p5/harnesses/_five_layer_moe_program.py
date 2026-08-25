@@ -63,9 +63,6 @@ ROUTED_W13_M1 = _canonical.ROUTED_W13_M1
 ROUTED_W2_N1 = _canonical.ROUTED_W2_N1
 ROUTED_W2_M1 = _canonical.ROUTED_W2_M1
 sh_inter_local = _canonical.sh_inter_local
-dispatch_lane_rows = _canonical.dispatch_lane_rows
-dispatch_aux_pad = _canonical.dispatch_aux_pad
-idx_pad = _canonical.idx_pad
 n_routes_per_rank = _canonical.n_routes_per_rank
 
 N_FULL_FIVE = 2
@@ -199,35 +196,11 @@ class FiveLayerMoeFocused:
         moe_attn_signal_stack: pld.DistributedTensor[
             [N_MOE_FIVE * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
         ],
-        moe_recv_meta: pld.DistributedTensor[
-            [n_ranks, n_local_experts_pad], pl.INT32
-        ],
-        moe_meta_arrived: pld.DistributedTensor[
-            [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
-        moe_recv_x: pld.DistributedTensor[
-            [dispatch_lane_rows, HIDDEN], pl.INT8
-        ],
-        moe_recv_aux: pld.DistributedTensor[
-            [dispatch_lane_rows, dispatch_aux_pad], pl.FP32
-        ],
-        moe_recv_route: pld.DistributedTensor[
-            [dispatch_lane_rows, idx_pad], pl.INT32
-        ],
-        moe_data_arrived: pld.DistributedTensor[
-            [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
         moe_sh_tmp_stack: pld.DistributedTensor[
             [N_MOE_FIVE * BATCH, HIDDEN], pl.BF16
         ],
         moe_sh_signal_stack: pld.DistributedTensor[
             [N_MOE_FIVE * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
-        moe_combine_arrived: pld.DistributedTensor[
-            [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
-        moe_routed_y_buf: pld.DistributedTensor[
-            [n_routes_per_rank, HIDDEN], pl.BF16
         ],
         num_tokens_per_owner: pl.Tensor[
             [NUM_TOKENS_RUNTIME], pl.INT32
@@ -422,7 +395,7 @@ class FiveLayerMoeFocused:
         local_expert_count_l3 = pl.create_tensor(
             [n_local_experts], dtype=pl.INT32,
         )
-        hidden_l3 = swa_moe_chip_orch(
+        hidden_l3, local_expert_count_l3 = swa_moe_chip_orch(
             h2,
             input_rms,
             pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [2 * HIDDEN, 0]),
@@ -497,25 +470,16 @@ class FiveLayerMoeFocused:
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [0, 0],
             ),
-            moe_recv_meta,
-            moe_meta_arrived,
-            moe_recv_x,
-            moe_recv_aux,
-            moe_recv_route,
-            moe_data_arrived,
             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [0, 0]),
             pl.slice(
                 moe_sh_signal_stack,
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [0, 0],
             ),
-            moe_combine_arrived,
-            moe_routed_y_buf,
             3,
             0,
             num_tokens,
             my_rank,
-            1,
         )
 
         # L4: full attention + MoE, epoch 2, consuming the actual L3 output.
@@ -523,7 +487,7 @@ class FiveLayerMoeFocused:
         local_expert_count_l4 = pl.create_tensor(
             [n_local_experts], dtype=pl.INT32,
         )
-        hidden_l4 = full_moe_chip_orch(
+        hidden_l4, local_expert_count_l4 = full_moe_chip_orch(
             hidden_l3,
             input_rms,
             pl.slice(full_wq, [HIDDEN, hidden_q_full], [HIDDEN, 0]),
@@ -614,25 +578,16 @@ class FiveLayerMoeFocused:
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [COMM_SIGNAL_STRIDE_I32, 0],
             ),
-            moe_recv_meta,
-            moe_meta_arrived,
-            moe_recv_x,
-            moe_recv_aux,
-            moe_recv_route,
-            moe_data_arrived,
             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [BATCH, 0]),
             pl.slice(
                 moe_sh_signal_stack,
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [COMM_SIGNAL_STRIDE_I32, 0],
             ),
-            moe_combine_arrived,
-            moe_routed_y_buf,
             4,
             0,
             num_tokens,
             my_rank,
-            2,
         )
         return hidden_l3, hidden_l4
 
@@ -807,35 +762,11 @@ class FiveLayerMoeFocused:
         moe_attn_signal_buf = pld.alloc_window_buffer(
             N_MOE_FIVE * COMM_CONTROL_SIGNAL_BYTES
         )
-        moe_recv_meta_buf = pld.alloc_window_buffer(
-            n_ranks * n_local_experts_pad * 4
-        )
-        moe_meta_arrived_buf = pld.alloc_window_buffer(
-            COMM_CONTROL_SIGNAL_BYTES
-        )
-        moe_recv_x_buf = pld.alloc_window_buffer(
-            dispatch_lane_rows * HIDDEN
-        )
-        moe_recv_aux_buf = pld.alloc_window_buffer(
-            dispatch_lane_rows * dispatch_aux_pad * 4
-        )
-        moe_recv_route_buf = pld.alloc_window_buffer(
-            dispatch_lane_rows * idx_pad * 4
-        )
-        moe_data_arrived_buf = pld.alloc_window_buffer(
-            COMM_CONTROL_SIGNAL_BYTES
-        )
         moe_sh_tmp_buf = pld.alloc_window_buffer(
             N_MOE_FIVE * BATCH * HIDDEN * 2
         )
         moe_sh_signal_buf = pld.alloc_window_buffer(
             N_MOE_FIVE * COMM_CONTROL_SIGNAL_BYTES
-        )
-        moe_combine_arrived_buf = pld.alloc_window_buffer(
-            COMM_CONTROL_SIGNAL_BYTES
-        )
-        moe_routed_y_buf = pld.alloc_window_buffer(
-            n_routes_per_rank * HIDDEN * 2
         )
 
         for rank in pl.range(pld.world_size()):
@@ -983,36 +914,6 @@ class FiveLayerMoeFocused:
                     dtype=pl.INT32,
                 ),
                 pld.window(
-                    moe_recv_meta_buf,
-                    [n_ranks, n_local_experts_pad],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_meta_arrived_buf,
-                    [COMM_SIGNAL_STRIDE_I32, 1],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_recv_x_buf,
-                    [dispatch_lane_rows, HIDDEN],
-                    dtype=pl.INT8,
-                ),
-                pld.window(
-                    moe_recv_aux_buf,
-                    [dispatch_lane_rows, dispatch_aux_pad],
-                    dtype=pl.FP32,
-                ),
-                pld.window(
-                    moe_recv_route_buf,
-                    [dispatch_lane_rows, idx_pad],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_data_arrived_buf,
-                    [COMM_SIGNAL_STRIDE_I32, 1],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
                     moe_sh_tmp_buf,
                     [N_MOE_FIVE * BATCH, HIDDEN],
                     dtype=pl.BF16,
@@ -1021,16 +922,6 @@ class FiveLayerMoeFocused:
                     moe_sh_signal_buf,
                     [N_MOE_FIVE * COMM_SIGNAL_STRIDE_I32, 1],
                     dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_combine_arrived_buf,
-                    [COMM_SIGNAL_STRIDE_I32, 1],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_routed_y_buf,
-                    [n_routes_per_rank, HIDDEN],
-                    dtype=pl.BF16,
                 ),
                 num_tokens_per_owner,
                 rank,

@@ -547,12 +547,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     // Unpack tensor: __gm_pipe_buffer
     __gm__ PyPTORuntimeTensor* __gm_pipe_buffer_tensor = reinterpret_cast<__gm__ PyPTORuntimeTensor*>(args[8]);
-    // SPMD: shard GM pipe workspace by logical block_idx to avoid overlap.
-    int64_t __pypto_gm_block_num = static_cast<int64_t>(__pypto_spmd_block_num);
-    if (__pypto_gm_block_num <= 0) __pypto_gm_block_num = 1;
-    int64_t __pypto_gm_total_elems = static_cast<int64_t>(__gm_pipe_buffer_tensor->shapes[0]);
-    int64_t __pypto_gm_elems_per_block = __pypto_gm_total_elems / __pypto_gm_block_num;
-    int64_t __pypto_gm_block_offset = static_cast<int64_t>(__pypto_spmd_block_idx) * __pypto_gm_elems_per_block;
+    // SPMD: index the fixed per-block GM pipe workspace.
+    const int64_t kGmPipeFloatsPerBlock = 32768;
+    int64_t __pypto_gm_block_offset =
+        static_cast<int64_t>(__pypto_spmd_block_idx)
+        * kGmPipeFloatsPerBlock;
     __gm__ float* __gm_pipe_buffer = reinterpret_cast<__gm__ float*>(__gm_pipe_buffer_tensor->buffer.addr) + __gm_pipe_buffer_tensor->start_offset + __pypto_gm_block_offset;
 
     // Unpack scalar: routed_workers_inline560__phi_v2

@@ -32,6 +32,8 @@ import time
 
 import torch
 
+from tools.step3p5.device_topology import validate_consecutive_device_ids
+
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 _I32 = torch.int32
@@ -103,7 +105,10 @@ class WholeDecodeHolder:
         platform="a2a3",
         kv_ipc=True,
     ):
-        self.device_ids = list(device_ids)
+        self.device_ids = validate_consecutive_device_ids(
+            device_ids,
+            owner="whole decode",
+        )
         self.tp = len(self.device_ids)
         self.dev_offset = self.device_ids[0]
         self.out_dir = out_dir
@@ -197,7 +202,11 @@ class WholeDecodeHolder:
         from models.step3p5 import weight_loader as K  # noqa: PLC0415
         self._cfg = cfg
         self._K = K
-        assert self.tp == cfg.TP_WORLD_SIZE, f"need {cfg.TP_WORLD_SIZE} cards; got {self.tp}"
+        if self.tp != cfg.TP_WORLD_SIZE:
+            raise ValueError(
+                f"whole decode holder requires TP={cfg.TP_WORLD_SIZE}, "
+                f"got {self.tp}"
+            )
         import models.step3p5.decode_fwd as dl  # noqa: PLC0415
         self._dl = dl
 
@@ -559,6 +568,7 @@ class WholeDecodeHolder:
 
         Live variable-batch callers should use :meth:`set_live_step`, which
         accepts active rows and updates the runtime token metadata separately.
+        Rank-specific input must be TP-replicated.
         """
         self.current_hidden.zero_()
         if hidden.dim() == 2:
@@ -580,7 +590,16 @@ class WholeDecodeHolder:
                     f"set_hidden expects TP storage shape {expected}, "
                     f"got {tuple(hidden.shape)}"
                 )
-            self.current_hidden.copy_(hidden.to(_BF16))
+            hidden_bf16 = hidden.to(_BF16)
+            if any(
+                not torch.equal(hidden_bf16[rank], hidden_bf16[0])
+                for rank in range(1, self.tp)
+            ):
+                raise ValueError(
+                    "replicated-input local-owner MoE requires identical "
+                    "hidden values on every TP rank"
+                )
+            self.current_hidden.copy_(hidden_bf16)
         if self.num_tokens_per_owner is not None:
             self.num_tokens_per_owner[: self.tp].fill_(self._consts["BATCH"])
 
@@ -798,7 +817,9 @@ class WholeDecodeHolder:
 
     def run(self):
         """复用常驻 rt 跑一次 whole-net forward，只返回 raw hidden。"""
-        assert self.rt is not None, "enter holder (with h:) before run()"
+        if self.rt is None:
+            raise RuntimeError("enter holder (with h:) before run()")
+        self._validate_replicated_owner_counts()
         t0 = time.time()
         # DFX capture (PERF-A1 baseline). N1_DFX = tokens; N1_PMU = int event type.
         #   "swim"/"l2" -> enable_l2_swimlane (dfx_outputs/l2_swimlane_records.json
@@ -822,3 +843,23 @@ class WholeDecodeHolder:
         self._last_run_sec = time.time() - t0
         result = {"next_hidden": self._next_hidden_out}
         return result
+
+    def _validate_replicated_owner_counts(self) -> int:
+        """Reject host ABI inputs that violate replicated-input semantics."""
+        if self.num_tokens_per_owner is None:
+            raise RuntimeError("owner-count storage is unavailable")
+        counts = self.num_tokens_per_owner[: self.tp].to(torch.int64)
+        active_batch = int(counts[0].item())
+        storage_batch = int(self._consts["BATCH"])
+        if not 1 <= active_batch <= storage_batch:
+            raise ValueError(
+                "active batch must be within "
+                f"[1, {storage_batch}], got {active_batch}"
+            )
+        if not bool(torch.all(counts == active_batch)):
+            raise ValueError(
+                "replicated-input local-owner MoE requires identical "
+                "num_tokens_per_owner on every TP rank, got "
+                f"{counts.tolist()}"
+            )
+        return active_batch

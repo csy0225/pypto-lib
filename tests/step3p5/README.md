@@ -33,20 +33,26 @@ generator 不允许重新添加兼容入口。
 ## MoE runtime-active scheduling contracts
 
 `tests/step3p5/unit/test_performance_bc_contract.py` is the static admission
-gate for the V4-Flash-compatible fixed-lane dispatch/combine schedule. It
+gate for the replicated-input local-owner decode schedule. Together with
+`test_local_ep_protocol.py`, it
 checks that:
 
-1. dispatch data workers follow runtime-active tokens and routes;
-2. dense route slots cover every `(token, top-k)` route exactly once;
-3. combine scatter consumes the compact active-expert plan and skips an empty
-   receive rank's data grid;
-4. payload and combine grids still publish exactly 36 completion credits, so
-   `moe_epoch * 36` cannot be reached before every emitted producer finishes.
+1. every rank consumes the same gate result without EP activation exchange;
+2. each `(token, top-k)` route is packed only by its unique contiguous expert
+   owner and stays within the fixed 128-row expert slab;
+3. local combine adds the TP-sharded shared partial and owner-local routed
+   rows in FP32;
+4. every MoE orchestrator performs one TP all-reduce after local combine and
+   adds the residual only after that collective;
+5. zero-route ranks still execute local combine and the final collective;
+6. routed external kernels use fixed workspace strides and never issue a
+   zero-valid GM load for an empty 8-row part.
 
 Run the focused contracts with:
 
 ```bash
 python -m pytest -q -p no:cacheprovider \
   tests/step3p5/unit/test_attention_swa_active_bound.py \
+  tests/step3p5/unit/test_local_ep_protocol.py \
   tests/step3p5/unit/test_performance_bc_contract.py
 ```

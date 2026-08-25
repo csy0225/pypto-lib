@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) PyPTO Contributors.
 # SPDX-License-Identifier: Apache-2.0
-"""Capture exact L3/L4 route metadata from the focused L0-L4 graph."""
+"""Capture exact L3/L4 local-owner route counts from the focused graph."""
 from __future__ import annotations
 
 import argparse
@@ -15,6 +15,11 @@ from typing import Any
 import torch
 
 from tests.step3p5.harnesses import _stage_five_layer_moe as formal_stage
+from tools.step3p5.five_layer_moe_golden_contract import (
+    GOLDEN_SCHEMA,
+    LOCAL_OWNER_PROTOCOL_PROFILE,
+    normalize_golden_source_binding,
+)
 
 
 TP = 8
@@ -24,7 +29,6 @@ TOPK = 8
 N_LOCAL_EXPERTS = 36
 N_LOCAL_EXPERTS_PAD = 40
 CONTEXT_LEN = 65536
-GOLDEN_SCHEMA = "step3p5.five-layer-moe-golden.v3"
 CHECKPOINT_SCHEMA = "step3p5.checkpoint-identity.v1"
 IMAGE_DIGEST_PATTERN = re.compile(r".+@sha256:[0-9a-f]{64}")
 
@@ -126,14 +130,27 @@ def _load_golden_contract(
     context_len: int,
     image_digest: str,
     source_decode_sha256: str,
+    expected_protocol_profile: str | None = None,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
-    """Validate the frozen baseline before starting device exporters."""
+    """Validate the frozen protocol golden before starting exporters."""
     manifest_path = golden_dir / "manifest.json"
     manifest = _json_object(manifest_path)
     if manifest.get("schema") != GOLDEN_SCHEMA:
         raise ValueError(f"{manifest_path}: unsupported golden schema")
-    if manifest.get("source_kind") != "baseline":
-        raise ValueError(f"{manifest_path}: golden is not from baseline")
+    golden_binding = normalize_golden_source_binding(
+        manifest,
+        field=str(manifest_path),
+    )
+    protocol = golden_binding["protocol_contract"]
+    if (
+        expected_protocol_profile is not None
+        and protocol["protocol_profile"] != expected_protocol_profile
+    ):
+        raise ValueError(
+            f"{manifest_path}: protocol_profile="
+            f"{protocol['protocol_profile']!r} does not match expected "
+            f"{expected_protocol_profile!r}"
+        )
     if manifest.get("active_batch") != active_batch:
         raise ValueError(f"{manifest_path}: active_batch mismatch")
     if (
@@ -150,8 +167,6 @@ def _load_golden_contract(
         manifest.get("source_decode_fwd_sha256"),
         field="golden.source_decode_fwd_sha256",
     )
-    if manifest.get("bit_exact") is not True:
-        raise ValueError(f"{manifest_path}: golden bit_exact must be true")
     live_source_decode_sha = _sha256_field(
         source_decode_sha256,
         field="live.source_decode_fwd_sha256",
@@ -201,14 +216,16 @@ def _load_golden_contract(
         "schema": GOLDEN_SCHEMA,
         "manifest_sha256": _sha256(manifest_path),
         "source_run": source_run,
-        "source_kind": "baseline",
+        "source_kind": protocol["source_kind"],
+        "protocol_profile": protocol["protocol_profile"],
+        "numeric_contract": dict(protocol["numeric_contract"]),
         "source_decode_fwd_sha256": source_decode_sha,
         "source_manifest_sha256": source_manifest_sha,
         "active_batch": active_batch,
         "context_len_per_sequence": context_len,
         "image_ref": image_digest,
         "files": file_hashes,
-        "bit_exact": True,
+        "bit_exact": protocol["bit_exact"],
     }
     return contract, tensors
 
@@ -365,22 +382,16 @@ def _validate_route_totals(
         raise ValueError("recv_meta padded experts 36:40 must be zero")
 
     routed = recv_meta[:, :, :, :N_LOCAL_EXPERTS].to(torch.int64)
-    per_layer_source = routed.sum(dim=(0, 3))
-    expected_per_source = int(active_batch) * TOPK
-    expected_source_matrix = torch.full(
-        (2, TP),
-        expected_per_source,
-        dtype=torch.int64,
-    )
-    if not torch.equal(per_layer_source, expected_source_matrix):
+    owner_mask = torch.eye(TP, dtype=torch.bool).reshape(TP, 1, TP, 1)
+    if bool(torch.any(routed.masked_select(~owner_mask))):
         raise ValueError(
-            "each source rank/layer must route active_batch * TOPK entries: "
-            f"actual={per_layer_source.tolist()}, "
-            f"expected={expected_source_matrix.tolist()}"
+            "local-owner snapshots must be diagonal in "
+            "(dst_rank, route_owner_rank)"
         )
 
-    global_per_layer = per_layer_source.sum(dim=1)
-    expected_global = TP * expected_per_source
+    per_layer_owner = routed.sum(dim=(2, 3)).transpose(0, 1)
+    global_per_layer = per_layer_owner.sum(dim=1)
+    expected_global = int(active_batch) * TOPK
     if not torch.equal(
         global_per_layer,
         torch.full((2,), expected_global, dtype=torch.int64),
@@ -390,10 +401,10 @@ def _validate_route_totals(
             f"expected={[expected_global, expected_global]}"
         )
     return {
-        "per_layer_per_source": per_layer_source.tolist(),
-        "expected_per_source": expected_per_source,
+        "per_layer_per_owner": per_layer_owner.tolist(),
         "global_per_layer": global_per_layer.tolist(),
         "expected_global_per_layer": expected_global,
+        "owner_rows_diagonal": True,
         "padding_zero": True,
         "nonnegative": True,
     }
@@ -417,35 +428,35 @@ def _sidecar_payload(
         local_expert_count_device.permute(1, 0, 2).contiguous()
     )
     return {
-        "schema": "step3p5.five-layer-moe-recv-meta.v1",
+        "schema": "step3p5.five-layer-moe-local-routes.v2",
         "layers": ["L3", "L4"],
         "axes": [
             "layer",
-            "dst_rank",
-            "src_rank",
+            "owner_rank",
+            "route_owner_rank",
             "local_expert_pad",
         ],
-        "recv_meta": recv_meta,
+        "owner_route_counts": recv_meta,
         "local_expert_count": local_expert_count,
-        "window_provenance": [
+        "snapshot_provenance": [
             {
                 "layer": "L3",
-                "window_id": f"{window_id_prefix}-l3",
+                "snapshot_id": f"{window_id_prefix}-l3",
                 "shape": [TP, N_LOCAL_EXPERTS_PAD],
                 "dtype": "int32",
                 "byte_size": TP * N_LOCAL_EXPERTS_PAD * 4,
-                "source_window": "moe_recv_meta",
-                "source_window_reused": True,
+                "source_tensor": "local_expert_count",
+                "source_protocol": "replicated_input_local_owner",
                 "capture_point": "after_l3_before_l4",
             },
             {
                 "layer": "L4",
-                "window_id": f"{window_id_prefix}-l4",
+                "snapshot_id": f"{window_id_prefix}-l4",
                 "shape": [TP, N_LOCAL_EXPERTS_PAD],
                 "dtype": "int32",
                 "byte_size": TP * N_LOCAL_EXPERTS_PAD * 4,
-                "source_window": "moe_recv_meta",
-                "source_window_reused": True,
+                "source_tensor": "local_expert_count",
+                "source_protocol": "replicated_input_local_owner",
                 "capture_point": "after_l4",
             },
         ],
@@ -529,6 +540,7 @@ def main() -> int:
         context_len=args.context_len,
         image_digest=args.image_digest,
         source_decode_sha256=live_decode_sha,
+        expected_protocol_profile=LOCAL_OWNER_PROTOCOL_PROFILE,
     )
     checkpoint = _checkpoint_identity(
         Path(args.ckpt),
@@ -642,7 +654,7 @@ def main() -> int:
     ].sum(dim=2, dtype=torch.int64).to(torch.int32)
     if not torch.equal(derived_counts, local_expert_count_device):
         raise AssertionError(
-            "holder local_expert_count is not exact sum_src(recv_meta)"
+            "holder local_expert_count disagrees with owner-route snapshot"
         )
 
     source = {
@@ -724,7 +736,7 @@ def main() -> int:
         name: _sha256(out / name) for name in artifact_tensors
     }
     report = {
-        "schema": "step3p5.five-layer-moe-route-capture.v1",
+        "schema": "step3p5.five-layer-moe-route-capture.v2",
         "program": "FiveLayerMoeRoute",
         "devices": devices,
         "hidden_comparison": hidden_comparison,
@@ -736,16 +748,17 @@ def main() -> int:
                 "shape": [TP, 2, TP, N_LOCAL_EXPERTS_PAD],
                 "dtype": "int32",
                 "axes": [
-                    "dst_rank",
+                    "owner_rank",
                     "layer",
-                    "src_rank",
+                    "route_owner_rank",
                     "local_expert_pad",
                 ],
+                "semantics": "diagonal local-owner route counts",
             },
             "local_expert_count": {
                 "shape": [TP, 2, N_LOCAL_EXPERTS],
                 "dtype": "int32",
-                "derivation": "sum over src_rank",
+                "derivation": "diagonal owner-route row",
             },
         },
         "analyzer_sidecar": "recv_meta_sidecar.pt",

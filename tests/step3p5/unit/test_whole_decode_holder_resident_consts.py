@@ -123,6 +123,48 @@ def test_invalid_resident_mode_is_rejected_before_prepare(monkeypatch) -> None:
     assert holder.rt is None
 
 
+@pytest.mark.parametrize(
+    "device_ids",
+    ([], [0, 2], [1, 0], [0, 0]),
+)
+def test_holder_rejects_nonconsecutive_logical_rank_mapping(
+    device_ids,
+) -> None:
+    with pytest.raises(ValueError, match="device_ids|logical ranks"):
+        WholeDecodeHolder(
+            device_ids,
+            "/tmp/out",
+            "/tmp/ckpt",
+            kv_ipc=False,
+        )
+
+
+def test_holder_accepts_consecutive_nonzero_device_range() -> None:
+    holder = WholeDecodeHolder(
+        list(range(8, 16)),
+        "/tmp/out",
+        "/tmp/ckpt",
+        kv_ipc=False,
+    )
+    assert holder.device_ids == list(range(8, 16))
+    assert holder.dev_offset == 8
+
+
+def test_set_hidden_rejects_rank_mismatch() -> None:
+    holder = WholeDecodeHolder([0, 1], "/tmp/out", "/tmp/ckpt", kv_ipc=False)
+    holder._consts = {"BATCH": 2, "HIDDEN": 4}
+    holder.current_hidden = torch.zeros(
+        (2, 2, 4),
+        dtype=torch.bfloat16,
+    )
+    holder.num_tokens_per_owner = torch.zeros(2, dtype=torch.int32)
+    hidden = torch.zeros((2, 2, 4), dtype=torch.bfloat16)
+    hidden[1, 0, 0] = 1
+
+    with pytest.raises(ValueError, match="requires identical hidden"):
+        holder.set_hidden(hidden)
+
+
 def test_resident_constants_are_uploaded_once_and_rebound(monkeypatch) -> None:
     monkeypatch.setenv("PYPTO_H4_RESIDENT", "all")
     holder, originals = _holder_with_constants()

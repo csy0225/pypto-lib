@@ -407,6 +407,7 @@ class FiveLayerMoeHolder(WholeDecodeHolder):
         """Run one focused forward and expose both post-MoE hidden states."""
         if self.rt is None:
             raise RuntimeError("enter the holder before run()")
+        self._validate_replicated_owner_counts()
         started = time.time()
         if dfx:
             from pypto.runtime.runner import RunConfig  # noqa: PLC0415
@@ -435,6 +436,5 @@ class FiveLayerMoeHolder(WholeDecodeHolder):
             "hidden_l3": self._hidden_l3_out,
             "hidden_l4": self._hidden_l4_out,
         }
-
 
 __all__ = ["FiveLayerMoeHolder"]

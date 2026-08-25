@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 from __future__ import annotations
 
+import pytest
 import torch
 
 from models.step3p5.config import (
@@ -30,6 +31,7 @@ from models.step3p5.weight_loader import (
     build_compact_shape_table,
     build_synthetic_bundle,
     expected_shapes,
+    load_step3p5_weights_for_rank,
 )
 
 
@@ -118,3 +120,34 @@ def test_native_shared_slice_preserves_checkpoint_nk_layout() -> None:
     torch.testing.assert_close(legacy, expected.T, rtol=0.0, atol=0.0)
     assert native.is_contiguous()
     assert legacy.is_contiguous()
+
+
+@pytest.mark.parametrize("tp_world_size", [1, 4, 16])
+def test_weight_loader_rejects_noncanonical_local_owner_world_size(
+    tp_world_size: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            "canonical Step3p5 deployment requires "
+            "co-located TP=EP=8"
+        ),
+    ):
+        load_step3p5_weights_for_rank(
+            "/checkpoint-is-not-read",
+            rank=0,
+            tp_world_size=tp_world_size,
+        )
+
+
+@pytest.mark.parametrize("rank", [-1, TP_WORLD_SIZE])
+def test_weight_loader_rejects_rank_outside_canonical_world(rank: int) -> None:
+    with pytest.raises(
+        ValueError,
+        match=rf"rank {rank} out of range \[0, {TP_WORLD_SIZE}\)",
+    ):
+        load_step3p5_weights_for_rank(
+            "/checkpoint-is-not-read",
+            rank=rank,
+            tp_world_size=TP_WORLD_SIZE,
+        )

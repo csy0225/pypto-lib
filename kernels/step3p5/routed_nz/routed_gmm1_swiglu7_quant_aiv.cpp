@@ -339,16 +339,20 @@ static __aicore__ void routed_gmm1_swiglu_quant_aiv(__gm__ int32_t* v1, __gm__ i
           // pto: %73
           int64_t v55 = (int64_t) ((uint64_t) k54 * (uint64_t) v22);
           // pto: %75, %76
-          int64_t v56 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) v51 - (uint64_t) v53)) - (uint64_t) v55);
+          int64_t v56 = v51 - v53 - v55;
+          // pto: %70, %72, %79
+          int64_t v60 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) ((int64_t) ((uint64_t) v49 * (uint64_t) v23)) + (uint64_t) v53)) + (uint64_t) v55);
+          const int64_t remaining_rows = v56;
+          const int64_t output_row = v60;
+          // PYPTO-LIB-AUTHORITY: empty-row-part-zero-store begin
+          if (remaining_rows > v40) {
           // pto: %77, %part_valid_inline589__phi_v4
-          int64_t v57 = v56 > v22 ? v22 : v56;
+          int64_t v57 = remaining_rows > v22 ? v22 : remaining_rows;
           // pto: %t__tmp_v145
           Tile<TileType::Vec, int32_t, 8, 256, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v58 = Tile<TileType::Vec, int32_t, 8, 256, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v57, v27);
           // pto: %t__tmp_v145
           uint64_t v59 = (uint64_t) v40;
           TASSIGN(v58, v59);
-          // pto: %70, %72, %79
-          int64_t v60 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) ((int64_t) ((uint64_t) v49 * (uint64_t) v23)) + (uint64_t) v53)) + (uint64_t) v55);
           // pto: %gate_up_i32_inline575__ssa_v0_pview
           int64_t v61 = v57 * v32;
           // pto: %gate_up_i32_inline575__ssa_v0_pview
@@ -541,6 +545,34 @@ static __aicore__ void routed_gmm1_swiglu_quant_aiv(__gm__ int32_t* v1, __gm__ i
           wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
           TSTORE(v118, v114);
           set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+          } else {
+            // Materialize the empty half consumed by fixed-shape quantization.
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            pipe_barrier(PIPE_ALL);
+            Tile<TileType::Vec, float, 8, 256, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Zero, CompactMode::Null> empty_part_f32 =
+                Tile<TileType::Vec, float, 8, 256, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Zero, CompactMode::Null>(v22, v27);
+            TASSIGN(empty_part_f32, (uint64_t) v40);
+            TEXPANDS(empty_part_f32, 0.0f);
+            Tile<TileType::Vec, bfloat16_t, 8, 256, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Zero, CompactMode::Null> empty_part_bf16 =
+                Tile<TileType::Vec, bfloat16_t, 8, 256, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Zero, CompactMode::Null>(v22, v27);
+            TASSIGN(empty_part_bf16, (uint64_t) v40);
+            pipe_barrier(PIPE_V);
+            TCVT(empty_part_bf16, empty_part_f32, v16, v17);
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            pto::Shape<1, 1, 1, 8, 256> empty_part_shape =
+                pto::Shape<1, 1, 1, 8, 256>();
+            pto::Stride<10240, 10240, 10240, 1280, 1> empty_part_stride =
+                pto::Stride<10240, 10240, 10240, 1280, 1>();
+            GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 8, 256>, pto::Stride<10240, 10240, 10240, 1280, 1>, pto::Layout::ND> empty_part_out =
+                GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 8, 256>, pto::Stride<10240, 10240, 10240, 1280, 1>, pto::Layout::ND>(
+                    v6 + ((v40 + output_row * v30) + v46 * v34),
+                    empty_part_shape,
+                    empty_part_stride);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            TSTORE(empty_part_out, empty_part_bf16);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+          }
+          // PYPTO-LIB-AUTHORITY: empty-row-part-zero-store end
         }
       }
     }

@@ -15,12 +15,19 @@ from pathlib import Path
 
 import torch
 
+from tools.step3p5.five_layer_moe_golden_contract import (
+    GOLDEN_SCHEMA,
+    LEGACY_PROTOCOL_PROFILE,
+    LOCAL_OWNER_PROTOCOL_PROFILE,
+    canonical_hidden_only_moe_protocol_fields,
+    golden_protocol_fields,
+    source_protocol_binding_fields,
+)
 
 TP = 8
 BATCH = 16
 HIDDEN = 4096
 BLOCK_SIZE = 128
-GOLDEN_SCHEMA = "step3p5.five-layer-moe-golden.v3"
 IMAGE_DIGEST_PATTERN = re.compile(r".+@sha256:[0-9a-f]{64}")
 
 
@@ -313,6 +320,7 @@ def _write_golden(
     manifest: dict[str, object],
     image_digest: str,
     source_run: str,
+    protocol_profile: str = LEGACY_PROTOCOL_PROFILE,
 ) -> None:
     _image_digest(image_digest, field="golden.image_ref")
     if not source_run:
@@ -336,6 +344,23 @@ def _write_golden(
         "harness_sha256",
     ):
         _require_sha256(source.get(field), field=f"golden.source.{field}")
+    protocol_fields = golden_protocol_fields(protocol_profile)
+    source_contract = source.get("declared_moe_protocol_contract")
+    if not isinstance(source_contract, dict):
+        raise ValueError("golden producer source protocol is missing")
+    if source_contract != protocol_fields:
+        raise ValueError(
+            "golden producer source protocol differs from requested protocol"
+        )
+    source_manifest_sha256 = _json_sha256(source)
+    source_binding = source_protocol_binding_fields(
+        source_manifest_sha256=source_manifest_sha256,
+        decode_fwd_sha256=str(source["decode_fwd_sha256"]),
+        moe_protocol_contract_sha256=str(
+            source.get("moe_protocol_contract_sha256", "")
+        ),
+        protocol_contract=source_contract,
+    )
 
     if golden_dir.exists() and any(golden_dir.iterdir()):
         raise FileExistsError(f"refusing to overwrite golden directory {golden_dir}")
@@ -351,14 +376,14 @@ def _write_golden(
     golden_manifest = {
         "schema": GOLDEN_SCHEMA,
         "source_run": source_run,
-        "source_kind": "baseline",
         "source_decode_fwd_sha256": source["decode_fwd_sha256"],
-        "source_manifest_sha256": _json_sha256(source),
+        "source_manifest_sha256": source_manifest_sha256,
+        **source_binding,
         "active_batch": active_batch,
         "context_len_per_sequence": context_len,
         "image_ref": image_digest,
         "files": hashes,
-        "bit_exact": True,
+        **protocol_fields,
     }
     (golden_dir / "manifest.json").write_text(
         json.dumps(golden_manifest, indent=2, sort_keys=True) + "\n",
@@ -621,6 +646,7 @@ def main() -> int:
                 ],
                 "max_ms": ordered[-1],
             }
+            source_protocol = canonical_hidden_only_moe_protocol_fields()
             manifest = {
                 "schema": "step3p5.five-layer-moe.v1",
                 "program": "FiveLayerMoe",
@@ -669,6 +695,14 @@ def main() -> int:
                         repo_root,
                         "tests/step3p5/harnesses/_stage_five_layer_moe.py",
                     ),
+                    "moe_protocol_contract_sha256": _source_sha256(
+                        repo_root,
+                        "tools/step3p5/five_layer_moe_golden_contract.py",
+                    ),
+                    "declared_moe_protocol_profile": source_protocol[
+                        "protocol_profile"
+                    ],
+                    "declared_moe_protocol_contract": source_protocol,
                 },
                 "build_output": str(holder.compiled.output_dir),
                 "timing": timing,
@@ -688,6 +722,7 @@ def main() -> int:
                     manifest=manifest,
                     image_digest=args.image_digest,
                     source_run=args.source_run,
+                    protocol_profile=LOCAL_OWNER_PROTOCOL_PROFILE,
                 )
 
             if args.dfx:

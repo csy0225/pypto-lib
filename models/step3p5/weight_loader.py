@@ -95,6 +95,7 @@ if TYPE_CHECKING:  # pragma: no cover — type-only import
     import torch
 
 from .config import (
+    EP_WORLD_SIZE,
     HEAD_DIM,
     HIDDEN,
     INTERMEDIATE,
@@ -870,15 +871,17 @@ def load_step3p5_weights_for_rank(
     ``decode_native_moe`` is true, router and shared gate/up matrices use
     explicit checkpoint-native ``[N, K]`` keys for b_trans matmuls.
     """
+    if (
+        tp_world_size != TP_WORLD_SIZE
+        or tp_world_size != EP_WORLD_SIZE
+    ):
+        raise ValueError(
+            "canonical Step3p5 deployment requires co-located "
+            f"TP=EP={TP_WORLD_SIZE}; got tp_world_size={tp_world_size}",
+        )
     if not 0 <= rank < tp_world_size:
         raise ValueError(
             f"rank {rank} out of range [0, {tp_world_size})",
-        )
-    if tp_world_size != TP_WORLD_SIZE:
-        log.warning(
-            "tp_world_size=%d does not match config.TP_WORLD_SIZE=%d; "
-            "slicing math uses the supplied value.",
-            tp_world_size, TP_WORLD_SIZE,
         )
 
     import torch  # noqa: PLC0415

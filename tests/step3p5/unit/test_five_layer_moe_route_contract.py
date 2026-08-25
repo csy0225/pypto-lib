@@ -25,6 +25,9 @@ from tools.step3p5.five_layer_moe_route_holder import (
     FiveLayerMoeRouteHolder,
     assemble_route_outputs,
 )
+from tools.step3p5.five_layer_moe_golden_contract import (
+    source_protocol_binding_fields,
+)
 
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -79,6 +82,18 @@ def _calls(function: ast.FunctionDef, name: str) -> list[ast.Call]:
         ],
         key=lambda node: node.lineno,
     )
+
+
+def _call_assignment(function: ast.FunctionDef, name: str) -> ast.Assign:
+    matches = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and _call_name(node.value) == name
+    ]
+    assert len(matches) == 1, f"expected one assignment to {name}"
+    return matches[0]
 
 
 def _fake_provenance(*, active_batch: int = 1) -> dict[str, object]:
@@ -172,18 +187,41 @@ def test_route_program_is_additive_and_reuses_canonical_compute() -> None:
         node.name for node in class_node.body if isinstance(node, ast.FunctionDef)
     }
     assert methods == {
-        "snapshot_recv_meta_and_hidden",
+        "snapshot_local_routes_and_hidden",
         "five_layer_route_chip_orch",
         "five_layer_route_host_orch",
     }
 
 
-def test_l3_snapshot_fences_reused_metadata_before_l4() -> None:
+def test_route_stage_requires_a_local_owner_protocol_golden() -> None:
+    source, tree = _parse(_STAGE)
+    main = _method(tree, "main")
+    body = ast.get_source_segment(source, main)
+
+    assert body is not None
+    assert (
+        "expected_protocol_profile=LOCAL_OWNER_PROTOCOL_PROFILE"
+        in body
+    )
+
+
+def test_route_program_stays_count_only_without_attention_replay() -> None:
+    source, _ = _parse(_PROGRAM)
+
+    assert "proves exact local-owner count histograms only" in source
+    assert "(token, topk-slot) -> expert/packed-row" in source
+    assert "replay_local_routes" not in source
+    assert "replay_attn" not in source
+    assert "attention_swa_inline" not in source
+    assert "attention_full_inline" not in source
+
+
+def test_l3_snapshot_fences_local_route_counts_before_l4() -> None:
     _, tree = _parse(_PROGRAM)
     chip = _method(tree, "five_layer_route_chip_orch")
     l3_call = _calls(chip, "swa_moe_chip_orch")
     l4_call = _calls(chip, "full_moe_chip_orch")
-    snapshots = _calls(chip, "snapshot_recv_meta_and_hidden")
+    snapshots = _calls(chip, "snapshot_local_routes_and_hidden")
     assert len(l3_call) == len(l4_call) == 1
     assert len(snapshots) == 2
     assert (
@@ -194,7 +232,7 @@ def test_l3_snapshot_fences_reused_metadata_before_l4() -> None:
     )
 
     assert [ast.unparse(arg) for arg in snapshots[0].args] == [
-        "moe_recv_meta",
+        "local_expert_count_l3",
         "my_rank",
         "hidden_l3_raw",
         "recv_meta_l3",
@@ -202,7 +240,7 @@ def test_l3_snapshot_fences_reused_metadata_before_l4() -> None:
     ]
     assert ast.unparse(l4_call[0].args[0]) == "hidden_l3"
     assert [ast.unparse(arg) for arg in snapshots[1].args] == [
-        "moe_recv_meta",
+        "local_expert_count_l4",
         "my_rank",
         "hidden_l4_raw",
         "recv_meta_l4",
@@ -220,26 +258,66 @@ def test_l3_snapshot_fences_reused_metadata_before_l4() -> None:
     )
 
 
+def test_l3_l4_rebind_post_call_local_expert_count() -> None:
+    _, route_tree = _parse(_PROGRAM)
+    _, canonical_tree = _parse(_DECODE)
+    chip = _method(route_tree, "five_layer_route_chip_orch")
+
+    for callee, hidden, count in (
+        ("swa_moe_chip_orch", "hidden_l3_raw", "local_expert_count_l3"),
+        ("full_moe_chip_orch", "hidden_l4_raw", "local_expert_count_l4"),
+    ):
+        canonical = _method(canonical_tree, callee)
+        assert ast.unparse(canonical.returns) == (
+            "tuple[pl.Tensor[[BATCH, HIDDEN], pl.BF16], "
+            "pl.Tensor[[n_local_experts], pl.INT32]]"
+        )
+        returns = [
+            node
+            for node in ast.walk(canonical)
+            if isinstance(node, ast.Return)
+        ]
+        assert len(returns) == 1
+        assert ast.unparse(returns[0].value) == (
+            "(next_hidden_out, local_expert_count)"
+        )
+
+        assignment = _call_assignment(chip, callee)
+        assert ast.unparse(assignment.targets[0]) == f"({hidden}, {count})"
+        call = assignment.value
+        parameters = [
+            arg.arg for arg in canonical.args.args if arg.arg != "self"
+        ]
+        bound = {
+            parameter: ast.unparse(argument)
+            for parameter, argument in zip(
+                parameters, call.args, strict=True
+            )
+        }
+        assert bound["next_hidden_out"] == hidden
+        assert bound["local_expert_count"] == count
+
+
 def test_snapshot_is_one_incore_body_without_nested_task_scope() -> None:
     _, tree = _parse(_PROGRAM)
-    snapshot = _method(tree, "snapshot_recv_meta_and_hidden")
+    snapshot = _method(tree, "snapshot_local_routes_and_hidden")
     annotations = {
         arg.arg: ast.unparse(arg.annotation)
         for arg in snapshot.args.args
         if arg.annotation is not None
     }
-    assert annotations["recv_meta"].startswith("pld.DistributedTensor[")
+    assert annotations["local_expert_count"].startswith("pl.Tensor[")
     assert annotations["recv_meta_out"].startswith("pl.Out[")
     assert annotations["hidden_out"].startswith("pl.Out[")
 
     calls = {_call_name(call) for call in ast.walk(snapshot) if isinstance(call, ast.Call)}
-    assert {"load", "store", "range"}.issubset(calls)
+    assert {"full", "read", "store", "range"}.issubset(calls)
     assert "at" not in calls
     body = ast.unparse(snapshot)
     assert "[n_ranks, n_local_experts_pad]" in body
     assert "SNAPSHOT_HIDDEN_CHUNK" in body
-    assert "n_local_experts, n_local_experts_pad" in body
-    assert "pl.cast(0, pl.INT32)" in body
+    assert "[my_rank, expert]" in body
+    assert "pl.read(local_expert_count, [expert])" in body
 
 
 def test_host_and_holder_expose_both_route_snapshots() -> None:
@@ -313,25 +391,17 @@ def test_route_program_registers_optional_fused_all_reduce() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("remote_count", "explicit_count", "expected_self"),
-    [(0, 5, 5), (3, 7, 4), (5, 5, 0)],
-)
-def test_explicit_counts_reconstruct_unpublished_self_rows(
-    remote_count: int,
-    explicit_count: int,
-    expected_self: int,
-) -> None:
+def test_explicit_counts_match_diagonal_owner_rows() -> None:
     l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
     l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
     count_l3 = torch.zeros((8, 36), dtype=torch.int32)
     count_l4 = torch.zeros((8, 36), dtype=torch.int32)
     rank = 3
     expert = 4
-    l3[rank, 0, expert] = remote_count
-    l4[rank, 2, expert] = remote_count
-    count_l3[rank, expert] = explicit_count
-    count_l4[rank, expert] = explicit_count
+    l3[rank, rank, expert] = 5
+    l4[rank, rank, expert] = 7
+    count_l3[rank, expert] = 5
+    count_l4[rank, expert] = 7
 
     recv_meta, counts = assemble_route_outputs(
         l3,
@@ -340,26 +410,38 @@ def test_explicit_counts_reconstruct_unpublished_self_rows(
         local_expert_count_l4=count_l4,
     )
 
-    assert int(recv_meta[rank, 0, rank, expert]) == expected_self
-    assert int(recv_meta[rank, 1, rank, expert]) == expected_self
+    assert int(recv_meta[rank, 0, rank, expert]) == 5
+    assert int(recv_meta[rank, 1, rank, expert]) == 7
     assert torch.equal(counts[:, 0], count_l3)
     assert torch.equal(counts[:, 1], count_l4)
-    assert torch.equal(
-        recv_meta[:, :, :, :36].sum(dim=2, dtype=torch.int64),
-        counts.to(torch.int64),
-    )
     assert not bool(torch.any(recv_meta[:, :, :, 36:]))
 
 
-def test_explicit_count_reconstruction_rejects_remote_excess() -> None:
+def test_route_output_assembly_rejects_off_owner_rows() -> None:
     l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
     l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
     count_l3 = torch.zeros((8, 36), dtype=torch.int32)
     count_l4 = torch.zeros((8, 36), dtype=torch.int32)
     l3[0, 1, 0] = 2
-    count_l3[0, 0] = 1
 
-    with pytest.raises(ValueError, match="smaller than published remote"):
+    with pytest.raises(ValueError, match="off-owner"):
+        assemble_route_outputs(
+            l3,
+            l4,
+            local_expert_count_l3=count_l3,
+            local_expert_count_l4=count_l4,
+        )
+
+
+def test_route_output_assembly_rejects_diagonal_count_mismatch() -> None:
+    l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    count_l3 = torch.zeros((8, 36), dtype=torch.int32)
+    count_l4 = torch.zeros((8, 36), dtype=torch.int32)
+    l3[3, 3, 4] = 5
+    count_l3[3, 4] = 4
+
+    with pytest.raises(ValueError, match="diagonal owner route row"):
         assemble_route_outputs(
             l3,
             l4,
@@ -385,16 +467,10 @@ def test_route_holder_preserves_ipc_provenance_for_weight_slices() -> None:
 def test_route_output_assembly_is_exact_and_device_ordered() -> None:
     l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
     l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
-    for src in range(8):
-        l3[2, src, src] = 8
-        l4[2, src, src] = 8
-
-    l3[2, 0, 0] = 6
-    l3[2, 1, 1] = 5
-    l4[2, 6, 6] = 4
-    l3[0, 0, 0] = 2
-    l3[0, 1, 0] = 3
-    l4[7, 6, 35] = 4
+    l3[0, 0, 0] = 5
+    l3[2, 2, 2] = 3
+    l4[2, 2, 6] = 4
+    l4[7, 7, 35] = 4
 
     recv_meta, local_expert_count = assemble_route_outputs(l3, l4)
     assert tuple(recv_meta.shape) == (8, 2, 8, 40)
@@ -404,37 +480,51 @@ def test_route_output_assembly_is_exact_and_device_ordered() -> None:
     assert int(local_expert_count[0, 0, 0]) == 5
     assert int(local_expert_count[7, 1, 35]) == 4
     validation = _validate_route_totals(recv_meta, active_batch=1)
-    assert validation["per_layer_per_source"] == [[8] * 8, [8] * 8]
-    assert validation["global_per_layer"] == [64, 64]
+    assert validation["per_layer_per_owner"] == [
+        [5, 0, 3, 0, 0, 0, 0, 0],
+        [0, 0, 4, 0, 0, 0, 0, 4],
+    ]
+    assert validation["global_per_layer"] == [8, 8]
+    assert validation["expected_global_per_layer"] == 8
+    assert validation["owner_rows_diagonal"]
 
 
 def test_route_sidecar_is_analyzer_compatible(tmp_path: Path) -> None:
     recv_meta = torch.zeros((8, 2, 8, 40), dtype=torch.int32)
-    for layer in range(2):
-        for src in range(8):
-            recv_meta[src, layer, src, 0] = 8
-    local_expert_count = recv_meta[:, :, :, :36].sum(
-        dim=2,
-        dtype=torch.int64,
-    ).to(torch.int32)
+    recv_meta[0, 0, 0, 0] = 5
+    recv_meta[2, 0, 2, 2] = 3
+    recv_meta[2, 1, 2, 6] = 4
+    recv_meta[7, 1, 7, 35] = 4
+    local_expert_count = torch.stack(
+        [
+            recv_meta[rank, :, rank, :36]
+            for rank in range(8)
+        ],
+        dim=0,
+    )
 
     validation = _validate_route_totals(recv_meta, active_batch=1)
-    assert validation["global_per_layer"] == [64, 64]
+    assert validation["global_per_layer"] == [8, 8]
     payload = _sidecar_payload(
         recv_meta_device=recv_meta,
         local_expert_count_device=local_expert_count,
         provenance=_fake_provenance(),
         window_id_prefix="route-test",
     )
-    assert tuple(payload["recv_meta"].shape) == (2, 8, 8, 40)
+    assert tuple(payload["owner_route_counts"].shape) == (2, 8, 8, 40)
     assert tuple(payload["local_expert_count"].shape) == (2, 8, 36)
+    assert payload["snapshot_provenance"][0]["source_tensor"] == (
+        "local_expert_count"
+    )
 
     sidecar = tmp_path / "recv_meta_sidecar.pt"
     torch.save(payload, sidecar)
     analyzed = _route_histogram_contract(sidecar)
     assert analyzed["L3"]["available"]
-    assert analyzed["L3"]["total_routed_tokens_by_rank"]["rank0/d0"] == 8
-    assert analyzed["L4"]["window_independence_validated"]
+    assert analyzed["L3"]["total_routed_tokens_by_rank"]["rank0/d0"] == 5
+    assert analyzed["L4"]["snapshot_independence_validated"]
+    assert analyzed["L3"]["owner_rows_diagonal"]
+    assert analyzed["L3"]["global_per_layer"] == [8, 8]
     assert analyzed["L3"]["source"] == sidecar.name
     assert analyzed["L3"]["provenance"]["active_batch"] == 1
 
@@ -500,6 +590,14 @@ def test_golden_contract_is_validated_before_device_use(
         "files": files,
         "bit_exact": True,
     }
+    manifest.update(
+        source_protocol_binding_fields(
+            source_manifest_sha256="2" * 64,
+            decode_fwd_sha256="1" * 64,
+            moe_protocol_contract_sha256="3" * 64,
+            protocol_contract=manifest,
+        )
+    )
     (tmp_path / "manifest.json").write_text(
         json.dumps(manifest),
         encoding="utf-8",
@@ -514,8 +612,24 @@ def test_golden_contract_is_validated_before_device_use(
     )
 
     assert contract["source_kind"] == "baseline"
+    assert contract["protocol_profile"] == "legacy_distributed_ep"
+    assert contract["numeric_contract"] == {
+        "name": "legacy_baseline_bit_exact_v1",
+        "comparison": "bit_exact_to_protocol_golden",
+        "bit_exact": True,
+    }
     assert contract["files"] == files
     assert torch.equal(tensors["hidden_l4"], hidden_l4)
+
+    with pytest.raises(ValueError, match="does not match expected"):
+        _load_golden_contract(
+            tmp_path,
+            active_batch=1,
+            context_len=65536,
+            image_digest=_IMAGE,
+            source_decode_sha256="1" * 64,
+            expected_protocol_profile="replicated_input_local_owner",
+        )
 
     manifest["files"]["hidden_l4.pt"] = "0" * 64
     (tmp_path / "manifest.json").write_text(
@@ -535,6 +649,14 @@ def test_golden_contract_is_validated_before_device_use(
         (tmp_path / "hidden_l4.pt").read_bytes()
     ).hexdigest()
     manifest["source_decode_fwd_sha256"] = "0" * 64
+    manifest.update(
+        source_protocol_binding_fields(
+            source_manifest_sha256="2" * 64,
+            decode_fwd_sha256="0" * 64,
+            moe_protocol_contract_sha256="3" * 64,
+            protocol_contract=manifest,
+        )
+    )
     (tmp_path / "manifest.json").write_text(
         json.dumps(manifest),
         encoding="utf-8",
@@ -547,6 +669,115 @@ def test_golden_contract_is_validated_before_device_use(
             image_digest=_IMAGE,
             source_decode_sha256="1" * 64,
         )
+
+
+def test_local_ep_golden_contract_requires_exact_protocol_metadata(
+    tmp_path: Path,
+) -> None:
+    hidden = torch.zeros((8, 1, 4096), dtype=torch.bfloat16)
+    for name in ("hidden_l3.pt", "hidden_l4.pt"):
+        torch.save(hidden, tmp_path / name)
+    files = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in ("hidden_l3.pt", "hidden_l4.pt")
+    }
+    manifest = {
+        "schema": "step3p5.five-layer-moe-golden.v3",
+        "source_run": "local-ep-formal-bs1-64k",
+        "source_kind": "local-ep",
+        "protocol_profile": "replicated_input_local_owner",
+        "numeric_contract": {
+            "name": "local_owner_partial_tp_all_reduce_bf16_v1",
+            "comparison": "bit_exact_to_protocol_golden",
+            "bit_exact": True,
+        },
+        "source_decode_fwd_sha256": "1" * 64,
+        "source_manifest_sha256": "2" * 64,
+        "active_batch": 1,
+        "context_len_per_sequence": 65536,
+        "image_ref": _IMAGE,
+        "files": files,
+        "bit_exact": True,
+    }
+    manifest.update(
+        source_protocol_binding_fields(
+            source_manifest_sha256="2" * 64,
+            decode_fwd_sha256="1" * 64,
+            moe_protocol_contract_sha256="3" * 64,
+            protocol_contract=manifest,
+        )
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    contract, _ = _load_golden_contract(
+        tmp_path,
+        active_batch=1,
+        context_len=65536,
+        image_digest=_IMAGE,
+        source_decode_sha256="1" * 64,
+        expected_protocol_profile="replicated_input_local_owner",
+    )
+
+    assert contract["source_kind"] == "local-ep"
+    assert contract["protocol_profile"] == "replicated_input_local_owner"
+    assert contract["numeric_contract"] == manifest["numeric_contract"]
+
+    invalid_cases = [
+        (
+            lambda value: value.pop("numeric_contract"),
+            "declare protocol_profile and numeric_contract together",
+        ),
+        (
+            lambda value: value.pop("protocol_profile"),
+            "declare protocol_profile and numeric_contract together",
+        ),
+        (
+            lambda value: value.__setitem__(
+                "protocol_profile",
+                "unknown_ep",
+            ),
+            "unsupported golden protocol_profile",
+        ),
+        (
+            lambda value: value.__setitem__("source_kind", "baseline"),
+            "source_kind=.*invalid",
+        ),
+        (
+            lambda value: value["numeric_contract"].__setitem__(
+                "name",
+                "legacy_baseline_bit_exact_v1",
+            ),
+            "numeric_contract.name",
+        ),
+        (
+            lambda value: value["numeric_contract"].__setitem__(
+                "comparison",
+                "bit_exact_to_legacy_baseline",
+            ),
+            "numeric_contract.comparison",
+        ),
+        (
+            lambda value: value["numeric_contract"].__setitem__(
+                "bit_exact",
+                1,
+            ),
+            "numeric_contract.bit_exact",
+        ),
+    ]
+    for mutate, match in invalid_cases:
+        candidate = json.loads(json.dumps(manifest))
+        mutate(candidate)
+        manifest_path.write_text(json.dumps(candidate), encoding="utf-8")
+        with pytest.raises(ValueError, match=match):
+            _load_golden_contract(
+                tmp_path,
+                active_batch=1,
+                context_len=65536,
+                image_digest=_IMAGE,
+                source_decode_sha256="1" * 64,
+                expected_protocol_profile="replicated_input_local_owner",
+            )
 
 
 def test_golden_contract_requires_explicit_bit_exact_manifest(
@@ -686,10 +917,27 @@ def test_exporters_are_cleaned_when_holder_build_fails() -> None:
     assert "build" in protected_calls
 
 
-def test_route_total_validation_rejects_missing_source_routes() -> None:
+def test_route_total_validation_rejects_missing_global_routes() -> None:
     recv_meta = torch.zeros((8, 2, 8, 40), dtype=torch.int32)
-    with pytest.raises(ValueError, match=r"active_batch \* TOPK"):
+    with pytest.raises(ValueError, match="global route totals"):
         _validate_route_totals(recv_meta, active_batch=1)
+
+
+@pytest.mark.parametrize("active_batch", [1, 2, 4, 7, 8, 16])
+def test_route_total_validation_counts_one_global_topk_set(
+    active_batch: int,
+) -> None:
+    recv_meta = torch.zeros((8, 2, 8, 40), dtype=torch.int32)
+    expected = active_batch * 8
+    recv_meta[0, 0, 0, 0] = expected
+    recv_meta[7, 1, 7, 35] = expected
+
+    validation = _validate_route_totals(
+        recv_meta,
+        active_batch=active_batch,
+    )
+    assert validation["global_per_layer"] == [expected, expected]
+    assert validation["expected_global_per_layer"] == expected
 
 
 def test_holder_rejects_heterogeneous_owner_counts() -> None:
@@ -702,12 +950,12 @@ def test_holder_rejects_heterogeneous_owner_counts() -> None:
         dtype=torch.int32,
     )
 
-    with pytest.raises(ValueError, match="heterogeneous owner-local counts"):
-        holder._validate_packed_global_owner_counts()
+    with pytest.raises(ValueError, match="requires identical"):
+        holder._validate_replicated_owner_counts()
 
 
 @pytest.mark.parametrize("active_batch", [1, 2, 4, 7, 8, 16])
-def test_holder_accepts_replicated_packed_global_owner_counts(
+def test_holder_accepts_replicated_owner_counts(
     active_batch: int,
 ) -> None:
     holder = object.__new__(FiveLayerMoeRouteHolder)
@@ -716,7 +964,7 @@ def test_holder_accepts_replicated_packed_global_owner_counts(
     holder.num_tokens_per_owner = torch.zeros(128, dtype=torch.int32)
     holder.num_tokens_per_owner[:8].fill_(active_batch)
 
-    assert holder._validate_packed_global_owner_counts() == active_batch
+    assert holder._validate_replicated_owner_counts() == active_batch
 
 
 @pytest.mark.parametrize("failure", ["shape", "dtype", "negative", "padding"])

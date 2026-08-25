@@ -720,8 +720,8 @@ for _name, _value in (
 #
 # Expert-Parallel (EP) sharding:
 #   - Routed experts         288 experts evenly partitioned, 36 per card
-#   - Token routing          all_to_all dispatch + combine
-#                            (per-token send_counts)
+#   - Token routing          replicated input, owner-local route packing,
+#                            then TP all-reduce of local output partials
 #
 # IMPORTANT for downstream code in this package:
 #   The single-card constants HIDDEN_Q_FULL, HIDDEN_Q_SWA, KV_HIDDEN,
@@ -777,6 +777,12 @@ MOE_NUM_EXPERTS_LOCAL = MOE_NUM_EXPERTS // EP_WORLD_SIZE  # 288 // 8 == 36
 #   (16 for full, 24 for SWA) likewise stay valid.
 
 # Sanity: every TP / EP sliced dim must divide cleanly.
+if (TP_WORLD_SIZE, EP_WORLD_SIZE) != (8, 8):
+    raise ValueError(
+        "replicated-input local-owner MoE requires co-located TP=EP=8, "
+        f"got TP_WORLD_SIZE={TP_WORLD_SIZE} and "
+        f"EP_WORLD_SIZE={EP_WORLD_SIZE}"
+    )
 assert NUM_HEADS_FULL % TP_WORLD_SIZE == 0, (
     f"NUM_HEADS_FULL={NUM_HEADS_FULL} must be a multiple of "
     f"TP_WORLD_SIZE={TP_WORLD_SIZE}"
@@ -814,7 +820,7 @@ def ep_expert_owner(expert_id: int) -> int:
 
     Experts ``0..MOE_NUM_EXPERTS_LOCAL-1`` belong to rank 0,
     ``MOE_NUM_EXPERTS_LOCAL..2*MOE_NUM_EXPERTS_LOCAL-1`` to rank 1, and so
-    on. Mirrors vllm's contiguous block-cyclic expert sharding.
+    on. Mirrors vLLM's contiguous expert-block sharding.
     """
     if not 0 <= expert_id < MOE_NUM_EXPERTS:
         raise ValueError(

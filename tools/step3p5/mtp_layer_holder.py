@@ -15,6 +15,8 @@ import time
 
 import torch
 
+from tools.step3p5.device_topology import validate_consecutive_device_ids
+
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 _I32 = torch.int32
@@ -80,7 +82,10 @@ class MtpLayerHolder:
         mtp_kv_dir=None,
         platform="a2a3",
     ):
-        self.device_ids = list(device_ids)
+        self.device_ids = validate_consecutive_device_ids(
+            device_ids,
+            owner="MTP layer",
+        )
         self.tp = len(self.device_ids)
         self.dev_offset = self.device_ids[0]
         self.out_dir = out_dir

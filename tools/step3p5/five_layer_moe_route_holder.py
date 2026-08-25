@@ -34,7 +34,7 @@ def assemble_route_outputs(
     local_expert_count_l3: torch.Tensor | None = None,
     local_expert_count_l4: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Validate snapshots and reconstruct unpublished self-route rows."""
+    """Validate diagonal local-owner snapshots and explicit counts."""
     expected = (tp, tp, n_local_experts_pad)
     for layer, tensor in (("L3", recv_meta_l3), ("L4", recv_meta_l4)):
         if tuple(tensor.shape) != expected:
@@ -55,18 +55,35 @@ def assemble_route_outputs(
             )
 
     recv_meta = torch.stack((recv_meta_l3, recv_meta_l4), dim=1)
+    routed = recv_meta[:, :, :, :n_local_experts]
+    for owner_rank in range(tp):
+        for route_owner_rank in range(tp):
+            if owner_rank == route_owner_rank:
+                continue
+            if bool(torch.any(routed[owner_rank, :, route_owner_rank])):
+                raise ValueError(
+                    "local-owner route snapshot contains a non-zero "
+                    "off-owner row at "
+                    f"owner_rank={owner_rank}, "
+                    f"route_owner_rank={route_owner_rank}"
+                )
+    diagonal_counts = torch.stack(
+        [
+            routed[owner_rank, :, owner_rank]
+            for owner_rank in range(tp)
+        ],
+        dim=0,
+    )
+    diagonal_i64 = diagonal_counts.to(torch.int64)
+    if bool(torch.any(diagonal_i64 > torch.iinfo(_I32).max)):
+        raise OverflowError("local expert count exceeds INT32")
+
     if (local_expert_count_l3 is None) != (local_expert_count_l4 is None):
         raise ValueError(
             "L3/L4 explicit local expert counts must be supplied together"
         )
     if local_expert_count_l3 is None:
-        counts_i64 = recv_meta[:, :, :, :n_local_experts].sum(
-            dim=2,
-            dtype=torch.int64,
-        )
-        if bool(torch.any(counts_i64 > torch.iinfo(_I32).max)):
-            raise OverflowError("local expert count exceeds INT32")
-        return recv_meta, counts_i64.to(_I32)
+        return recv_meta, diagonal_i64.to(_I32)
 
     assert local_expert_count_l4 is not None
     explicit = (local_expert_count_l3, local_expert_count_l4)
@@ -89,42 +106,20 @@ def assemble_route_outputs(
 
     explicit_counts = torch.stack(explicit, dim=1)
     explicit_i64 = explicit_counts.to(torch.int64)
-    recv_i64 = recv_meta[:, :, :, :n_local_experts].to(torch.int64)
-    for rank in range(tp):
-        remote_sum = recv_i64[rank].sum(dim=1) - recv_i64[rank, :, rank]
-        self_rows = explicit_i64[rank] - remote_sum
-        if bool(torch.any(self_rows < 0)):
-            layer, expert = torch.nonzero(
-                self_rows < 0,
-                as_tuple=False,
-            )[0].tolist()
-            raise ValueError(
-                "explicit dispatch count is smaller than published remote "
-                f"routes at rank={rank}, layer={layer}, expert={expert}"
-            )
-        recv_meta[rank, :, rank, :n_local_experts] = self_rows.to(_I32)
-    recv_meta[:, :, :, n_local_experts:] = 0
-
-    derived_i64 = recv_meta[:, :, :, :n_local_experts].sum(
-        dim=2,
-        dtype=torch.int64,
-    )
-    if bool(torch.any(derived_i64 > torch.iinfo(_I32).max)):
-        raise OverflowError("local expert count exceeds INT32")
-    if not torch.equal(derived_i64, explicit_i64):
+    if not torch.equal(diagonal_i64, explicit_i64):
         mismatch = torch.nonzero(
-            derived_i64 != explicit_i64,
+            diagonal_i64 != explicit_i64,
             as_tuple=False,
         )[0].tolist()
         raise ValueError(
-            "explicit dispatch counts disagree with reconstructed recv_meta "
+            "local_expert_count disagrees with diagonal owner route row "
             f"at index={mismatch}"
         )
     return recv_meta, explicit_counts
 
 
 class FiveLayerMoeRouteHolder(WholeDecodeHolder):
-    """Run L0-L4 while exporting exact L3/L4 dispatch metadata."""
+    """Run L0-L4 while exporting exact L3/L4 local-owner route counts."""
 
     def __init__(
         self,
@@ -533,10 +528,10 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
         return self
 
     def run(self, *, dfx: str = ""):
-        """Run once and expose hidden states plus exact route metadata."""
+        """Run once and expose hidden states plus exact owner-count metadata."""
         if self.rt is None:
             raise RuntimeError("enter the holder before run()")
-        self._validate_packed_global_owner_counts()
+        self._validate_replicated_owner_counts()
         started = time.time()
         if dfx:
             from pypto.runtime.runner import RunConfig  # noqa: PLC0415
@@ -576,26 +571,5 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
             "recv_meta": recv_meta,
             "local_expert_count": local_expert_count,
         }
-
-    def _validate_packed_global_owner_counts(self) -> int:
-        """Reject owner-local row counts unsupported by the focused graph."""
-        if self.num_tokens_per_owner is None:
-            raise RuntimeError("owner-count storage is unavailable")
-        counts = self.num_tokens_per_owner[: self.tp].to(torch.int64)
-        active_batch = int(counts[0].item())
-        storage_batch = int(self._consts["BATCH"])
-        if not 1 <= active_batch <= storage_batch:
-            raise ValueError(
-                "packed-global active batch must be within "
-                f"[1, {storage_batch}], got {active_batch}"
-            )
-        if not bool(torch.all(counts == active_batch)):
-            raise ValueError(
-                "five-layer route capture requires identical "
-                "num_tokens_per_owner on every TP rank; heterogeneous "
-                f"owner-local counts are unsupported, got {counts.tolist()}"
-            )
-        return active_batch
-
 
 __all__ = ["FiveLayerMoeRouteHolder", "assemble_route_outputs"]

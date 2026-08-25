@@ -10,15 +10,21 @@ The focused graph keeps exactly the first five canonical decode layers:
 * L3: sliding-window attention + MoE
 * L4: full attention + MoE
 
-This diagnostic-only graph snapshots the reused distributed ``moe_recv_meta``
-window after L3 and again after L4.  Each snapshot also copies the matching
-hidden state.  L4 consumes the copied L3 hidden state, creating a real
-producer-consumer fence that prevents L4 from overwriting metadata before the
-L3 snapshot completes.
+This diagnostic-only graph snapshots the local owner-expert counts after L3
+and again after L4.  The compatibility ``recv_meta`` output has exactly one
+non-zero source row per device: row ``my_rank`` contains that rank's local
+expert counts.  Each snapshot also copies the matching hidden state.  L4
+consumes the copied L3 hidden state, creating a real producer-consumer fence
+between the two diagnostic snapshots.
 
 The compute bodies are not copied.  This module composes the canonical IR
 functions from ``models.step3p5.decode_fwd`` with diagnostic orchestration and
 one local snapshot kernel.  The formal normal/DFX program remains unchanged.
+
+This v2 graph intentionally proves exact local-owner count histograms only.
+It does not export ``(token, topk-slot) -> expert/packed-row`` identity.
+Replaying attention here is not valid evidence because it would repeat
+collectives and write the canonical KV slots a second time.
 """
 from __future__ import annotations
 
@@ -64,11 +70,6 @@ ROUTED_W13_M1 = _canonical.ROUTED_W13_M1
 ROUTED_W2_N1 = _canonical.ROUTED_W2_N1
 ROUTED_W2_M1 = _canonical.ROUTED_W2_M1
 sh_inter_local = _canonical.sh_inter_local
-dispatch_lane_rows = _canonical.dispatch_lane_rows
-dispatch_aux_pad = _canonical.dispatch_aux_pad
-idx_pad = _canonical.idx_pad
-n_routes_per_rank = _canonical.n_routes_per_rank
-
 N_FULL_FIVE = 2
 N_SWA_FIVE = 3
 N_DENSE_FIVE = 3
@@ -91,11 +92,9 @@ swa_moe_chip_orch = _CANONICAL_PROGRAM.get_function("swa_moe_chip_orch")
 @pl.program
 class FiveLayerMoeRouteInstrumented:
     @pl.function(type=pl.FunctionType.InCore)
-    def snapshot_recv_meta_and_hidden(
+    def snapshot_local_routes_and_hidden(
         self,
-        recv_meta: pld.DistributedTensor[
-            [n_ranks, n_local_experts_pad], pl.INT32
-        ],
+        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
         hidden_in: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         recv_meta_out: pl.Out[
@@ -106,24 +105,17 @@ class FiveLayerMoeRouteInstrumented:
         pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32],
         pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     ]:
-        meta_tile = pl.load(
-            recv_meta,
-            [0, 0],
+        meta_tile = pl.tile.full(
             [n_ranks, n_local_experts_pad],
+            dtype=pl.INT32,
+            value=0,
         )
-        # Self-target stores have no peer notification/fence.  Keep that row
-        # deterministic and reconstruct it from explicit dispatch counts.
         for expert in pl.range(n_local_experts):
             pl.tile.write(
                 meta_tile,
                 [my_rank, expert],
-                pl.cast(0, pl.INT32),
+                pl.read(local_expert_count, [expert]),
             )
-        for src in pl.range(n_ranks):
-            for expert in pl.range(
-                n_local_experts, n_local_experts_pad
-            ):
-                pl.tile.write(meta_tile, [src, expert], pl.cast(0, pl.INT32))
         pl.store(meta_tile, [0, 0], recv_meta_out)
         for k0 in pl.range(0, HIDDEN, SNAPSHOT_HIDDEN_CHUNK):
             hidden_tile = pl.load(
@@ -259,35 +251,11 @@ class FiveLayerMoeRouteInstrumented:
         moe_attn_signal_stack: pld.DistributedTensor[
             [N_MOE_FIVE * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
         ],
-        moe_recv_meta: pld.DistributedTensor[
-            [n_ranks, n_local_experts_pad], pl.INT32
-        ],
-        moe_meta_arrived: pld.DistributedTensor[
-            [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
-        moe_recv_x: pld.DistributedTensor[
-            [dispatch_lane_rows, HIDDEN], pl.INT8
-        ],
-        moe_recv_aux: pld.DistributedTensor[
-            [dispatch_lane_rows, dispatch_aux_pad], pl.FP32
-        ],
-        moe_recv_route: pld.DistributedTensor[
-            [dispatch_lane_rows, idx_pad], pl.INT32
-        ],
-        moe_data_arrived: pld.DistributedTensor[
-            [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
         moe_sh_tmp_stack: pld.DistributedTensor[
             [N_MOE_FIVE * BATCH, HIDDEN], pl.BF16
         ],
         moe_sh_signal_stack: pld.DistributedTensor[
             [N_MOE_FIVE * COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
-        moe_combine_arrived: pld.DistributedTensor[
-            [COMM_SIGNAL_STRIDE_I32, 1], pl.INT32
-        ],
-        moe_routed_y_buf: pld.DistributedTensor[
-            [n_routes_per_rank, HIDDEN], pl.BF16
         ],
         num_tokens_per_owner: pl.Tensor[
             [NUM_TOKENS_RUNTIME], pl.INT32
@@ -479,10 +447,10 @@ class FiveLayerMoeRouteInstrumented:
             my_rank,
         )
 
-        # L3: SWA + MoE, epoch 1. Snapshot before L4 reuses moe_recv_meta.
+        # L3: SWA + MoE. Snapshot local owner counts before L4.
         resid_l3 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         hidden_l3_raw = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        hidden_l3_raw = swa_moe_chip_orch(
+        hidden_l3_raw, local_expert_count_l3 = swa_moe_chip_orch(
             h2,
             input_rms,
             pl.slice(swa_wq, [HIDDEN, hidden_q_swa], [2 * HIDDEN, 0]),
@@ -557,28 +525,19 @@ class FiveLayerMoeRouteInstrumented:
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [0, 0],
             ),
-            moe_recv_meta,
-            moe_meta_arrived,
-            moe_recv_x,
-            moe_recv_aux,
-            moe_recv_route,
-            moe_data_arrived,
             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [0, 0]),
             pl.slice(
                 moe_sh_signal_stack,
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [0, 0],
             ),
-            moe_combine_arrived,
-            moe_routed_y_buf,
             3,
             0,
             num_tokens,
             my_rank,
-            1,
         )
-        recv_meta_l3, hidden_l3 = self.snapshot_recv_meta_and_hidden(
-            moe_recv_meta,
+        recv_meta_l3, hidden_l3 = self.snapshot_local_routes_and_hidden(
+            local_expert_count_l3,
             my_rank,
             hidden_l3_raw,
             recv_meta_l3,
@@ -588,7 +547,7 @@ class FiveLayerMoeRouteInstrumented:
         # L4 consumes the fenced, bit-identical L3 snapshot.
         resid_l4 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         hidden_l4_raw = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-        hidden_l4_raw = full_moe_chip_orch(
+        hidden_l4_raw, local_expert_count_l4 = full_moe_chip_orch(
             hidden_l3,
             input_rms,
             pl.slice(full_wq, [HIDDEN, hidden_q_full], [HIDDEN, 0]),
@@ -679,28 +638,19 @@ class FiveLayerMoeRouteInstrumented:
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [COMM_SIGNAL_STRIDE_I32, 0],
             ),
-            moe_recv_meta,
-            moe_meta_arrived,
-            moe_recv_x,
-            moe_recv_aux,
-            moe_recv_route,
-            moe_data_arrived,
             pl.slice(moe_sh_tmp_stack, [BATCH, HIDDEN], [BATCH, 0]),
             pl.slice(
                 moe_sh_signal_stack,
                 [COMM_SIGNAL_STRIDE_I32, 1],
                 [COMM_SIGNAL_STRIDE_I32, 0],
             ),
-            moe_combine_arrived,
-            moe_routed_y_buf,
             4,
             0,
             num_tokens,
             my_rank,
-            2,
         )
-        recv_meta_l4, hidden_l4 = self.snapshot_recv_meta_and_hidden(
-            moe_recv_meta,
+        recv_meta_l4, hidden_l4 = self.snapshot_local_routes_and_hidden(
+            local_expert_count_l4,
             my_rank,
             hidden_l4_raw,
             recv_meta_l4,
@@ -895,37 +845,12 @@ class FiveLayerMoeRouteInstrumented:
         moe_attn_signal_buf = pld.alloc_window_buffer(
             N_MOE_FIVE * COMM_CONTROL_SIGNAL_BYTES
         )
-        moe_recv_meta_buf = pld.alloc_window_buffer(
-            n_ranks * n_local_experts_pad * 4
-        )
-        moe_meta_arrived_buf = pld.alloc_window_buffer(
-            COMM_CONTROL_SIGNAL_BYTES
-        )
-        moe_recv_x_buf = pld.alloc_window_buffer(
-            dispatch_lane_rows * HIDDEN
-        )
-        moe_recv_aux_buf = pld.alloc_window_buffer(
-            dispatch_lane_rows * dispatch_aux_pad * 4
-        )
-        moe_recv_route_buf = pld.alloc_window_buffer(
-            dispatch_lane_rows * idx_pad * 4
-        )
-        moe_data_arrived_buf = pld.alloc_window_buffer(
-            COMM_CONTROL_SIGNAL_BYTES
-        )
         moe_sh_tmp_buf = pld.alloc_window_buffer(
             N_MOE_FIVE * BATCH * HIDDEN * 2
         )
         moe_sh_signal_buf = pld.alloc_window_buffer(
             N_MOE_FIVE * COMM_CONTROL_SIGNAL_BYTES
         )
-        moe_combine_arrived_buf = pld.alloc_window_buffer(
-            COMM_CONTROL_SIGNAL_BYTES
-        )
-        moe_routed_y_buf = pld.alloc_window_buffer(
-            n_routes_per_rank * HIDDEN * 2
-        )
-
         for rank in pl.range(pld.world_size()):
             self.five_layer_route_chip_orch(
                 current_hidden[rank],
@@ -1075,36 +1000,6 @@ class FiveLayerMoeRouteInstrumented:
                     dtype=pl.INT32,
                 ),
                 pld.window(
-                    moe_recv_meta_buf,
-                    [n_ranks, n_local_experts_pad],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_meta_arrived_buf,
-                    [COMM_SIGNAL_STRIDE_I32, 1],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_recv_x_buf,
-                    [dispatch_lane_rows, HIDDEN],
-                    dtype=pl.INT8,
-                ),
-                pld.window(
-                    moe_recv_aux_buf,
-                    [dispatch_lane_rows, dispatch_aux_pad],
-                    dtype=pl.FP32,
-                ),
-                pld.window(
-                    moe_recv_route_buf,
-                    [dispatch_lane_rows, idx_pad],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_data_arrived_buf,
-                    [COMM_SIGNAL_STRIDE_I32, 1],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
                     moe_sh_tmp_buf,
                     [N_MOE_FIVE * BATCH, HIDDEN],
                     dtype=pl.BF16,
@@ -1113,16 +1008,6 @@ class FiveLayerMoeRouteInstrumented:
                     moe_sh_signal_buf,
                     [N_MOE_FIVE * COMM_SIGNAL_STRIDE_I32, 1],
                     dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_combine_arrived_buf,
-                    [COMM_SIGNAL_STRIDE_I32, 1],
-                    dtype=pl.INT32,
-                ),
-                pld.window(
-                    moe_routed_y_buf,
-                    [n_routes_per_rank, HIDDEN],
-                    dtype=pl.BF16,
                 ),
                 num_tokens_per_owner,
                 rank,

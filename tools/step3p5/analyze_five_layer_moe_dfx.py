@@ -8,9 +8,9 @@ The focused graph has two MoE layers:
 * L4: full attention + MoE
 
 This analyzer keeps those layers separate, keeps AIC and AIV accounting
-separate for mixed kernels, and compares dispatch/combine arrival times across
-all ranks.  It intentionally treats long ``tp_all_reduce`` spans as possible
-in-kernel peer wait rather than arithmetic time.
+separate for mixed kernels, and compares profile-specific collective arrival
+times across all ranks.  It intentionally treats long ``tp_all_reduce`` spans
+as possible in-kernel peer wait rather than arithmetic time.
 """
 
 from __future__ import annotations
@@ -30,6 +30,11 @@ from pathlib import Path
 from typing import Any
 
 from pypto.runtime.runner import _CHIP_SWIMLANE_RECORDS_NAME
+from tools.step3p5.five_layer_moe_golden_contract import (
+    GOLDEN_SCHEMA as _GOLDEN_SCHEMA,
+    LOCAL_OWNER_PROTOCOL_PROFILE,
+    normalize_golden_protocol,
+)
 
 
 _LAYER_PREFIX = {
@@ -48,6 +53,7 @@ _STAGE_SUFFIXES = {
     "dispatch_push": ("dispatch_push",),
     "dispatch_wait": ("dispatch_wait",),
     "dispatch_gather": ("dispatch_gather",),
+    "local_route_pack": ("local_route_pack",),
     "expert_gate_up": ("expert_gate_up",),
     "expert_gate": ("expert_gate_mm",),
     "expert_up": ("expert_up_mm",),
@@ -57,25 +63,29 @@ _STAGE_SUFFIXES = {
     "combine_scatter": ("combine_scatter",),
     "combine_wait": ("combine_wait",),
     "combine_reduce": ("combine_reduce",),
+    "local_combine_reduce": ("local_combine_reduce",),
     "moe_residual_add": ("moe_residual_add",),
 }
 _PACKED_NZ_EXTERNAL_STAGES = {
     "expert_gate_up": "routed_nz_gmm1_swiglu_quant",
     "expert_down": "routed_nz_down",
 }
-_ARRIVAL_PAIRS = (
+_LEGACY_ARRIVAL_PAIRS = (
     ("dispatch", "dispatch_push", "dispatch_wait"),
     ("combine", "combine_scatter", "combine_wait"),
+)
+_LOCAL_EP_ARRIVAL_PAIRS = (
+    ("moe_collective", "local_combine_reduce", "moe_all_reduce"),
 )
 _EXPECTED_RANKS = 8
 _EXPECTED_RANK_TAGS = {f"rank{rank}/d0" for rank in range(_EXPECTED_RANKS)}
 _EXPECTED_CORE_TYPES = ["aic"] * 24 + ["aiv"] * 48
-_RECV_META_SIDECAR_SCHEMA = "step3p5.five-layer-moe-recv-meta.v1"
+_RECV_META_SIDECAR_SCHEMA = "step3p5.five-layer-moe-local-routes.v2"
 _RECV_META_LAYERS = ("L3", "L4")
 _RECV_META_AXES = (
     "layer",
-    "dst_rank",
-    "src_rank",
+    "owner_rank",
+    "route_owner_rank",
     "local_expert_pad",
 )
 _RECV_META_SHAPE = (2, 8, 8, 40)
@@ -86,7 +96,6 @@ _RECV_META_WINDOW_BYTES = 8 * 40 * 4
 _MOE_TOPK = 8
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _IMAGE_DIGEST_PATTERN = re.compile(r".+@sha256:[0-9a-f]{64}")
-_GOLDEN_SCHEMA = "step3p5.five-layer-moe-golden.v3"
 _CHECKPOINT_SCHEMA = "step3p5.checkpoint-identity.v1"
 _BASELINE_DECODE_SHA256 = (
     "3553664cbe5bba2453b17b992c9c8a5489deb0df8f88b98d4a93a1aa45544ff0"
@@ -100,6 +109,9 @@ _R6_ROUTE_DECODE_SHA256 = (
 )
 _PACKED_NZ_DECODE_SHA256 = (
     "da36c09dc275838ee364f76342d74717338ef313d912ba2b372808530489dd14"
+)
+_LOCAL_EP_DECODE_SHA256 = (
+    "26c1b06d739c8d32c04c455c23854c4e45436049fc60e9496a64df895712a85e"
 )
 # These are the only upper bounds carried from the release-qualified R5
 # packed-fused analyzer.  R5 had a single mixed fused stage; the route-sidecar
@@ -161,6 +173,29 @@ _FROZEN_SOURCE_POLICIES = {
             "qualification remains in the matched A/B/A and swimlane gates."
         ),
         "experimental": False,
+        "enforce_candidate_release_gate": True,
+    },
+    "local-ep": {
+        "policy_id": "release-local-ep-26c1b06d-replicated-input-v1",
+        "frozen_ref": "immutable source decode@26c1b06d",
+        "decode_sha256_prefix": "26c1b06d",
+        "decode_sha256": _LOCAL_EP_DECODE_SHA256,
+        "golden_protocol_profile": LOCAL_OWNER_PROTOCOL_PROFILE,
+        "source_role": "candidate",
+        "storage_family": "replicated_input_local_owner_packed_nz",
+        "schedule_family": (
+            "local_route_pack_mixed_experts_local_combine_tp_all_reduce"
+        ),
+        "task_partition": (
+            "owner_local_pack_task_or_grid_mixed_expert_compute_"
+            "local_combine_tp_all_reduce"
+        ),
+        "expert_release_family": "packed_nz_mixed",
+        "duration_limit_source": (
+            "No new per-slice duration threshold is introduced here; timing "
+            "qualification remains in the matched A/B/A and swimlane gates."
+        ),
+        "experimental": True,
         "enforce_candidate_release_gate": True,
     },
     "row16": {
@@ -244,7 +279,7 @@ _PACKED_NZ_RESOURCE_TARGETS = {
         "aiv": 46,
     },
 }
-_DIAGNOSTIC_STAGE_RESOURCES = {
+_LEGACY_DIAGNOSTIC_STAGE_RESOURCES = {
     "expert_gate_up": "aic",
     "expert_gate": "aic",
     "expert_up": "aic",
@@ -254,7 +289,14 @@ _DIAGNOSTIC_STAGE_RESOURCES = {
     "combine_wait": "aiv",
     "combine_reduce": "aiv",
 }
-_TASK_TIMING_PROFILE_STAGES = (
+_LOCAL_EP_DIAGNOSTIC_STAGE_RESOURCES = {
+    "local_route_pack": "aiv",
+    "expert_gate_up": "aic",
+    "expert_down": "aic",
+    "local_combine_reduce": "aiv",
+    "moe_all_reduce": "aiv",
+}
+_LEGACY_TASK_TIMING_PROFILE_STAGES = (
     *_ROUTED_PROFILE_STAGES,
     "shared_mlp",
     "shared_gate_up",
@@ -263,6 +305,54 @@ _TASK_TIMING_PROFILE_STAGES = (
     "combine_scatter",
     "combine_wait",
     "combine_reduce",
+)
+_LOCAL_EP_TASK_TIMING_PROFILE_STAGES = (
+    "local_route_pack",
+    *_ROUTED_PROFILE_STAGES,
+    "shared_mlp",
+    "shared_gate_up",
+    "shared_gate_up_act",
+    "shared_down",
+    "local_combine_reduce",
+    "moe_all_reduce",
+)
+_LEGACY_MARKDOWN_STAGE_ORDER = (
+    "norm_quant",
+    "gate_fanout",
+    "gate_topk",
+    "shared_mlp",
+    "shared_gate_up",
+    "shared_gate_up_act",
+    "shared_down",
+    "shared_split",
+    "shared_all_reduce",
+    "dispatch_push",
+    "dispatch_wait",
+    "dispatch_gather",
+    "expert_gate_up",
+    "expert_gate",
+    "expert_up",
+    "expert_gate_up_act",
+    "routed_h_quant",
+    "expert_down",
+    "combine_scatter",
+    "combine_wait",
+    "combine_reduce",
+)
+_LOCAL_EP_MARKDOWN_STAGE_ORDER = (
+    "norm_quant",
+    "gate_fanout",
+    "gate_topk",
+    "shared_mlp",
+    "shared_gate_up",
+    "shared_gate_up_act",
+    "shared_down",
+    "shared_split",
+    "local_route_pack",
+    "expert_gate_up",
+    "expert_down",
+    "local_combine_reduce",
+    "moe_all_reduce",
 )
 _CRITICAL_PATH_CONTRIBUTION_REASON = (
     "critical_path_report.md exposes aggregate totals and a name-only table; "
@@ -398,6 +488,38 @@ def _source_policy(profile: str | None) -> dict[str, Any]:
             dict(_ORIGIN_MAIN_COMPATIBILITY_REFERENCE)
         ),
     }
+
+
+def _arrival_pairs(
+    profile: str | None = None,
+) -> tuple[tuple[str, str, str], ...]:
+    if _resolve_profile(profile) == "local-ep":
+        return _LOCAL_EP_ARRIVAL_PAIRS
+    return _LEGACY_ARRIVAL_PAIRS
+
+
+def _diagnostic_stage_resources(
+    profile: str | None = None,
+) -> dict[str, str]:
+    if _resolve_profile(profile) == "local-ep":
+        return dict(_LOCAL_EP_DIAGNOSTIC_STAGE_RESOURCES)
+    return dict(_LEGACY_DIAGNOSTIC_STAGE_RESOURCES)
+
+
+def _timing_profile_stages(
+    profile: str | None = None,
+) -> tuple[str, ...]:
+    if _resolve_profile(profile) == "local-ep":
+        return _LOCAL_EP_TASK_TIMING_PROFILE_STAGES
+    return _LEGACY_TASK_TIMING_PROFILE_STAGES
+
+
+def _markdown_stage_order(
+    profile: str | None = None,
+) -> tuple[str, ...]:
+    if _resolve_profile(profile) == "local-ep":
+        return _LOCAL_EP_MARKDOWN_STAGE_ORDER
+    return _LEGACY_MARKDOWN_STAGE_ORDER
 
 
 def _source_identity_contract(
@@ -674,8 +796,10 @@ def _find_packed_nz_layer_tasks(
     trace: RankTrace,
     layer: str,
     stage_ids: dict[str, list[str]],
+    profile: str = "candidate",
 ) -> dict[str, str]:
     """Map layer-agnostic packed-NZ extern tasks to one MoE layer."""
+    resolved_profile = _resolve_profile(profile)
     packed_names = set(_PACKED_NZ_EXTERNAL_STAGES.values())
     if not any(
         _strip_resource_suffix(task.name) in packed_names
@@ -683,26 +807,46 @@ def _find_packed_nz_layer_tasks(
     ):
         return {}
 
-    gather_ids = stage_ids["dispatch_gather"]
-    scatter_ids = stage_ids["combine_scatter"]
-    if len(gather_ids) != 1 or len(scatter_ids) != 1:
-        raise RuntimeError(
-            f"{trace.tag}/{layer}: packed-NZ mapping requires exactly one "
-            "dispatch_gather and one combine_scatter task; "
-            f"gather={gather_ids}, scatter={scatter_ids}"
+    if resolved_profile == "local-ep":
+        start_stage = "local_route_pack"
+        end_stage = "local_combine_reduce"
+        window_name = "local_route_pack -> local_combine_reduce"
+    else:
+        start_stage = "dispatch_gather"
+        end_stage = "combine_scatter"
+        window_name = "dispatch_gather -> combine_scatter"
+    start_ids = stage_ids[start_stage]
+    end_ids = stage_ids[end_stage]
+    valid_start_count = (
+        bool(start_ids)
+        if resolved_profile == "local-ep"
+        else len(start_ids) == 1
+    )
+    if not valid_start_count or len(end_ids) != 1:
+        start_expectation = (
+            "at least one"
+            if resolved_profile == "local-ep"
+            else "exactly one"
         )
-    gather = trace.task_by_id[gather_ids[0]]
-    scatter = trace.task_by_id[scatter_ids[0]]
-    if gather.order >= scatter.order:
+        raise RuntimeError(
+            f"{trace.tag}/{layer}: packed-NZ mapping requires "
+            f"{start_expectation} {start_stage} and exactly one "
+            f"{end_stage} task; "
+            f"start={start_ids}, end={end_ids}"
+        )
+    start_tasks = [trace.task_by_id[task_id] for task_id in start_ids]
+    start_task = max(start_tasks, key=lambda task: task.order)
+    end_task = trace.task_by_id[end_ids[0]]
+    if start_task.order >= end_task.order:
         raise RuntimeError(
             f"{trace.tag}/{layer}: invalid packed-NZ task window; "
-            f"gather_order={gather.order}, scatter_order={scatter.order}"
+            f"start_order={start_task.order}, end_order={end_task.order}"
         )
 
     window = [
         task
         for task in trace.tasks
-        if gather.order < task.order < scatter.order
+        if start_task.order < task.order < end_task.order
     ]
     mapped: dict[str, Task] = {}
     for stage, expected_name in _PACKED_NZ_EXTERNAL_STAGES.items():
@@ -714,18 +858,35 @@ def _find_packed_nz_layer_tasks(
         if len(matches) != 1:
             raise RuntimeError(
                 f"{trace.tag}/{layer}: expected exactly one {expected_name!r} "
-                "dependency task inside the dispatch_gather -> "
-                f"combine_scatter window, got "
+                f"dependency task inside the {window_name} window, got "
                 f"{[(task.task_id, task.order, task.name) for task in matches]}"
             )
         mapped[stage] = matches[0]
 
     fused = mapped["expert_gate_up"]
     down = mapped["expert_down"]
+    order_valid = (
+        start_task.order < fused.order < down.order < end_task.order
+    )
+    if resolved_profile == "local-ep":
+        all_starts_before_fused = all(
+            task.order < fused.order
+            for task in start_tasks
+        )
+        if not order_valid or not all_starts_before_fused:
+            raise RuntimeError(
+                f"{trace.tag}/{layer}: invalid packed-NZ task order inside "
+                f"{window_name}; start_orders="
+                f"{[task.order for task in start_tasks]}, "
+                f"fused={fused.order}, down={down.order}, "
+                f"end={end_task.order}"
+            )
+        return {stage: task.task_id for stage, task in mapped.items()}
+
     dependency_chain = {
         "gather_to_fused": _has_dependency_edge(
             trace,
-            gather.task_id,
+            start_task.task_id,
             fused.task_id,
         ),
         "fused_to_down": _has_dependency_edge(
@@ -736,12 +897,9 @@ def _find_packed_nz_layer_tasks(
         "down_to_scatter": _has_dependency_edge(
             trace,
             down.task_id,
-            scatter.task_id,
+            end_task.task_id,
         ),
     }
-    order_valid = (
-        gather.order < fused.order < down.order < scatter.order
-    )
     if not order_valid or not all(dependency_chain.values()):
         raise RuntimeError(
             f"{trace.tag}/{layer}: invalid packed-NZ dependency chain; "
@@ -753,7 +911,9 @@ def _find_packed_nz_layer_tasks(
 def _find_layer_task_ids(
     trace: RankTrace,
     layer: str,
+    profile: str = "candidate",
 ) -> dict[str, list[str]]:
+    resolved_profile = _resolve_profile(profile)
     result: dict[str, list[str]] = {}
     for stage, suffixes in _STAGE_SUFFIXES.items():
         result[stage] = [
@@ -762,7 +922,12 @@ def _find_layer_task_ids(
             if any(_task_matches_layer(task, layer, suffix) for suffix in suffixes)
         ]
 
-    packed_nz_tasks = _find_packed_nz_layer_tasks(trace, layer, result)
+    packed_nz_tasks = _find_packed_nz_layer_tasks(
+        trace,
+        layer,
+        result,
+        resolved_profile,
+    )
     for stage, task_id in packed_nz_tasks.items():
         if result[stage]:
             raise RuntimeError(
@@ -816,6 +981,29 @@ def _find_layer_task_ids(
         )
     else:
         result["shared_all_reduce"] = []
+    result["moe_all_reduce"] = []
+    if resolved_profile == "local-ep":
+        combine_ids = result["local_combine_reduce"]
+        residual_ids = result["moe_residual_add"]
+        if len(combine_ids) == 1 and len(residual_ids) == 1:
+            combine = trace.task_by_id[combine_ids[0]]
+            residual = trace.task_by_id[residual_ids[0]]
+            all_reduces = [
+                task
+                for task in trace.tasks
+                if (
+                    task.name == "tp_all_reduce"
+                    and combine.order < task.order < residual.order
+                )
+            ]
+            if len(all_reduces) != 1:
+                raise RuntimeError(
+                    f"{trace.tag}/{layer}: local-EP mapping requires exactly "
+                    "one tp_all_reduce between local_combine_reduce and "
+                    f"moe_residual_add, got "
+                    f"{[(task.task_id, task.order) for task in all_reduces]}"
+                )
+            result["moe_all_reduce"] = [all_reduces[0].task_id]
     return result
 
 
@@ -1300,11 +1488,483 @@ def _combine_dependency_contract(trace: RankTrace) -> dict[str, Any]:
     }
 
 
+def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
+    """Validate the replicated-input local-owner MoE dependency chain."""
+    stage_ids_by_layer = {
+        layer: _find_layer_task_ids(trace, layer, "local-ep")
+        for layer in _LAYER_PREFIX
+    }
+    chain_stages = (
+        "local_route_pack",
+        "expert_gate_up",
+        "expert_down",
+        "local_combine_reduce",
+        "moe_all_reduce",
+        "moe_residual_add",
+    )
+    mandatory_swim_stages = (
+        "local_route_pack",
+        "local_combine_reduce",
+        "moe_all_reduce",
+        "moe_residual_add",
+    )
+    single_chain_stages = tuple(
+        stage
+        for stage in chain_stages
+        if stage != "local_route_pack"
+    )
+    single_mandatory_swim_stages = tuple(
+        stage
+        for stage in mandatory_swim_stages
+        if stage != "local_route_pack"
+    )
+    expert_stages = ("expert_gate_up", "expert_down")
+    required_edge_specs = (
+        (
+            "pack_to_expert_explicit",
+            "local_route_pack",
+            "expert_gate_up",
+            ("explicit",),
+            "each_predecessor",
+        ),
+        (
+            "expert_to_down_explicit",
+            "expert_gate_up",
+            "expert_down",
+            ("explicit",),
+            "exactly_one",
+        ),
+        (
+            "pack_to_combine_explicit",
+            "local_route_pack",
+            "local_combine_reduce",
+            ("explicit",),
+            "each_predecessor",
+        ),
+        (
+            "down_to_combine_explicit",
+            "expert_down",
+            "local_combine_reduce",
+            ("explicit",),
+            "exactly_one",
+        ),
+        (
+            "shared_down_to_combine_data",
+            "shared_output",
+            "local_combine_reduce",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "combine_to_all_reduce_data",
+            "local_combine_reduce",
+            "moe_all_reduce",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "all_reduce_to_residual_data",
+            "moe_all_reduce",
+            "moe_residual_add",
+            ("tensormap",),
+            "at_least_one",
+        ),
+    )
+
+    layers: dict[str, Any] = {}
+    all_errors: list[dict[str, Any]] = []
+    skipped_ids = set(trace.predicated_skip_task_ids)
+    for layer, stage_ids in stage_ids_by_layer.items():
+        layer_errors: list[dict[str, Any]] = []
+        task_ids = {
+            stage: list(stage_ids[stage])
+            for stage in chain_stages
+        }
+        shared_candidates = [
+            *stage_ids["shared_down"],
+            *stage_ids["shared_mlp"],
+        ]
+        task_ids["shared_output"] = shared_candidates
+        stage_counts = {
+            stage: len(ids)
+            for stage, ids in task_ids.items()
+        }
+        for stage, count in stage_counts.items():
+            valid_count = (
+                count >= 1
+                if stage == "local_route_pack"
+                else count == 1
+            )
+            if valid_count:
+                continue
+            layer_errors.append(
+                {
+                    "code": "stage_task_count",
+                    "stage": stage,
+                    "expected": (
+                        "at_least_one"
+                        if stage == "local_route_pack"
+                        else 1
+                    ),
+                    "actual": count,
+                    "task_ids": task_ids[stage],
+                }
+            )
+
+        resolved_ids = {
+            stage: ids[0]
+            for stage, ids in task_ids.items()
+            if stage != "local_route_pack" and len(ids) == 1
+        }
+        pack_ids = list(task_ids["local_route_pack"])
+        task_order: dict[str, Any] = {
+            "available": all(
+                stage in resolved_ids
+                for stage in (*single_chain_stages, "shared_output")
+            )
+            and bool(pack_ids),
+            "pass": False,
+        }
+        if task_order["available"]:
+            pack_orders = [
+                trace.task_by_id[task_id].order
+                for task_id in pack_ids
+            ]
+            ordered = (
+                max(pack_orders)
+                < trace.task_by_id[resolved_ids["expert_gate_up"]].order
+                < trace.task_by_id[resolved_ids["expert_down"]].order
+                < trace.task_by_id[
+                    resolved_ids["local_combine_reduce"]
+                ].order
+                < trace.task_by_id[resolved_ids["moe_all_reduce"]].order
+                < trace.task_by_id[resolved_ids["moe_residual_add"]].order
+            )
+            shared_before_combine = (
+                trace.task_by_id[resolved_ids["shared_output"]].order
+                < trace.task_by_id[
+                    resolved_ids["local_combine_reduce"]
+                ].order
+            )
+            task_order = {
+                "available": True,
+                "pass": ordered and shared_before_combine,
+                "local_owner_chain_ordered": ordered,
+                "shared_down_before_combine": shared_before_combine,
+                "orders": {
+                    stage: trace.task_by_id[task_id].order
+                    for stage, task_id in resolved_ids.items()
+                },
+            }
+            task_order["orders"]["local_route_pack"] = pack_orders
+            if not task_order["pass"]:
+                layer_errors.append(
+                    {
+                        "code": "task_order",
+                        **task_order,
+                    }
+                )
+
+        execution: dict[str, Any] = {}
+        pack_execution = [
+            {
+                "task_id": task_id,
+                "has_physical_slices": bool(
+                    trace.slices_by_task.get(task_id)
+                ),
+                "predicated_skip": task_id in skipped_ids,
+            }
+            for task_id in pack_ids
+        ]
+        execution["local_route_pack"] = {
+            "pass": bool(pack_execution)
+            and all(
+                item["has_physical_slices"]
+                and not item["predicated_skip"]
+                for item in pack_execution
+            ),
+            "task_ids": pack_ids,
+            "task_count": len(pack_ids),
+            "tasks": pack_execution,
+            "has_physical_slices": bool(pack_execution)
+            and all(
+                item["has_physical_slices"]
+                for item in pack_execution
+            ),
+            "predicated_skip": any(
+                item["predicated_skip"]
+                for item in pack_execution
+            ),
+            "semantics": (
+                "Every task named local_route_pack must execute, while the "
+                "implementation may choose one in-core task or a wider SPMD "
+                "task shape."
+            ),
+        }
+        if not execution["local_route_pack"]["pass"]:
+            layer_errors.append(
+                {
+                    "code": "physical_execution",
+                    "stage": "local_route_pack",
+                    **execution["local_route_pack"],
+                }
+            )
+        for stage in (
+            "shared_output",
+            *single_mandatory_swim_stages,
+            *expert_stages,
+        ):
+            task_id = resolved_ids.get(stage)
+            if task_id is None:
+                continue
+            has_slices = bool(trace.slices_by_task.get(task_id))
+            predicated_skip = task_id in skipped_ids
+            if (
+                stage in mandatory_swim_stages
+                or stage == "shared_output"
+            ):
+                passed = has_slices and not predicated_skip
+                semantics = (
+                    "This task must execute even when the rank owns zero "
+                    "routed tokens."
+                )
+            else:
+                passed = (
+                    (has_slices and not predicated_skip)
+                    or (not has_slices and predicated_skip)
+                )
+                semantics = (
+                    "A local expert task may lack physical slices only with "
+                    "an explicit predicated_skip scheduler event."
+                )
+            execution[stage] = {
+                "pass": passed,
+                "task_id": task_id,
+                "has_physical_slices": has_slices,
+                "predicated_skip": predicated_skip,
+                "semantics": semantics,
+            }
+            if not passed:
+                layer_errors.append(
+                    {
+                        "code": "physical_execution",
+                        "stage": stage,
+                        **execution[stage],
+                    }
+                )
+
+        required_edges: dict[str, Any] = {}
+        local_swim_edges: dict[str, Any] = {}
+        for (
+            edge_name,
+            pred_stage,
+            succ_stage,
+            allowed_sources,
+            cardinality,
+        ) in required_edge_specs:
+            pred_ids = (
+                pack_ids
+                if pred_stage == "local_route_pack"
+                else (
+                    [resolved_ids[pred_stage]]
+                    if pred_stage in resolved_ids
+                    else []
+                )
+            )
+            succ_ids = (
+                pack_ids
+                if succ_stage == "local_route_pack"
+                else (
+                    [resolved_ids[succ_stage]]
+                    if succ_stage in resolved_ids
+                    else []
+                )
+            )
+            if not pred_ids or not succ_ids:
+                required_edges[edge_name] = {
+                    "pass": False,
+                    "available": False,
+                    "pred_stage": pred_stage,
+                    "succ_stage": succ_stage,
+                    "reason": "one or both stage task IDs are unavailable",
+                }
+                continue
+            pair_edges = [
+                edge
+                for pred in pred_ids
+                for succ in succ_ids
+                for edge in _edges_between(trace, pred, succ)
+            ]
+            matching_edges = [
+                edge
+                for edge in pair_edges
+                if str(edge.get("source")) in allowed_sources
+            ]
+            matching_by_pred = {
+                pred: [
+                    edge
+                    for edge in matching_edges
+                    if edge.get("pred") == pred
+                ]
+                for pred in pred_ids
+            }
+            if cardinality == "exactly_one":
+                edge_pass = len(matching_edges) == 1
+            elif cardinality == "each_predecessor":
+                edge_pass = all(matching_by_pred[pred] for pred in pred_ids)
+            else:
+                edge_pass = bool(matching_edges)
+            required_edges[edge_name] = {
+                "pass": edge_pass,
+                "available": True,
+                "pred_task_ids": pred_ids,
+                "succ_task_ids": succ_ids,
+                "pred_stage": pred_stage,
+                "succ_stage": succ_stage,
+                "allowed_sources": list(allowed_sources),
+                "cardinality": cardinality,
+                "matches": [
+                    _edge_summary(edge)
+                    for edge in matching_edges
+                ],
+                "matches_by_pred_task": {
+                    pred: [
+                        _edge_summary(edge)
+                        for edge in matching_by_pred[pred]
+                    ]
+                    for pred in pred_ids
+                },
+                "all_pair_edges": [
+                    _edge_summary(edge)
+                    for edge in pair_edges
+                ],
+            }
+            if not edge_pass:
+                layer_errors.append(
+                    {
+                        "code": "required_edge",
+                        "edge": edge_name,
+                        **required_edges[edge_name],
+                    }
+                )
+
+            pred_slices = [
+                item
+                for task_id in pred_ids
+                for item in trace.slices_by_task.get(task_id, [])
+            ]
+            succ_slices = [
+                item
+                for task_id in succ_ids
+                for item in trace.slices_by_task.get(task_id, [])
+            ]
+            if pred_slices and succ_slices:
+                pred_end = max(item.end for item in pred_slices)
+                succ_start = min(item.start for item in succ_slices)
+                envelopes_overlap = pred_end > succ_start
+                local_swim_edges[edge_name] = {
+                    "available": True,
+                    "pass": True,
+                    "pred_end_tick": pred_end,
+                    "succ_start_tick": succ_start,
+                    "envelopes_overlap": envelopes_overlap,
+                    "semantics": (
+                        "Diagnostic only: allow_early_resolve permits safe "
+                        "producer/consumer task-envelope overlap, so overlap "
+                        "is not a structural failure."
+                    ),
+                }
+            else:
+                missing_stages = [
+                    stage
+                    for stage, stage_ids, slices in (
+                        (pred_stage, pred_ids, pred_slices),
+                        (succ_stage, succ_ids, succ_slices),
+                    )
+                    if not slices
+                ]
+                allowed_predicated_skip = all(
+                    stage in expert_stages
+                    and all(
+                        task_id in skipped_ids
+                        for task_id in stage_ids
+                    )
+                    for stage, stage_ids, slices in (
+                        (pred_stage, pred_ids, pred_slices),
+                        (succ_stage, succ_ids, succ_slices),
+                    )
+                    if not slices
+                )
+                local_swim_edges[edge_name] = {
+                    "available": False,
+                    "pass": allowed_predicated_skip,
+                    "missing_stages": missing_stages,
+                    "reason": (
+                        "physical ordering is not observable for an explicitly "
+                        "predicated local expert task"
+                        if allowed_predicated_skip
+                        else "one or both required task slices are missing"
+                    ),
+                }
+
+        layers[layer] = {
+            "pass": not layer_errors,
+            "stage_task_ids": task_ids,
+            "stage_task_counts": stage_counts,
+            "task_order": task_order,
+            "execution": execution,
+            "required_edges": required_edges,
+            "local_swim_order": {
+                "pass": all(
+                    edge["pass"]
+                    for edge in local_swim_edges.values()
+                ),
+                "edges": local_swim_edges,
+                "semantics": (
+                    "Physical task envelopes are diagnostic only because "
+                    "allow_early_resolve may expose safe overlap. Dependency "
+                    "correctness is enforced by the task graph."
+                ),
+            },
+            "errors": layer_errors,
+        }
+        all_errors.extend(
+            {"layer": layer, **error}
+            for error in layer_errors
+        )
+    return {
+        "pass": not all_errors,
+        "layers": layers,
+        "errors": all_errors,
+        "interpretation": (
+            "Each layer must execute every local route pack producer, run the "
+            "owner-local expert tasks, merge local routed and shared partial "
+            "outputs, run one TP all-reduce, and then apply the residual. "
+            "Only the two local expert tasks may retire through an explicit "
+            "predicated_skip event on a zero-route rank."
+        ),
+    }
+
+
 def _validate_structural_contracts(
     traces: list[RankTrace],
+    profile: str = "candidate",
 ) -> dict[str, Any]:
+    resolved_profile = _resolve_profile(profile)
     task_ids = {trace.tag: _task_id_contract(trace) for trace in traces}
-    combine = {trace.tag: _combine_dependency_contract(trace) for trace in traces}
+    dependency_contract_name = (
+        "local_ep_dependency"
+        if resolved_profile == "local-ep"
+        else "combine_dependency"
+    )
+    dependency_contracts = {
+        trace.tag: (
+            _local_ep_dependency_contract(trace)
+            if resolved_profile == "local-ep"
+            else _combine_dependency_contract(trace)
+        )
+        for trace in traces
+    }
     errors = []
     for rank, contract in task_ids.items():
         if not contract["pass"]:
@@ -1327,12 +1987,12 @@ def _validate_structural_contracts(
                     ),
                 }
             )
-    for rank, contract in combine.items():
+    for rank, contract in dependency_contracts.items():
         if not contract["pass"]:
             errors.append(
                 {
                     "rank": rank,
-                    "contract": "combine_dependency",
+                    "contract": dependency_contract_name,
                     "errors": contract["errors"],
                 }
             )
@@ -1340,11 +2000,14 @@ def _validate_structural_contracts(
         raise RuntimeError(
             "task-level structural DFX contract failed: " + json.dumps(errors[:8], sort_keys=True)
         )
-    return {
+    result = {
         "pass": True,
         "task_id": task_ids,
-        "combine_dependency": combine,
+        dependency_contract_name: dependency_contracts,
     }
+    if resolved_profile != "local-ep":
+        result["combine_dependency"] = dependency_contracts
+    return result
 
 
 def _concurrency(intervals: list[tuple[int, int]]) -> tuple[int, float]:
@@ -1679,7 +2342,10 @@ def _stage_metrics(
     return result
 
 
-def _rank_metrics(trace: RankTrace) -> dict[str, Any]:
+def _rank_metrics(
+    trace: RankTrace,
+    profile: str = "candidate",
+) -> dict[str, Any]:
     all_slices = trace.all_slices
     if not all_slices:
         return {}
@@ -1688,7 +2354,7 @@ def _rank_metrics(trace: RankTrace) -> dict[str, Any]:
     end = max(item.end for item in all_slices)
     layers: dict[str, Any] = {}
     for layer in _LAYER_PREFIX:
-        stage_ids = _find_layer_task_ids(trace, layer)
+        stage_ids = _find_layer_task_ids(trace, layer, profile)
         layers[layer] = {
             stage: metrics
             for stage, task_ids in stage_ids.items()
@@ -1875,6 +2541,8 @@ def _require_sha256(value: Any, field: str) -> str:
 
 def _validated_sidecar_provenance(
     payload: dict[str, Any],
+    *,
+    expected_protocol_profile: str | None = None,
 ) -> dict[str, Any]:
     provenance = payload.get("provenance")
     if not isinstance(provenance, dict):
@@ -2010,15 +2678,33 @@ def _validated_sidecar_provenance(
     golden = provenance.get("formal_golden")
     if not isinstance(golden, dict):
         raise ValueError("recv_meta formal_golden provenance is missing")
+    if golden.get("schema") != _GOLDEN_SCHEMA:
+        raise ValueError("recv_meta formal_golden semantic contract is invalid")
+    try:
+        protocol = normalize_golden_protocol(
+            golden,
+            field="recv_meta formal_golden",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "recv_meta formal_golden semantic contract is invalid: "
+            f"{exc}"
+        ) from exc
     if (
-        golden.get("schema") != _GOLDEN_SCHEMA
-        or golden.get("source_kind") != "baseline"
-        or golden.get("bit_exact") is not True
-        or golden.get("active_batch") != active_batch
+        golden.get("active_batch") != active_batch
         or golden.get("context_len_per_sequence") != 65536
         or golden.get("image_ref") != image_digest
     ):
         raise ValueError("recv_meta formal_golden semantic contract is invalid")
+    if (
+        expected_protocol_profile is not None
+        and protocol["protocol_profile"] != expected_protocol_profile
+    ):
+        raise ValueError(
+            "recv_meta formal_golden protocol_profile="
+            f"{protocol['protocol_profile']!r} does not match expected "
+            f"{expected_protocol_profile!r}"
+        )
     source_run = golden.get("source_run")
     if not isinstance(source_run, str) or not source_run:
         raise ValueError("recv_meta formal_golden source_run is missing")
@@ -2048,6 +2734,9 @@ def _validated_sidecar_provenance(
         "source": dict(source),
         "input_contract_sha256": input_contract_sha256,
         "golden_manifest_sha256": golden["manifest_sha256"],
+        "source_kind": protocol["source_kind"],
+        "protocol_profile": protocol["protocol_profile"],
+        "numeric_contract": dict(protocol["numeric_contract"]),
         "active_batch": active_batch,
         "context_len_per_sequence": 65536,
     }
@@ -2077,9 +2766,24 @@ def _validated_route_histogram(
             f"{path}: expected axes={list(_RECV_META_AXES)}, "
             f"got {payload.get('axes')!r}"
         )
-    provenance = _validated_sidecar_provenance(payload)
-    if profile is not None:
-        policy = _source_policy(profile)
+    policy = _source_policy(profile) if profile is not None else None
+    expected_protocol_profile = (
+        policy.get("golden_protocol_profile")
+        if policy is not None
+        else None
+    )
+    if (
+        expected_protocol_profile is not None
+        and not isinstance(expected_protocol_profile, str)
+    ):
+        raise ValueError(
+            f"{path}: source policy golden_protocol_profile is invalid"
+        )
+    provenance = _validated_sidecar_provenance(
+        payload,
+        expected_protocol_profile=expected_protocol_profile,
+    )
+    if policy is not None:
         policy_id = str(policy["policy_id"])
         expected_prefix = str(policy["decode_sha256_prefix"])
         actual_decode = str(provenance["decode_fwd_sha256"])
@@ -2110,8 +2814,8 @@ def _validated_route_histogram(
         }
 
     recv_shape, recv_meta, recv_dtype = _nested_values(
-        payload.get("recv_meta"),
-        "recv_meta",
+        payload.get("owner_route_counts"),
+        "owner_route_counts",
     )
     count_shape, local_expert_count, count_dtype = _nested_values(
         payload.get("local_expert_count"),
@@ -2119,7 +2823,8 @@ def _validated_route_histogram(
     )
     if recv_shape != _RECV_META_SHAPE:
         raise ValueError(
-            f"{path}: recv_meta shape={recv_shape}, expected={_RECV_META_SHAPE}"
+            f"{path}: owner_route_counts shape={recv_shape}, "
+            f"expected={_RECV_META_SHAPE}"
         )
     if count_shape != _LOCAL_EXPERT_COUNT_SHAPE:
         raise ValueError(
@@ -2127,50 +2832,59 @@ def _validated_route_histogram(
             f"expected={_LOCAL_EXPERT_COUNT_SHAPE}"
         )
     if recv_dtype != "json-integer" and not recv_dtype.lower().endswith("int32"):
-        raise ValueError(f"{path}: recv_meta dtype must be int32, got {recv_dtype}")
+        raise ValueError(
+            f"{path}: owner_route_counts dtype must be int32, "
+            f"got {recv_dtype}"
+        )
     if count_dtype != "json-integer" and not count_dtype.lower().endswith("int32"):
         raise ValueError(
             f"{path}: local_expert_count dtype must be int32, got {count_dtype}"
         )
-    _require_nonnegative_integers(recv_meta, "recv_meta")
+    _require_nonnegative_integers(recv_meta, "owner_route_counts")
     _require_nonnegative_integers(local_expert_count, "local_expert_count")
 
-    window_records = payload.get("window_provenance")
+    window_records = payload.get("snapshot_provenance")
     if not isinstance(window_records, list) or len(window_records) != 2:
         raise ValueError(
-            f"{path}: window_provenance must contain exactly L3 and L4 records"
+            f"{path}: snapshot_provenance must contain exactly L3 and L4 "
+            "records"
         )
     windows_by_layer: dict[str, dict[str, Any]] = {}
     for record in window_records:
         if not isinstance(record, dict):
-            raise ValueError(f"{path}: window_provenance records must be mappings")
+            raise ValueError(
+                f"{path}: snapshot_provenance records must be mappings"
+            )
         layer = str(record.get("layer"))
         if layer in windows_by_layer:
             raise ValueError(f"{path}: duplicate window provenance for {layer}")
         shape = tuple(record.get("shape", ()))
-        window_id = record.get("window_id")
+        window_id = record.get("snapshot_id")
         if layer not in _RECV_META_LAYERS:
             raise ValueError(f"{path}: unexpected window layer {layer!r}")
         if shape != _RECV_META_WINDOW_SHAPE:
             raise ValueError(
-                f"{path}: {layer} window shape={shape}, "
+                f"{path}: {layer} snapshot shape={shape}, "
                 f"expected={_RECV_META_WINDOW_SHAPE}"
             )
         if str(record.get("dtype")).lower() != "int32":
-            raise ValueError(f"{path}: {layer} window dtype must be int32")
+            raise ValueError(f"{path}: {layer} snapshot dtype must be int32")
         if int(record.get("byte_size", -1)) != _RECV_META_WINDOW_BYTES:
             raise ValueError(
-                f"{path}: {layer} window byte_size must be "
+                f"{path}: {layer} snapshot byte_size must be "
                 f"{_RECV_META_WINDOW_BYTES}"
             )
         if not isinstance(window_id, (str, int)) or str(window_id) == "":
-            raise ValueError(f"{path}: {layer} window_id is missing")
-        if record.get("source_window") != "moe_recv_meta":
-            raise ValueError(f"{path}: {layer} source_window is invalid")
-        if record.get("source_window_reused") is not True:
+            raise ValueError(f"{path}: {layer} snapshot_id is missing")
+        if record.get("source_tensor") != "local_expert_count":
             raise ValueError(
-                f"{path}: {layer} must prove source_window_reused=true"
+                f"{path}: {layer} source_tensor is invalid"
             )
+        if (
+            record.get("source_protocol")
+            != "replicated_input_local_owner"
+        ):
+            raise ValueError(f"{path}: {layer} source_protocol is invalid")
         expected_capture = {
             "L3": "after_l3_before_l4",
             "L4": "after_l4",
@@ -2179,12 +2893,12 @@ def _validated_route_histogram(
             raise ValueError(f"{path}: {layer} capture_point is invalid")
         windows_by_layer[layer] = {
             "layer": layer,
-            "window_id": str(window_id),
+            "snapshot_id": str(window_id),
             "shape": list(shape),
             "dtype": "int32",
             "byte_size": _RECV_META_WINDOW_BYTES,
-            "source_window": "moe_recv_meta",
-            "source_window_reused": True,
+            "source_tensor": "local_expert_count",
+            "source_protocol": "replicated_input_local_owner",
             "capture_point": expected_capture,
         }
     if set(windows_by_layer) != set(_RECV_META_LAYERS):
@@ -2193,86 +2907,82 @@ def _validated_route_histogram(
             f"expected={list(_RECV_META_LAYERS)}"
         )
     window_ids = [
-        windows_by_layer[layer]["window_id"] for layer in _RECV_META_LAYERS
+        windows_by_layer[layer]["snapshot_id"]
+        for layer in _RECV_META_LAYERS
     ]
     if len(set(window_ids)) != len(window_ids):
         raise ValueError(
-            f"{path}: L3/L4 must use distinct recv_meta distributed windows"
+            f"{path}: L3/L4 must use distinct route snapshot IDs"
         )
 
     padding_errors = []
     derived_counts = []
     count_mismatches = []
-    per_layer_per_source: list[list[int]] = []
+    off_owner_errors = []
+    per_layer_per_owner: list[list[int]] = []
     for layer_index, layer in enumerate(_RECV_META_LAYERS):
         layer_counts = []
-        for dst_rank in range(_EXPECTED_RANKS):
-            for src_rank in range(_EXPECTED_RANKS):
-                padding = recv_meta[layer_index][dst_rank][src_rank][36:]
+        for owner_rank in range(_EXPECTED_RANKS):
+            for route_owner_rank in range(_EXPECTED_RANKS):
+                row = recv_meta[layer_index][owner_rank][route_owner_rank]
+                padding = row[36:]
                 if any(value != 0 for value in padding):
                     padding_errors.append(
                         {
                             "layer": layer,
-                            "dst_rank": dst_rank,
-                            "src_rank": src_rank,
+                            "owner_rank": owner_rank,
+                            "route_owner_rank": route_owner_rank,
                             "padding": padding,
                         }
                     )
-            rank_counts = [
-                sum(
-                    recv_meta[layer_index][dst_rank][src_rank][expert]
-                    for src_rank in range(_EXPECTED_RANKS)
-                )
-                for expert in range(36)
-            ]
+                if (
+                    route_owner_rank != owner_rank
+                    and any(value != 0 for value in row[:36])
+                ):
+                    off_owner_errors.append(
+                        {
+                            "layer": layer,
+                            "owner_rank": owner_rank,
+                            "route_owner_rank": route_owner_rank,
+                        }
+                    )
+            rank_counts = list(
+                recv_meta[layer_index][owner_rank][owner_rank][:36]
+            )
             layer_counts.append(rank_counts)
-            expected = local_expert_count[layer_index][dst_rank]
+            expected = local_expert_count[layer_index][owner_rank]
             if rank_counts != expected:
                 count_mismatches.append(
                     {
                         "layer": layer,
-                        "dst_rank": dst_rank,
+                        "owner_rank": owner_rank,
                         "derived": rank_counts,
                         "exported": expected,
                     }
                 )
         derived_counts.append(layer_counts)
-        per_layer_per_source.append(
-            [
-                sum(
-                    recv_meta[layer_index][dst_rank][src_rank][expert]
-                    for dst_rank in range(_EXPECTED_RANKS)
-                    for expert in range(36)
-                )
-                for src_rank in range(_EXPECTED_RANKS)
-            ]
+        per_layer_per_owner.append(
+            [sum(rank_counts) for rank_counts in layer_counts]
         )
     if padding_errors:
         raise ValueError(
-            f"{path}: recv_meta padding columns 36:40 must be zero; "
+            f"{path}: owner_route_counts padding columns 36:40 must be zero; "
             f"errors={padding_errors[:8]}"
+        )
+    if off_owner_errors:
+        raise ValueError(
+            f"{path}: local-owner route rows must be diagonal; "
+            f"errors={off_owner_errors[:8]}"
         )
     if count_mismatches:
         raise ValueError(
-            f"{path}: local_expert_count != sum_src(recv_meta[..., :36]); "
+            f"{path}: local_expert_count != diagonal owner route row; "
             f"errors={count_mismatches[:8]}"
         )
 
-    expected_per_source = provenance["active_batch"] * _MOE_TOPK
-    expected_global = expected_per_source * _EXPECTED_RANKS
+    expected_global = provenance["active_batch"] * _MOE_TOPK
     global_per_layer = [
-        sum(source_totals) for source_totals in per_layer_per_source
-    ]
-    source_total_mismatches = [
-        {
-            "layer": layer,
-            "src_rank": src_rank,
-            "actual": total,
-            "expected": expected_per_source,
-        }
-        for layer_index, layer in enumerate(_RECV_META_LAYERS)
-        for src_rank, total in enumerate(per_layer_per_source[layer_index])
-        if total != expected_per_source
+        sum(owner_totals) for owner_totals in per_layer_per_owner
     ]
     global_total_mismatches = [
         {
@@ -2283,13 +2993,10 @@ def _validated_route_histogram(
         for layer, total in zip(_RECV_META_LAYERS, global_per_layer)
         if total != expected_global
     ]
-    if source_total_mismatches or global_total_mismatches:
+    if global_total_mismatches:
         raise ValueError(
             f"{path}: route totals invalid; "
-            "per layer/source must equal active_batch * TOPK="
-            f"{expected_per_source}, "
-            f"mismatches={source_total_mismatches[:8]}; "
-            "global per layer must equal active_batch * TP * TOPK="
+            "global per layer must equal active_batch * TOPK="
             f"{expected_global}, "
             f"mismatches={global_total_mismatches[:8]}"
         )
@@ -2313,14 +3020,14 @@ def _validated_route_histogram(
             "histogram": histogram,
             "histogram_semantics": (
                 "List index is local expert ID 0..35; each value is the exact "
-                "sum over eight source ranks from recv_meta."
+                "route count computed by that rank's local expert owner."
             ),
             "total_routed_tokens_by_rank": totals,
             "route_totals_validated": True,
-            "per_layer_per_source": per_layer_per_source[layer_index],
-            "expected_per_source": expected_per_source,
+            "per_layer_per_owner": per_layer_per_owner[layer_index],
             "global_per_layer": global_per_layer,
             "expected_global_per_layer": expected_global,
+            "owner_rows_diagonal": True,
             "zero_route_ranks": [
                 rank for rank, total in totals.items() if total == 0
             ],
@@ -2329,15 +3036,17 @@ def _validated_route_histogram(
             "source_sha256": source_sha256,
             "source_schema": _RECV_META_SIDECAR_SCHEMA,
             "source_axes": list(_RECV_META_AXES),
-            "recv_meta_shape": list(_RECV_META_SHAPE),
-            "recv_meta_dtype": recv_dtype,
+            "owner_route_counts_shape": list(_RECV_META_SHAPE),
+            "owner_route_counts_dtype": recv_dtype,
             "local_expert_count_shape": list(_LOCAL_EXPERT_COUNT_SHAPE),
             "local_expert_count_dtype": count_dtype,
-            "window_provenance": windows_by_layer[layer],
-            "window_independence_validated": True,
+            "snapshot_provenance": windows_by_layer[layer],
+            "snapshot_independence_validated": True,
             "provenance": provenance,
-            "expected_sidecar": "recv_meta",
-            "reason": "validated exact recv_meta sidecar",
+            "expected_sidecar": "local_owner_route_counts",
+            "reason": (
+                "validated exact local-owner route-count histogram sidecar"
+            ),
             "required_input": None,
             "proxy_fallback_allowed": False,
             "rejected_proxies": [
@@ -2356,7 +3065,7 @@ def _route_histogram_contract(
     profile: str | None = None,
     source_decode_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Load exact recv_meta or declare an analyzer-only limitation.
+    """Load exact owner-count histograms or declare an analyzer limitation.
 
     Missing evidence never fails the analyzer gate, but it keeps candidate
     publication readiness in NOT_EVALUABLE state.
@@ -2376,14 +3085,14 @@ def _route_histogram_contract(
             "publication_evidence_ready": False,
             "histogram": None,
             "source": None,
-            "expected_sidecar": "recv_meta",
+            "expected_sidecar": "local_owner_route_counts",
             "expected_schema": _RECV_META_SIDECAR_SCHEMA,
             "expected_shape": list(_RECV_META_SHAPE),
             "reason": _ROUTE_HISTOGRAM_REASON,
             "required_input": (
-                "Provide a recv_meta sidecar containing exact "
-                "[2,8,8,40] counts, [2,8,36] local_expert_count, and distinct "
-                "L3/L4 distributed-window provenance."
+                "Provide a local-owner route sidecar containing exact "
+                "[2,8,8,40] diagonal owner counts, [2,8,36] "
+                "local_expert_count, and distinct L3/L4 snapshot provenance."
             ),
             "proxy_fallback_allowed": False,
             "rejected_proxies": [
@@ -2397,6 +3106,193 @@ def _route_histogram_contract(
     }
 
 
+def _local_ep_route_execution_contract(
+    structural_contracts: dict[str, Any],
+    route_histogram: dict[str, Any],
+    profile: str = "candidate",
+) -> dict[str, Any]:
+    """Cross-check exact local route totals against expert execution."""
+    if _resolve_profile(profile) != "local-ep":
+        return {
+            "applicable": False,
+            "available": False,
+            "pass": True,
+            "layers": {},
+            "errors": [],
+            "reason": "selected profile does not use local-owner EP",
+        }
+
+    dependency_by_rank = structural_contracts.get(
+        "local_ep_dependency",
+        {},
+    )
+    unavailable_layers = [
+        layer
+        for layer in _LAYER_PREFIX
+        if not route_histogram.get(layer, {}).get("available")
+    ]
+    if unavailable_layers:
+        return {
+            "applicable": True,
+            "available": False,
+            "pass": None,
+            "layers": {
+                layer: {
+                    "available": False,
+                    "pass": None,
+                    "reason": (
+                        route_histogram.get(layer, {}).get(
+                            "reason",
+                            "exact local route totals are unavailable",
+                        )
+                    ),
+                }
+                for layer in unavailable_layers
+            },
+            "errors": [],
+            "reason": (
+                "Exact local-owner route-count histogram evidence is required "
+                "to correlate route emptiness with expert execution."
+            ),
+        }
+
+    mandatory_stages = (
+        "local_route_pack",
+        "local_combine_reduce",
+        "moe_all_reduce",
+        "moe_residual_add",
+    )
+    expert_stages = ("expert_gate_up", "expert_down")
+    layers: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
+    for layer in _LAYER_PREFIX:
+        histogram = route_histogram[layer]["histogram"]
+        rank_results: dict[str, Any] = {}
+        layer_errors: list[dict[str, Any]] = []
+        for rank, local_counts in histogram.items():
+            dependency = dependency_by_rank.get(rank)
+            layer_dependency = (
+                dependency.get("layers", {}).get(layer)
+                if isinstance(dependency, dict)
+                else None
+            )
+            if not isinstance(layer_dependency, dict):
+                error = {
+                    "rank": rank,
+                    "layer": layer,
+                    "code": "missing_structural_execution",
+                }
+                layer_errors.append(error)
+                rank_results[rank] = {
+                    "available": False,
+                    "pass": False,
+                    "errors": [error],
+                }
+                continue
+
+            route_total = sum(int(value) for value in local_counts)
+            expect_skip = route_total == 0
+            execution = layer_dependency.get("execution", {})
+            rank_errors: list[dict[str, Any]] = []
+            expert_evidence: dict[str, Any] = {}
+            for stage in expert_stages:
+                stage_execution = execution.get(stage, {})
+                has_slices = bool(
+                    stage_execution.get("has_physical_slices")
+                )
+                predicated_skip = bool(
+                    stage_execution.get("predicated_skip")
+                )
+                stage_pass = (
+                    not has_slices and predicated_skip
+                    if expect_skip
+                    else has_slices and not predicated_skip
+                )
+                expert_evidence[stage] = {
+                    "pass": stage_pass,
+                    "has_physical_slices": has_slices,
+                    "predicated_skip": predicated_skip,
+                    "expected": (
+                        "predicated_skip_without_physical_slices"
+                        if expect_skip
+                        else "physical_slices_without_predicated_skip"
+                    ),
+                }
+                if not stage_pass:
+                    rank_errors.append(
+                        {
+                            "rank": rank,
+                            "layer": layer,
+                            "code": "expert_execution_route_mismatch",
+                            "stage": stage,
+                            "route_total": route_total,
+                            **expert_evidence[stage],
+                        }
+                    )
+
+            mandatory_evidence: dict[str, Any] = {}
+            for stage in mandatory_stages:
+                stage_execution = execution.get(stage, {})
+                has_slices = bool(
+                    stage_execution.get("has_physical_slices")
+                )
+                predicated_skip = bool(
+                    stage_execution.get("predicated_skip")
+                )
+                stage_pass = has_slices and not predicated_skip
+                mandatory_evidence[stage] = {
+                    "pass": stage_pass,
+                    "has_physical_slices": has_slices,
+                    "predicated_skip": predicated_skip,
+                    "expected": "physical_slices_without_predicated_skip",
+                }
+                if not stage_pass:
+                    rank_errors.append(
+                        {
+                            "rank": rank,
+                            "layer": layer,
+                            "code": "mandatory_stage_not_executed",
+                            "stage": stage,
+                            "route_total": route_total,
+                            **mandatory_evidence[stage],
+                        }
+                    )
+
+            rank_results[rank] = {
+                "available": True,
+                "pass": not rank_errors,
+                "route_total": route_total,
+                "expected_expert_state": (
+                    "predicated_skip" if expect_skip else "executed"
+                ),
+                "expert_stages": expert_evidence,
+                "mandatory_stages": mandatory_evidence,
+                "errors": rank_errors,
+            }
+            layer_errors.extend(rank_errors)
+        layers[layer] = {
+            "available": True,
+            "pass": not layer_errors,
+            "ranks": rank_results,
+            "errors": layer_errors,
+        }
+        errors.extend(layer_errors)
+    return {
+        "applicable": True,
+        "available": True,
+        "pass": not errors,
+        "layers": layers,
+        "errors": errors,
+        "interpretation": (
+            "An exact zero local route total requires both local expert tasks "
+            "to retire through explicit predicate skips with no physical "
+            "slices. A nonzero total requires both expert tasks to execute. "
+            "Route pack, local combine, MoE TP all-reduce, and residual add "
+            "must execute in either case."
+        ),
+    }
+
+
 def _predecessors(trace: RankTrace, task_id: str) -> list[dict[str, Any]]:
     return [edge for edge in trace.edges if str(edge.get("succ")) == str(task_id)]
 
@@ -2405,6 +3301,7 @@ def _arrival_analysis(
     traces: list[RankTrace],
     ranks: dict[str, dict[str, Any]],
     clock_alignment: dict[str, Any],
+    profile: str = "candidate",
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if not traces:
@@ -2413,14 +3310,14 @@ def _arrival_analysis(
     frequency = traces[0].frequency_hz
     for layer in _LAYER_PREFIX:
         layer_result: dict[str, Any] = {}
-        for label, producer_stage, wait_stage in _ARRIVAL_PAIRS:
+        for label, producer_stage, consumer_stage in _arrival_pairs(profile):
             producers = []
-            waiters = []
+            consumers = []
             for trace in traces:
                 rank_data = ranks[trace.tag]
                 stage_data = rank_data.get("layers", {}).get(layer, {})
                 producer = stage_data.get(producer_stage)
-                waiter = stage_data.get(wait_stage)
+                consumer = stage_data.get(consumer_stage)
                 if producer is not None:
                     producers.append(
                         {
@@ -2430,18 +3327,38 @@ def _arrival_analysis(
                             "span_us": producer["stage_span_us"],
                         },
                     )
-                if waiter is not None:
-                    wait_task_id = waiter["task_ids"][0]
-                    predecessors = _predecessors(trace, wait_task_id)
+                if consumer is not None:
+                    consumer_task_id = consumer["task_ids"][0]
+                    predecessors = _predecessors(trace, consumer_task_id)
                     explicit = [edge for edge in predecessors if edge.get("source") == "explicit"]
-                    wait_task = trace.task_by_id[wait_task_id]
-                    waiters.append(
+                    producer_task_ids = set(
+                        producer.get("task_ids", [])
+                        if producer is not None
+                        else []
+                    )
+                    producer_predecessors = [
+                        edge
+                        for edge in predecessors
+                        if str(edge.get("pred")) in producer_task_ids
+                    ]
+                    consumer_task = trace.task_by_id[consumer_task_id]
+                    consumers.append(
                         {
                             "rank": trace.tag,
-                            "task_id": wait_task_id,
-                            "start_tick": waiter["start_tick"],
-                            "end_tick": waiter["end_tick"],
-                            "span_us": waiter["stage_span_us"],
+                            "task_id": consumer_task_id,
+                            "stage": consumer_stage,
+                            "start_tick": consumer["start_tick"],
+                            "end_tick": consumer["end_tick"],
+                            "span_us": consumer["stage_span_us"],
+                            "has_producer_dependency": bool(
+                                producer_predecessors
+                            ),
+                            "producer_dependency_sources": sorted(
+                                {
+                                    str(edge.get("source", "unknown"))
+                                    for edge in producer_predecessors
+                                }
+                            ),
                             "has_explicit_producer_dependency": bool(explicit),
                             "explicit_predecessors": [
                                 {
@@ -2455,18 +3372,18 @@ def _arrival_analysis(
                             ],
                             "timing_evidence": _task_timing_evidence(
                                 trace,
-                                wait_task,
+                                consumer_task,
                             ),
                         },
                     )
-            if not producers or not waiters:
+            if not producers or not consumers:
                 continue
             latest = max(producers, key=lambda item: item["end_tick"]) if comparable_ticks else None
             earliest = min(producers, key=lambda item: item["end_tick"]) if comparable_ticks else None
             producer_by_rank = {item["rank"]: item for item in producers}
-            waiter_details = []
-            for waiter in waiters:
-                rank = waiter["rank"]
+            consumer_details = []
+            for consumer in consumers:
+                rank = consumer["rank"]
                 local_producer = producer_by_rank.get(rank)
                 peer_producers = [item for item in producers if item["rank"] != rank]
                 latest_peer = (
@@ -2474,26 +3391,33 @@ def _arrival_analysis(
                     if comparable_ticks and peer_producers
                     else None
                 )
-                detail = dict(waiter)
+                detail = dict(consumer)
                 if comparable_ticks and latest_peer is not None:
                     detail["latest_peer_producer_rank"] = latest_peer["rank"]
-                    detail["remote_arrival_after_wait_start_us"] = _round(
+                    detail["remote_arrival_after_consumer_start_us"] = _round(
                         max(
                             0,
-                            latest_peer["end_tick"] - waiter["start_tick"],
+                            latest_peer["end_tick"] - consumer["start_tick"],
                         )
                         / frequency
                         * 1e6,
                     )
+                    detail["remote_arrival_after_wait_start_us"] = detail[
+                        "remote_arrival_after_consumer_start_us"
+                    ]
                 if comparable_ticks and local_producer is not None:
                     all_ready_tick = max(item["end_tick"] for item in producers)
                     detail["wait_overlap_completion_upper_bound_us"] = _round(
-                        max(0, waiter["end_tick"] - all_ready_tick) / frequency * 1e6,
+                        max(0, consumer["end_tick"] - all_ready_tick)
+                        / frequency
+                        * 1e6,
                     )
-                waiter_details.append(detail)
+                consumer_details.append(detail)
             layer_result[label] = {
                 "clock_domain_comparable": comparable_ticks,
                 "clock_evidence_level": clock_alignment.get("evidence_level"),
+                "producer_stage": producer_stage,
+                "consumer_stage": consumer_stage,
                 "producer_end_skew_us": (
                     _round(
                         (latest["end_tick"] - earliest["end_tick"]) / frequency * 1e6,
@@ -2504,7 +3428,9 @@ def _arrival_analysis(
                 "earliest_producer_rank": (earliest["rank"] if earliest is not None else None),
                 "latest_producer_rank": (latest["rank"] if latest is not None else None),
                 "producer_ranks": producers,
-                "wait_ranks": waiter_details,
+                "consumer_ranks": consumer_details,
+                # Retained for consumers of the v6 dispatch/combine schema.
+                "wait_ranks": consumer_details,
             }
         result[layer] = layer_result
     return result
@@ -3115,6 +4041,7 @@ def _parallelism_classification(resource: dict[str, Any]) -> dict[str, Any]:
 def _execution_limit_classification(
     ranks: dict[str, dict[str, Any]],
     route_histogram: dict[str, Any],
+    profile: str = "candidate",
 ) -> dict[str, Any]:
     """Keep route, readiness, queueing, and packing diagnoses separate."""
     coverage: dict[str, Any] = {layer: {} for layer in _LAYER_PREFIX}
@@ -3155,7 +4082,9 @@ def _execution_limit_classification(
                 "stages": {},
             }
             stages = rank_data.get("layers", {}).get(layer, {})
-            for stage, resource_name in _DIAGNOSTIC_STAGE_RESOURCES.items():
+            for stage, resource_name in _diagnostic_stage_resources(
+                profile
+            ).items():
                 stage_data = stages.get(stage)
                 if stage_data is None:
                     rank_result["stages"][stage] = {
@@ -3214,11 +4143,25 @@ def _external_correctness_contract() -> dict[str, Any]:
                 "hidden_l3.pt",
                 "hidden_l4.pt",
             ],
-            "comparison": "bit-exact against the read-only frozen golden",
+            "comparison": (
+                "bit-exact against the matching protocol-specific "
+                "read-only frozen golden"
+            ),
+            "required_manifest_fields": [
+                "source_kind",
+                "bit_exact",
+            ],
+            "local_ep_required_manifest_fields": [
+                "source_kind",
+                "protocol_profile",
+                "numeric_contract",
+                "bit_exact",
+            ],
             "interpretation": (
                 "This DFX analyzer does not load or compare hidden states. "
-                "DFX publication must be paired with the outer bit-exact gate; "
-                "a tolerance-based comparison is not a substitute."
+                "DFX publication must be paired with the outer bit-exact gate "
+                "for the same protocol_profile and numeric_contract; a "
+                "tolerance-based comparison is not a substitute."
             ),
         }
     }
@@ -3226,6 +4169,7 @@ def _external_correctness_contract() -> dict[str, Any]:
 
 def _timing_evidence_contract(
     ranks: dict[str, dict[str, Any]],
+    profile: str = "candidate",
 ) -> dict[str, Any]:
     fields = {
         field: {
@@ -3241,10 +4185,11 @@ def _timing_evidence_contract(
         )
     }
     profiled_tasks = 0
+    profiled_stages = _timing_profile_stages(profile)
     for rank, rank_data in ranks.items():
         for layer in _LAYER_PREFIX:
             stages = rank_data.get("layers", {}).get(layer, {})
-            for stage in _TASK_TIMING_PROFILE_STAGES:
+            for stage in profiled_stages:
                 stage_data = stages.get(stage)
                 if stage_data is None:
                     continue
@@ -3279,7 +4224,7 @@ def _timing_evidence_contract(
     return {
         "pass": not unavailable_fields,
         "profiled_task_count": profiled_tasks,
-        "profiled_stages": list(_TASK_TIMING_PROFILE_STAGES),
+        "profiled_stages": list(profiled_stages),
         "fields": fields,
         "unavailable_fields": unavailable_fields,
         "interpretation": (
@@ -3484,8 +4429,8 @@ def _admission_contract(
             {
                 "code": "recv_meta_publication_evidence_missing",
                 "reason": (
-                    "Exact L3/L4 recv_meta route evidence is required before "
-                    "candidate publication readiness can be evaluated."
+                    "Exact L3/L4 owner-count histogram evidence is required "
+                    "before candidate publication readiness can be evaluated."
                 ),
             }
         ]
@@ -3525,14 +4470,15 @@ def _admission_contract(
         },
         "external_required_gates": external,
         "interpretation": (
-            "Structural task-ID/combine/slice corruption raises before report "
-            "publication. This analyzer gate covers executable DFX contracts "
-            "and policy-selected expert kernel release limits. Missing recv_meta "
-            "does not fail the analyzer gate, but candidate release readiness "
-            "is NOT_EVALUABLE and blocked until the exact sidecar is present. "
-            "Unavailable critical-path contribution remains a non-blocking "
-            "instrumentation limitation. Even with a valid sidecar, publication "
-            "still requires the outer hidden-state bit-exact gate."
+            "Structural task-ID/profile-dependency/slice corruption raises "
+            "before report publication. This analyzer gate covers executable "
+            "DFX contracts and policy-selected expert kernel release limits. "
+            "Missing recv_meta does not fail the analyzer gate, but candidate "
+            "release readiness is NOT_EVALUABLE and blocked until the exact "
+            "sidecar is present. Unavailable critical-path contribution "
+            "remains a non-blocking instrumentation limitation. Even with a "
+            "valid sidecar, publication still requires the outer hidden-state "
+            "bit-exact gate."
         ),
     }
 
@@ -3541,7 +4487,9 @@ def _aggregate_findings(
     ranks: dict[str, dict[str, Any]],
     arrivals: dict[str, Any],
     route_histogram: dict[str, Any],
+    profile: str = "candidate",
 ) -> list[dict[str, str]]:
+    local_ep = _resolve_profile(profile) == "local-ep"
     findings: list[dict[str, str]] = []
     for layer in _LAYER_PREFIX:
         fused_gate_rows = []
@@ -3583,12 +4531,19 @@ def _aggregate_findings(
                     split_shared_stage_rows[stage].append(
                         (rank, split_stage),
                     )
-            scatter = stages.get("combine_scatter")
-            if scatter and scatter["resources"].get("aiv", {}).get("available"):
-                scatter_rows.append((rank, scatter))
-            wait = stages.get("combine_wait")
-            if wait and wait["resources"].get("aiv", {}).get("available"):
-                wait_rows.append((rank, wait))
+            if not local_ep:
+                scatter = stages.get("combine_scatter")
+                if (
+                    scatter
+                    and scatter["resources"].get("aiv", {}).get("available")
+                ):
+                    scatter_rows.append((rank, scatter))
+                wait = stages.get("combine_wait")
+                if (
+                    wait
+                    and wait["resources"].get("aiv", {}).get("available")
+                ):
+                    wait_rows.append((rank, wait))
 
         route_contract = route_histogram.get(layer, {})
         if not route_contract.get("available"):
@@ -3675,55 +4630,93 @@ def _aggregate_findings(
                         "a route-histogram inference."
                     ),
                     "action": (
-                        "Use all-rank arrival analysis; do not attribute the "
-                        "entire combine_wait span to the wait kernel itself."
+                        (
+                            "Use the local-combine to TP all-reduce arrival "
+                            "analysis; do not treat a long collective span as "
+                            "pure reduction arithmetic."
+                        )
+                        if local_ep
+                        else (
+                            "Use all-rank arrival analysis; do not attribute "
+                            "the entire combine_wait span to the wait kernel "
+                            "itself."
+                        )
                     ),
                 },
             )
 
-        combine = arrivals.get(layer, {}).get("combine")
-        if combine and (combine.get("producer_end_skew_us") or 0.0) > 100.0:
-            findings.append(
-                {
-                    "layer": layer,
-                    "severity": "high",
-                    "finding": (
-                        "Combine producer completion skew is "
-                        f"{combine['producer_end_skew_us']:.1f} us; latest "
-                        f"producer is {combine['latest_producer_rank']}."
-                    ),
-                    "action": (
-                        "Optimize the late routed-expert/scatter producer. "
-                        "Removing an explicit wait dependency alone cannot "
-                        "eliminate cross-rank producer skew."
-                    ),
-                },
-            )
-        elif wait_rows:
-            max_wait_rank, max_wait = max(
-                wait_rows,
-                key=lambda item: item[1]["stage_span_us"],
-            )
-            max_wait_us = max_wait["stage_span_us"]
-            if max_wait_us > 100.0:
+        if local_ep:
+            collective = arrivals.get(layer, {}).get("moe_collective")
+            if (
+                collective
+                and (collective.get("producer_end_skew_us") or 0.0) > 100.0
+            ):
                 findings.append(
                     {
                         "layer": layer,
                         "severity": "high",
                         "finding": (
-                            f"Combine wait reaches {max_wait_us:.1f} us on "
-                            f"{max_wait_rank}. Cross-rank completion "
-                            "subtraction is unavailable for this capture, and "
-                            "task counts are not used as route evidence."
+                            "Local-combine producer completion skew is "
+                            f"{collective['producer_end_skew_us']:.1f} us; "
+                            "latest producer is "
+                            f"{collective['latest_producer_rank']}."
                         ),
                         "action": (
-                            "Treat this as a remote-producer tail signal, not "
-                            "wait-kernel arithmetic. Reduce routed compute and "
-                            "scatter tails; separately check whether local "
-                            "scatter overlaps the wait."
+                            "Optimize the late local expert/shared partial "
+                            "producer. The following TP all-reduce span may "
+                            "include peer-arrival spin."
                         ),
                     },
                 )
+        else:
+            combine = arrivals.get(layer, {}).get("combine")
+            if (
+                combine
+                and (combine.get("producer_end_skew_us") or 0.0) > 100.0
+            ):
+                findings.append(
+                    {
+                        "layer": layer,
+                        "severity": "high",
+                        "finding": (
+                            "Combine producer completion skew is "
+                            f"{combine['producer_end_skew_us']:.1f} us; "
+                            "latest producer is "
+                            f"{combine['latest_producer_rank']}."
+                        ),
+                        "action": (
+                            "Optimize the late routed-expert/scatter producer. "
+                            "Removing an explicit wait dependency alone cannot "
+                            "eliminate cross-rank producer skew."
+                        ),
+                    },
+                )
+            elif wait_rows:
+                max_wait_rank, max_wait = max(
+                    wait_rows,
+                    key=lambda item: item[1]["stage_span_us"],
+                )
+                max_wait_us = max_wait["stage_span_us"]
+                if max_wait_us > 100.0:
+                    findings.append(
+                        {
+                            "layer": layer,
+                            "severity": "high",
+                            "finding": (
+                                f"Combine wait reaches {max_wait_us:.1f} us "
+                                f"on {max_wait_rank}. Cross-rank completion "
+                                "subtraction is unavailable for this capture, "
+                                "and task counts are not used as route "
+                                "evidence."
+                            ),
+                            "action": (
+                                "Treat this as a remote-producer tail signal, "
+                                "not wait-kernel arithmetic. Reduce routed "
+                                "compute and scatter tails; separately check "
+                                "whether local scatter overlaps the wait."
+                            ),
+                        },
+                    )
 
         if shared_rows:
             max_peak = max(row["resources"]["aic"]["peak_concurrency"] for _rank, row in shared_rows)
@@ -3834,6 +4827,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         )
 
     source_policy = report["source_policy"]
+    profile = report["profile"]
     release_readiness = report["admission"]["release_readiness"]
     lines = [
         "# Step3p5 L0-L4 MoE DFX report",
@@ -3972,29 +4966,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         stage_rows = []
         for rank, data in report["ranks"].items():
             stages = data.get("layers", {}).get(layer, {})
-            for stage in (
-                "norm_quant",
-                "gate_fanout",
-                "gate_topk",
-                "shared_mlp",
-                "shared_gate_up",
-                "shared_gate_up_act",
-                "shared_down",
-                "shared_split",
-                "shared_all_reduce",
-                "dispatch_push",
-                "dispatch_wait",
-                "dispatch_gather",
-                "expert_gate_up",
-                "expert_gate",
-                "expert_up",
-                "expert_gate_up_act",
-                "routed_h_quant",
-                "expert_down",
-                "combine_scatter",
-                "combine_wait",
-                "combine_reduce",
-            ):
+            for stage in _markdown_stage_order(profile):
                 metrics = stages.get(stage)
                 if metrics is None:
                     continue
@@ -4047,7 +5019,9 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         )
 
         lines.extend(["", f"### {layer} all-rank arrivals", ""])
-        for label in ("dispatch", "combine"):
+        for label, _producer_stage, _consumer_stage in _arrival_pairs(
+            profile
+        ):
             arrival = report["arrivals"].get(layer, {}).get(label)
             if not arrival:
                 continue
@@ -4061,28 +5035,33 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             lines.append(
                 f"- **{label}** producer end skew: "
                 f"`{producer_skew_text}`; "
-                f"latest producer: {latest_producer}.",
+                f"latest producer: {latest_producer}; "
+                f"consumer: `{arrival['consumer_stage']}`.",
             )
             arrival_rows = []
             producer_by_rank = {item["rank"]: item for item in arrival["producer_ranks"]}
-            for waiter in arrival["wait_ranks"]:
-                producer = producer_by_rank.get(waiter["rank"], {})
-                queue_delay = waiter["timing_evidence"]["queue_delay"]
+            for consumer in arrival["consumer_ranks"]:
+                producer = producer_by_rank.get(consumer["rank"], {})
+                queue_delay = consumer["timing_evidence"]["queue_delay"]
                 arrival_rows.append(
                     [
-                        waiter["rank"],
+                        consumer["rank"],
                         f"{producer.get('span_us', 0.0):.1f}",
-                        f"{waiter['span_us']:.1f}",
+                        f"{consumer['span_us']:.1f}",
                         (
-                            f"{waiter['remote_arrival_after_wait_start_us']:.1f}"
-                            if "remote_arrival_after_wait_start_us" in waiter
+                            f"{consumer['remote_arrival_after_consumer_start_us']:.1f}"
+                            if "remote_arrival_after_consumer_start_us"
+                            in consumer
                             else "-"
                         ),
-                        str(waiter["has_explicit_producer_dependency"]),
+                        str(consumer["has_producer_dependency"]),
+                        ",".join(consumer["producer_dependency_sources"])
+                        or "-",
                         (f"{queue_delay['value_us']:.1f}" if queue_delay.get("available") else "blocked"),
                         (
-                            f"{waiter['wait_overlap_completion_upper_bound_us']:.1f}"
-                            if "wait_overlap_completion_upper_bound_us" in waiter
+                            f"{consumer['wait_overlap_completion_upper_bound_us']:.1f}"
+                            if "wait_overlap_completion_upper_bound_us"
+                            in consumer
                             else "-"
                         ),
                     ],
@@ -4093,9 +5072,10 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
                     [
                         "rank",
                         "producer span us",
-                        "wait span us",
-                        "remote arrival after wait start us",
-                        "explicit dep",
+                        "consumer span us",
+                        "remote arrival after consumer start us",
+                        "producer dep",
+                        "dep sources",
                         "local queue delay us",
                         "completion saving upper bound us",
                     ],
@@ -4225,8 +5205,14 @@ def analyze(
     missing_critical_path = [trace.tag for trace in traces if trace.critical_path.get("makespan_ms") is None]
     if missing_critical_path:
         raise RuntimeError(f"missing or malformed critical-path report for {missing_critical_path}")
-    structural_contracts = _validate_structural_contracts(traces)
-    ranks = {trace.tag: _rank_metrics(trace) for trace in traces}
+    structural_contracts = _validate_structural_contracts(
+        traces,
+        resolved_profile,
+    )
+    ranks = {
+        trace.tag: _rank_metrics(trace, resolved_profile)
+        for trace in traces
+    }
     slice_contract_errors = []
     for rank, rank_data in ranks.items():
         for layer, stages in rank_data.get("layers", {}).items():
@@ -4250,12 +5236,33 @@ def analyze(
         raise RuntimeError(f"physical slice contract failed: {slice_contract_errors[:8]}")
     reference_rank = min(ranks, key=lambda tag: ranks[tag]["makespan_us"])
     clock_alignment = _clock_alignment(traces)
-    arrivals = _arrival_analysis(traces, ranks, clock_alignment)
+    arrivals = _arrival_analysis(
+        traces,
+        ranks,
+        clock_alignment,
+        resolved_profile,
+    )
     route_histogram = _route_histogram_contract(
         recv_meta_sidecar,
         profile=resolved_profile,
         source_decode_sha256=source_decode_sha256,
     )
+    local_ep_route_execution = _local_ep_route_execution_contract(
+        structural_contracts,
+        route_histogram,
+        resolved_profile,
+    )
+    if (
+        local_ep_route_execution["available"]
+        and local_ep_route_execution["pass"] is not True
+    ):
+        raise RuntimeError(
+            "local-EP route/execution contract failed: "
+            + json.dumps(
+                local_ep_route_execution["errors"][:8],
+                sort_keys=True,
+            )
+        )
     routed_slice_profiles = _routed_slice_profile_contract(ranks)
     if not routed_slice_profiles["pass"]:
         raise RuntimeError(
@@ -4265,8 +5272,15 @@ def analyze(
         ranks,
         resolved_profile,
     )
-    execution_limits = _execution_limit_classification(ranks, route_histogram)
-    timing_evidence = _timing_evidence_contract(ranks)
+    execution_limits = _execution_limit_classification(
+        ranks,
+        route_histogram,
+        resolved_profile,
+    )
+    timing_evidence = _timing_evidence_contract(
+        ranks,
+        resolved_profile,
+    )
     admission = _admission_contract(
         route_histogram,
         timing_evidence,
@@ -4274,7 +5288,7 @@ def analyze(
         expert_kernel_release,
     )
     report = {
-        "schema": "step3p5.five-layer-moe-dfx.v6",
+        "schema": "step3p5.five-layer-moe-dfx.v7",
         "build_dir": str(build_dir),
         "dfx_root": str(dfx_root),
         "profile": resolved_profile,
@@ -4285,8 +5299,17 @@ def analyze(
         ),
         "reference_rank": reference_rank,
         "reference_note": (
-            "Minimum makespan is a LOW-WAIT heuristic only. Compare every "
-            "rank for dispatch/combine arrival and TP all-reduce spin."
+            (
+                "Minimum makespan is a LOW-WAIT heuristic only. Compare "
+                "every rank from local_combine_reduce into moe_all_reduce; "
+                "the collective span may include peer-arrival spin."
+            )
+            if resolved_profile == "local-ep"
+            else (
+                "Minimum makespan is a LOW-WAIT heuristic only. Compare "
+                "every rank for dispatch/combine arrival and TP all-reduce "
+                "spin."
+            )
         ),
         "clock_alignment": clock_alignment,
         "rank_contract": {
@@ -4304,6 +5327,9 @@ def analyze(
         "execution_limit_classification": execution_limits,
         "timing_evidence_contract": timing_evidence,
         "route_histogram": route_histogram,
+        "local_ep_route_execution_contract": (
+            local_ep_route_execution
+        ),
         "external_correctness_contract": _external_correctness_contract(),
         "admission": admission,
         "ranks": ranks,
@@ -4312,6 +5338,7 @@ def analyze(
             ranks,
             arrivals,
             route_histogram,
+            resolved_profile,
         ),
     }
     json_path = out / "moe_dfx_report.json"

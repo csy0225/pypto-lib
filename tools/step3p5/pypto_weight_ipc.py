@@ -44,12 +44,13 @@ KEY+MAP SCHEMA
       "rank": <int>,
       "tp_world_size": <int>,
       "pool_bytes": <int>,            # total consolidated buffer size
-      "pool_dtype_bytes": 2,          # bf16 (all weights are bf16/fp32; see note)
+      "pool_dtype_bytes": 2,          # legacy default; each entry carries its own dtype
       "map": {
-        "<bundle_key>": {             # e.g. "wq_full", "moe_w_gate_r", "lm_head_weight"
+        "<bundle_key>": {             # e.g. "wq_full", "moe_w13_r", "lm_head_weight"
           "offset": <int>,            # byte offset within the pool
-          "shape": [<int>, ...],      # PyPTO bundle shape (per-rank, post-transform)
-          "dtype": "bfloat16"|"float32",
+          "shape": [<int>, ...],      # resident physical shape
+          "dtype": "bfloat16"|"float32"|"int8",
+          "layout": "ND"|"FRACTAL_NZ",
           "nbytes": <int>
         },
         ...
@@ -116,13 +117,71 @@ _HUGE_FIRST = 0                    # ACL_MEM_MALLOC_HUGE_FIRST
 _H2D = 1                           # ACL_MEMCPY_HOST_TO_DEVICE
 _ALIGN = 512                       # per-weight byte alignment inside the pool
 
-# Bundle keys that are FP32 (everything else is BF16).
-# Mirrors the legacy and checkpoint-native router keys in weight_loader.py.
-_FP32_KEYS = {"moe_gate_w", "moe_gate_w_nk", "moe_router_bias"}
+# Canonical dtypes in the exported whole-decode pool.  The loader keeps norm
+# tables in BF16, then ``_prepare_checkpoint_bundle`` promotes the small tables
+# below to the FP32 dtypes consumed by the program ABI.
+_PROGRAM_FP32_KEYS = {
+    "input_rms_weight",
+    "post_attn_rms_weight",
+    "q_norm_weight",
+    "k_norm_weight",
+    "final_norm_weight",
+    "mtp_enorm_weight",
+    "mtp_hnorm_weight",
+    "mtp_input_rms_weight",
+    "mtp_post_attn_rms_weight",
+    "mtp_q_norm_weight",
+    "mtp_k_norm_weight",
+    "mtp_shared_head_norm_weight",
+}
+_FP32_KEYS = _PROGRAM_FP32_KEYS | {
+    "moe_gate_w",
+    "moe_gate_w_nk",
+    "moe_router_bias",
+    "moe_w13_r_scale",
+    "moe_w_down_r_scale",
+}
+_INT8_KEYS = {"moe_w13_r", "moe_w_down_r"}
+_LAYOUT_ND = "ND"
+_LAYOUT_FRACTAL_NZ = "FRACTAL_NZ"
+_KNOWN_LAYOUTS = {_LAYOUT_ND, _LAYOUT_FRACTAL_NZ}
+_LEGACY_ROUTED_KEYS = {
+    "moe_w_gate_r",
+    "moe_w_up_r",
+    "moe_w_gate_r_scale",
+    "moe_w_up_r_scale",
+}
 
 
-def _dtype_for(key: str) -> str:
+def _dtype_for(key: str, *, native_w8a8: bool = True) -> str:
+    """Return the canonical logical dtype for one pool key.
+
+    The packed routed ABI has two explicit variants: a BF16 reference bundle
+    and the native W8A8 bundle used by the live decode path. The caller must
+    select the variant; the default is the production native-W8A8 contract.
+    """
+    if key in _INT8_KEYS:
+        return "int8" if native_w8a8 else "bfloat16"
     return "float32" if key in _FP32_KEYS else "bfloat16"
+
+
+def _layout_for(key: str, *, native_w8a8: bool = True) -> str:
+    """Return the resident physical layout for one pool key."""
+    if native_w8a8 and key in _INT8_KEYS:
+        return _LAYOUT_FRACTAL_NZ
+    return _LAYOUT_ND
+
+
+def _validate_layout_shape(key: str, shape: Tuple[int, ...], layout: str) -> None:
+    """Reject an NZ label whose physical fractal axes are not explicit."""
+    if layout not in _KNOWN_LAYOUTS:
+        raise ValueError(f"weight {key!r} has unsupported layout {layout!r}")
+    if layout == _LAYOUT_FRACTAL_NZ:
+        if len(shape) < 4 or tuple(shape[-2:]) != (16, 32):
+            raise ValueError(
+                f"weight {key!r} FRACTAL_NZ physical shape must end in "
+                f"[16, 32], got {shape!r}",
+            )
 
 
 def _torch_dtype(name: str):
@@ -150,13 +209,34 @@ class WeightMapInvalid(ValueError):
 # so the validator stays stdlib-only and runs card-free).
 _DTYPE_ITEMSIZE = {"float32": 4, "bfloat16": 2, "float16": 2, "int8": 1}
 
+
+def _tensor_dtype_name(tensor: Any) -> str:
+    """Return a supported torch dtype name without importing torch."""
+    try:
+        name = str(tensor.dtype).removeprefix("torch.")
+    except AttributeError as exc:
+        raise TypeError("weight entry must expose a dtype") from exc
+    if name not in _DTYPE_ITEMSIZE:
+        raise TypeError(f"unsupported tensor dtype {name!r}")
+    return name
+
+
+def _infer_native_w8a8(bundle: Dict[str, Any]) -> bool:
+    """Infer the routed bundle variant for legacy static callers."""
+    if set(_ROUTED_FP32_SCALE_KEYS) & set(bundle):
+        return True
+    for key in _INT8_KEYS:
+        tensor = bundle.get(key)
+        if tensor is not None and _tensor_dtype_name(tensor) == "int8":
+            return True
+    return False
+
 # native-W8A8 routed-expert contract (design rule 3 / hard-constraint 4):
 # routed projection weights MUST be INT8; their per-channel scales MUST be FP32.
 # A BF16-dequantized routed weight is a forbidden fallback and must be rejected.
-_ROUTED_INT8_KEYS = ("moe_w_gate_r", "moe_w_up_r", "moe_w_down_r")
+_ROUTED_INT8_KEYS = ("moe_w13_r", "moe_w_down_r")
 _ROUTED_FP32_SCALE_KEYS = (
-    "moe_w_gate_r_scale",
-    "moe_w_up_r_scale",
+    "moe_w13_r_scale",
     "moe_w_down_r_scale",
 )
 # Router gate matrix + bias are FP32 regardless of routed quantization.
@@ -195,15 +275,16 @@ def validate_weight_map(
 
     Structural checks (always):
       - ``version == 1``; ``pool_bytes`` is a positive int;
-      - ``map`` is a non-empty dict; each entry has offset/shape/dtype/nbytes;
-      - dtype is a known name; ``nbytes == prod(shape) * itemsize``;
+      - ``map`` is a non-empty dict; each entry has
+        offset/shape/dtype/layout/nbytes;
+      - dtype/layout are known names; ``nbytes == prod(shape) * itemsize``;
       - ``offset`` is ``align``-byte aligned; ``nbytes > 0``;
       - ``[offset, offset + nbytes)`` lies inside ``pool_bytes``;
       - no two entries overlap.
 
     native-W8A8 checks (when ``native_w8a8``):
-      - any present routed weight key is INT8 (never a BF16 dequant);
-      - any present routed scale key is FP32;
+      - packed routed W13/down keys are INT8 (never a BF16 dequant);
+      - packed W13/down scale keys are FP32;
       - router gate/bias, when present, are FP32.
 
     Expected cross-check (when ``expected`` is a ``{key: (shape, dtype)}`` map):
@@ -230,13 +311,14 @@ def validate_weight_map(
     for key, entry in entries.items():
         if not isinstance(entry, dict):
             raise WeightMapInvalid(f"entry {key!r} must be a dict")
-        for field in ("offset", "shape", "dtype", "nbytes"):
+        for field in ("offset", "shape", "dtype", "layout", "nbytes"):
             if field not in entry:
                 raise WeightMapInvalid(f"entry {key!r} missing field {field!r}")
-        offset, shape, dtype, nbytes = (
+        offset, shape, dtype, layout, nbytes = (
             entry["offset"],
             entry["shape"],
             entry["dtype"],
+            entry["layout"],
             entry["nbytes"],
         )
         if not isinstance(offset, int) or offset < 0:
@@ -249,10 +331,20 @@ def validate_weight_map(
             )
         if dtype not in _DTYPE_ITEMSIZE:
             raise WeightMapInvalid(f"{key!r} unknown dtype {dtype!r}")
+        if layout not in _KNOWN_LAYOUTS:
+            raise WeightMapInvalid(f"{key!r} unknown layout {layout!r}")
         if not isinstance(shape, (list, tuple)) or not shape:
             raise WeightMapInvalid(
                 f"{key!r} shape must be a non-empty sequence, got {shape!r}"
             )
+        if any(not isinstance(dim, int) or dim <= 0 for dim in shape):
+            raise WeightMapInvalid(
+                f"{key!r} shape must contain positive ints, got {shape!r}"
+            )
+        try:
+            _validate_layout_shape(key, tuple(shape), layout)
+        except ValueError as exc:
+            raise WeightMapInvalid(str(exc)) from exc
         want_nbytes = _prod(shape) * _DTYPE_ITEMSIZE[dtype]
         if want_nbytes != nbytes:
             raise WeightMapInvalid(
@@ -277,25 +369,45 @@ def validate_weight_map(
                 f"entries {k0!r} [{o0},{e0}) and {k1!r} [{o1},{e1}) overlap"
             )
 
+    legacy = sorted(_LEGACY_ROUTED_KEYS & set(entries))
+    if legacy:
+        raise WeightMapInvalid(
+            f"map contains removed routed keys: {legacy}; use packed W13 ABI"
+        )
+
+    # Known ABI keys are fail-closed. Unknown auxiliary keys remain allowed
+    # for compatibility (for example standalone KV buffers), but a known key
+    # can never be silently reinterpreted by the importer.
+    known_keys = _FP32_KEYS | _INT8_KEYS
+    for key in sorted(known_keys & set(entries)):
+        if not native_w8a8 and key in _ROUTED_FP32_SCALE_KEYS:
+            raise WeightMapInvalid(
+                f"non-native routed map must not contain scale key {key!r}"
+            )
+        want = _dtype_for(key, native_w8a8=native_w8a8)
+        got = entries[key]["dtype"]
+        if got != want:
+            detail = " (BF16-dequant routed is forbidden)" if (
+                native_w8a8 and key in _INT8_KEYS
+            ) else ""
+            raise WeightMapInvalid(
+                f"canonical dtype for {key!r} is {want!r}, got {got!r}{detail}"
+            )
+        want_layout = _layout_for(key, native_w8a8=native_w8a8)
+        got_layout = entries[key]["layout"]
+        if got_layout != want_layout:
+            raise WeightMapInvalid(
+                f"canonical layout for {key!r} is {want_layout!r}, "
+                f"got {got_layout!r}",
+            )
+
     if native_w8a8:
-        for k in _ROUTED_INT8_KEYS:
-            if k in entries and entries[k]["dtype"] != "int8":
-                raise WeightMapInvalid(
-                    f"native-W8A8 requires routed weight {k!r} to be int8, got "
-                    f"{entries[k]['dtype']!r} (BF16-dequant routed is forbidden)"
-                )
-        for k in _ROUTED_FP32_SCALE_KEYS:
-            if k in entries and entries[k]["dtype"] != "float32":
-                raise WeightMapInvalid(
-                    f"native-W8A8 requires routed scale {k!r} to be float32, "
-                    f"got {entries[k]['dtype']!r}"
-                )
-        for k in _ROUTER_FP32_KEYS:
-            if k in entries and entries[k]["dtype"] != "float32":
-                raise WeightMapInvalid(
-                    f"router weight {k!r} must be float32, got "
-                    f"{entries[k]['dtype']!r}"
-                )
+        required_routed = set(_ROUTED_INT8_KEYS) | set(_ROUTED_FP32_SCALE_KEYS)
+        missing_routed = sorted(required_routed - set(entries))
+        if missing_routed:
+            raise WeightMapInvalid(
+                f"native-W8A8 map missing packed routed keys: {missing_routed}"
+            )
 
     if expected is not None:
         missing = [k for k in expected if k not in entries]
@@ -363,27 +475,67 @@ class WeightIpcExporter:
         self._initialized = True
 
     @staticmethod
-    def plan_layout(bundle: Dict[str, Any]) -> List[Tuple[str, int, Tuple[int, ...], str, int]]:
-        """Lay out the bundle into the pool: aligned (offset, nbytes) per key.
+    def plan_layout(
+        bundle: Dict[str, Any],
+        *,
+        native_w8a8: Optional[bool] = None,
+    ) -> List[Tuple[str, int, Tuple[int, ...], str, int]]:
+        """Lay out a bundle while enforcing its canonical dtype contract.
 
-        Returns a list of (key, offset, shape, dtype_name, nbytes) in pool order.
-        Shape/dtype come straight from each bundle tensor (post-transform PyPTO
-        layout). Order is deterministic (sorted by key) so exporter/importer
-        agree without communicating it out-of-band beyond the map JSON.
+        ``native_w8a8`` should be supplied by the checkpoint/live loader. If
+        omitted, the variant is inferred from packed routed scales or INT8
+        routed tensors. The actual tensor dtype is checked against the ABI; it
+        is never allowed to overwrite the dtype recorded in the map.
         """
+        if not isinstance(bundle, dict) or not bundle:
+            raise ValueError("weight bundle must be a non-empty dict")
+        if native_w8a8 is None:
+            native_w8a8 = _infer_native_w8a8(bundle)
+
+        legacy = sorted(_LEGACY_ROUTED_KEYS & set(bundle))
+        if legacy:
+            raise ValueError(
+                f"weight bundle contains removed routed keys: {legacy}; "
+                "use packed moe_w13_r/moe_w_down_r ABI"
+            )
+        if native_w8a8:
+            required = set(_ROUTED_INT8_KEYS) | set(_ROUTED_FP32_SCALE_KEYS)
+            missing = sorted(required - set(bundle))
+            if missing:
+                raise ValueError(
+                    f"native-W8A8 bundle missing packed routed keys: {missing}"
+                )
+        else:
+            scales = sorted(set(_ROUTED_FP32_SCALE_KEYS) & set(bundle))
+            if scales:
+                raise ValueError(
+                    f"non-native routed bundle must not contain scale keys: {scales}"
+                )
+
         layout: List[Tuple[str, int, Tuple[int, ...], str, int]] = []
         offset = 0
         for key in sorted(bundle):
             t = bundle[key]
             shape = tuple(int(s) for s in t.shape)
-            dtype_name = _dtype_for(key)
-            # Defensive: honor the tensor's own dtype if it disagrees with the
-            # canonical rule (e.g. a checkpoint that ships gate_w in bf16).
-            td = str(t.dtype).removeprefix("torch.")
-            if td in ("float32", "bfloat16", "int8", "float16"):
-                dtype_name = td
+            if not shape or any(dim <= 0 for dim in shape):
+                raise ValueError(f"weight {key!r} has invalid shape {shape!r}")
+            actual = _tensor_dtype_name(t)
+            expected = _dtype_for(key, native_w8a8=native_w8a8)
+            layout_name = _layout_for(key, native_w8a8=native_w8a8)
+            _validate_layout_shape(key, shape, layout_name)
+            if actual != expected:
+                raise ValueError(
+                    f"canonical dtype mismatch for {key!r}: got {actual!r}, "
+                    f"want {expected!r}"
+                )
             nbytes = int(t.numel() * t.element_size())
-            layout.append((key, offset, shape, dtype_name, nbytes))
+            want_nbytes = int(t.numel()) * _DTYPE_ITEMSIZE[expected]
+            if nbytes != want_nbytes:
+                raise ValueError(
+                    f"byte-size mismatch for {key!r}: got {nbytes}, "
+                    f"want {want_nbytes} for dtype {expected!r}"
+                )
+            layout.append((key, offset, shape, expected, nbytes))
             offset = _align_up(offset + nbytes)
         return layout
 
@@ -395,6 +547,7 @@ class WeightIpcExporter:
         rank: int,
         tp_world_size: int = 8,
         max_pool_bytes: Optional[int] = None,
+        native_w8a8: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Consolidate ``bundle`` into one pool, emit key + map, return summary.
 
@@ -415,7 +568,9 @@ class WeightIpcExporter:
                     else self._dev
                 ),
             )
-        layout = self.plan_layout(bundle)
+        if native_w8a8 is None:
+            native_w8a8 = _infer_native_w8a8(bundle)
+        layout = self.plan_layout(bundle, native_w8a8=native_w8a8)
         if not layout:
             raise RuntimeError("weight bundle is empty; nothing to export")
         pool_bytes = _align_up(layout[-1][1] + layout[-1][4])
@@ -500,6 +655,9 @@ class WeightIpcExporter:
                     "offset": offset,
                     "shape": list(shape),
                     "dtype": dtype_name,
+                    "layout": _layout_for(
+                        key, native_w8a8=bool(native_w8a8),
+                    ),
                     "nbytes": nbytes,
                 }
                 for key, offset, shape, dtype_name, nbytes in layout
@@ -586,30 +744,13 @@ def _prepare_checkpoint_bundle(
         bundle,
         tp_world_size,
         decode_native_moe=production_hidden_only,
+        int8_routed=int8_routed,
     )
     # The whole_decode host_orch expects FP32 for the norm weights + final_norm
     # (matching the dummy device harness), but weight_loader stores norms as bf16.
     # Zero-copy IPC cannot cast at read time, so materialize FP32 bytes here so the
     # exported pool + map dtype are FP32 (router weights are already FP32).
-    _PROG_FP32 = (
-        "input_rms_weight",
-        "post_attn_rms_weight",
-        "q_norm_weight",
-        "k_norm_weight",
-        "final_norm_weight",
-        # MTP checkpoint tensors are native BF16, while the PyPTO norm ABI
-        # consumes FP32 gamma. Materialize only those small norm tables as
-        # FP32; MTP projection/attention/MLP/shared-head matrices stay their
-        # checkpoint-native BF16 (not a W8A8 dequant fallback).
-        "mtp_enorm_weight",
-        "mtp_hnorm_weight",
-        "mtp_input_rms_weight",
-        "mtp_post_attn_rms_weight",
-        "mtp_q_norm_weight",
-        "mtp_k_norm_weight",
-        "mtp_shared_head_norm_weight",
-    )
-    for key in _PROG_FP32:
+    for key in _PROGRAM_FP32_KEYS:
         if key in bundle and str(bundle[key].dtype) != "torch.float32":
             bundle[key] = bundle[key].to(torch.float32)
     if production_hidden_only:
@@ -628,6 +769,21 @@ def _prepare_checkpoint_bundle(
         )
         for key in forbidden_tail:
             bundle.pop(key, None)
+    fp32_keys = _FP32_KEYS & set(bundle)
+    routed_keys = _INT8_KEYS & set(bundle)
+    for key, tensor in bundle.items():
+        if key in fp32_keys:
+            expected_dtype = "float32"
+        elif key in routed_keys and int8_routed:
+            expected_dtype = "int8"
+        else:
+            expected_dtype = "bfloat16"
+        actual_dtype = str(tensor.dtype).removeprefix("torch.")
+        if actual_dtype != expected_dtype:
+            raise ValueError(
+                f"bundle dtype mismatch for {key!r}: got {actual_dtype!r}, "
+                f"want {expected_dtype!r}"
+            )
     if kv_ipc:
         # Standalone validation-only KV. Live serving exports vLLM's allocator
         # through vllm_kvpool_backend instead and must keep this disabled.
@@ -684,6 +840,7 @@ def export_from_checkpoint_resident(
         out_dir=out_dir,
         rank=rank,
         tp_world_size=tp_world_size,
+        native_w8a8=int8_routed,
     )
     return exporter, summary, bundle
 
@@ -871,6 +1028,7 @@ def export_mtp_hidden_weights_from_checkpoint(
         out_dir=out_dir,
         rank=rank,
         tp_world_size=tp_world_size,
+        native_w8a8=False,
     )
     return exporter, summary, selected
 
@@ -962,18 +1120,22 @@ class WeightIpcMap:
         return self._runtime.imported_tensor(ptr, shape, dtype, worker_id=self._worker_id)
 
     @classmethod
-    def from_files(cls, key_path: str, map_path: str, *, rt, worker_id: int = 0) -> "WeightIpcMap":
+    def from_files(
+        cls, key_path: str, map_path: str, *, rt, worker_id: int = 0,
+        native_w8a8: bool = True,
+    ) -> "WeightIpcMap":
         """Read key + map, import the pool into the worker's address space.
 
         ``rt`` is a ``DistributedWorker`` (or anything exposing
         ``import_ipc(key, worker_id=0) -> int``). Returns a WeightIpcMap bound
         to the imported peer_base.
         """
+        with open(map_path) as f:
+            pool_map = json.load(f)
+        validate_weight_map(pool_map, native_w8a8=native_w8a8)
         with open(key_path, "rb") as f:
             key = f.read()
         peer_base = int(rt.import_ipc(key, worker_id=worker_id))
-        with open(map_path) as f:
-            pool_map = json.load(f)
         print(
             f"[weight-ipc importer] ONE_KEY pool import peer_base={hex(peer_base)} "
             f"keys={len(pool_map['map'])} pool_GiB={pool_map['pool_bytes']/2**30:.2f}",
@@ -1029,7 +1191,10 @@ class WeightIpcMap:
 # rt.import_ipc (missing C++ facade); the WORKING path is the pure-Python batch
 # import_ipc_all (distributed_runner.py:1086) + direct WeightIpcMap(peer_base=va).
 # =============================================================================
-def import_weights_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> List["WeightIpcMap"]:
+def import_weights_all(
+    rt, out_dir: str, *, tp: int, dev_offset: int = 0,
+    native_w8a8: bool = True,
+) -> List["WeightIpcMap"]:
     """Batch-import all ``tp`` per-rank weight pools via ``DistributedWorker.import_ipc_all``.
 
     Reads ``pypto_weight.key.rank{r}`` + ``pypto_weight_map.rank{r}.json`` from
@@ -1052,6 +1217,7 @@ def import_weights_all(rt, out_dir: str, *, tp: int, dev_offset: int = 0) -> Lis
         key = validate_key_file(key_path)
         with open(map_path) as f:
             pool_map = json.load(f)
+        validate_weight_map(pool_map, native_w8a8=native_w8a8)
         validate_live_session(
             pool_map,
             expected_rank=r,
@@ -1129,20 +1295,28 @@ def _smoke_layout() -> int:
     No device, no ACL, no checkpoint load — pure dict math. Confirms:
       - every bundle key gets an offset
       - offsets are 512-aligned and non-overlapping
-      - dtypes match the fp32/bf16 rule
+      - dtypes match the FP32/BF16/INT8 rule
       - total pool_bytes is sane
     """
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-    from models.step3p5.weight_loader import expected_shapes  # noqa: PLC0415
+    from models.step3p5.weight_loader import (  # noqa: PLC0415
+        build_compact_shape_table,
+        build_synthetic_bundle,
+    )
 
-    shapes = expected_shapes(8)
-    # Synthesize a host bundle of the right shape/dtype per key.
+    shapes = build_compact_shape_table(8, int8_routed=True)
+    bundle = build_synthetic_bundle(
+        rank=0,
+        tp_world_size=8,
+        shape_overrides=shapes,
+        int8_routed=True,
+    )
     import torch  # noqa: PLC0415
-    bundle: Dict[str, Any] = {}
-    for key, shape in shapes.items():
-        dtype = torch.float32 if key in _FP32_KEYS else torch.bfloat16
-        bundle[key] = torch.empty(shape, dtype=dtype)
-    layout = WeightIpcExporter.plan_layout(bundle)
+
+    for key in _PROGRAM_FP32_KEYS:
+        if key in bundle:
+            bundle[key] = bundle[key].to(torch.float32)
+    layout = WeightIpcExporter.plan_layout(bundle, native_w8a8=True)
     keys = [k for k, _, _, _, _ in layout]
     assert len(keys) == len(shapes), f"key count mismatch {len(keys)} vs {len(shapes)}"
     # Non-overlapping + aligned.
@@ -1155,17 +1329,27 @@ def _smoke_layout() -> int:
     pool_bytes = _align_up(end)
     print(
         f"[weight-ipc smoke] keys={len(keys)} pool_GiB={pool_bytes/2**30:.2f} "
-        f"fp32_keys={[k for k in keys if k in _FP32_KEYS]}",
+        f"fp32_keys={[k for k in keys if k in _FP32_KEYS]} "
+        f"int8_keys={[k for k in keys if k in _INT8_KEYS]}",
         flush=True,
     )
     # Round-trip the map JSON the importer would read.
     map_obj = {
         "version": 1, "rank": 0, "tp_world_size": 8,
         "pool_bytes": pool_bytes, "pool_dtype_bytes": 2,
-        "map": {k: {"offset": o, "shape": list(s), "dtype": d, "nbytes": n}
-                for k, o, s, d, n in layout},
+        "map": {
+            k: {
+                "offset": o,
+                "shape": list(s),
+                "dtype": d,
+                "layout": _layout_for(k, native_w8a8=True),
+                "nbytes": n,
+            }
+            for k, o, s, d, n in layout
+        },
     }
     json.loads(json.dumps(map_obj))  # serializable
+    validate_weight_map(map_obj, native_w8a8=True)
     print("[weight-ipc smoke] layout + map round-trip OK", flush=True)
     return 0
 

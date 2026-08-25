@@ -59,6 +59,10 @@ _STAGE_SUFFIXES = {
     "combine_reduce": ("combine_reduce",),
     "moe_residual_add": ("moe_residual_add",),
 }
+_PACKED_NZ_EXTERNAL_STAGES = {
+    "expert_gate_up": "routed_nz_gmm1_swiglu_quant",
+    "expert_down": "routed_nz_down",
+}
 _ARRIVAL_PAIRS = (
     ("dispatch", "dispatch_push", "dispatch_wait"),
     ("combine", "combine_scatter", "combine_wait"),
@@ -93,6 +97,9 @@ _BASELINE_DECODE_SHA256 = (
 # generations.
 _R6_ROUTE_DECODE_SHA256 = (
     "671a5df8a07e09303c398871fd1772f306b2998ea3e8168048588de6cc3fa323"
+)
+_PACKED_NZ_DECODE_SHA256 = (
+    "da36c09dc275838ee364f76342d74717338ef313d912ba2b372808530489dd14"
 )
 # These are the only upper bounds carried from the release-qualified R5
 # packed-fused analyzer.  R5 had a single mixed fused stage; the route-sidecar
@@ -135,6 +142,25 @@ _FROZEN_SOURCE_POLICIES = {
             "no lower bound is inferred for separately named gate_up."
         ),
         "experimental": True,
+        "enforce_candidate_release_gate": True,
+    },
+    "packed-nz": {
+        "policy_id": "release-packed-nz-da36c09d-mixed-fused-v1",
+        "frozen_ref": "immutable source decode@da36c09d",
+        "decode_sha256_prefix": "da36c09d",
+        "decode_sha256": _PACKED_NZ_DECODE_SHA256,
+        "source_role": "candidate",
+        "storage_family": "packed_nz_w13_w2",
+        "schedule_family": "mixed_fused_gmm1_swiglu_requant_then_down",
+        "task_partition": (
+            "one_mixed_aic_aiv_fused_task_then_one_mixed_aic_aiv_down_task"
+        ),
+        "expert_release_family": "packed_nz_mixed",
+        "duration_limit_source": (
+            "No new per-slice duration threshold is introduced here; timing "
+            "qualification remains in the matched A/B/A and swimlane gates."
+        ),
+        "experimental": False,
         "enforce_candidate_release_gate": True,
     },
     "row16": {
@@ -193,6 +219,10 @@ _EXPERT_AIC_RELEASE_STAGES = {
         "expert_up",
         "expert_down",
     ),
+    "packed_nz_mixed": (
+        "expert_gate_up",
+        "expert_down",
+    ),
 }
 _EXPERT_DURATION_LIMITS_US = {
     "staged_fused_gate_up": _STAGED_FUSED_DURATION_LIMITS_US,
@@ -202,6 +232,16 @@ _EXPERT_DURATION_LIMITS_US = {
         "p90_max": 30.0,
         "p99_max": 60.0,
         "max": 100.0,
+    },
+}
+_PACKED_NZ_RESOURCE_TARGETS = {
+    "expert_gate_up": {
+        "aic": 24,
+        "aiv": 48,
+    },
+    "expert_down": {
+        "aic": 23,
+        "aiv": 46,
     },
 }
 _DIAGNOSTIC_STAGE_RESOURCES = {
@@ -623,6 +663,93 @@ def _task_matches_layer(task: Task, layer: str, suffix: str) -> bool:
     return base == expected and not base.startswith(_LAYER_PREFIX["L3"])
 
 
+def _has_dependency_edge(trace: RankTrace, pred: str, succ: str) -> bool:
+    return any(
+        str(edge.get("pred")) == pred and str(edge.get("succ")) == succ
+        for edge in trace.edges
+    )
+
+
+def _find_packed_nz_layer_tasks(
+    trace: RankTrace,
+    layer: str,
+    stage_ids: dict[str, list[str]],
+) -> dict[str, str]:
+    """Map layer-agnostic packed-NZ extern tasks to one MoE layer."""
+    packed_names = set(_PACKED_NZ_EXTERNAL_STAGES.values())
+    if not any(
+        _strip_resource_suffix(task.name) in packed_names
+        for task in trace.tasks
+    ):
+        return {}
+
+    gather_ids = stage_ids["dispatch_gather"]
+    scatter_ids = stage_ids["combine_scatter"]
+    if len(gather_ids) != 1 or len(scatter_ids) != 1:
+        raise RuntimeError(
+            f"{trace.tag}/{layer}: packed-NZ mapping requires exactly one "
+            "dispatch_gather and one combine_scatter task; "
+            f"gather={gather_ids}, scatter={scatter_ids}"
+        )
+    gather = trace.task_by_id[gather_ids[0]]
+    scatter = trace.task_by_id[scatter_ids[0]]
+    if gather.order >= scatter.order:
+        raise RuntimeError(
+            f"{trace.tag}/{layer}: invalid packed-NZ task window; "
+            f"gather_order={gather.order}, scatter_order={scatter.order}"
+        )
+
+    window = [
+        task
+        for task in trace.tasks
+        if gather.order < task.order < scatter.order
+    ]
+    mapped: dict[str, Task] = {}
+    for stage, expected_name in _PACKED_NZ_EXTERNAL_STAGES.items():
+        matches = [
+            task
+            for task in window
+            if _strip_resource_suffix(task.name) == expected_name
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"{trace.tag}/{layer}: expected exactly one {expected_name!r} "
+                "dependency task inside the dispatch_gather -> "
+                f"combine_scatter window, got "
+                f"{[(task.task_id, task.order, task.name) for task in matches]}"
+            )
+        mapped[stage] = matches[0]
+
+    fused = mapped["expert_gate_up"]
+    down = mapped["expert_down"]
+    dependency_chain = {
+        "gather_to_fused": _has_dependency_edge(
+            trace,
+            gather.task_id,
+            fused.task_id,
+        ),
+        "fused_to_down": _has_dependency_edge(
+            trace,
+            fused.task_id,
+            down.task_id,
+        ),
+        "down_to_scatter": _has_dependency_edge(
+            trace,
+            down.task_id,
+            scatter.task_id,
+        ),
+    }
+    order_valid = (
+        gather.order < fused.order < down.order < scatter.order
+    )
+    if not order_valid or not all(dependency_chain.values()):
+        raise RuntimeError(
+            f"{trace.tag}/{layer}: invalid packed-NZ dependency chain; "
+            f"order_valid={order_valid}, edges={dependency_chain}"
+        )
+    return {stage: task.task_id for stage, task in mapped.items()}
+
+
 def _find_layer_task_ids(
     trace: RankTrace,
     layer: str,
@@ -634,6 +761,15 @@ def _find_layer_task_ids(
             for task in trace.tasks
             if any(_task_matches_layer(task, layer, suffix) for suffix in suffixes)
         ]
+
+    packed_nz_tasks = _find_packed_nz_layer_tasks(trace, layer, result)
+    for stage, task_id in packed_nz_tasks.items():
+        if result[stage]:
+            raise RuntimeError(
+                f"{trace.tag}/{layer}: both named and packed-NZ tasks map to "
+                f"{stage}: named={result[stage]}, packed={task_id}"
+            )
+        result[stage] = [task_id]
 
     gate_tasks = [trace.task_by_id[task_id] for task_id in result["gate_init"]]
     if gate_tasks:
@@ -2485,11 +2621,13 @@ def _expert_kernel_release_contract(
             f"for profile {resolved_profile!r}"
         )
     required_aic_stages = _EXPERT_AIC_RELEASE_STAGES[release_family]
-    duration_limits = _EXPERT_DURATION_LIMITS_US[release_family]
+    duration_limits = _EXPERT_DURATION_LIMITS_US.get(release_family, {})
+    packed_nz_mixed = release_family == "packed_nz_mixed"
     coverage: dict[str, Any] = {layer: {} for layer in _LAYER_PREFIX}
     coverage_errors: list[dict[str, Any]] = []
     duration_errors: list[dict[str, Any]] = []
     activation_errors: list[dict[str, Any]] = []
+    mixed_resource_errors: list[dict[str, Any]] = []
     for layer in _LAYER_PREFIX:
         for rank, rank_data in ranks.items():
             stages = rank_data.get("layers", {}).get(layer, {})
@@ -2515,8 +2653,20 @@ def _expert_kernel_release_contract(
                 "observed_slices_by_stage": observed_by_stage,
                 "aic_duration_stages": {},
                 "activation_aiv": {
-                    "applicable": execution_nonempty,
-                    "pass": None if not execution_nonempty else False,
+                    "applicable": execution_nonempty and not packed_nz_mixed,
+                    "pass": (
+                        None
+                        if not execution_nonempty or packed_nz_mixed
+                        else False
+                    ),
+                },
+                "mixed_resource_grid": {
+                    "applicable": execution_nonempty and packed_nz_mixed,
+                    "pass": (
+                        None
+                        if not execution_nonempty or not packed_nz_mixed
+                        else False
+                    ),
                 },
             }
             if not execution_nonempty:
@@ -2524,6 +2674,101 @@ def _expert_kernel_release_contract(
                     "No routed physical compute was observed. This does not "
                     "prove route-empty because no routed-token histogram is "
                     "available."
+                )
+                coverage[layer][rank] = rank_coverage
+                continue
+
+            if packed_nz_mixed:
+                stage_checks: dict[str, Any] = {}
+                rank_errors: list[dict[str, Any]] = []
+                for stage, targets in _PACKED_NZ_RESOURCE_TARGETS.items():
+                    stage_data = stages.get(stage)
+                    resources = (
+                        stage_data.get("resources", {})
+                        if stage_data is not None
+                        else {}
+                    )
+                    checks = {
+                        "stage_present": stage_data is not None,
+                        "one_task_instance": (
+                            stage_data is not None
+                            and int(stage_data.get("task_instances", 0)) == 1
+                        ),
+                        "blocks_match_aic_grid": (
+                            stage_data is not None
+                            and stage_data.get("blocks_per_task")
+                            == [targets["aic"]]
+                        ),
+                    }
+                    observed: dict[str, Any] = {}
+                    for resource, target in targets.items():
+                        metrics = resources.get(resource, {})
+                        observed[resource] = {
+                            "target": target,
+                            "expected_slices": int(
+                                metrics.get("expected_slices", 0)
+                            ),
+                            "observed_slices": int(
+                                metrics.get("observed_slices", 0)
+                            ),
+                            "distinct_cores": int(
+                                metrics.get("distinct_cores", 0)
+                            ),
+                        }
+                        checks[f"{resource}_available"] = bool(
+                            metrics.get("available")
+                        )
+                        checks[f"{resource}_expected_slices"] = (
+                            observed[resource]["expected_slices"] == target
+                        )
+                        checks[f"{resource}_observed_slices"] = (
+                            observed[resource]["observed_slices"] == target
+                        )
+                        checks[f"{resource}_distinct_cores"] = (
+                            observed[resource]["distinct_cores"] == target
+                        )
+                    stage_pass = all(checks.values())
+                    stage_checks[stage] = {
+                        "pass": stage_pass,
+                        "checks": checks,
+                        "observed": observed,
+                    }
+                    if not stage_pass:
+                        rank_errors.append(
+                            {
+                                "rank": rank,
+                                "layer": layer,
+                                "stage": stage,
+                                "code": "packed_nz_mixed_resource_grid",
+                                "failed_checks": [
+                                    name
+                                    for name, passed in checks.items()
+                                    if not passed
+                                ],
+                                "observed": observed,
+                            }
+                        )
+                mixed_resource_errors.extend(rank_errors)
+                rank_coverage["mixed_resource_grid"] = {
+                    "applicable": True,
+                    "pass": not rank_errors,
+                    "targets": _PACKED_NZ_RESOURCE_TARGETS,
+                    "stages": stage_checks,
+                }
+                rank_coverage["activation_aiv"] = {
+                    "applicable": False,
+                    "pass": None,
+                    "reason": (
+                        "Activation and requant run on the AIV slices of the "
+                        "mixed expert_gate_up task."
+                    ),
+                }
+                rank_coverage["interpretation"] = (
+                    "Packed-NZ nonempty ranks require one fused mixed task at "
+                    "24 AIC/48 AIV and one down mixed task at 23 AIC/46 AIV. "
+                    "A rank with no routed physical slices is accepted here; "
+                    "the task-ID contract must prove explicit predicate skips "
+                    "and the route sidecar must prove zero routes."
                 )
                 coverage[layer][rank] = rank_coverage
                 continue
@@ -2689,6 +2934,7 @@ def _expert_kernel_release_contract(
         not coverage_errors
         and not duration_errors
         and not activation_errors
+        and not mixed_resource_errors
     )
     release_enforced = policy["enforce_candidate_release_gate"]
     return {
@@ -2705,26 +2951,38 @@ def _expert_kernel_release_contract(
         "coverage_pass": not coverage_errors,
         "duration_pass": not duration_errors,
         "activation_pass": not activation_errors,
+        "mixed_resource_grid_pass": not mixed_resource_errors,
         "profile": resolved_profile,
         "source_policy": policy,
         "release_enforced": release_enforced,
         "release_family": release_family,
         "required_aic_stages": list(required_aic_stages),
         "duration_limits_us": dict(duration_limits),
+        "mixed_resource_targets": (
+            _PACKED_NZ_RESOURCE_TARGETS if packed_nz_mixed else {}
+        ),
         "duration_limit_source": policy.get("duration_limit_source"),
         "coverage": coverage,
         "coverage_errors": coverage_errors,
         "duration_errors": duration_errors,
         "activation_errors": activation_errors,
+        "mixed_resource_errors": mixed_resource_errors,
         "interpretation": (
-            "The 671a5df8 route-sidecar candidate is selected by exact source SHA, "
-            "not by task-name inference. Its staged_fused_gate_up family "
-            "requires AIC gate_up/down coverage and AIV-only activation and "
-            "quant coverage on every execution-nonempty rank. R5's "
-            "release-qualified packed-fused upper scheduling bounds are "
-            "carried as p50<=200us, p90<=220us, p99<=320us, max<=500us; "
-            "a lower bound is intentionally not applied to separately named "
-            "gate_up because R5 measured one combined stage."
+            (
+                "The da36c09d packed-NZ source is selected by exact source "
+                "SHA. Each execution-nonempty rank must expose one mixed "
+                "fused task at 24 AIC/48 AIV and one mixed down task at "
+                "23 AIC/46 AIV; independent activation/quant stages are not "
+                "required."
+            )
+            if packed_nz_mixed
+            else (
+                "The 671a5df8 route-sidecar candidate is selected by exact "
+                "source SHA, not by task-name inference. Its staged fused "
+                "family requires AIC gate_up/down coverage and AIV-only "
+                "activation and quant coverage on every execution-nonempty "
+                "rank."
+            )
         ),
     }
 
@@ -3046,6 +3304,9 @@ def _admission_contract(
     expert_release_enforced = bool(
         source_policy["enforce_candidate_release_gate"]
     )
+    packed_nz_mixed = (
+        expert_kernel_release.get("release_family") == "packed_nz_mixed"
+    )
     reported_release_enforced = expert_kernel_release.get("release_enforced")
     route_sidecar_ready = bool(route_histogram) and all(
         contract.get("available", False)
@@ -3061,12 +3322,17 @@ def _admission_contract(
         ),
         "expert_aic_duration": (
             bool(expert_kernel_release["duration_pass"])
-            if expert_release_enforced
+            if expert_release_enforced and not packed_nz_mixed
             else None
         ),
         "expert_activation_aiv": (
             bool(expert_kernel_release["activation_pass"])
-            if expert_release_enforced
+            if expert_release_enforced and not packed_nz_mixed
+            else None
+        ),
+        "expert_mixed_resource_grid": (
+            bool(expert_kernel_release["mixed_resource_grid_pass"])
+            if expert_release_enforced and packed_nz_mixed
             else None
         ),
         "route_histogram_proxy_prohibited": all(
@@ -3099,7 +3365,11 @@ def _admission_contract(
                 "errors": routed_slice_profiles["errors"][:8],
             }
         )
-    if expert_release_enforced and not expert_kernel_release["duration_pass"]:
+    if (
+        expert_release_enforced
+        and not packed_nz_mixed
+        and not expert_kernel_release["duration_pass"]
+    ):
         blockers.append(
             {
                 "code": "expert_aic_duration_release_failed",
@@ -3113,11 +3383,26 @@ def _admission_contract(
                 "errors": expert_kernel_release["coverage_errors"][:8],
             }
         )
-    if expert_release_enforced and not expert_kernel_release["activation_pass"]:
+    if (
+        expert_release_enforced
+        and not packed_nz_mixed
+        and not expert_kernel_release["activation_pass"]
+    ):
         blockers.append(
             {
                 "code": "expert_activation_aiv_release_failed",
                 "errors": expert_kernel_release["activation_errors"][:8],
+            }
+        )
+    if (
+        expert_release_enforced
+        and packed_nz_mixed
+        and not expert_kernel_release["mixed_resource_grid_pass"]
+    ):
+        blockers.append(
+            {
+                "code": "expert_mixed_resource_grid_release_failed",
+                "errors": expert_kernel_release["mixed_resource_errors"][:8],
             }
         )
     if not expert_release_enforced:
@@ -3596,6 +3881,24 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
     else:
         lines.append("- None.")
     hidden_gate = report["external_correctness_contract"]["hidden_state_bit_exact"]
+    expert_release = report["expert_kernel_release"]
+    if expert_release["release_family"] == "packed_nz_mixed":
+        expert_gate_lines = [
+            "- Packed-NZ mixed resource grid gate: "
+            f"`{expert_release['mixed_resource_grid_pass']}` "
+            "(fused 24 AIC/48 AIV; BS1 down 23 AIC/46 AIV)",
+            "- Independent activation/quant stage gate: `not applicable` "
+            "(activation and requant execute on fused-task AIV slices)",
+        ]
+    else:
+        expert_gate_lines = [
+            "- Expert AIC duration gate: "
+            f"`{expert_release['duration_pass']}` "
+            "(raw diagnostic; enforced only for candidate)",
+            "- Expert activation AIV gate: "
+            f"`{expert_release['activation_pass']}` "
+            "(raw diagnostic; enforced only for candidate)",
+        ]
     lines.extend(
         [
             "",
@@ -3611,14 +3914,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
             f"`{report['expert_kernel_release']['release_enforced']}`",
             "- Candidate expert gate status: "
             f"`{report['expert_kernel_release']['release_gate_status']}`",
-            "- Expert AIC duration gate: "
-            f"`{report['expert_kernel_release']['duration_pass']}` "
-            "(raw diagnostic; enforced only for candidate; gate/up/down per "
-            "execution-nonempty rank: "
-            "p50 10-30us, p90<=30us, p99<=60us, max<=100us)",
-            "- Expert activation AIV gate: "
-            f"`{report['expert_kernel_release']['activation_pass']}` "
-            "(raw diagnostic; enforced only for candidate)",
+            *expert_gate_lines,
             "- Hidden-state bit-exact gate: "
             f"`external`, enforced by `{hidden_gate['enforced_by']}` for "
             f"`{hidden_gate['required_artifacts']}`",

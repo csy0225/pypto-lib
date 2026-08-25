@@ -28,6 +28,7 @@ from tools.step3p5.analyze_five_layer_moe_dfx import (
     _percentile,
     _predicated_skip_task_ids,
     _raw_swimlane_metadata,
+    _rank_metrics,
     _route_histogram_contract,
     _routed_slice_profile_contract,
     _source_identity_contract,
@@ -173,6 +174,81 @@ def _shared_trace(*, layer: str, split: bool) -> RankTrace:
     )
 
 
+def _packed_nz_trace(*, skip_l4: bool = False) -> RankTrace:
+    specs = (
+        ("l3-gather", "swa_moe_chip_orch_dispatch_gather", (-1, 10, -1)),
+        (
+            "l3-fused",
+            "routed_nz_gmm1_swiglu_quant_aic",
+            (11, 12, 12),
+        ),
+        ("l3-down", "routed_nz_down_aic", (13, 14, 14)),
+        ("l3-scatter", "swa_moe_chip_orch_combine_scatter", (-1, 15, -1)),
+        ("l4-gather", "dispatch_gather", (-1, 20, -1)),
+        (
+            "l4-fused",
+            "routed_nz_gmm1_swiglu_quant_aic",
+            (11, 12, 12),
+        ),
+        ("l4-down", "routed_nz_down_aic", (13, 14, 14)),
+        ("l4-scatter", "combine_scatter", (-1, 21, -1)),
+    )
+    tasks = [
+        Task(
+            task_id=task_id,
+            order=order,
+            name=name,
+            block_num=1,
+            kernel_ids=kernel_ids,
+            early_dispatch=True,
+        )
+        for order, (task_id, name, kernel_ids) in enumerate(specs)
+    ]
+    skipped = {"l4-fused", "l4-down"} if skip_l4 else set()
+    slices_by_task = {
+        task.task_id: [
+            Slice(
+                core=(
+                    0
+                    if task.kernel_ids[0] >= 0
+                    else 24
+                ),
+                task_id=task.task_id,
+                start=task.order * 100,
+                end=task.order * 100 + 10,
+                resource=(
+                    "aic"
+                    if task.kernel_ids[0] >= 0
+                    else "aiv"
+                ),
+            )
+        ]
+        for task in tasks
+        if task.task_id not in skipped
+    }
+    edges = [
+        {"pred": "l3-gather", "succ": "l3-fused", "source": "tensormap"},
+        {"pred": "l3-fused", "succ": "l3-down", "source": "explicit"},
+        {"pred": "l3-down", "succ": "l3-scatter", "source": "explicit"},
+        {"pred": "l4-gather", "succ": "l4-fused", "source": "tensormap"},
+        {"pred": "l4-fused", "succ": "l4-down", "source": "explicit"},
+        {"pred": "l4-down", "succ": "l4-scatter", "source": "explicit"},
+    ]
+    return RankTrace(
+        tag="rank0/d0",
+        rank_dir=Path("rank0/d0"),
+        frequency_hz=1_000_000,
+        core_types=["aic"] * 24 + ["aiv"] * 48,
+        tasks=tasks,
+        task_by_id={task.task_id: task for task in tasks},
+        slices_by_task=slices_by_task,
+        edges=edges,
+        critical_path={},
+        swimlane_level=4,
+        predicated_skip_task_ids=tuple(sorted(skipped)),
+    )
+
+
 def _fake_resource(
     *,
     p50_us: float = 20.0,
@@ -182,10 +258,22 @@ def _fake_resource(
     observed_slices: int = 24,
     available_cores: int = 24,
     peak_concurrency: int = 24,
+    expected_slices: int | None = None,
+    distinct_cores: int | None = None,
 ) -> dict:
     return {
         "available": observed_slices > 0,
+        "expected_slices": (
+            observed_slices
+            if expected_slices is None
+            else expected_slices
+        ),
         "observed_slices": observed_slices,
+        "distinct_cores": (
+            observed_slices
+            if distinct_cores is None
+            else distinct_cores
+        ),
         "available_cores": available_cores,
         "peak_concurrency": peak_concurrency,
         "duration_distribution": {
@@ -196,6 +284,38 @@ def _fake_resource(
             "p99_us": p99_us,
             "max_us": max_us,
         },
+    }
+
+
+def _packed_nz_stage(aic: int, aiv: int) -> dict:
+    return {
+        "task_instances": 1,
+        "blocks_per_task": [aic],
+        "resources": {
+            "aic": _fake_resource(
+                observed_slices=aic,
+                available_cores=24,
+                peak_concurrency=aic,
+            ),
+            "aiv": _fake_resource(
+                observed_slices=aiv,
+                available_cores=48,
+                peak_concurrency=aiv,
+            ),
+        },
+        "task_instance_details": [],
+    }
+
+
+def _valid_packed_nz_rank() -> dict:
+    return {
+        "layers": {
+            layer: {
+                "expert_gate_up": _packed_nz_stage(24, 48),
+                "expert_down": _packed_nz_stage(23, 46),
+            }
+            for layer in ("L3", "L4")
+        }
     }
 
 
@@ -557,6 +677,54 @@ def test_find_layer_task_ids_supports_old_and_split_shared_layouts(
         assert stages["shared_split"] == []
 
 
+def test_packed_nz_external_tasks_are_mapped_by_layer_window_and_task_id() -> None:
+    trace = _packed_nz_trace()
+
+    l3 = _find_layer_task_ids(trace, "L3")
+    l4 = _find_layer_task_ids(trace, "L4")
+    assert l3["expert_gate_up"] == ["l3-fused"]
+    assert l3["expert_down"] == ["l3-down"]
+    assert l4["expert_gate_up"] == ["l4-fused"]
+    assert l4["expert_down"] == ["l4-down"]
+
+    metrics = _rank_metrics(trace)["layers"]
+    assert metrics["L3"]["expert_gate_up"]["task_ids"] == ["l3-fused"]
+    assert metrics["L3"]["expert_gate_up"]["task_instances"] == 1
+    assert metrics["L4"]["expert_gate_up"]["task_ids"] == ["l4-fused"]
+    assert metrics["L4"]["expert_gate_up"]["task_instances"] == 1
+
+
+def test_packed_nz_mapping_accepts_route_empty_predicated_skips() -> None:
+    trace = _packed_nz_trace(skip_l4=True)
+
+    l4 = _find_layer_task_ids(trace, "L4")
+    assert l4["expert_gate_up"] == ["l4-fused"]
+    assert l4["expert_down"] == ["l4-down"]
+    assert "expert_gate_up" not in _rank_metrics(trace)["layers"]["L4"]
+
+    task_ids = _task_id_contract(trace)
+    assert task_ids["pass"]
+    assert task_ids["predicated_skip_without_physical_slices"] == [
+        "l4-down",
+        "l4-fused",
+    ]
+
+
+def test_packed_nz_mapping_rejects_a_broken_dependency_chain() -> None:
+    trace = _packed_nz_trace()
+    trace.edges = [
+        edge
+        for edge in trace.edges
+        if not (
+            edge["pred"] == "l4-fused"
+            and edge["succ"] == "l4-down"
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="invalid packed-NZ dependency chain"):
+        _find_layer_task_ids(trace, "L4")
+
+
 def test_duration_distribution_uses_closed_10_to_30_us_gate() -> None:
     distribution = _duration_distribution([9.999, 10.0, 30.0, 30.001])
     assert distribution["min_us"] == 9.999
@@ -610,6 +778,15 @@ def test_source_identity_contract_matches_only_the_selected_policy() -> None:
     assert missing["pass"] is None
     with pytest.raises(ValueError, match="lowercase SHA256"):
         _source_identity_contract("candidate", "not-a-digest")
+
+    packed_sha256 = (
+        "da36c09dc275838ee364f76342d74717338ef313"
+        "d912ba2b372808530489dd14"
+    )
+    packed = _source_identity_contract("packed-nz", packed_sha256)
+    assert packed["available"]
+    assert packed["pass"]
+    assert packed["policy_id"].startswith("release-packed-nz-")
 
 
 def test_route_histogram_awaits_recv_meta_without_using_task_counts() -> None:
@@ -701,6 +878,40 @@ def test_route_histogram_sidecar_must_match_source_policy(tmp_path) -> None:
             profile="candidate",
             source_decode_sha256="0" * 64,
         )
+
+
+def test_route_histogram_accepts_exact_packed_nz_source_policy(
+    tmp_path,
+) -> None:
+    payload = _recv_meta_payload()
+    packed_sha256 = (
+        "da36c09dc275838ee364f76342d74717338ef313"
+        "d912ba2b372808530489dd14"
+    )
+    payload["provenance"]["source"]["decode_fwd_sha256"] = packed_sha256
+    payload["provenance"]["formal_golden"][
+        "source_decode_fwd_sha256"
+    ] = packed_sha256
+    payload["provenance"]["source_manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload["provenance"]["source"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    sidecar = tmp_path / "packed-nz-recv-meta.json"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _route_histogram_contract(
+        sidecar,
+        profile="packed-nz",
+        source_decode_sha256=packed_sha256,
+    )
+
+    assert result["L3"]["available"]
+    assert result["L3"]["provenance"]["source_policy_id"].startswith(
+        "release-packed-nz-"
+    )
 
 
 def test_route_histogram_rejects_overlapping_windows_and_bad_derived_count(
@@ -1023,6 +1234,42 @@ def test_expert_release_requires_staged_fused_aic_and_aiv_stages() -> None:
     empty_l4 = contract["coverage"]["L4"]["rank1/d0"]
     assert not empty_l4["execution_nonempty"]
     assert not empty_l4["route_empty_inferred"]
+
+
+def test_packed_nz_release_enforces_mixed_resource_grids() -> None:
+    ranks = {
+        "rank0/d0": _valid_packed_nz_rank(),
+        "rank1/d0": {"layers": {"L3": {}, "L4": {}}},
+    }
+    passing = _expert_kernel_release_contract(
+        ranks,
+        profile="packed-nz",
+    )
+    assert passing["pass"]
+    assert passing["mixed_resource_grid_pass"]
+    assert passing["activation_pass"]
+    assert passing["duration_limits_us"] == {}
+    assert passing["mixed_resource_targets"] == {
+        "expert_gate_up": {"aic": 24, "aiv": 48},
+        "expert_down": {"aic": 23, "aiv": 46},
+    }
+    assert not passing["coverage"]["L3"]["rank1/d0"][
+        "execution_nonempty"
+    ]
+
+    ranks["rank0/d0"]["layers"]["L4"]["expert_down"]["resources"][
+        "aiv"
+    ]["observed_slices"] = 45
+    blocked = _expert_kernel_release_contract(
+        ranks,
+        profile="packed-nz",
+    )
+    assert not blocked["pass"]
+    assert not blocked["mixed_resource_grid_pass"]
+    assert blocked["mixed_resource_errors"][0]["stage"] == "expert_down"
+    assert "aiv_observed_slices" in blocked["mixed_resource_errors"][0][
+        "failed_checks"
+    ]
 
 
 def test_expert_release_accepts_valid_nonempty_rank_and_rejects_aic_vector_stage() -> None:

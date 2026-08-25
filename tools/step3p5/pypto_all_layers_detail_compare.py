@@ -207,6 +207,7 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
         HEAD_DIM,
         LAYER_TYPE_FULL,
         LAYER_TYPES,
+        MOE_INTERMEDIATE,
         MOE_LAYER_INDICES,
         NUM_HIDDEN_LAYERS,
         NUM_HEADS_FULL_LOCAL,
@@ -225,11 +226,10 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
         KEY_K_NORM,
         KEY_MOE_GATE_W,
         KEY_MOE_ROUTER_BIAS,
+        KEY_MOE_W13_R,
         KEY_MOE_W_DOWN_R,
         KEY_MOE_W_DOWN_S,
-        KEY_MOE_W_GATE_R,
         KEY_MOE_W_GATE_S,
-        KEY_MOE_W_UP_R,
         KEY_MOE_W_UP_S,
         KEY_POST_ATTN_RMS,
         KEY_Q_NORM,
@@ -384,11 +384,11 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
             base = bundles[0]
             gate_w_full = base[KEY_MOE_GATE_W][moe_pos]
             router_bias_full = base[KEY_MOE_ROUTER_BIAS][moe_pos]
-            w_gate_r_full = torch.cat(
-                [bundle[KEY_MOE_W_GATE_R][moe_pos] for bundle in bundles], dim=0,
+            w13_r_full = torch.cat(
+                [bundle[KEY_MOE_W13_R][moe_pos] for bundle in bundles], dim=0,
             )
-            w_up_r_full = torch.cat(
-                [bundle[KEY_MOE_W_UP_R][moe_pos] for bundle in bundles], dim=0,
+            w_gate_r_full, w_up_r_full = torch.split(
+                w13_r_full, MOE_INTERMEDIATE, dim=-1,
             )
             w_down_r_full = torch.cat(
                 [bundle[KEY_MOE_W_DOWN_R][moe_pos] for bundle in bundles], dim=0,

@@ -23,34 +23,75 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _tensor_meta(tensor) -> dict[str, Any]:
+_ROUTED_WEIGHT_KEYS = {"moe_w13_r", "moe_w_down_r"}
+
+
+def _layout_for_key(key: str, *, int8_routed: bool) -> str:
+    return "FRACTAL_NZ" if int8_routed and key in _ROUTED_WEIGHT_KEYS else "ND"
+
+
+def _tensor_meta(key: str, tensor, *, int8_routed: bool) -> dict[str, Any]:
     return {
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype).removeprefix("torch."),
+        "layout": _layout_for_key(key, int8_routed=int8_routed),
         "numel": int(tensor.numel()),
     }
 
 
-def _expected_meta(tp_world_size: int) -> dict[str, dict[str, Any]]:
+def _expected_meta(
+    tp_world_size: int,
+    *,
+    decode_native_moe: bool = False,
+    int8_routed: bool = False,
+) -> dict[str, dict[str, Any]]:
     from models.step3p5.weight_loader import (  # noqa: PLC0415
         KEY_MOE_GATE_W,
+        KEY_MOE_GATE_W_NK,
         KEY_MOE_ROUTER_BIAS,
+        KEY_MOE_W13_R_SCALE,
+        KEY_MOE_W_DOWN_R_SCALE,
         expected_shapes,
     )
 
-    fp32_keys = {KEY_MOE_GATE_W, KEY_MOE_ROUTER_BIAS}
+    fp32_keys = {
+        KEY_MOE_GATE_W,
+        KEY_MOE_GATE_W_NK,
+        KEY_MOE_ROUTER_BIAS,
+        KEY_MOE_W13_R_SCALE,
+        KEY_MOE_W_DOWN_R_SCALE,
+    }
+    int8_keys = {"moe_w13_r", "moe_w_down_r"}
     out: dict[str, dict[str, Any]] = {}
-    for key, shape in expected_shapes(tp_world_size).items():
+    for key, shape in expected_shapes(
+        tp_world_size,
+        decode_native_moe=decode_native_moe,
+        int8_routed=int8_routed,
+    ).items():
+        if key in fp32_keys:
+            dtype = "float32"
+        elif int8_routed and key in int8_keys:
+            dtype = "int8"
+        else:
+            dtype = "bfloat16"
         out[key] = {
             "shape": list(shape),
-            "dtype": "float32" if key in fp32_keys else "bfloat16",
+            "dtype": dtype,
+            "layout": _layout_for_key(key, int8_routed=int8_routed),
             "numel": int(__import__("math").prod(shape)),
         }
     return out
 
 
-def _bundle_meta(bundle: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {key: _tensor_meta(value) for key, value in sorted(bundle.items())}
+def _bundle_meta(
+    bundle: dict[str, Any],
+    *,
+    int8_routed: bool,
+) -> dict[str, dict[str, Any]]:
+    return {
+        key: _tensor_meta(key, value, int8_routed=int8_routed)
+        for key, value in sorted(bundle.items())
+    }
 
 
 def translate_rank_from_checkpoint(
@@ -59,15 +100,28 @@ def translate_rank_from_checkpoint(
     tp_world_size: int,
     *,
     verify: bool = True,
+    decode_native_moe: bool = False,
+    int8_routed: bool = False,
 ) -> dict[str, Any]:
     from models.step3p5.weight_loader import (  # noqa: PLC0415
         load_step3p5_weights_for_rank,
         verify_bundle_shapes,
     )
 
-    bundle = load_step3p5_weights_for_rank(ckpt_dir, rank, tp_world_size)
+    bundle = load_step3p5_weights_for_rank(
+        ckpt_dir,
+        rank,
+        tp_world_size,
+        decode_native_moe=decode_native_moe,
+        int8_routed=int8_routed,
+    )
     if verify:
-        verify_bundle_shapes(bundle, tp_world_size)
+        verify_bundle_shapes(
+            bundle,
+            tp_world_size,
+            decode_native_moe=decode_native_moe,
+            int8_routed=int8_routed,
+        )
     return bundle
 
 
@@ -78,6 +132,8 @@ def build_manifest(
     ranks: list[int],
     tp_world_size: int,
     metadata_only: bool,
+    decode_native_moe: bool,
+    int8_routed: bool,
     rank_metadata: dict[int, dict[str, dict[str, Any]]],
     saved_files: dict[int, str],
 ) -> dict[str, Any]:
@@ -87,6 +143,8 @@ def build_manifest(
         "tp_world_size": tp_world_size,
         "ranks": ranks,
         "metadata_only": metadata_only,
+        "decode_native_moe": decode_native_moe,
+        "int8_routed": int8_routed,
         "bundle_contract": "models.step3p5.weight_loader per-rank bundle",
         "rank_metadata": {str(rank): rank_metadata[rank] for rank in ranks},
         "saved_files": {str(rank): saved_files[rank] for rank in sorted(saved_files)},
@@ -109,8 +167,6 @@ def _expected_vllm_param_meta(tp_world_size: int) -> dict[str, dict[str, Any]]:
         HEAD_DIM,
         HIDDEN,
         INTERMEDIATE,
-        LAYER_TYPE_FULL,
-        LAYER_TYPES,
         MOE_INTERMEDIATE,
         MOE_LAYER_INDICES,
         MOE_NUM_EXPERTS,
@@ -218,15 +274,15 @@ def build_vllm_to_pypto_transform_plan(tp_world_size: int = 8) -> dict[str, Any]
 
     The plan intentionally excludes ``embed_tokens`` and MTP-only keys because
     ``Step3p5DecodeFwd`` consumes hidden states and covers the 45 main layers +
-    final LM-head shard.  This is the exact transform surface the online runner
-    needs before calling PyPTO.
+    final LM-head shard. Routed W13 is one packed gate|up target; its first
+    ``MOE_INTERMEDIATE`` output channels are gate and the second half are up.
+    This is the exact transform surface the online runner needs before calling
+    PyPTO.
     """
     from models.step3p5.config import (  # noqa: PLC0415
         DENSE_LAYER_INDICES,
         HEAD_DIM,
-        HIDDEN,
         INTERMEDIATE,
-        MOE_INTERMEDIATE,
         MOE_LAYER_INDICES,
         NUM_HEADS_FULL,
         NUM_HEADS_SWA,
@@ -256,7 +312,8 @@ def build_vllm_to_pypto_transform_plan(tp_world_size: int = 8) -> dict[str, Any]
         "dense_w_gate": [], "dense_w_up": [], "dense_w_down": [],
         "moe_gate_w": [], "moe_router_bias": [],
         "moe_w_gate_s": [], "moe_w_up_s": [], "moe_w_down_s": [],
-        "moe_w_gate_r": [], "moe_w_up_r": [], "moe_w_down_r": [],
+        "moe_w13_r": [], "moe_w13_r_scale": [],
+        "moe_w_down_r": [], "moe_w_down_r_scale": [],
     }
     dense_layers = set(DENSE_LAYER_INDICES)
     moe_layers = set(MOE_LAYER_INDICES)
@@ -290,9 +347,39 @@ def build_vllm_to_pypto_transform_plan(tp_world_size: int = 8) -> dict[str, Any]
             plan["moe_w_gate_s"].append({"layer": li, "source": src, "slice_rows": [0, share_local], "transform": "transpose"})
             plan["moe_w_up_s"].append({"layer": li, "source": src, "slice_rows": [share_local, 2 * share_local], "transform": "transpose"})
             plan["moe_w_down_s"].append({"layer": li, "source": f"{prefix}.moe.share_expert.down_proj.weight", "transform": "transpose"})
-            plan["moe_w_gate_r"].append({"layer": li, "source": f"{prefix}.moe.experts.w13_weight", "scale": f"{prefix}.moe.experts.w13_weight_scale", "offset": f"{prefix}.moe.experts.w13_weight_offset", "slice_last_dim": [0, MOE_INTERMEDIATE], "transform": "w8a8_dequant_keep_expert_hidden_inter"})
-            plan["moe_w_up_r"].append({"layer": li, "source": f"{prefix}.moe.experts.w13_weight", "scale": f"{prefix}.moe.experts.w13_weight_scale", "offset": f"{prefix}.moe.experts.w13_weight_offset", "slice_last_dim": [MOE_INTERMEDIATE, 2 * MOE_INTERMEDIATE], "transform": "w8a8_dequant_keep_expert_hidden_inter"})
-            plan["moe_w_down_r"].append({"layer": li, "source": f"{prefix}.moe.experts.w2_weight", "scale": f"{prefix}.moe.experts.w2_weight_scale", "offset": f"{prefix}.moe.experts.w2_weight_offset", "transform": "w8a8_dequant_keep_expert_inter_hidden"})
+            plan["moe_w13_r"].append({
+                "layer": li,
+                "source": f"{prefix}.moe.experts.w13_weight",
+                "transform": "transpose_gate_up_then_pack_int8_fractal_nz",
+                "packed_order": "gate_then_up",
+                "layout": "FRACTAL_NZ",
+                "logical_shape": ["experts_local", "hidden", "2*moe_intermediate"],
+                "physical_shape": [
+                    "experts_local", "2*moe_intermediate/32", "hidden/16", 16, 32,
+                ],
+            })
+            plan["moe_w13_r_scale"].append({
+                "layer": li,
+                "source": f"{prefix}.moe.experts.w13_weight_scale",
+                "transform": "flatten_fp32_scale_keep_gate_then_up",
+                "logical_shape": ["experts_local", "2*moe_intermediate"],
+            })
+            plan["moe_w_down_r"].append({
+                "layer": li,
+                "source": f"{prefix}.moe.experts.w2_weight",
+                "transform": "transpose_w2_then_pack_int8_fractal_nz",
+                "layout": "FRACTAL_NZ",
+                "logical_shape": ["experts_local", "moe_intermediate", "hidden"],
+                "physical_shape": [
+                    "experts_local", "hidden/32", "moe_intermediate/16", 16, 32,
+                ],
+            })
+            plan["moe_w_down_r_scale"].append({
+                "layer": li,
+                "source": f"{prefix}.moe.experts.w2_weight_scale",
+                "transform": "flatten_fp32_scale",
+                "logical_shape": ["experts_local", "hidden"],
+            })
     return plan
 
 
@@ -304,6 +391,10 @@ def parse_args() -> argparse.Namespace:
                         help="Rank to translate. Repeatable. Default: rank 0")
     parser.add_argument("--all-ranks", action="store_true")
     parser.add_argument("--tp-world-size", type=int, default=8)
+    parser.add_argument("--decode-native-moe", action="store_true",
+                        help="Emit checkpoint-native NK router/shared-expert keys.")
+    parser.add_argument("--int8-routed", action="store_true",
+                        help="Keep routed W13/down weights INT8 and emit FP32 scales.")
     parser.add_argument("--metadata-only", action="store_true",
                         help="Only emit expected bundle key/shape/dtype metadata; do not load checkpoint tensors.")
     parser.add_argument("--save-bundles", action="store_true",
@@ -347,7 +438,11 @@ def main() -> int:
     rank_metadata: dict[int, dict[str, dict[str, Any]]] = {}
     saved_files: dict[int, str] = {}
     if args.metadata_only:
-        expected = _expected_meta(args.tp_world_size)
+        expected = _expected_meta(
+            args.tp_world_size,
+            decode_native_moe=args.decode_native_moe,
+            int8_routed=args.int8_routed,
+        )
         for rank in ranks:
             rank_metadata[rank] = expected
     else:
@@ -357,8 +452,12 @@ def main() -> int:
                 rank,
                 args.tp_world_size,
                 verify=not args.no_verify,
+                decode_native_moe=args.decode_native_moe,
+                int8_routed=args.int8_routed,
             )
-            rank_metadata[rank] = _bundle_meta(bundle)
+            rank_metadata[rank] = _bundle_meta(
+                bundle, int8_routed=args.int8_routed,
+            )
             if args.save_bundles:
                 import torch  # noqa: PLC0415
 
@@ -372,6 +471,8 @@ def main() -> int:
         ranks=ranks,
         tp_world_size=args.tp_world_size,
         metadata_only=args.metadata_only,
+        decode_native_moe=args.decode_native_moe,
+        int8_routed=args.int8_routed,
         rank_metadata=rank_metadata,
         saved_files=saved_files,
     )

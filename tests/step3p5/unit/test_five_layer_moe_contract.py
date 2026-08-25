@@ -380,6 +380,12 @@ def test_focused_program_reuses_canonical_compute_functions() -> None:
 
     required = {
         "tp_all_reduce",
+        "routed_nz_gmm1_swiglu_quant_aic",
+        "routed_nz_gmm1_swiglu_quant_aiv",
+        "routed_nz_gmm1_swiglu_quant",
+        "routed_nz_down_aic",
+        "routed_nz_down_aiv",
+        "routed_nz_down",
         "full_chip_orch",
         "swa_chip_orch",
         "_gate",

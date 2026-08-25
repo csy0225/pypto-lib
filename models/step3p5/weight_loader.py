@@ -49,9 +49,13 @@ TP-SLICED tensors — each rank holds 1/TP_WORLD_SIZE:
   * ``lm_head_weight``              ``[VOCAB_LOCAL, HIDDEN]`` BF16
 
 EP-SLICED tensors — each rank hosts MOE_NUM_EXPERTS_LOCAL of MOE_NUM_EXPERTS experts:
-  * ``moe_w_gate_r`` / ``moe_w_up_r`` ``[NUM_MOE_LAYERS, MOE_NUM_EXPERTS_LOCAL, HIDDEN, MOE_INTERMEDIATE]`` INT8
-  * ``moe_w_down_r`` ``[NUM_MOE_LAYERS, MOE_NUM_EXPERTS_LOCAL, MOE_INTERMEDIATE, HIDDEN]`` INT8
-  * routed gate/up/down scales are FP32 and remain paired with those INT8 slabs
+  * native INT8 ``moe_w13_r`` is resident FRACTAL_NZ with physical shape
+    ``[NUM_MOE_LAYERS, E_LOCAL, (2I)/32, H/16, 16, 32]``
+  * native INT8 ``moe_w_down_r`` is resident FRACTAL_NZ with physical shape
+    ``[NUM_MOE_LAYERS, E_LOCAL, H/32, I/16, 16, 32]``
+  * routed W13/down scales stay logical FP32 ``[..., N]`` arrays
+  * the BF16 reference bundle keeps the legacy logical ND shapes; it is not
+    accepted by the production native-W8A8 decode ABI
 
 MTP tensors (3 next-N-predict layers; LAYER_TYPES[45..47] all SWA):
   * ``mtp_enorm_weight`` / ``mtp_hnorm_weight``  ``[NUM_MTP, HIDDEN]`` BF16 (replicated)
@@ -131,6 +135,13 @@ NUM_MTP = NUM_NEXTN_PREDICT_LAYERS
 MTP_HIDDEN_LOCAL = HIDDEN // TP_WORLD_SIZE  # 512 — eh_proj row-slice output dim
 EH_IN = 2 * HIDDEN
 
+# Ascend INT8 FRACTAL_NZ physical fractal.  For a logical [..., M, N]
+# projector the resident byte order is [..., N1, M1, M0, N0], where
+# M0=16 and N0=32.  These are byte-layout constants, not tunable tiles.
+FRACTAL_NZ_M0 = 16
+FRACTAL_NZ_N0_INT8 = 32
+ROUTED_WEIGHT_LAYOUT_NZ = "FRACTAL_NZ"
+
 # Default checkpoint location on the Ascend network share.
 DEFAULT_CKPT_DIR = (
     "/mnt/chensiyu-jfs/multi-hardware/models/"
@@ -166,14 +177,12 @@ KEY_DENSE_DOWN = "dense_w_down"
 KEY_MOE_GATE_W = "moe_gate_w"
 KEY_MOE_GATE_W_NK = "moe_gate_w_nk"
 KEY_MOE_ROUTER_BIAS = "moe_router_bias"
-KEY_MOE_W_GATE_R = "moe_w_gate_r"
-KEY_MOE_W_UP_R = "moe_w_up_r"
+KEY_MOE_W13_R = "moe_w13_r"
 KEY_MOE_W_DOWN_R = "moe_w_down_r"
 # INT8-native routed-expert scales (present only when the bundle is built with
 # ``int8_routed=True``): one FP32 per output channel, aligned to the routed
 # weight's trailing (N/output) dim after ``_transpose_routed_block``.
-KEY_MOE_W_GATE_R_SCALE = "moe_w_gate_r_scale"
-KEY_MOE_W_UP_R_SCALE = "moe_w_up_r_scale"
+KEY_MOE_W13_R_SCALE = "moe_w13_r_scale"
 KEY_MOE_W_DOWN_R_SCALE = "moe_w_down_r_scale"
 KEY_MOE_W_GATE_S = "moe_w_gate_s"
 KEY_MOE_W_GATE_S_NK = "moe_w_gate_s_nk"
@@ -208,8 +217,9 @@ def expected_shapes(
     tp_world_size: int = TP_WORLD_SIZE,
     *,
     decode_native_moe: bool = False,
+    int8_routed: bool = False,
 ) -> dict[str, tuple[int, ...]]:
-    """Per-rank expected shape for every bundle key."""
+    """Return the logical per-rank shape contract for one bundle variant."""
     num_heads_full_local = NUM_HEADS_FULL // tp_world_size
     num_heads_swa_local = NUM_HEADS_SWA // tp_world_size
     # Gate weights are zero-padded to the kernel tile width (NUM_HEADS_*_LOCAL_PAD).
@@ -257,12 +267,14 @@ def expected_shapes(
         KEY_MOE_W_GATE_S: (NUM_MOE_LAYERS, HIDDEN, share_expert_dim_local),
         KEY_MOE_W_UP_S: (NUM_MOE_LAYERS, HIDDEN, share_expert_dim_local),
         KEY_MOE_W_DOWN_S: (NUM_MOE_LAYERS, share_expert_dim_local, HIDDEN),
-        # EP-sliced routed experts
-        KEY_MOE_W_GATE_R: (
-            NUM_MOE_LAYERS, moe_num_experts_local, HIDDEN, MOE_INTERMEDIATE,
-        ),
-        KEY_MOE_W_UP_R: (
-            NUM_MOE_LAYERS, moe_num_experts_local, HIDDEN, MOE_INTERMEDIATE,
+        # EP-sliced routed experts.  The BF16 reference variant remains
+        # logical ND; the native INT8 variant is replaced below by its resident
+        # FRACTAL_NZ physical shape.
+        KEY_MOE_W13_R: (
+            NUM_MOE_LAYERS,
+            moe_num_experts_local,
+            HIDDEN,
+            2 * MOE_INTERMEDIATE,
         ),
         KEY_MOE_W_DOWN_R: (
             NUM_MOE_LAYERS, moe_num_experts_local, MOE_INTERMEDIATE, HIDDEN,
@@ -289,6 +301,33 @@ def expected_shapes(
         KEY_MTP_DENSE_UP: (NUM_MTP, HIDDEN, intermediate_local),
         KEY_MTP_DENSE_DOWN: (NUM_MTP, intermediate_local, HIDDEN),
     }
+    if int8_routed:
+        shapes[KEY_MOE_W13_R] = routed_int8_nz_shape(
+            (
+                NUM_MOE_LAYERS,
+                moe_num_experts_local,
+                HIDDEN,
+                2 * MOE_INTERMEDIATE,
+            ),
+        )
+        shapes[KEY_MOE_W_DOWN_R] = routed_int8_nz_shape(
+            (
+                NUM_MOE_LAYERS,
+                moe_num_experts_local,
+                MOE_INTERMEDIATE,
+                HIDDEN,
+            ),
+        )
+        shapes[KEY_MOE_W13_R_SCALE] = (
+            NUM_MOE_LAYERS,
+            moe_num_experts_local,
+            2 * MOE_INTERMEDIATE,
+        )
+        shapes[KEY_MOE_W_DOWN_R_SCALE] = (
+            NUM_MOE_LAYERS,
+            moe_num_experts_local,
+            HIDDEN,
+        )
     if decode_native_moe:
         shapes.pop(KEY_MOE_GATE_W)
         shapes.pop(KEY_MOE_W_GATE_S)
@@ -676,13 +715,134 @@ def _slice_eh_proj(
     return _to_bf16(eh_full[lo:hi, :].contiguous())
 
 
-def _transpose_routed_block(t: "torch.Tensor") -> "torch.Tensor":
-    """Routed gate/up HF block is ``[E_local, MOE_INTERMEDIATE, HIDDEN]``;
-    the kernel wants ``[E_local, HIDDEN, MOE_INTERMEDIATE]``. Routed-down
-    is the reverse — HF ``[E_local, HIDDEN, MOE_INTERMEDIATE]`` -> kernel
-    ``[E_local, MOE_INTERMEDIATE, HIDDEN]``.
+def routed_int8_nz_shape(logical_shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Return the physical INT8 FRACTAL_NZ shape for logical ``[..., M, N]``.
+
+    The returned shape describes actual resident bytes and is therefore the
+    shape exported through IPC and declared by the native decode program.  It
+    must never be interpreted as a logical ND matrix.
     """
+    if len(logical_shape) < 2:
+        raise ValueError(f"NZ logical shape must have at least two axes: {logical_shape}")
+    *prefix, m, n = (int(dim) for dim in logical_shape)
+    if m <= 0 or n <= 0:
+        raise ValueError(f"NZ logical matrix axes must be positive: {logical_shape}")
+    if m % FRACTAL_NZ_M0 != 0 or n % FRACTAL_NZ_N0_INT8 != 0:
+        raise ValueError(
+            "INT8 FRACTAL_NZ requires M divisible by 16 and N divisible by 32; "
+            f"got M={m}, N={n}",
+        )
+    return (
+        *prefix,
+        n // FRACTAL_NZ_N0_INT8,
+        m // FRACTAL_NZ_M0,
+        FRACTAL_NZ_M0,
+        FRACTAL_NZ_N0_INT8,
+    )
+
+
+def pack_int8_fractal_nz(logical: "torch.Tensor") -> "torch.Tensor":
+    """Pack logical contiguous ``[..., M, N]`` INT8 bytes into FRACTAL_NZ.
+
+    This pure-host transform matches ``torch_npu.npu_format_cast(..., 29)``:
+    ``reshape(..., M1, 16, N1, 32).permute(..., N1, M1, 16, 32)``.
+    """
+    if str(logical.dtype) != "torch.int8":
+        raise TypeError(f"FRACTAL_NZ routed weight must be torch.int8, got {logical.dtype}")
+    logical_shape = tuple(int(dim) for dim in logical.shape)
+    physical_shape = routed_int8_nz_shape(logical_shape)
+    prefix = logical_shape[:-2]
+    m, n = logical_shape[-2:]
+    prefix_ndim = len(prefix)
+    reshaped = logical.contiguous().reshape(
+        *prefix,
+        m // FRACTAL_NZ_M0,
+        FRACTAL_NZ_M0,
+        n // FRACTAL_NZ_N0_INT8,
+        FRACTAL_NZ_N0_INT8,
+    )
+    order = [
+        *range(prefix_ndim),
+        prefix_ndim + 2,
+        prefix_ndim,
+        prefix_ndim + 1,
+        prefix_ndim + 3,
+    ]
+    packed = reshaped.permute(*order).contiguous()
+    if tuple(packed.shape) != physical_shape:
+        raise AssertionError(
+            f"internal FRACTAL_NZ shape mismatch: got {tuple(packed.shape)}, "
+            f"want {physical_shape}",
+        )
+    return packed
+
+
+def unpack_int8_fractal_nz(
+    packed: "torch.Tensor",
+    logical_shape: tuple[int, ...],
+) -> "torch.Tensor":
+    """Host-only inverse used by golden/reference checks, never by decode."""
+    if str(packed.dtype) != "torch.int8":
+        raise TypeError(f"FRACTAL_NZ routed weight must be torch.int8, got {packed.dtype}")
+    logical_shape = tuple(int(dim) for dim in logical_shape)
+    expected = routed_int8_nz_shape(logical_shape)
+    if tuple(packed.shape) != expected:
+        raise ValueError(
+            f"packed FRACTAL_NZ shape {tuple(packed.shape)} != expected {expected}",
+        )
+    prefix = logical_shape[:-2]
+    prefix_ndim = len(prefix)
+    restored = packed.permute(
+        *range(prefix_ndim),
+        prefix_ndim + 1,
+        prefix_ndim + 2,
+        prefix_ndim,
+        prefix_ndim + 3,
+    ).contiguous()
+    return restored.reshape(logical_shape)
+
+
+def _transpose_routed_block(t: "torch.Tensor") -> "torch.Tensor":
+    """Transpose a routed projector from ``[E, N, K]`` to ``[E, K, N]``."""
     return t.transpose(-2, -1).contiguous()
+
+
+def _flatten_routed_output_scale(scale: "torch.Tensor") -> "torch.Tensor":
+    """Normalize a routed per-output scale slab to ``[E, N]`` FP32 layout."""
+    if scale.ndim >= 2 and scale.shape[-1] == 1:
+        scale = scale.squeeze(-1)
+    return scale.contiguous()
+
+
+def _pack_routed_w13(
+    gate: "torch.Tensor",
+    up: "torch.Tensor",
+) -> "torch.Tensor":
+    """Pack checkpoint gate/up ``[E, I, H]`` into logical W13 ``[E, H, 2I]``."""
+    import torch  # noqa: PLC0415
+
+    if tuple(gate.shape) != tuple(up.shape):
+        raise ValueError(
+            f"routed gate/up shapes differ: {tuple(gate.shape)} vs {tuple(up.shape)}",
+        )
+    return _transpose_routed_block(torch.cat((gate, up), dim=-2))
+
+
+def _pack_routed_w13_scale(
+    gate_scale: "torch.Tensor",
+    up_scale: "torch.Tensor",
+) -> "torch.Tensor":
+    """Pack gate/up per-output scales into logical ``[E, 2I]`` order."""
+    import torch  # noqa: PLC0415
+
+    gate_flat = _flatten_routed_output_scale(gate_scale)
+    up_flat = _flatten_routed_output_scale(up_scale)
+    if tuple(gate_flat.shape) != tuple(up_flat.shape):
+        raise ValueError(
+            "routed gate/up scale shapes differ: "
+            f"{tuple(gate_flat.shape)} vs {tuple(up_flat.shape)}",
+        )
+    return torch.cat((gate_flat, up_flat), dim=-1).contiguous()
 
 
 # =============================================================================
@@ -860,15 +1020,12 @@ def load_step3p5_weights_for_rank(
         #    routed experts, TP-sliced share expert. ─────────────────────
         gate_w_rows: list[torch.Tensor] = []
         router_bias_rows: list[torch.Tensor] = []
-        routed_gate_rows: list[torch.Tensor] = []
-        routed_up_rows: list[torch.Tensor] = []
+        routed_w13_rows: list[torch.Tensor] = []
         routed_down_rows: list[torch.Tensor] = []
         # INT8-native routed collectors (used only when int8_routed=True).
-        routed_gate_rows_i8: list[torch.Tensor] = []
-        routed_up_rows_i8: list[torch.Tensor] = []
+        routed_w13_rows_i8: list[torch.Tensor] = []
         routed_down_rows_i8: list[torch.Tensor] = []
-        routed_gate_scale_rows: list[torch.Tensor] = []
-        routed_up_scale_rows: list[torch.Tensor] = []
+        routed_w13_scale_rows: list[torch.Tensor] = []
         routed_down_scale_rows: list[torch.Tensor] = []
         share_gate_rows: list[torch.Tensor] = []
         share_up_rows: list[torch.Tensor] = []
@@ -916,15 +1073,38 @@ def load_step3p5_weights_for_rank(
                             for eid in range(ep_lo, ep_hi)]
                 down_pairs = [_load_quantized_expert_projector_int8(cache, li, eid, "down_proj")
                               for eid in range(ep_lo, ep_hi)]
-                routed_gate_rows_i8.append(_transpose_routed_block(
-                    torch.stack([w for w, _ in gate_pairs], dim=0)))
-                routed_up_rows_i8.append(_transpose_routed_block(
-                    torch.stack([w for w, _ in up_pairs], dim=0)))
-                routed_down_rows_i8.append(_transpose_routed_block(
-                    torch.stack([w for w, _ in down_pairs], dim=0)))
-                routed_gate_scale_rows.append(torch.stack([s for _, s in gate_pairs], dim=0))
-                routed_up_scale_rows.append(torch.stack([s for _, s in up_pairs], dim=0))
-                routed_down_scale_rows.append(torch.stack([s for _, s in down_pairs], dim=0))
+                gate_slab_i8 = torch.stack(
+                    [w for w, _ in gate_pairs], dim=0,
+                )
+                up_slab_i8 = torch.stack(
+                    [w for w, _ in up_pairs], dim=0,
+                )
+                routed_w13_rows_i8.append(
+                    pack_int8_fractal_nz(
+                        _pack_routed_w13(gate_slab_i8, up_slab_i8),
+                    ),
+                )
+                routed_down_rows_i8.append(
+                    pack_int8_fractal_nz(
+                        _transpose_routed_block(
+                            torch.stack([w for w, _ in down_pairs], dim=0),
+                        ),
+                    ),
+                )
+                gate_scale_slab = torch.stack(
+                    [s for _, s in gate_pairs], dim=0,
+                )
+                up_scale_slab = torch.stack(
+                    [s for _, s in up_pairs], dim=0,
+                )
+                routed_w13_scale_rows.append(
+                    _pack_routed_w13_scale(gate_scale_slab, up_scale_slab),
+                )
+                routed_down_scale_rows.append(
+                    _flatten_routed_output_scale(
+                        torch.stack([s for _, s in down_pairs], dim=0),
+                    ),
+                )
             else:
                 if _has_quantized_routed_experts(weight_map, li):
                     gate_slab = torch.stack([
@@ -950,8 +1130,9 @@ def load_step3p5_weights_for_rank(
                     up_slab = up_full[ep_lo:ep_hi].contiguous()
                     down_slab = down_full[ep_lo:ep_hi].contiguous()
 
-                routed_gate_rows.append(_to_bf16(_transpose_routed_block(gate_slab)))
-                routed_up_rows.append(_to_bf16(_transpose_routed_block(up_slab)))
+                routed_w13_rows.append(
+                    _to_bf16(_pack_routed_w13(gate_slab, up_slab)),
+                )
                 routed_down_rows.append(_to_bf16(_transpose_routed_block(down_slab)))
 
             # Shared expert: TP-sliced like dense MLP.
@@ -972,18 +1153,16 @@ def load_step3p5_weights_for_rank(
         bundle[gate_key] = torch.stack(gate_w_rows, dim=0)
         bundle[KEY_MOE_ROUTER_BIAS] = torch.stack(router_bias_rows, dim=0)
         if int8_routed:
-            bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows_i8, dim=0)
-            bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows_i8, dim=0)
+            bundle[KEY_MOE_W13_R] = torch.stack(routed_w13_rows_i8, dim=0)
             bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows_i8, dim=0)
-            # Per-output-channel scale is [.., N] (2D per expert); the projector
-            # returns a [.., N, 1] column, so squeeze the trailing singleton to
-            # match the kernel/program signature [tp_size, N_MOE, EXPL, N].
-            bundle[KEY_MOE_W_GATE_R_SCALE] = torch.stack(routed_gate_scale_rows, dim=0).squeeze(-1)
-            bundle[KEY_MOE_W_UP_R_SCALE] = torch.stack(routed_up_scale_rows, dim=0).squeeze(-1)
-            bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(routed_down_scale_rows, dim=0).squeeze(-1)
+            bundle[KEY_MOE_W13_R_SCALE] = torch.stack(
+                routed_w13_scale_rows, dim=0,
+            )
+            bundle[KEY_MOE_W_DOWN_R_SCALE] = torch.stack(
+                routed_down_scale_rows, dim=0,
+            )
         else:
-            bundle[KEY_MOE_W_GATE_R] = torch.stack(routed_gate_rows, dim=0)
-            bundle[KEY_MOE_W_UP_R] = torch.stack(routed_up_rows, dim=0)
+            bundle[KEY_MOE_W13_R] = torch.stack(routed_w13_rows, dim=0)
             bundle[KEY_MOE_W_DOWN_R] = torch.stack(routed_down_rows, dim=0)
         share_gate_key = (
             KEY_MOE_W_GATE_S_NK if decode_native_moe else KEY_MOE_W_GATE_S
@@ -1093,15 +1272,18 @@ def verify_bundle_shapes(
     tp_world_size: int = TP_WORLD_SIZE,
     *,
     decode_native_moe: bool = False,
+    int8_routed: bool = False,
 ) -> None:
-    """Assert every expected key is present with the right shape.
+    """Assert the selected bundle variant has the expected keys, shapes, and dtypes.
 
-    Raises ``ValueError`` if a key is missing or a shape mismatches the
-    table in ``expected_shapes``. Does not check dtypes (the loader
-    promotes/demotes via ``_to_bf16`` / ``_to_fp32`` already).
+    The native W8A8 variant is deliberately fail-closed: routed W13/down
+    weights must stay INT8 and their scales must stay FP32 instead of silently
+    accepting a BF16-dequantized fallback.
     """
     expected = expected_shapes(
-        tp_world_size, decode_native_moe=decode_native_moe,
+        tp_world_size,
+        decode_native_moe=decode_native_moe,
+        int8_routed=int8_routed,
     )
     missing = sorted(set(expected) - set(bundle))
     extra = sorted(set(bundle) - set(expected))
@@ -1115,17 +1297,50 @@ def verify_bundle_shapes(
             "bundle has %d unexpected keys: %s",
             len(extra), extra[:5],
         )
-    mismatches = []
+
+    shape_mismatches = []
     for key, want in expected.items():
         got = tuple(bundle[key].shape)
         if got != want:
-            mismatches.append((key, got, want))
-    if mismatches:
+            shape_mismatches.append((key, got, want))
+    if shape_mismatches:
         msg = "; ".join(
-            f"{k}: got {g} want {w}" for k, g, w in mismatches[:5]
+            f"{k}: got {g} want {w}" for k, g, w in shape_mismatches[:5]
         )
-        more = f" (+{len(mismatches) - 5} more)" if len(mismatches) > 5 else ""
+        more = (
+            f" (+{len(shape_mismatches) - 5} more)"
+            if len(shape_mismatches) > 5 else ""
+        )
         raise ValueError(f"bundle shape mismatches: {msg}{more}")
+
+    fp32_keys = {
+        KEY_MOE_GATE_W,
+        KEY_MOE_GATE_W_NK,
+        KEY_MOE_ROUTER_BIAS,
+        KEY_MOE_W13_R_SCALE,
+        KEY_MOE_W_DOWN_R_SCALE,
+    }
+    int8_keys = {KEY_MOE_W13_R, KEY_MOE_W_DOWN_R}
+    dtype_mismatches = []
+    for key in expected:
+        if key in fp32_keys:
+            want_dtype = "torch.float32"
+        elif int8_routed and key in int8_keys:
+            want_dtype = "torch.int8"
+        else:
+            want_dtype = "torch.bfloat16"
+        got_dtype = str(bundle[key].dtype)
+        if got_dtype != want_dtype:
+            dtype_mismatches.append((key, got_dtype, want_dtype))
+    if dtype_mismatches:
+        msg = "; ".join(
+            f"{k}: got {g} want {w}" for k, g, w in dtype_mismatches[:5]
+        )
+        more = (
+            f" (+{len(dtype_mismatches) - 5} more)"
+            if len(dtype_mismatches) > 5 else ""
+        )
+        raise ValueError(f"bundle dtype mismatches: {msg}{more}")
 
 
 # =============================================================================
@@ -1181,6 +1396,7 @@ def build_compact_shape_table(
     overrides: dict[str, int] | None = None,
     *,
     decode_native_moe: bool = False,
+    int8_routed: bool = False,
 ) -> dict[str, tuple[int, ...]]:
     """Construct a shape table with scaled-down axes for smoke testing.
 
@@ -1242,8 +1458,7 @@ def build_compact_shape_table(
         KEY_MOE_W_GATE_S: (LM, H, I_LOCAL),
         KEY_MOE_W_UP_S: (LM, H, I_LOCAL),
         KEY_MOE_W_DOWN_S: (LM, I_LOCAL, H),
-        KEY_MOE_W_GATE_R: (LM, EXPL, H, MI),
-        KEY_MOE_W_UP_R: (LM, EXPL, H, MI),
+        KEY_MOE_W13_R: (LM, EXPL, H, 2 * MI),
         KEY_MOE_W_DOWN_R: (LM, EXPL, MI, H),
         KEY_LM_HEAD: (V_LOCAL, H),
         KEY_MTP_ENORM: (MTP, H),
@@ -1264,6 +1479,15 @@ def build_compact_shape_table(
         KEY_MTP_DENSE_UP: (MTP, H, I_LOCAL),
         KEY_MTP_DENSE_DOWN: (MTP, I_LOCAL, H),
     }
+    if int8_routed:
+        shapes[KEY_MOE_W13_R] = routed_int8_nz_shape(
+            (LM, EXPL, H, 2 * MI),
+        )
+        shapes[KEY_MOE_W_DOWN_R] = routed_int8_nz_shape(
+            (LM, EXPL, MI, H),
+        )
+        shapes[KEY_MOE_W13_R_SCALE] = (LM, EXPL, 2 * MI)
+        shapes[KEY_MOE_W_DOWN_R_SCALE] = (LM, EXPL, H)
     if decode_native_moe:
         shapes.pop(KEY_MOE_GATE_W)
         shapes.pop(KEY_MOE_W_GATE_S)
@@ -1281,27 +1505,45 @@ def build_synthetic_bundle(
     shape_overrides: dict[str, tuple[int, ...]] | None = None,
     *,
     decode_native_moe: bool = False,
+    int8_routed: bool = False,
 ) -> dict[str, "torch.Tensor"]:
     """Build a per-rank bundle filled with deterministic random values.
 
     Shapes default to ``expected_shapes(tp_world_size)`` (production-size,
     ~72 GB per bundle); pass ``shape_overrides`` for compact smoke runs.
-    Dtypes are BF16 for weight tensors and FP32 for the two router fields.
+    Native W8A8 routed weights are INT8 with FP32 scales; router fields are
+    FP32 and all other unquantized tensors are BF16.
     """
     import torch  # noqa: PLC0415
 
     shapes = shape_overrides or expected_shapes(
-        tp_world_size, decode_native_moe=decode_native_moe,
+        tp_world_size,
+        decode_native_moe=decode_native_moe,
+        int8_routed=int8_routed,
     )
     gen = torch.Generator().manual_seed(seed * 8191 + rank * 17)
     bundle: dict[str, torch.Tensor] = {}
     fp32_keys = {
-        KEY_MOE_GATE_W, KEY_MOE_GATE_W_NK, KEY_MOE_ROUTER_BIAS,
+        KEY_MOE_GATE_W,
+        KEY_MOE_GATE_W_NK,
+        KEY_MOE_ROUTER_BIAS,
+        KEY_MOE_W13_R_SCALE,
+        KEY_MOE_W_DOWN_R_SCALE,
     }
+    int8_keys = {KEY_MOE_W13_R, KEY_MOE_W_DOWN_R}
     for key, shape in shapes.items():
-        dtype = torch.float32 if key in fp32_keys else torch.bfloat16
-        t = (torch.rand(*shape, generator=gen, dtype=torch.float32) - 0.5) * 0.1
-        bundle[key] = t.to(dtype).contiguous()
+        if key in fp32_keys:
+            dtype = torch.float32
+        elif int8_routed and key in int8_keys:
+            dtype = torch.int8
+        else:
+            dtype = torch.bfloat16
+        values = (
+            torch.rand(*shape, generator=gen, dtype=torch.float32) - 0.5
+        ) * 0.1
+        if dtype == torch.int8:
+            values = torch.round(values * 127.0)
+        bundle[key] = values.to(dtype).contiguous()
     return bundle
 
 
@@ -1338,14 +1580,21 @@ __all__ = [
     "KEY_MOE_GATE_W",
     "KEY_MOE_GATE_W_NK",
     "KEY_MOE_ROUTER_BIAS",
-    "KEY_MOE_W_GATE_R",
-    "KEY_MOE_W_UP_R",
+    "KEY_MOE_W13_R",
+    "KEY_MOE_W13_R_SCALE",
     "KEY_MOE_W_DOWN_R",
+    "KEY_MOE_W_DOWN_R_SCALE",
     "KEY_MOE_W_GATE_S",
     "KEY_MOE_W_GATE_S_NK",
     "KEY_MOE_W_UP_S",
     "KEY_MOE_W_UP_S_NK",
     "KEY_MOE_W_DOWN_S",
+    "FRACTAL_NZ_M0",
+    "FRACTAL_NZ_N0_INT8",
+    "ROUTED_WEIGHT_LAYOUT_NZ",
+    "routed_int8_nz_shape",
+    "pack_int8_fractal_nz",
+    "unpack_int8_fractal_nz",
     "KEY_MTP_ENORM",
     "KEY_MTP_HNORM",
     "KEY_MTP_EH_PROJ",

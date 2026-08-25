@@ -436,8 +436,7 @@ class WholeDecodeHolder:
                  self.gate_r_moe_swa]
         # MoE expert/router weights
         args += [W(K.KEY_MOE_GATE_W_NK), W(K.KEY_MOE_ROUTER_BIAS),
-                 W(K.KEY_MOE_W_GATE_R), W(K.KEY_MOE_W_GATE_R_SCALE),
-                 W(K.KEY_MOE_W_UP_R), W(K.KEY_MOE_W_UP_R_SCALE),
+                 W(K.KEY_MOE_W13_R), W(K.KEY_MOE_W13_R_SCALE),
                  W(K.KEY_MOE_W_DOWN_R), W(K.KEY_MOE_W_DOWN_R_SCALE),
                  W(K.KEY_MOE_W_GATE_S_NK),
                  W(K.KEY_MOE_W_UP_S_NK), W(K.KEY_MOE_W_DOWN_S)]

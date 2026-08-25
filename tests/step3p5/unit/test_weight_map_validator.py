@@ -33,21 +33,28 @@ def _align_up(n: int, a: int = _ALIGN) -> int:
     return (n + a - 1) // a * a
 
 
-def _entry(offset: int, shape, dtype: str) -> dict:
+def _entry(offset: int, shape, dtype: str, layout: str = "ND") -> dict:
     itemsize = {"float32": 4, "bfloat16": 2, "float16": 2, "int8": 1}[dtype]
     nbytes = 1
     for s in shape:
         nbytes *= int(s)
     nbytes *= itemsize
-    return {"offset": offset, "shape": list(shape), "dtype": dtype, "nbytes": nbytes}
+    return {
+        "offset": offset,
+        "shape": list(shape),
+        "dtype": dtype,
+        "layout": layout,
+        "nbytes": nbytes,
+    }
 
 
 def _build_map(entries_spec, *, version: int = 1) -> dict:
-    """Build a well-formed, contiguous, 512-aligned map from (key,shape,dtype)."""
+    """Build a well-formed, contiguous, aligned map from entry tuples."""
     offset = 0
     mp: dict[str, dict] = {}
-    for key, shape, dtype in entries_spec:
-        e = _entry(offset, shape, dtype)
+    for spec in entries_spec:
+        key, shape, dtype, *layout = spec
+        e = _entry(offset, shape, dtype, layout[0] if layout else "ND")
         mp[key] = e
         offset = _align_up(offset + e["nbytes"])
     return {
@@ -67,11 +74,9 @@ _W8A8_SPEC = [
     ("input_rms_weight", (4096,), "float32"),
     ("moe_gate_w", (48, 4096), "float32"),
     ("moe_router_bias", (48,), "float32"),
-    ("moe_w_gate_r", (36, 2048, 4096), "int8"),
-    ("moe_w_up_r", (36, 2048, 4096), "int8"),
-    ("moe_w_down_r", (36, 4096, 2048), "int8"),
-    ("moe_w_gate_r_scale", (36, 2048), "float32"),
-    ("moe_w_up_r_scale", (36, 2048), "float32"),
+    ("moe_w13_r", (36, 80, 256, 16, 32), "int8", "FRACTAL_NZ"),
+    ("moe_w_down_r", (36, 128, 80, 16, 32), "int8", "FRACTAL_NZ"),
+    ("moe_w13_r_scale", (36, 2560), "float32"),
     ("moe_w_down_r_scale", (36, 4096), "float32"),
 ]
 
@@ -88,26 +93,52 @@ class TestWeightMapValidator(unittest.TestCase):
         structural overlap/nbytes checks pass) — the native-W8A8 dtype check is
         the thing that must fail closed.
         """
-        spec = [(k, s, ("bfloat16" if k == "moe_w_gate_r" else d)) for k, s, d in _W8A8_SPEC]
+        spec = [
+            (k, s, "bfloat16" if k == "moe_w13_r" else d, *layout)
+            for k, s, d, *layout in _W8A8_SPEC
+        ]
         mp = _build_map(spec)
         with self.assertRaises(WeightMapInvalid) as ctx:
             validate_weight_map(mp, native_w8a8=True)
-        self.assertIn("moe_w_gate_r", str(ctx.exception))
+        self.assertIn("moe_w13_r", str(ctx.exception))
         self.assertIn("int8", str(ctx.exception))
 
     def test_routed_scale_must_be_fp32(self):
-        spec = [(k, s, ("bfloat16" if k == "moe_w_up_r_scale" else d)) for k, s, d in _W8A8_SPEC]
+        spec = [
+            (k, s, "bfloat16" if k == "moe_w13_r_scale" else d, *layout)
+            for k, s, d, *layout in _W8A8_SPEC
+        ]
         mp = _build_map(spec)
         with self.assertRaises(WeightMapInvalid) as ctx:
             validate_weight_map(mp, native_w8a8=True)
-        self.assertIn("moe_w_up_r_scale", str(ctx.exception))
+        self.assertIn("moe_w13_r_scale", str(ctx.exception))
 
     def test_router_weight_must_be_fp32(self):
-        spec = [(k, s, ("bfloat16" if k == "moe_gate_w" else d)) for k, s, d in _W8A8_SPEC]
+        spec = [
+            (k, s, "bfloat16" if k == "moe_gate_w" else d, *layout)
+            for k, s, d, *layout in _W8A8_SPEC
+        ]
         mp = _build_map(spec)
         with self.assertRaises(WeightMapInvalid) as ctx:
             validate_weight_map(mp, native_w8a8=True)
         self.assertIn("moe_gate_w", str(ctx.exception))
+
+    def test_native_routed_weight_must_use_fractal_nz(self):
+        spec = [
+            (k, s, d, "ND" if k == "moe_w13_r" else (layout[0] if layout else "ND"))
+            for k, s, d, *layout in _W8A8_SPEC
+        ]
+        mp = _build_map(spec)
+        with self.assertRaises(WeightMapInvalid) as ctx:
+            validate_weight_map(mp, native_w8a8=True)
+        self.assertIn("moe_w13_r", str(ctx.exception))
+        self.assertIn("FRACTAL_NZ", str(ctx.exception))
+
+    def test_legacy_routed_keys_are_rejected(self):
+        mp = _build_map([("moe_w_gate_r", (36, 2048, 4096), "int8")])
+        with self.assertRaises(WeightMapInvalid) as ctx:
+            validate_weight_map(mp, native_w8a8=False)
+        self.assertIn("removed routed keys", str(ctx.exception))
 
     def test_unaligned_offset_rejected(self):
         mp = _build_map(_W8A8_SPEC)

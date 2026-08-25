@@ -290,6 +290,7 @@ class MtpLayerHolder:
                 self.out_dir,
                 tp=tp,
                 dev_offset=self.dev_offset,
+                native_w8a8=False,
             )
             mtp_maps = import_mtp_kv_all(
                 runtime,

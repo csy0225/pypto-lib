@@ -261,79 +261,178 @@ def _local_ep_trace(
     skip_layer: str | None = None,
 ) -> RankTrace:
     specs = (
-        ("l3-shared", "swa_moe_chip_orch_sh_down", (1, 2, -1)),
+        (
+            "l3-norm",
+            "swa_moe_chip_orch_norm_quant_moe_input",
+            (-1, 1, -1),
+            2,
+        ),
+        (
+            "l3-gate",
+            "swa_moe_chip_orch_gate_topk",
+            (-1, 2, -1),
+            1,
+        ),
+        ("l3-shared", "swa_moe_chip_orch_sh_down", (3, 4, -1), 1),
+        (
+            "l3-map",
+            "swa_moe_chip_orch_local_route_map_init",
+            (-1, 5, -1),
+            1,
+        ),
         (
             "l3-pack",
             "swa_moe_chip_orch_local_route_pack",
-            (-1, 3, -1),
+            (-1, 6, -1),
+            36,
+        ),
+        (
+            "l3-plan",
+            "swa_moe_chip_orch_local_route_plan",
+            (-1, 7, -1),
+            1,
         ),
         (
             "l3-fused",
             "routed_nz_gmm1_swiglu_quant_aic",
-            (4, 5, 5),
+            (8, 9, 9),
+            1,
         ),
-        ("l3-down", "routed_nz_down_aic", (6, 7, 7)),
+        ("l3-down", "routed_nz_down_aic", (10, 11, 11), 1),
         (
             "l3-combine",
             "swa_moe_chip_orch_local_combine_reduce",
-            (-1, 8, -1),
+            (-1, 12, -1),
+            16,
         ),
-        ("l3-ar", "tp_all_reduce", (-1, 9, -1)),
+        ("l3-ar", "tp_all_reduce", (-1, 13, -1), 1),
         (
             "l3-residual",
             "swa_moe_chip_orch_moe_residual_add",
-            (-1, 10, -1),
+            (-1, 14, -1),
+            1,
         ),
-        ("l4-shared", "sh_down", (11, 12, -1)),
-        ("l4-pack", "local_route_pack", (-1, 13, -1)),
+        (
+            "l4-norm",
+            "norm_quant_moe_input",
+            (-1, 15, -1),
+            2,
+        ),
+        ("l4-gate", "gate_topk", (-1, 16, -1), 1),
+        ("l4-shared", "sh_down", (17, 18, -1), 1),
+        (
+            "l4-map",
+            "local_route_map_init",
+            (-1, 19, -1),
+            1,
+        ),
+        (
+            "l4-pack",
+            "local_route_pack",
+            (-1, 20, -1),
+            36,
+        ),
+        (
+            "l4-plan",
+            "local_route_plan",
+            (-1, 21, -1),
+            1,
+        ),
         (
             "l4-fused",
             "routed_nz_gmm1_swiglu_quant_aic",
-            (14, 15, 15),
+            (22, 23, 23),
+            1,
         ),
-        ("l4-down", "routed_nz_down_aic", (16, 17, 17)),
-        ("l4-combine", "local_combine_reduce", (-1, 18, -1)),
-        ("l4-ar", "tp_all_reduce", (-1, 19, -1)),
-        ("l4-residual", "moe_residual_add", (-1, 20, -1)),
+        ("l4-down", "routed_nz_down_aic", (24, 25, 25), 1),
+        (
+            "l4-combine",
+            "local_combine_reduce",
+            (-1, 26, -1),
+            16,
+        ),
+        ("l4-ar", "tp_all_reduce", (-1, 27, -1), 1),
+        (
+            "l4-residual",
+            "moe_residual_add",
+            (-1, 28, -1),
+            1,
+        ),
     )
     tasks = [
         Task(
             task_id=task_id,
             order=order,
             name=name,
-            block_num=1,
+            block_num=block_num,
             kernel_ids=kernel_ids,
             early_dispatch=True,
         )
-        for order, (task_id, name, kernel_ids) in enumerate(specs)
+        for order, (task_id, name, kernel_ids, block_num) in enumerate(
+            specs
+        )
     ]
     skipped = (
         {f"{skip_layer.lower()}-fused", f"{skip_layer.lower()}-down"}
         if skip_layer is not None
         else set()
     )
-    slices_by_task = {
-        task.task_id: [
+    slices_by_task = {}
+    for task in tasks:
+        if task.task_id in skipped:
+            continue
+        resource = "aic" if task.kernel_ids[0] >= 0 else "aiv"
+        slices_by_task[task.task_id] = [
             Slice(
-                core=0 if task.kernel_ids[0] >= 0 else 24,
+                core=(
+                    slice_idx
+                    if resource == "aic"
+                    else 24 + slice_idx
+                ),
                 task_id=task.task_id,
                 start=task.order * 100,
                 end=task.order * 100 + 10,
-                resource=(
-                    "aic" if task.kernel_ids[0] >= 0 else "aiv"
-                ),
+                resource=resource,
             )
+            for slice_idx in range(task.block_num)
         ]
-        for task in tasks
-        if task.task_id not in skipped
-    }
     edges = []
     for layer in ("l3", "l4"):
         edges.extend(
             [
                 {
+                    "pred": f"{layer}-gate",
+                    "succ": f"{layer}-map",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-gate",
+                    "succ": f"{layer}-pack",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-norm",
+                    "succ": f"{layer}-pack",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-map",
+                    "succ": f"{layer}-pack",
+                    "source": "explicit",
+                },
+                {
                     "pred": f"{layer}-pack",
+                    "succ": f"{layer}-plan",
+                    "source": "explicit",
+                },
+                {
+                    "pred": f"{layer}-plan",
                     "succ": f"{layer}-fused",
+                    "source": "explicit",
+                },
+                {
+                    "pred": f"{layer}-plan",
+                    "succ": f"{layer}-down",
                     "source": "explicit",
                 },
                 {
@@ -342,7 +441,7 @@ def _local_ep_trace(
                     "source": "explicit",
                 },
                 {
-                    "pred": f"{layer}-pack",
+                    "pred": f"{layer}-plan",
                     "succ": f"{layer}-combine",
                     "source": "explicit",
                 },
@@ -350,6 +449,61 @@ def _local_ep_trace(
                     "pred": f"{layer}-down",
                     "succ": f"{layer}-combine",
                     "source": "explicit",
+                },
+                {
+                    "pred": f"{layer}-map",
+                    "succ": f"{layer}-pack",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-map",
+                    "succ": f"{layer}-plan",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-map",
+                    "succ": f"{layer}-combine",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-map",
+                    "succ": f"{layer}-fused",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-map",
+                    "succ": f"{layer}-down",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-pack",
+                    "succ": f"{layer}-fused",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-pack",
+                    "succ": f"{layer}-down",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-plan",
+                    "succ": f"{layer}-fused",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-plan",
+                    "succ": f"{layer}-down",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-fused",
+                    "succ": f"{layer}-down",
+                    "source": "tensormap",
+                },
+                {
+                    "pred": f"{layer}-down",
+                    "succ": f"{layer}-combine",
+                    "source": "tensormap",
                 },
                 {
                     "pred": f"{layer}-shared",
@@ -855,19 +1009,27 @@ def test_packed_nz_mapping_rejects_a_broken_dependency_chain() -> None:
         _find_layer_task_ids(trace, "L4")
 
 
-def test_local_ep_external_tasks_are_mapped_by_pack_combine_window() -> None:
+def test_local_ep_external_tasks_are_mapped_by_plan_combine_window() -> None:
     trace = _local_ep_trace()
 
     l3 = _find_layer_task_ids(trace, "L3", "local-ep")
     l4 = _find_layer_task_ids(trace, "L4", "local-ep")
 
+    assert l3["norm_quant"] == ["l3-norm"]
+    assert l3["gate_topk"] == ["l3-gate"]
+    assert l3["local_route_map_init"] == ["l3-map"]
     assert l3["local_route_pack"] == ["l3-pack"]
+    assert l3["local_route_plan"] == ["l3-plan"]
     assert l3["expert_gate_up"] == ["l3-fused"]
     assert l3["expert_down"] == ["l3-down"]
     assert l3["local_combine_reduce"] == ["l3-combine"]
     assert l3["moe_all_reduce"] == ["l3-ar"]
     assert l3["moe_residual_add"] == ["l3-residual"]
+    assert l4["norm_quant"] == ["l4-norm"]
+    assert l4["gate_topk"] == ["l4-gate"]
+    assert l4["local_route_map_init"] == ["l4-map"]
     assert l4["local_route_pack"] == ["l4-pack"]
+    assert l4["local_route_plan"] == ["l4-plan"]
     assert l4["expert_gate_up"] == ["l4-fused"]
     assert l4["expert_down"] == ["l4-down"]
     assert l4["local_combine_reduce"] == ["l4-combine"]
@@ -875,7 +1037,11 @@ def test_local_ep_external_tasks_are_mapped_by_pack_combine_window() -> None:
     assert l4["moe_residual_add"] == ["l4-residual"]
 
     metrics = _rank_metrics(trace, "local-ep")["layers"]
+    assert metrics["L3"]["norm_quant"]["task_ids"] == ["l3-norm"]
+    assert metrics["L3"]["gate_topk"]["task_ids"] == ["l3-gate"]
+    assert metrics["L3"]["local_route_map_init"]["task_ids"] == ["l3-map"]
     assert metrics["L3"]["local_route_pack"]["task_ids"] == ["l3-pack"]
+    assert metrics["L3"]["local_route_plan"]["task_ids"] == ["l3-plan"]
     assert metrics["L3"]["moe_all_reduce"]["task_ids"] == ["l3-ar"]
     assert metrics["L4"]["local_combine_reduce"]["task_ids"] == [
         "l4-combine"
@@ -896,6 +1062,9 @@ def test_local_ep_dependency_contract_accepts_complete_two_layer_chain() -> None
         layer_contract = contract["layers"][layer]
         assert layer_contract["pass"]
         assert layer_contract["task_order"]["pass"]
+        assert layer_contract["task_order"]["gate_topk_before_map"]
+        assert layer_contract["task_order"]["gate_topk_before_pack"]
+        assert layer_contract["task_order"]["norm_quant_before_pack"]
         assert all(
             edge["pass"]
             for edge in layer_contract["required_edges"].values()
@@ -906,121 +1075,197 @@ def test_local_ep_dependency_contract_accepts_complete_two_layer_chain() -> None
         )
 
 
-def test_local_ep_dependency_contract_allows_wider_pack_grid() -> None:
+def test_local_ep_dependency_contract_accepts_frozen_task_grids() -> None:
     trace = _local_ep_trace()
-    original = trace.task_by_id["l3-pack"]
-    wide_pack = Task(
-        task_id=original.task_id,
-        order=original.order,
-        name=original.name,
-        block_num=36,
-        kernel_ids=original.kernel_ids,
-        early_dispatch=original.early_dispatch,
-    )
-    trace.tasks = [
-        wide_pack if task.task_id == wide_pack.task_id else task
-        for task in trace.tasks
-    ]
-    trace.task_by_id[wide_pack.task_id] = wide_pack
 
     contract = _local_ep_dependency_contract(trace)
 
     assert contract["pass"]
-    l3_pack = contract["layers"]["L3"]["execution"][
-        "local_route_pack"
+    expected = {
+        "norm_quant": 2,
+        "gate_topk": 1,
+        "local_route_map_init": 1,
+        "local_route_pack": 36,
+        "local_route_plan": 1,
+        "local_combine_reduce": 16,
+    }
+    for layer in ("L3", "L4"):
+        execution = contract["layers"][layer]["execution"]
+        for stage, block_num in expected.items():
+            assert execution[stage]["pass"]
+            assert execution[stage]["block_num"] == block_num
+            assert execution[stage]["expected_block_num"] == block_num
+
+
+@pytest.mark.parametrize(
+    ("task_id", "block_num", "stage"),
+    [
+        ("l4-norm", 1, "norm_quant"),
+        ("l4-gate", 2, "gate_topk"),
+        ("l4-map", 2, "local_route_map_init"),
+        ("l4-pack", 35, "local_route_pack"),
+        ("l4-plan", 2, "local_route_plan"),
+        ("l4-combine", 15, "local_combine_reduce"),
+    ],
+)
+def test_local_ep_dependency_contract_rejects_nonfrozen_task_grid(
+    task_id: str,
+    block_num: int,
+    stage: str,
+) -> None:
+    trace = _local_ep_trace()
+    original = trace.task_by_id[task_id]
+    replacement = Task(
+        task_id=original.task_id,
+        order=original.order,
+        name=original.name,
+        block_num=block_num,
+        kernel_ids=original.kernel_ids,
+        early_dispatch=original.early_dispatch,
+    )
+    trace.tasks = [
+        replacement if task.task_id == task_id else task
+        for task in trace.tasks
     ]
-    assert l3_pack["pass"]
-    assert l3_pack["task_count"] == 1
-    assert trace.task_by_id["l3-pack"].block_num == 36
+    trace.task_by_id[task_id] = replacement
+
+    contract = _local_ep_dependency_contract(trace)
+
+    assert not contract["pass"]
+    execution = contract["layers"]["L4"]["execution"][stage]
+    assert not execution["pass"]
+    assert execution["block_num"] == block_num
 
 
-def test_local_ep_dependency_contract_rejects_orphan_pack_producer() -> None:
+def test_local_ep_dependency_contract_rejects_duplicate_pack_task() -> None:
     trace = _local_ep_trace()
     extra_pack = Task(
-        task_id="l3-pack-wide",
-        order=1,
+        task_id="l3-pack-duplicate",
+        order=trace.task_by_id["l3-pack"].order,
         name="swa_moe_chip_orch_local_route_pack",
         block_num=36,
-        kernel_ids=(-1, 21, -1),
+        kernel_ids=(-1, 25, -1),
         early_dispatch=True,
     )
     trace.tasks.append(extra_pack)
     trace.task_by_id[extra_pack.task_id] = extra_pack
     trace.slices_by_task[extra_pack.task_id] = [
-        Slice(24, extra_pack.task_id, 100, 110, "aiv")
+        Slice(
+            item.core,
+            extra_pack.task_id,
+            item.start,
+            item.end,
+            item.resource,
+        )
+        for item in trace.slices_by_task["l3-pack"]
     ]
 
     contract = _local_ep_dependency_contract(trace)
 
     assert not contract["pass"]
-    required_edges = contract["layers"]["L3"]["required_edges"]
-    assert not required_edges["pack_to_expert_explicit"]["pass"]
-    assert not required_edges["pack_to_combine_explicit"]["pass"]
-    assert (
-        required_edges["pack_to_expert_explicit"][
-            "matches_by_pred_task"
-        ][extra_pack.task_id]
-        == []
-    )
-
-
-def test_local_ep_dependency_contract_accepts_connected_pack_producers() -> None:
-    trace = _local_ep_trace()
-    extra_pack = Task(
-        task_id="l3-pack-wide",
-        order=1,
-        name="swa_moe_chip_orch_local_route_pack",
-        block_num=36,
-        kernel_ids=(-1, 21, -1),
-        early_dispatch=True,
-    )
-    trace.tasks.append(extra_pack)
-    trace.task_by_id[extra_pack.task_id] = extra_pack
-    trace.slices_by_task[extra_pack.task_id] = [
-        Slice(24, extra_pack.task_id, 100, 110, "aiv")
-    ]
-    trace.edges.extend(
-        [
-            {
-                "pred": extra_pack.task_id,
-                "succ": "l3-fused",
-                "source": "explicit",
-            },
-            {
-                "pred": extra_pack.task_id,
-                "succ": "l3-combine",
-                "source": "explicit",
-            },
-        ]
-    )
-
-    contract = _local_ep_dependency_contract(trace)
-
-    assert contract["pass"]
     assert contract["layers"]["L3"]["stage_task_counts"][
         "local_route_pack"
     ] == 2
+    assert any(
+        error["code"] == "stage_task_count"
+        and error["stage"] == "local_route_pack"
+        for error in contract["layers"]["L3"]["errors"]
+    )
 
 
 @pytest.mark.parametrize(
-    ("pred", "succ", "edge_name"),
+    ("pred", "succ", "source", "edge_name"),
     [
-        ("l4-pack", "l4-fused", "pack_to_expert_explicit"),
-        ("l4-fused", "l4-down", "expert_to_down_explicit"),
-        ("l4-pack", "l4-combine", "pack_to_combine_explicit"),
-        ("l4-down", "l4-combine", "down_to_combine_explicit"),
+        ("l4-gate", "l4-map", "tensormap", "gate_to_map_data"),
+        ("l4-gate", "l4-pack", "tensormap", "gate_to_pack_data"),
+        ("l4-norm", "l4-pack", "tensormap", "norm_to_pack_data"),
+        ("l4-map", "l4-pack", "explicit", "map_to_pack_explicit"),
+        ("l4-pack", "l4-plan", "explicit", "pack_to_plan_explicit"),
+        ("l4-plan", "l4-fused", "explicit", "plan_to_expert_explicit"),
+        ("l4-plan", "l4-down", "explicit", "plan_to_down_explicit"),
+        ("l4-fused", "l4-down", "explicit", "expert_to_down_explicit"),
+        (
+            "l4-plan",
+            "l4-combine",
+            "explicit",
+            "plan_to_combine_explicit",
+        ),
+        (
+            "l4-down",
+            "l4-combine",
+            "explicit",
+            "down_to_combine_explicit",
+        ),
+        ("l4-map", "l4-pack", "tensormap", "map_to_pack_data"),
+        ("l4-map", "l4-plan", "tensormap", "map_to_plan_data"),
+        (
+            "l4-map",
+            "l4-combine",
+            "tensormap",
+            "map_to_combine_data",
+        ),
+        (
+            "l4-map",
+            "l4-fused",
+            "tensormap",
+            "map_to_expert_count_data",
+        ),
+        (
+            "l4-map",
+            "l4-down",
+            "tensormap",
+            "map_to_down_count_data",
+        ),
+        (
+            "l4-pack",
+            "l4-fused",
+            "tensormap",
+            "pack_to_expert_data",
+        ),
+        ("l4-pack", "l4-down", "tensormap", "pack_to_down_data"),
+        (
+            "l4-plan",
+            "l4-fused",
+            "tensormap",
+            "plan_to_expert_data",
+        ),
+        ("l4-plan", "l4-down", "tensormap", "plan_to_down_data"),
+        (
+            "l4-fused",
+            "l4-down",
+            "tensormap",
+            "expert_to_down_data",
+        ),
+        (
+            "l4-down",
+            "l4-combine",
+            "tensormap",
+            "down_to_combine_data",
+        ),
         (
             "l4-shared",
             "l4-combine",
+            "tensormap",
             "shared_down_to_combine_data",
         ),
-        ("l4-combine", "l4-ar", "combine_to_all_reduce_data"),
-        ("l4-ar", "l4-residual", "all_reduce_to_residual_data"),
+        (
+            "l4-combine",
+            "l4-ar",
+            "tensormap",
+            "combine_to_all_reduce_data",
+        ),
+        (
+            "l4-ar",
+            "l4-residual",
+            "tensormap",
+            "all_reduce_to_residual_data",
+        ),
     ],
 )
 def test_local_ep_dependency_contract_rejects_missing_required_edges(
     pred: str,
     succ: str,
+    source: str,
     edge_name: str,
 ) -> None:
     trace = _local_ep_trace()
@@ -1030,6 +1275,7 @@ def test_local_ep_dependency_contract_rejects_missing_required_edges(
         if not (
             edge["pred"] == pred
             and edge["succ"] == succ
+            and edge["source"] == source
         )
     ]
 
@@ -1051,7 +1297,11 @@ def test_local_ep_zero_route_allows_only_expert_predicate_skips() -> None:
     assert l4_execution["expert_gate_up"]["predicated_skip"]
     assert l4_execution["expert_down"]["predicated_skip"]
     for stage in (
+        "norm_quant",
+        "gate_topk",
+        "local_route_map_init",
         "local_route_pack",
+        "local_route_plan",
         "local_combine_reduce",
         "moe_all_reduce",
         "moe_residual_add",
@@ -1218,8 +1468,15 @@ def test_local_ep_route_execution_waits_for_exact_route_evidence() -> None:
 
 def test_local_ep_swim_envelope_overlap_is_diagnostic() -> None:
     trace = _local_ep_trace()
+    down_start = trace.task_by_id["l4-down"].order * 100
     trace.slices_by_task["l4-fused"] = [
-        Slice(0, "l4-fused", 920, 1110, "aic")
+        Slice(
+            0,
+            "l4-fused",
+            down_start - 80,
+            down_start + 10,
+            "aic",
+        )
     ]
 
     contract = _local_ep_dependency_contract(trace)
@@ -1297,13 +1554,16 @@ def test_source_identity_contract_matches_only_the_selected_policy() -> None:
     assert packed["policy_id"].startswith("release-packed-nz-")
 
     local_ep_sha256 = (
-        "26c1b06d739c8d32c04c455c23854c4e"
-        "45436049fc60e9496a64df895712a85e"
+        "91d677a874a5a9a4ac394e8a0e1d5e44"
+        "fe7eccd87fa83dc3715a7ae20d392e41"
     )
     local_ep = _source_identity_contract("local-ep", local_ep_sha256)
     assert local_ep["available"]
     assert local_ep["pass"]
-    assert local_ep["policy_id"].startswith("release-local-ep-")
+    assert (
+        local_ep["policy_id"]
+        == "release-local-ep-91d677a8-full-input-dag-v6"
+    )
 
     local_ep_mismatch = _source_identity_contract(
         "local-ep",
@@ -1461,8 +1721,8 @@ def test_route_histogram_accepts_exact_local_ep_source_policy(
 ) -> None:
     payload = _local_owner_payload()
     local_ep_sha256 = (
-        "26c1b06d739c8d32c04c455c23854c4e"
-        "45436049fc60e9496a64df895712a85e"
+        "91d677a874a5a9a4ac394e8a0e1d5e44"
+        "fe7eccd87fa83dc3715a7ae20d392e41"
     )
     payload["provenance"]["source"]["decode_fwd_sha256"] = (
         local_ep_sha256
@@ -2191,19 +2451,25 @@ def test_local_ep_profile_selects_local_topology_diagnostics() -> None:
         ),
     )
     assert set(_diagnostic_stage_resources("local-ep")) == {
+        "local_route_map_init",
         "local_route_pack",
+        "local_route_plan",
         "expert_gate_up",
         "expert_down",
         "local_combine_reduce",
         "moe_all_reduce",
     }
     timing_stages = _timing_profile_stages("local-ep")
+    assert "local_route_map_init" in timing_stages
     assert "local_route_pack" in timing_stages
+    assert "local_route_plan" in timing_stages
     assert "local_combine_reduce" in timing_stages
     assert "moe_all_reduce" in timing_stages
     assert "dispatch_wait" not in timing_stages
     markdown_stages = _markdown_stage_order("local-ep")
+    assert "local_route_map_init" in markdown_stages
     assert "local_route_pack" in markdown_stages
+    assert "local_route_plan" in markdown_stages
     assert "local_combine_reduce" in markdown_stages
     assert "moe_all_reduce" in markdown_stages
     assert "dispatch_wait" not in markdown_stages
@@ -2219,7 +2485,9 @@ def test_local_ep_execution_limit_uses_local_collective_stages() -> None:
         "rank0/d0": {
             "layers": {
                 "L3": {
+                    "local_route_map_init": _fake_stage(resource="aiv"),
                     "local_route_pack": _fake_stage(resource="aiv"),
+                    "local_route_plan": _fake_stage(resource="aiv"),
                     "local_combine_reduce": _fake_stage(resource="aiv"),
                     "moe_all_reduce": _fake_stage(resource="aiv"),
                 },
@@ -2236,7 +2504,9 @@ def test_local_ep_execution_limit_uses_local_collective_stages() -> None:
 
     stages = result["coverage"]["L3"]["rank0/d0"]["stages"]
     assert set(stages) == set(_diagnostic_stage_resources("local-ep"))
+    assert stages["local_route_map_init"]["execution_observed"]
     assert stages["local_route_pack"]["execution_observed"]
+    assert stages["local_route_plan"]["execution_observed"]
     assert stages["local_combine_reduce"]["execution_observed"]
     assert stages["moe_all_reduce"]["execution_observed"]
     assert "combine_wait" not in stages
@@ -2452,7 +2722,9 @@ def test_local_ep_arrival_reports_only_moe_collective() -> None:
     assert timing["profiled_stages"] == list(
         _timing_profile_stages("local-ep")
     )
+    assert "local_route_map_init" in timing["profiled_stages"]
     assert "local_route_pack" in timing["profiled_stages"]
+    assert "local_route_plan" in timing["profiled_stages"]
     assert "moe_all_reduce" in timing["profiled_stages"]
     assert "combine_wait" not in timing["profiled_stages"]
 

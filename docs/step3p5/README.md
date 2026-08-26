@@ -180,9 +180,16 @@ critical-path rationale is recorded in
 
 The active per-rank MoE chain is:
 
+Gate routes are published as complete `[16, 8]` INT32/FP32 tiles. Local expert
+counts and the compact route plan use a 40-entry physical INT32 ABI so every
+TSTORE row is 32-byte aligned; only count entries `0:36` and plan entries
+`0:38` are semantic, and the producer zeroes the remaining tail.
+
 | Swimlane task | Runtime shape | Function |
 |---|---:|---|
-| `local_route_pack` | owner-local pack task/grid | Initialize route sentinels, filter owner-local routes, pack local rows, and build the compact active-expert plan. |
+| `local_route_map_init` | one CORE_GROUP task | Build route sentinels, owner-local fixed-slab row mappings, and counts with a single GM metadata writer. |
+| `local_route_pack` | owner-local expert grid | Copy payload, scale, and route weight into disjoint fixed expert slabs. |
+| `local_route_plan` | one CORE_GROUP task | Build the compact active-expert plan after all local payload writers complete. |
 | `routed_nz_gmm1_swiglu_quant` | fixed mixed grid | Compute gate/up, activation, and requantization for the active local experts and rows. |
 | `routed_nz_down` | 23 workers at BS1, 22 otherwise | Compute the owner-local weighted routed partial. |
 | `local_combine_reduce` | fixed storage grid of 16 | Add the TP-sharded shared partial and this rank's routed rows in FP32. |

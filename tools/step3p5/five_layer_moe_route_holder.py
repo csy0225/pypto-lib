@@ -67,27 +67,28 @@ def assemble_route_outputs(
                     f"owner_rank={owner_rank}, "
                     f"route_owner_rank={route_owner_rank}"
                 )
-    diagonal_counts = torch.stack(
+    diagonal_padded = torch.stack(
         [
-            routed[owner_rank, :, owner_rank]
+            recv_meta[owner_rank, :, owner_rank]
             for owner_rank in range(tp)
         ],
         dim=0,
     )
-    diagonal_i64 = diagonal_counts.to(torch.int64)
-    if bool(torch.any(diagonal_i64 > torch.iinfo(_I32).max)):
+    diagonal_padded_i64 = diagonal_padded.to(torch.int64)
+    if bool(torch.any(diagonal_padded_i64 > torch.iinfo(_I32).max)):
         raise OverflowError("local expert count exceeds INT32")
+    diagonal_counts = diagonal_padded[:, :, :n_local_experts]
 
     if (local_expert_count_l3 is None) != (local_expert_count_l4 is None):
         raise ValueError(
             "L3/L4 explicit local expert counts must be supplied together"
         )
     if local_expert_count_l3 is None:
-        return recv_meta, diagonal_i64.to(_I32)
+        return recv_meta, diagonal_counts.contiguous()
 
     assert local_expert_count_l4 is not None
     explicit = (local_expert_count_l3, local_expert_count_l4)
-    expected_count_shape = (tp, n_local_experts)
+    expected_count_shape = (tp, n_local_experts_pad)
     for layer, tensor in zip(("L3", "L4"), explicit, strict=True):
         if tuple(tensor.shape) != expected_count_shape:
             raise ValueError(
@@ -103,19 +104,27 @@ def assemble_route_outputs(
             raise ValueError(
                 f"{layer} local_expert_count contains negative counts"
             )
+        if bool(torch.any(tensor[:, n_local_experts:] != 0)):
+            raise ValueError(
+                f"{layer} local_expert_count padding "
+                f"{n_local_experts}:{n_local_experts_pad} is non-zero"
+            )
 
-    explicit_counts = torch.stack(explicit, dim=1)
-    explicit_i64 = explicit_counts.to(torch.int64)
-    if not torch.equal(diagonal_i64, explicit_i64):
+    explicit_padded = torch.stack(explicit, dim=1)
+    explicit_padded_i64 = explicit_padded.to(torch.int64)
+    if not torch.equal(diagonal_padded_i64, explicit_padded_i64):
         mismatch = torch.nonzero(
-            diagonal_i64 != explicit_i64,
+            diagonal_padded_i64 != explicit_padded_i64,
             as_tuple=False,
         )[0].tolist()
         raise ValueError(
             "local_expert_count disagrees with diagonal owner route row "
             f"at index={mismatch}"
         )
-    return recv_meta, explicit_counts
+    return (
+        recv_meta,
+        explicit_padded[:, :, :n_local_experts].contiguous(),
+    )
 
 
 class FiveLayerMoeRouteHolder(WholeDecodeHolder):
@@ -367,12 +376,12 @@ class FiveLayerMoeRouteHolder(WholeDecodeHolder):
         self._hidden_l4_out = _zsh(tp, batch, hidden)
         self._local_expert_count_l3_out = _zsh(
             tp,
-            self._focused.n_local_experts,
+            self._focused.n_local_experts_pad,
             dtype=_I32,
         )
         self._local_expert_count_l4_out = _zsh(
             tp,
-            self._focused.n_local_experts,
+            self._focused.n_local_experts_pad,
             dtype=_I32,
         )
         self._recv_meta_l3_out = _zsh(

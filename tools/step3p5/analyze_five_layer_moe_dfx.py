@@ -53,7 +53,9 @@ _STAGE_SUFFIXES = {
     "dispatch_push": ("dispatch_push",),
     "dispatch_wait": ("dispatch_wait",),
     "dispatch_gather": ("dispatch_gather",),
+    "local_route_map_init": ("local_route_map_init",),
     "local_route_pack": ("local_route_pack",),
+    "local_route_plan": ("local_route_plan",),
     "expert_gate_up": ("expert_gate_up",),
     "expert_gate": ("expert_gate_mm",),
     "expert_up": ("expert_up_mm",),
@@ -111,7 +113,7 @@ _PACKED_NZ_DECODE_SHA256 = (
     "da36c09dc275838ee364f76342d74717338ef313d912ba2b372808530489dd14"
 )
 _LOCAL_EP_DECODE_SHA256 = (
-    "26c1b06d739c8d32c04c455c23854c4e45436049fc60e9496a64df895712a85e"
+    "91d677a874a5a9a4ac394e8a0e1d5e44fe7eccd87fa83dc3715a7ae20d392e41"
 )
 # These are the only upper bounds carried from the release-qualified R5
 # packed-fused analyzer.  R5 had a single mixed fused stage; the route-sidecar
@@ -176,19 +178,21 @@ _FROZEN_SOURCE_POLICIES = {
         "enforce_candidate_release_gate": True,
     },
     "local-ep": {
-        "policy_id": "release-local-ep-26c1b06d-replicated-input-v1",
-        "frozen_ref": "immutable source decode@26c1b06d",
-        "decode_sha256_prefix": "26c1b06d",
+        "policy_id": "release-local-ep-91d677a8-full-input-dag-v6",
+        "frozen_ref": "immutable source decode@91d677a8",
+        "decode_sha256_prefix": "91d677a8",
         "decode_sha256": _LOCAL_EP_DECODE_SHA256,
         "golden_protocol_profile": LOCAL_OWNER_PROTOCOL_PROFILE,
         "source_role": "candidate",
         "storage_family": "replicated_input_local_owner_packed_nz",
         "schedule_family": (
-            "local_route_pack_mixed_experts_local_combine_tp_all_reduce"
+            "single_writer_route_map_owner_local_pack_plan_"
+            "mixed_experts_local_combine_tp_all_reduce"
         ),
         "task_partition": (
-            "owner_local_pack_task_or_grid_mixed_expert_compute_"
-            "local_combine_tp_all_reduce"
+            "one_route_metadata_task_owner_local_payload_grid_"
+            "one_route_plan_task_mixed_expert_compute_local_combine_"
+            "tp_all_reduce"
         ),
         "expert_release_family": "packed_nz_mixed",
         "duration_limit_source": (
@@ -290,7 +294,9 @@ _LEGACY_DIAGNOSTIC_STAGE_RESOURCES = {
     "combine_reduce": "aiv",
 }
 _LOCAL_EP_DIAGNOSTIC_STAGE_RESOURCES = {
+    "local_route_map_init": "aiv",
     "local_route_pack": "aiv",
+    "local_route_plan": "aiv",
     "expert_gate_up": "aic",
     "expert_down": "aic",
     "local_combine_reduce": "aiv",
@@ -307,7 +313,9 @@ _LEGACY_TASK_TIMING_PROFILE_STAGES = (
     "combine_reduce",
 )
 _LOCAL_EP_TASK_TIMING_PROFILE_STAGES = (
+    "local_route_map_init",
     "local_route_pack",
+    "local_route_plan",
     *_ROUTED_PROFILE_STAGES,
     "shared_mlp",
     "shared_gate_up",
@@ -348,7 +356,9 @@ _LOCAL_EP_MARKDOWN_STAGE_ORDER = (
     "shared_gate_up_act",
     "shared_down",
     "shared_split",
+    "local_route_map_init",
     "local_route_pack",
+    "local_route_plan",
     "expert_gate_up",
     "expert_down",
     "local_combine_reduce",
@@ -808,34 +818,24 @@ def _find_packed_nz_layer_tasks(
         return {}
 
     if resolved_profile == "local-ep":
-        start_stage = "local_route_pack"
+        start_stage = "local_route_plan"
         end_stage = "local_combine_reduce"
-        window_name = "local_route_pack -> local_combine_reduce"
+        window_name = "local_route_plan -> local_combine_reduce"
     else:
         start_stage = "dispatch_gather"
         end_stage = "combine_scatter"
         window_name = "dispatch_gather -> combine_scatter"
     start_ids = stage_ids[start_stage]
     end_ids = stage_ids[end_stage]
-    valid_start_count = (
-        bool(start_ids)
-        if resolved_profile == "local-ep"
-        else len(start_ids) == 1
-    )
-    if not valid_start_count or len(end_ids) != 1:
-        start_expectation = (
-            "at least one"
-            if resolved_profile == "local-ep"
-            else "exactly one"
-        )
+    if len(start_ids) != 1 or len(end_ids) != 1:
         raise RuntimeError(
             f"{trace.tag}/{layer}: packed-NZ mapping requires "
-            f"{start_expectation} {start_stage} and exactly one "
+            f"exactly one {start_stage} and exactly one "
             f"{end_stage} task; "
             f"start={start_ids}, end={end_ids}"
         )
     start_tasks = [trace.task_by_id[task_id] for task_id in start_ids]
-    start_task = max(start_tasks, key=lambda task: task.order)
+    start_task = start_tasks[0]
     end_task = trace.task_by_id[end_ids[0]]
     if start_task.order >= end_task.order:
         raise RuntimeError(
@@ -869,11 +869,7 @@ def _find_packed_nz_layer_tasks(
         start_task.order < fused.order < down.order < end_task.order
     )
     if resolved_profile == "local-ep":
-        all_starts_before_fused = all(
-            task.order < fused.order
-            for task in start_tasks
-        )
-        if not order_valid or not all_starts_before_fused:
+        if not order_valid:
             raise RuntimeError(
                 f"{trace.tag}/{layer}: invalid packed-NZ task order inside "
                 f"{window_name}; start_orders="
@@ -937,7 +933,17 @@ def _find_layer_task_ids(
         result[stage] = [task_id]
 
     gate_tasks = [trace.task_by_id[task_id] for task_id in result["gate_init"]]
-    if gate_tasks:
+    if resolved_profile == "local-ep":
+        result["norm_quant"] = [
+            task.task_id
+            for task in trace.tasks
+            if _task_matches_layer(
+                task,
+                layer,
+                "norm_quant_moe_input",
+            )
+        ]
+    elif gate_tasks:
         gate_order = min(task.order for task in gate_tasks)
         prior_norm = [
             task for task in trace.tasks if task.name == "_norm_quant_moe_input" and task.order < gate_order
@@ -1494,8 +1500,14 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
         layer: _find_layer_task_ids(trace, layer, "local-ep")
         for layer in _LAYER_PREFIX
     }
+    producer_stages = (
+        "norm_quant",
+        "gate_topk",
+    )
     chain_stages = (
+        "local_route_map_init",
         "local_route_pack",
+        "local_route_plan",
         "expert_gate_up",
         "expert_down",
         "local_combine_reduce",
@@ -1503,29 +1515,64 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
         "moe_residual_add",
     )
     mandatory_swim_stages = (
+        *producer_stages,
+        "local_route_map_init",
         "local_route_pack",
+        "local_route_plan",
         "local_combine_reduce",
         "moe_all_reduce",
         "moe_residual_add",
     )
-    single_chain_stages = tuple(
-        stage
-        for stage in chain_stages
-        if stage != "local_route_pack"
-    )
-    single_mandatory_swim_stages = tuple(
-        stage
-        for stage in mandatory_swim_stages
-        if stage != "local_route_pack"
-    )
     expert_stages = ("expert_gate_up", "expert_down")
     required_edge_specs = (
         (
-            "pack_to_expert_explicit",
+            "gate_to_map_data",
+            "gate_topk",
+            "local_route_map_init",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "gate_to_pack_data",
+            "gate_topk",
             "local_route_pack",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "norm_to_pack_data",
+            "norm_quant",
+            "local_route_pack",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "map_to_pack_explicit",
+            "local_route_map_init",
+            "local_route_pack",
+            ("explicit",),
+            "exactly_one",
+        ),
+        (
+            "pack_to_plan_explicit",
+            "local_route_pack",
+            "local_route_plan",
+            ("explicit",),
+            "exactly_one",
+        ),
+        (
+            "plan_to_expert_explicit",
+            "local_route_plan",
             "expert_gate_up",
             ("explicit",),
-            "each_predecessor",
+            "exactly_one",
+        ),
+        (
+            "plan_to_down_explicit",
+            "local_route_plan",
+            "expert_down",
+            ("explicit",),
+            "exactly_one",
         ),
         (
             "expert_to_down_explicit",
@@ -1535,11 +1582,11 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
             "exactly_one",
         ),
         (
-            "pack_to_combine_explicit",
-            "local_route_pack",
+            "plan_to_combine_explicit",
+            "local_route_plan",
             "local_combine_reduce",
             ("explicit",),
-            "each_predecessor",
+            "exactly_one",
         ),
         (
             "down_to_combine_explicit",
@@ -1547,6 +1594,83 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
             "local_combine_reduce",
             ("explicit",),
             "exactly_one",
+        ),
+        (
+            "map_to_pack_data",
+            "local_route_map_init",
+            "local_route_pack",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "map_to_plan_data",
+            "local_route_map_init",
+            "local_route_plan",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "map_to_combine_data",
+            "local_route_map_init",
+            "local_combine_reduce",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "map_to_expert_count_data",
+            "local_route_map_init",
+            "expert_gate_up",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "map_to_down_count_data",
+            "local_route_map_init",
+            "expert_down",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "pack_to_expert_data",
+            "local_route_pack",
+            "expert_gate_up",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "pack_to_down_data",
+            "local_route_pack",
+            "expert_down",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "plan_to_expert_data",
+            "local_route_plan",
+            "expert_gate_up",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "plan_to_down_data",
+            "local_route_plan",
+            "expert_down",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "expert_to_down_data",
+            "expert_gate_up",
+            "expert_down",
+            ("tensormap",),
+            "at_least_one",
+        ),
+        (
+            "down_to_combine_data",
+            "expert_down",
+            "local_combine_reduce",
+            ("tensormap",),
+            "at_least_one",
         ),
         (
             "shared_down_to_combine_data",
@@ -1578,7 +1702,7 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
         layer_errors: list[dict[str, Any]] = []
         task_ids = {
             stage: list(stage_ids[stage])
-            for stage in chain_stages
+            for stage in (*producer_stages, *chain_stages)
         }
         shared_candidates = [
             *stage_ids["shared_down"],
@@ -1590,22 +1714,13 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
             for stage, ids in task_ids.items()
         }
         for stage, count in stage_counts.items():
-            valid_count = (
-                count >= 1
-                if stage == "local_route_pack"
-                else count == 1
-            )
-            if valid_count:
+            if count == 1:
                 continue
             layer_errors.append(
                 {
                     "code": "stage_task_count",
                     "stage": stage,
-                    "expected": (
-                        "at_least_one"
-                        if stage == "local_route_pack"
-                        else 1
-                    ),
+                    "expected": 1,
                     "actual": count,
                     "task_ids": task_ids[stage],
                 }
@@ -1614,24 +1729,30 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
         resolved_ids = {
             stage: ids[0]
             for stage, ids in task_ids.items()
-            if stage != "local_route_pack" and len(ids) == 1
+            if len(ids) == 1
         }
-        pack_ids = list(task_ids["local_route_pack"])
         task_order: dict[str, Any] = {
             "available": all(
                 stage in resolved_ids
-                for stage in (*single_chain_stages, "shared_output")
-            )
-            and bool(pack_ids),
+                for stage in (
+                    *producer_stages,
+                    *chain_stages,
+                    "shared_output",
+                )
+            ),
             "pass": False,
         }
         if task_order["available"]:
-            pack_orders = [
-                trace.task_by_id[task_id].order
-                for task_id in pack_ids
-            ]
             ordered = (
-                max(pack_orders)
+                trace.task_by_id[
+                    resolved_ids["local_route_map_init"]
+                ].order
+                < trace.task_by_id[
+                    resolved_ids["local_route_pack"]
+                ].order
+                < trace.task_by_id[
+                    resolved_ids["local_route_plan"]
+                ].order
                 < trace.task_by_id[resolved_ids["expert_gate_up"]].order
                 < trace.task_by_id[resolved_ids["expert_down"]].order
                 < trace.task_by_id[
@@ -1646,17 +1767,46 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
                     resolved_ids["local_combine_reduce"]
                 ].order
             )
+            gate_before_map = (
+                trace.task_by_id[resolved_ids["gate_topk"]].order
+                < trace.task_by_id[
+                    resolved_ids["local_route_map_init"]
+                ].order
+            )
+            gate_before_pack = (
+                trace.task_by_id[resolved_ids["gate_topk"]].order
+                < trace.task_by_id[
+                    resolved_ids["local_route_pack"]
+                ].order
+            )
+            norm_before_pack = (
+                trace.task_by_id[resolved_ids["norm_quant"]].order
+                < trace.task_by_id[
+                    resolved_ids["local_route_pack"]
+                ].order
+            )
+            producers_before_consumers = (
+                gate_before_map
+                and gate_before_pack
+                and norm_before_pack
+            )
             task_order = {
                 "available": True,
-                "pass": ordered and shared_before_combine,
+                "pass": (
+                    ordered
+                    and shared_before_combine
+                    and producers_before_consumers
+                ),
                 "local_owner_chain_ordered": ordered,
                 "shared_down_before_combine": shared_before_combine,
+                "gate_topk_before_map": gate_before_map,
+                "gate_topk_before_pack": gate_before_pack,
+                "norm_quant_before_pack": norm_before_pack,
                 "orders": {
                     stage: trace.task_by_id[task_id].order
                     for stage, task_id in resolved_ids.items()
                 },
             }
-            task_order["orders"]["local_route_pack"] = pack_orders
             if not task_order["pass"]:
                 layer_errors.append(
                     {
@@ -1666,52 +1816,9 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
                 )
 
         execution: dict[str, Any] = {}
-        pack_execution = [
-            {
-                "task_id": task_id,
-                "has_physical_slices": bool(
-                    trace.slices_by_task.get(task_id)
-                ),
-                "predicated_skip": task_id in skipped_ids,
-            }
-            for task_id in pack_ids
-        ]
-        execution["local_route_pack"] = {
-            "pass": bool(pack_execution)
-            and all(
-                item["has_physical_slices"]
-                and not item["predicated_skip"]
-                for item in pack_execution
-            ),
-            "task_ids": pack_ids,
-            "task_count": len(pack_ids),
-            "tasks": pack_execution,
-            "has_physical_slices": bool(pack_execution)
-            and all(
-                item["has_physical_slices"]
-                for item in pack_execution
-            ),
-            "predicated_skip": any(
-                item["predicated_skip"]
-                for item in pack_execution
-            ),
-            "semantics": (
-                "Every task named local_route_pack must execute, while the "
-                "implementation may choose one in-core task or a wider SPMD "
-                "task shape."
-            ),
-        }
-        if not execution["local_route_pack"]["pass"]:
-            layer_errors.append(
-                {
-                    "code": "physical_execution",
-                    "stage": "local_route_pack",
-                    **execution["local_route_pack"],
-                }
-            )
         for stage in (
             "shared_output",
-            *single_mandatory_swim_stages,
+            *mandatory_swim_stages,
             *expert_stages,
         ):
             task_id = resolved_ids.get(stage)
@@ -1740,6 +1847,7 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
             execution[stage] = {
                 "pass": passed,
                 "task_id": task_id,
+                "task_count": 1,
                 "has_physical_slices": has_slices,
                 "predicated_skip": predicated_skip,
                 "semantics": semantics,
@@ -1750,6 +1858,40 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
                         "code": "physical_execution",
                         "stage": stage,
                         **execution[stage],
+                    }
+                )
+        expected_block_nums = {
+            "norm_quant": 2,
+            "gate_topk": 1,
+            "local_route_map_init": 1,
+            "local_route_pack": 36,
+            "local_route_plan": 1,
+            "local_combine_reduce": 16,
+        }
+        for stage, expected_block_num in expected_block_nums.items():
+            task_id = resolved_ids.get(stage)
+            if task_id is None:
+                continue
+            block_num = trace.task_by_id[task_id].block_num
+            block_num_pass = block_num == expected_block_num
+            execution[stage].update(
+                {
+                    "pass": (
+                        execution[stage]["pass"]
+                        and block_num_pass
+                    ),
+                    "block_num": block_num,
+                    "expected_block_num": expected_block_num,
+                }
+            )
+            if not block_num_pass:
+                layer_errors.append(
+                    {
+                        "code": "stage_block_num",
+                        "stage": stage,
+                        "expected": expected_block_num,
+                        "actual": block_num,
+                        "task_id": task_id,
                     }
                 )
 
@@ -1763,22 +1905,14 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
             cardinality,
         ) in required_edge_specs:
             pred_ids = (
-                pack_ids
-                if pred_stage == "local_route_pack"
-                else (
-                    [resolved_ids[pred_stage]]
-                    if pred_stage in resolved_ids
-                    else []
-                )
+                [resolved_ids[pred_stage]]
+                if pred_stage in resolved_ids
+                else []
             )
             succ_ids = (
-                pack_ids
-                if succ_stage == "local_route_pack"
-                else (
-                    [resolved_ids[succ_stage]]
-                    if succ_stage in resolved_ids
-                    else []
-                )
+                [resolved_ids[succ_stage]]
+                if succ_stage in resolved_ids
+                else []
             )
             if not pred_ids or not succ_ids:
                 required_edges[edge_name] = {
@@ -1800,18 +1934,8 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
                 for edge in pair_edges
                 if str(edge.get("source")) in allowed_sources
             ]
-            matching_by_pred = {
-                pred: [
-                    edge
-                    for edge in matching_edges
-                    if edge.get("pred") == pred
-                ]
-                for pred in pred_ids
-            }
             if cardinality == "exactly_one":
                 edge_pass = len(matching_edges) == 1
-            elif cardinality == "each_predecessor":
-                edge_pass = all(matching_by_pred[pred] for pred in pred_ids)
             else:
                 edge_pass = bool(matching_edges)
             required_edges[edge_name] = {
@@ -1827,13 +1951,6 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
                     _edge_summary(edge)
                     for edge in matching_edges
                 ],
-                "matches_by_pred_task": {
-                    pred: [
-                        _edge_summary(edge)
-                        for edge in matching_by_pred[pred]
-                    ]
-                    for pred in pred_ids
-                },
                 "all_pair_edges": [
                     _edge_summary(edge)
                     for edge in pair_edges
@@ -1937,11 +2054,14 @@ def _local_ep_dependency_contract(trace: RankTrace) -> dict[str, Any]:
         "layers": layers,
         "errors": all_errors,
         "interpretation": (
-            "Each layer must execute every local route pack producer, run the "
-            "owner-local expert tasks, merge local routed and shared partial "
-            "outputs, run one TP all-reduce, and then apply the residual. "
-            "Only the two local expert tasks may retire through an explicit "
-            "predicated_skip event on a zero-route rank."
+            "Each layer must publish one norm/quant input and one complete "
+            "gate-topk result into one route-map task, one 36-block local pack "
+            "task, and one route-plan task before the owner-local expert "
+            "tasks. Explicit scheduler dependencies and tensor-lineage edges "
+            "must both preserve the frozen local-owner DAG through local "
+            "combine, one TP all-reduce, and residual add. Only the two local "
+            "expert tasks may retire through an explicit predicated_skip "
+            "event on a zero-route rank."
         ),
     }
 
@@ -3157,7 +3277,11 @@ def _local_ep_route_execution_contract(
         }
 
     mandatory_stages = (
+        "norm_quant",
+        "gate_topk",
+        "local_route_map_init",
         "local_route_pack",
+        "local_route_plan",
         "local_combine_reduce",
         "moe_all_reduce",
         "moe_residual_add",

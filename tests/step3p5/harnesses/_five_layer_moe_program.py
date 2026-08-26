@@ -393,7 +393,7 @@ class FiveLayerMoeFocused:
         # L3: SWA + MoE, epoch 1.  This output is frozen as a golden.
         resid_l3 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         local_expert_count_l3 = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
+            [n_local_experts_pad], dtype=pl.INT32,
         )
         hidden_l3, local_expert_count_l3 = swa_moe_chip_orch(
             h2,
@@ -485,7 +485,7 @@ class FiveLayerMoeFocused:
         # L4: full attention + MoE, epoch 2, consuming the actual L3 output.
         resid_l4 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         local_expert_count_l4 = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
+            [n_local_experts_pad], dtype=pl.INT32,
         )
         hidden_l4, local_expert_count_l4 = full_moe_chip_orch(
             hidden_l3,

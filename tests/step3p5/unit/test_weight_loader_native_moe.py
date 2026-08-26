@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 from __future__ import annotations
 
+import inspect
+
 import pytest
 import torch
 
@@ -16,6 +18,7 @@ from models.step3p5.config import (
     MOE_NUM_EXPERTS,
     SHARE_EXPERT_DIM,
     TP_WORLD_SIZE,
+    ep_global_expert_id,
 )
 from models.step3p5.weight_loader import (
     KEY_MOE_GATE_W,
@@ -123,8 +126,10 @@ def test_native_shared_slice_preserves_checkpoint_nk_layout() -> None:
 
 
 @pytest.mark.parametrize("tp_world_size", [1, 4, 16])
+@pytest.mark.parametrize("decode_native_moe", [False, True])
 def test_weight_loader_rejects_noncanonical_local_owner_world_size(
     tp_world_size: int,
+    decode_native_moe: bool,
 ) -> None:
     with pytest.raises(
         ValueError,
@@ -137,7 +142,37 @@ def test_weight_loader_rejects_noncanonical_local_owner_world_size(
             "/checkpoint-is-not-read",
             rank=0,
             tp_world_size=tp_world_size,
+            decode_native_moe=decode_native_moe,
         )
+
+
+def test_loader_uses_canonical_helper_for_disjoint_expert_shards() -> None:
+    source = inspect.getsource(load_step3p5_weights_for_rank)
+    assert (
+        "moe_num_experts_local = MOE_NUM_EXPERTS // tp_world_size"
+        in source
+    )
+    assert "ep_lo = ep_global_expert_id(rank, 0)" in source
+
+    world_size = TP_WORLD_SIZE
+    local_experts = MOE_NUM_EXPERTS // world_size
+    shards = [
+        (
+            ep_global_expert_id(rank, 0),
+            ep_global_expert_id(rank, 0) + local_experts,
+        )
+        for rank in range(world_size)
+    ]
+    assert shards == [
+        (0, 36),
+        (36, 72),
+        (72, 108),
+        (108, 144),
+        (144, 180),
+        (180, 216),
+        (216, 252),
+        (252, 288),
+    ]
 
 
 @pytest.mark.parametrize("rank", [-1, TP_WORLD_SIZE])

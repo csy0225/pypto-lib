@@ -162,6 +162,15 @@ def test_sidecar_harness_and_ci_offer_no_main_rollback_selector() -> None:
     assert '"models/step3p5/decode_fwd.py"' in sources[_CI]
 
 
+def test_main_live_harness_fails_closed_on_tp_hidden_spread() -> None:
+    source, tree = _parse(_HARNESS)
+    run = _method(tree, "_run_worker")
+    run_source = ast.get_source_segment(source, run) or ""
+    assert "if tp_spread != 0.0:" in run_source
+    assert "Main hidden differs across TP ranks at " in run_source
+    assert "max_abs_spread={tp_spread}" in run_source
+
+
 def test_holder_run_exposes_only_raw_hidden() -> None:
     source, tree = _parse(_HOLDER)
     run = _method(tree, "run")

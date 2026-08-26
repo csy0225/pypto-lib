@@ -248,6 +248,13 @@ static __aicore__ void routed_gmm1_swiglu_quant_aic(__gm__ int32_t* v1, __gm__ i
   wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
   wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
   wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+  // PYPTO-LIB-AUTHORITY: cross-core-gate-up-publish begin
+  // The first mixed-core barrier does not publish the AIC FIXPIPE stores.
+  // Drain and flush gate_up_i32 before AIV consumers cross the rendezvous.
+  pipe_barrier(PIPE_ALL);
+  dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+  dsb(DSB_DDR);
+  // PYPTO-LIB-AUTHORITY: cross-core-gate-up-publish end
   SYNCALL<SyncCoreType::Mix>();
   SYNCALL<SyncCoreType::Mix>();
   #endif // __DAV_CUBE__
@@ -305,7 +312,11 @@ static __aicore__ void routed_gmm1_swiglu_quant_aiv(__gm__ int32_t* v1, __gm__ i
     int64_t v43 = (int64_t) v42;
     // pto: %57, %active_expert_count_inline574__phi_v4
     int64_t v44 = v43 > v31 ? v31 : v43;
+    // PYPTO-LIB-AUTHORITY: cross-core-gate-up-acquire begin
     SYNCALL<SyncCoreType::Mix>();
+    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+    dsb(DSB_DDR);
+    // PYPTO-LIB-AUTHORITY: cross-core-gate-up-acquire end
     // pto: %59
     for (int64_t i45 = v41; i45 < ((int64_t) ((uint64_t) v44 * (uint64_t) v29)); i45 += v28) {
       // pto: %61, %62
@@ -555,9 +566,18 @@ static __aicore__ void routed_gmm1_swiglu_quant_aiv(__gm__ int32_t* v1, __gm__ i
     }
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-    SYNCALL<SyncCoreType::Mix>();
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    // PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish begin
+    // SYNCALL is only a rendezvous. Drain each producer's TSTOREs to DDR
+    // before the barrier, then invalidate the readers' data cache afterwards.
+    pipe_barrier(PIPE_ALL);
+    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+    dsb(DSB_DDR);
+    SYNCALL<SyncCoreType::Mix>();
+    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+    dsb(DSB_DDR);
+    // PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish end
     for (int64_t i119 = v41; i119 < v44; i119 += v28) {
       // pto: %86, %85
       int32_t v120 = v1[(int64_t) ((uint64_t) i119 + (uint64_t) v26)];
@@ -769,7 +789,11 @@ static __aicore__ void routed_gmm1_swiglu_quant_aiv(__gm__ int32_t* v1, __gm__ i
     int64_t v185 = (int64_t) v184;
     // pto: %103, %104
     int64_t v186 = v185 > v31 ? v31 : v185;
+    // PYPTO-LIB-AUTHORITY: cross-core-gate-up-acquire begin
     SYNCALL<SyncCoreType::Mix>();
+    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+    dsb(DSB_DDR);
+    // PYPTO-LIB-AUTHORITY: cross-core-gate-up-acquire end
     // pto: %106
     for (int64_t i187 = v183; i187 < ((int64_t) ((uint64_t) v186 * (uint64_t) v29)); i187 += v28) {
       // pto: %108, %110, %109
@@ -903,7 +927,16 @@ static __aicore__ void routed_gmm1_swiglu_quant_aiv(__gm__ int32_t* v1, __gm__ i
         }
       }
     }
+    // PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish begin
+    // Keep the non-producing AIV lane on the same publish/acquire generation
+    // as the lane that materializes h_bf16.
+    pipe_barrier(PIPE_ALL);
+    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+    dsb(DSB_DDR);
     SYNCALL<SyncCoreType::Mix>();
+    dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);
+    dsb(DSB_DDR);
+    // PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish end
     for (int64_t i230 = v183; i230 < v186; i230 += v28) {
       // pto: %126, %125
       int32_t v231 = v1[(int64_t) ((uint64_t) i230 + (uint64_t) v26)];

@@ -94,7 +94,7 @@ class FiveLayerMoeRouteInstrumented:
     @pl.function(type=pl.FunctionType.InCore)
     def snapshot_local_routes_and_hidden(
         self,
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
         hidden_in: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
         recv_meta_out: pl.Out[
@@ -110,7 +110,9 @@ class FiveLayerMoeRouteInstrumented:
             dtype=pl.INT32,
             value=0,
         )
-        for expert in pl.range(n_local_experts):
+        # Copy the physical count ABI, including its producer-owned zero tail.
+        # Host validation must observe the real [36:40] values before cropping.
+        for expert in pl.range(n_local_experts_pad):
             pl.tile.write(
                 meta_tile,
                 [my_rank, expert],
@@ -222,10 +224,10 @@ class FiveLayerMoeRouteInstrumented:
         hidden_l3: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         hidden_l4: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         local_expert_count_l3: pl.Out[
-            pl.Tensor[[n_local_experts], pl.INT32]
+            pl.Tensor[[n_local_experts_pad], pl.INT32]
         ],
         local_expert_count_l4: pl.Out[
-            pl.Tensor[[n_local_experts], pl.INT32]
+            pl.Tensor[[n_local_experts_pad], pl.INT32]
         ],
         recv_meta_l3: pl.Out[
             pl.Tensor[[n_ranks, n_local_experts_pad], pl.INT32]
@@ -808,10 +810,10 @@ class FiveLayerMoeRouteInstrumented:
             pl.Tensor[[tp_size, BATCH, HIDDEN], pl.BF16]
         ],
         local_expert_count_l3: pl.Out[
-            pl.Tensor[[tp_size, n_local_experts], pl.INT32]
+            pl.Tensor[[tp_size, n_local_experts_pad], pl.INT32]
         ],
         local_expert_count_l4: pl.Out[
-            pl.Tensor[[tp_size, n_local_experts], pl.INT32]
+            pl.Tensor[[tp_size, n_local_experts_pad], pl.INT32]
         ],
         recv_meta_l3: pl.Out[
             pl.Tensor[

@@ -7,6 +7,8 @@ import ast
 from collections import Counter
 from pathlib import Path
 
+import torch
+
 from tools.step3p5.five_layer_moe_golden_contract import (
     CANONICAL_HIDDEN_ONLY_MOE_PROTOCOL_PROFILE,
     LOCAL_OWNER_PROTOCOL_PROFILE,
@@ -282,6 +284,79 @@ def _route_ownership(
     return routes_by_rank
 
 
+def _independent_local_owner_fixture(
+    expert_indices: torch.Tensor,
+    *,
+    tp_size: int,
+    experts_per_rank: int,
+    expert_capacity: int,
+) -> dict[str, torch.Tensor]:
+    """Build the owner-local packed route table without product helpers."""
+    if expert_indices.ndim != 2:
+        raise ValueError("expert_indices must have [token, topk_slot] shape")
+    if expert_capacity <= 0:
+        raise ValueError("expert_capacity must be positive")
+
+    num_tokens, topk = expert_indices.shape
+    next_row = torch.zeros(
+        (tp_size, experts_per_rank),
+        dtype=torch.int64,
+    )
+    records: dict[str, list[int]] = {
+        "route_id": [],
+        "token": [],
+        "topk_slot": [],
+        "expert_id": [],
+        "owner_rank": [],
+        "local_expert": [],
+        "packed_row": [],
+    }
+
+    # Model the actual replicated-input schedule: every rank sees every route
+    # and only the unique owner accepts it into its local expert slab.
+    for rank in range(tp_size):
+        for token in range(num_tokens):
+            for topk_slot in range(topk):
+                expert_id = int(expert_indices[token, topk_slot])
+                owner_rank = expert_id // experts_per_rank
+                if not 0 <= owner_rank < tp_size:
+                    raise ValueError(f"expert_id={expert_id} has no owner")
+                if owner_rank != rank:
+                    continue
+                local_expert = expert_id % experts_per_rank
+                ordinal = int(next_row[rank, local_expert])
+                if ordinal >= expert_capacity:
+                    raise ValueError(
+                        f"expert_id={expert_id} exceeds packed capacity"
+                    )
+                next_row[rank, local_expert] += 1
+
+                records["route_id"].append(token * topk + topk_slot)
+                records["token"].append(token)
+                records["topk_slot"].append(topk_slot)
+                records["expert_id"].append(expert_id)
+                records["owner_rank"].append(owner_rank)
+                records["local_expert"].append(local_expert)
+                records["packed_row"].append(
+                    local_expert * expert_capacity + ordinal
+                )
+
+    return {
+        name: torch.tensor(values, dtype=torch.int64)
+        for name, values in records.items()
+    }
+
+
+def _swiglu_mlp(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+) -> torch.Tensor:
+    """Small dense SwiGLU reference with checkpoint-native weight layout."""
+    return (torch.nn.functional.silu(x @ gate) * (x @ up)) @ down
+
+
 def test_product_moe_route_path_is_local_only_and_owner_filtered() -> None:
     _, tree = _parse()
     methods = _methods(tree)
@@ -475,6 +550,195 @@ def test_replicated_routes_are_computed_once_by_their_unique_owner() -> None:
     assert all(not routes for routes in skewed[1:])
 
 
+def test_independent_torch_oracle_matches_dense_reference_moe() -> None:
+    """Prove the local-owner partial protocol independent of product routing."""
+    tp_size = 4
+    experts_per_rank = 3
+    num_experts = tp_size * experts_per_rank
+    hidden_size = 6
+    routed_intermediate = 5
+    shared_intermediate_per_rank = 2
+    expert_indices = torch.tensor(
+        [
+            [0, 3, 8],
+            [11, 4, 1],
+            [6, 2, 9],
+            [7, 10, 5],
+            [3, 8, 0],
+        ],
+        dtype=torch.int64,
+    )
+    expert_weight_logits = torch.tensor(
+        [
+            [1.0, 2.0, 4.0],
+            [3.0, 5.0, 2.0],
+            [7.0, 1.0, 3.0],
+            [2.0, 6.0, 5.0],
+            [4.0, 3.0, 8.0],
+        ],
+        dtype=torch.float64,
+    )
+    expert_weights = expert_weight_logits / expert_weight_logits.sum(
+        dim=1,
+        keepdim=True,
+    )
+    num_tokens, topk = expert_indices.shape
+    expert_capacity = num_tokens * topk
+    fixture = _independent_local_owner_fixture(
+        expert_indices,
+        tp_size=tp_size,
+        experts_per_rank=experts_per_rank,
+        expert_capacity=expert_capacity,
+    )
+
+    expected_route_ids = torch.arange(num_tokens * topk, dtype=torch.int64)
+    route_counts = torch.bincount(
+        fixture["route_id"],
+        minlength=num_tokens * topk,
+    )
+    assert torch.equal(route_counts, torch.ones_like(expected_route_ids))
+    assert torch.equal(
+        fixture["owner_rank"],
+        fixture["expert_id"] // experts_per_rank,
+    )
+    assert torch.equal(
+        fixture["local_expert"],
+        fixture["expert_id"] % experts_per_rank,
+    )
+    owner_packed_row = (
+        fixture["owner_rank"] * experts_per_rank * expert_capacity
+        + fixture["packed_row"]
+    )
+    assert torch.unique(owner_packed_row).numel() == num_tokens * topk
+
+    for rank in range(tp_size):
+        for local_expert in range(experts_per_rank):
+            selected = (
+                (fixture["owner_rank"] == rank)
+                & (fixture["local_expert"] == local_expert)
+            )
+            rows = fixture["packed_row"][selected]
+            expected_rows = (
+                local_expert * expert_capacity
+                + torch.arange(rows.numel(), dtype=torch.int64)
+            )
+            assert torch.equal(rows, expected_rows)
+            assert torch.unique(rows).numel() == rows.numel()
+
+    generator = torch.Generator().manual_seed(20260825)
+    hidden = torch.randn(
+        (num_tokens, hidden_size),
+        dtype=torch.float64,
+        generator=generator,
+    )
+    replicated_hidden = hidden.unsqueeze(0).repeat(tp_size, 1, 1)
+    assert all(
+        torch.equal(replicated_hidden[0], replicated_hidden[rank])
+        for rank in range(1, tp_size)
+    )
+
+    routed_gate = torch.randn(
+        (num_experts, hidden_size, routed_intermediate),
+        dtype=torch.float64,
+        generator=generator,
+    )
+    routed_up = torch.randn(
+        (num_experts, hidden_size, routed_intermediate),
+        dtype=torch.float64,
+        generator=generator,
+    )
+    routed_down = torch.randn(
+        (num_experts, routed_intermediate, hidden_size),
+        dtype=torch.float64,
+        generator=generator,
+    )
+    shared_gate = torch.randn(
+        (
+            tp_size,
+            hidden_size,
+            shared_intermediate_per_rank,
+        ),
+        dtype=torch.float64,
+        generator=generator,
+    )
+    shared_up = torch.randn(
+        (
+            tp_size,
+            hidden_size,
+            shared_intermediate_per_rank,
+        ),
+        dtype=torch.float64,
+        generator=generator,
+    )
+    shared_down = torch.randn(
+        (
+            tp_size,
+            shared_intermediate_per_rank,
+            hidden_size,
+        ),
+        dtype=torch.float64,
+        generator=generator,
+    )
+
+    rank_partials: list[torch.Tensor] = []
+    computed_route_ids: list[int] = []
+    for rank in range(tp_size):
+        shared_partial = _swiglu_mlp(
+            replicated_hidden[rank],
+            shared_gate[rank],
+            shared_up[rank],
+            shared_down[rank],
+        )
+        routed_partial = torch.zeros_like(hidden)
+        local_records = torch.nonzero(
+            fixture["owner_rank"] == rank,
+            as_tuple=False,
+        ).flatten()
+        for record in local_records.tolist():
+            token = int(fixture["token"][record])
+            topk_slot = int(fixture["topk_slot"][record])
+            expert_id = int(fixture["expert_id"][record])
+            routed_partial[token] += expert_weights[token, topk_slot] * (
+                _swiglu_mlp(
+                    replicated_hidden[rank, token : token + 1],
+                    routed_gate[expert_id],
+                    routed_up[expert_id],
+                    routed_down[expert_id],
+                )[0]
+            )
+            computed_route_ids.append(int(fixture["route_id"][record]))
+        rank_partials.append(shared_partial + routed_partial)
+
+    assert Counter(computed_route_ids) == Counter(expected_route_ids.tolist())
+
+    dense_shared = _swiglu_mlp(
+        hidden,
+        torch.cat(shared_gate.unbind(), dim=1),
+        torch.cat(shared_up.unbind(), dim=1),
+        torch.cat(shared_down.unbind(), dim=0),
+    )
+    dense_routed = torch.zeros_like(hidden)
+    for token in range(num_tokens):
+        for topk_slot in range(topk):
+            expert_id = int(expert_indices[token, topk_slot])
+            dense_routed[token] += expert_weights[token, topk_slot] * (
+                _swiglu_mlp(
+                    hidden[token : token + 1],
+                    routed_gate[expert_id],
+                    routed_up[expert_id],
+                    routed_down[expert_id],
+                )[0]
+            )
+
+    tp_reduced = torch.stack(rank_partials).sum(dim=0)
+    torch.testing.assert_close(
+        tp_reduced,
+        dense_shared + dense_routed,
+        rtol=1e-10,
+        atol=1e-10,
+    )
+
+
 def test_local_owner_protocol_requires_colocated_tp_ep_ranks() -> None:
     config = _CONFIG.read_text(encoding="utf-8")
     assert "if (TP_WORLD_SIZE, EP_WORLD_SIZE) != (8, 8):" in config
@@ -482,7 +746,7 @@ def test_local_owner_protocol_requires_colocated_tp_ep_ranks() -> None:
     canonical = _CANONICAL.read_text(encoding="utf-8")
     assert "n_ranks = tp_size" in canonical
     assert (
-        "global_e = my_rank * n_local_experts + local_e_i32"
+        "global_e = my_rank * n_local_experts + pack_local_e_i32"
         in canonical
     )
     assert "if eid == global_e:" in canonical
@@ -494,13 +758,159 @@ def test_local_route_pack_does_not_shadow_expert_indices() -> None:
     body = ast.get_source_segment(source, dispatch)
     assert body is not None
     assert "local_e_idx = pl.tile.get_block_idx()" in body
-    assert "local_e_i32 = pl.cast(local_e_idx, pl.INT32)" in body
+    assert "pack_local_e_i32 = pl.cast(local_e_idx, pl.INT32)" in body
     assert (
-        "global_e = my_rank * n_local_experts + local_e_i32"
+        "global_e = my_rank * n_local_experts + pack_local_e_i32"
         in body
     )
+    assert "pack_out_row_i32 = pl.read(" in body
+    assert "local_route_row_out, [0, route]," in body
+    assert "if pack_out_row_i32 >= pack_slab_begin_i32:" in body
+    assert "if pack_out_row_i32 < pack_slab_end_i32:" in body
     assert "for local_e in pl.range" not in body
     assert "local_e = pl.cast" not in body
+
+
+def test_route_metadata_has_one_core_group_writer() -> None:
+    source, tree = _parse()
+    dispatch = _methods(tree)["dispatch_step"]
+    parents = _parent_map(dispatch)
+    metadata_names = {
+        "local_route_row_out",
+        "local_expert_count_view",
+    }
+    writes: dict[str, list[ast.Call]] = {
+        name: []
+        for name in metadata_names
+    }
+    for node in ast.walk(dispatch):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if _call_path(node) not in {"pl.write", "pl.store"}:
+            continue
+        target_arg = (
+            node.args[0]
+            if _call_path(node) == "pl.write"
+            else node.args[2]
+        )
+        target = ast.unparse(target_arg)
+        if target in writes:
+            writes[target].append(node)
+
+    for tensor_name, tensor_writes in writes.items():
+        assert tensor_writes, tensor_name
+        for write in tensor_writes:
+            assert _call_path(write) == "pl.store"
+            current: ast.AST = write
+            scopes: list[ast.With] = []
+            while current is not dispatch:
+                current = parents[current]
+                if isinstance(current, ast.With):
+                    scopes.append(current)
+            assert any(
+                any(
+                    isinstance(item.context_expr, ast.Call)
+                    and _call_path(item.context_expr) == "pl.at"
+                    and any(
+                        keyword.arg == "name_hint"
+                        and isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value == "local_route_map_init"
+                        for keyword in item.context_expr.keywords
+                    )
+                    for item in scope.items
+                )
+                for scope in scopes
+            ), (tensor_name, ast.get_source_segment(source, write))
+
+
+def test_cross_task_route_publications_are_full_tile_stores() -> None:
+    _, tree = _parse()
+    methods = _methods(tree)
+    expected = {
+        "expert_indices": ("expert_indices_tile", "[0, 0]"),
+        "expert_weights": ("expert_weights_tile", "[0, 0]"),
+        "local_expert_count_view": ("expert_count_tile", "[0, 0]"),
+        "local_route_row_out": ("route_map", "[0, 0]"),
+        "local_routed_x_scale_out": (
+            "scale_slab",
+            "[0, pack_slab_begin]",
+        ),
+        "local_routed_weight_out_view": (
+            "weight_slab",
+            "[0, pack_slab_begin]",
+        ),
+        "local_route_count_view": ("route_plan_tile", "[0, 0]"),
+    }
+    publication_calls: dict[str, list[tuple[ast.Call, ast.AST]]] = {
+        name: []
+        for name in expected
+    }
+    for function_name in ("_gate", "dispatch_step"):
+        function = methods[function_name]
+        parents = _parent_map(function)
+        for call in (
+            node for node in ast.walk(function) if isinstance(node, ast.Call)
+        ):
+            call_path = _call_path(call)
+            if call_path == "pl.write" and call.args:
+                assert ast.unparse(call.args[0]) not in expected
+            if call_path != "pl.store" or len(call.args) != 3:
+                continue
+            target = ast.unparse(call.args[2])
+            if target in publication_calls:
+                publication_calls[target].append((call, parents[call]))
+
+    for target, publications in publication_calls.items():
+        assert len(publications) == 1, target
+        call, parent = publications[0]
+        assert (
+            ast.unparse(call.args[0]),
+            ast.unparse(call.args[1]),
+        ) == expected[target]
+        assert isinstance(parent, ast.Assign), target
+        assert ast.unparse(parent.targets[0]) == target
+
+
+def test_physical_metadata_padding_preserves_36_expert_semantics() -> None:
+    source, tree = _parse()
+    dispatch = _methods(tree)["dispatch_step"]
+    body = ast.get_source_segment(source, dispatch)
+    assert body is not None
+
+    assert "n_local_experts = N_LOCAL_EXPERTS" in source
+    assert "n_local_experts_pad = ((n_local_experts + 7) // 8) * 8" in source
+    assert "local_route_plan_valid_size = n_local_experts + 2" in source
+    assert "local_route_plan_size = n_local_experts_pad" in source
+    assert "[1, n_local_experts_pad], dtype=pl.INT32, value=0" in body
+    assert "[1, local_route_plan_size], dtype=pl.INT32, value=0" in body
+    assert (
+        "local_expert_count, [1, n_local_experts_pad]"
+        in body
+    )
+    assert (
+        "local_route_count, [1, local_route_plan_size]"
+        in body
+    )
+    assert "pl.read(local_expert_count_view, [0, e])" in body
+    assert (
+        "local_routed_weight_out_view, [local_recv_max]"
+        in body
+    )
+    assert (
+        "local_route_count_view, [local_route_plan_size]"
+        in body
+    )
+    assert body.count("for e in pl.range(n_local_experts):") == 3
+    assert "with pl.spmd(\n            n_local_experts," in body
+    assert "route_owner = eid // n_local_experts" in body
+    assert "if route_owner == my_rank:" in body
+    assert "route_local_e = eid - my_rank * n_local_experts" in body
+    assert "if route_local_e >= 0:" not in body
+    assert (
+        "global_e = my_rank * n_local_experts + pack_local_e_i32"
+        in body
+    )
+    assert "pl.set_validshape" not in body
 
 
 def test_local_route_rows_are_bounds_checked_before_routed_load() -> None:

@@ -969,6 +969,11 @@ def _run_worker(args: argparse.Namespace) -> int:
                         f"Main active hidden has {active_nonzero_rows} "
                         f"nonzero rank/rows, expected {args.active_batch * TP}"
                     )
+                if tp_spread != 0.0:
+                    raise AssertionError(
+                        "Main hidden differs across TP ranks at "
+                        f"step {step}: max_abs_spread={tp_spread}"
+                    )
                 sampled = _cpu_tail_token(row0, ckpt=args.ckpt)
                 expected = (
                     303

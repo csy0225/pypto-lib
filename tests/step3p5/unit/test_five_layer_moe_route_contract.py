@@ -270,7 +270,7 @@ def test_l3_l4_rebind_post_call_local_expert_count() -> None:
         canonical = _method(canonical_tree, callee)
         assert ast.unparse(canonical.returns) == (
             "tuple[pl.Tensor[[BATCH, HIDDEN], pl.BF16], "
-            "pl.Tensor[[n_local_experts], pl.INT32]]"
+            "pl.Tensor[[n_local_experts_pad], pl.INT32]]"
         )
         returns = [
             node
@@ -307,6 +307,7 @@ def test_snapshot_is_one_incore_body_without_nested_task_scope() -> None:
         if arg.annotation is not None
     }
     assert annotations["local_expert_count"].startswith("pl.Tensor[")
+    assert "n_local_experts_pad" in annotations["local_expert_count"]
     assert annotations["recv_meta_out"].startswith("pl.Out[")
     assert annotations["hidden_out"].startswith("pl.Out[")
 
@@ -317,6 +318,7 @@ def test_snapshot_is_one_incore_body_without_nested_task_scope() -> None:
     assert "[n_ranks, n_local_experts_pad]" in body
     assert "SNAPSHOT_HIDDEN_CHUNK" in body
     assert "[my_rank, expert]" in body
+    assert "for expert in pl.range(n_local_experts_pad):" in body
     assert "pl.read(local_expert_count, [expert])" in body
 
 
@@ -337,6 +339,8 @@ def test_host_and_holder_expose_both_route_snapshots() -> None:
         "recv_meta_l4",
     ):
         assert annotations[name].startswith("pl.Out[")
+    for name in ("local_expert_count_l3", "local_expert_count_l4"):
+        assert "n_local_experts_pad" in annotations[name]
 
     route_calls = _calls(host, "five_layer_route_chip_orch")
     assert len(route_calls) == 1
@@ -348,6 +352,7 @@ def test_host_and_holder_expose_both_route_snapshots() -> None:
     assert "class FiveLayerMoeRouteHolder" in holder
     assert "_five_layer_moe_route_program as focused" in holder
     assert "focused.five_layer_moe_route" in holder
+    assert "self._focused.n_local_experts_pad" in holder
     assert '"recv_meta": recv_meta' in holder
     assert '"local_expert_count": local_expert_count' in holder
 
@@ -360,6 +365,7 @@ def test_canonical_moe_helpers_export_count_as_out_tensor() -> None:
         index = args.index("local_expert_count")
         annotation = ast.unparse(fn.args.args[index].annotation)
         assert annotation.startswith("pl.Out[")
+        assert "n_local_experts_pad" in annotation
         assert "local_expert_count = pl.create_tensor" not in ast.unparse(fn)
 
 
@@ -394,8 +400,8 @@ def test_route_program_registers_optional_fused_all_reduce() -> None:
 def test_explicit_counts_match_diagonal_owner_rows() -> None:
     l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
     l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
-    count_l3 = torch.zeros((8, 36), dtype=torch.int32)
-    count_l4 = torch.zeros((8, 36), dtype=torch.int32)
+    count_l3 = torch.zeros((8, 40), dtype=torch.int32)
+    count_l4 = torch.zeros((8, 40), dtype=torch.int32)
     rank = 3
     expert = 4
     l3[rank, rank, expert] = 5
@@ -412,16 +418,17 @@ def test_explicit_counts_match_diagonal_owner_rows() -> None:
 
     assert int(recv_meta[rank, 0, rank, expert]) == 5
     assert int(recv_meta[rank, 1, rank, expert]) == 7
-    assert torch.equal(counts[:, 0], count_l3)
-    assert torch.equal(counts[:, 1], count_l4)
+    assert tuple(counts.shape) == (8, 2, 36)
+    assert torch.equal(counts[:, 0], count_l3[:, :36])
+    assert torch.equal(counts[:, 1], count_l4[:, :36])
     assert not bool(torch.any(recv_meta[:, :, :, 36:]))
 
 
 def test_route_output_assembly_rejects_off_owner_rows() -> None:
     l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
     l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
-    count_l3 = torch.zeros((8, 36), dtype=torch.int32)
-    count_l4 = torch.zeros((8, 36), dtype=torch.int32)
+    count_l3 = torch.zeros((8, 40), dtype=torch.int32)
+    count_l4 = torch.zeros((8, 40), dtype=torch.int32)
     l3[0, 1, 0] = 2
 
     with pytest.raises(ValueError, match="off-owner"):
@@ -436,12 +443,28 @@ def test_route_output_assembly_rejects_off_owner_rows() -> None:
 def test_route_output_assembly_rejects_diagonal_count_mismatch() -> None:
     l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
     l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
-    count_l3 = torch.zeros((8, 36), dtype=torch.int32)
-    count_l4 = torch.zeros((8, 36), dtype=torch.int32)
+    count_l3 = torch.zeros((8, 40), dtype=torch.int32)
+    count_l4 = torch.zeros((8, 40), dtype=torch.int32)
     l3[3, 3, 4] = 5
     count_l3[3, 4] = 4
 
     with pytest.raises(ValueError, match="diagonal owner route row"):
+        assemble_route_outputs(
+            l3,
+            l4,
+            local_expert_count_l3=count_l3,
+            local_expert_count_l4=count_l4,
+        )
+
+
+def test_route_output_assembly_rejects_nonzero_count_padding() -> None:
+    l3 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    l4 = torch.zeros((8, 8, 40), dtype=torch.int32)
+    count_l3 = torch.zeros((8, 40), dtype=torch.int32)
+    count_l4 = torch.zeros((8, 40), dtype=torch.int32)
+    count_l3[0, 36] = 1
+
+    with pytest.raises(ValueError, match="padding 36:40 is non-zero"):
         assemble_route_outputs(
             l3,
             l4,

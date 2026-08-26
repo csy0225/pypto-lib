@@ -12,6 +12,10 @@ The maintained release semantics are:
 - mixed GMM1/SwiGLU/requant execution over the compact active-expert plan;
 - a fully initialized 16-row activation tile before fixed-shape quantization;
 - no zero-valid or negative-valid GM load/store for an empty 8-row half;
+- explicit AIC publish and AIV acquire around the cross-core `gate_up_i32`
+  handoff;
+- explicit MTE3 drain, DDR publish, mixed-core rendezvous, and read-side cache
+  invalidation before quant workers consume another core's `h_bf16` chunks;
 - a fixed 32768-float routed-down pipe workspace for each logical worker.
 
 Manual changes must keep the `PYPTO-LIB-AUTHORITY` regions and their semantic

@@ -235,8 +235,12 @@ sh_inter_local = INTER_S_LOCAL
 local_recv_max = n_local_experts * expert_recv_max
 stage_rows = 8
 n_routes_per_rank = BATCH * TOPK
-# Combine-only compact route plan: total routes, active-expert count, IDs.
-local_route_plan_size = n_local_experts + 2
+# Count and plan metadata use one 32-byte-aligned physical ABI.  Counts occupy
+# [0, 36), while the route plan occupies total/active plus at most 36 expert
+# IDs in [0, 38).  Their padded tails are explicitly zero-published.
+local_route_plan_valid_size = n_local_experts + 2
+local_route_plan_size = n_local_experts_pad
+assert local_route_plan_valid_size <= local_route_plan_size
 sh_tp_chunk = HIDDEN // tp_size
 # G1 runtime ABI: one active-token count per owner rank.  This is an ordinary
 # host tensor, not a notify/wait signal window.  Its 128-element storage comes
@@ -303,7 +307,7 @@ class WholeDecodeStep3p5:
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         w13_nz: pl.Tensor[
             [
@@ -340,7 +344,7 @@ class WholeDecodeStep3p5:
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         w13_nz: pl.Tensor[
             [
@@ -371,7 +375,7 @@ class WholeDecodeStep3p5:
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         w13_nz: pl.Tensor[
             [
@@ -433,7 +437,7 @@ class WholeDecodeStep3p5:
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         w13_nz: pl.Tensor[
             [
@@ -464,7 +468,7 @@ class WholeDecodeStep3p5:
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         w13_nz: pl.Tensor[
             [
@@ -523,7 +527,7 @@ class WholeDecodeStep3p5:
         local_routed_y: pl.Out[
             pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         h_i8: pl.Tensor[[local_recv_max, inter], pl.INT8],
         w_down_nz: pl.Tensor[
             [
@@ -564,7 +568,7 @@ class WholeDecodeStep3p5:
         local_routed_y: pl.Out[
             pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         h_i8: pl.Tensor[[local_recv_max, inter], pl.INT8],
         w_down_nz: pl.Tensor[
             [
@@ -601,7 +605,7 @@ class WholeDecodeStep3p5:
         local_routed_y: pl.Out[
             pl.Tensor[[local_recv_max, HIDDEN], pl.BF16]
         ],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         h_i8: pl.Tensor[[local_recv_max, inter], pl.INT8],
         w_down_nz: pl.Tensor[
             [
@@ -1345,7 +1349,10 @@ class WholeDecodeStep3p5:
         expert_indices: pl.Tensor[[BATCH, TOPK], pl.INT32],
         expert_weights: pl.Tensor[[BATCH, TOPK], pl.FP32],
         num_tokens: pl.Scalar[pl.INT32],
-    ):
+    ) -> tuple[
+        pl.Tensor[[BATCH, TOPK], pl.INT32],
+        pl.Tensor[[BATCH, TOPK], pl.FP32],
+    ]:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -1447,6 +1454,15 @@ class WholeDecodeStep3p5:
             logit_buf = pl.assemble(logit_buf, logits_n, [m0, n0])
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_topk"):
+            # TOPK=8 gives a legal 32-byte row for both INT32 and FP32.  One
+            # producer fills complete 512-byte tiles and publishes each output
+            # through a single TSTORE; inactive token rows stay zero.
+            expert_indices_tile = pl.tile.full(
+                [BATCH, TOPK], dtype=pl.INT32, value=0,
+            )
+            expert_weights_tile = pl.tile.full(
+                [BATCH, TOPK], dtype=pl.FP32, value=0.0,
+            )
             # Process only logical rows. The cube still executes its required
             # 16-row tile, but sigmoid, bias, sort and normalization scale with
             # the runtime batch like vLLM-Ascend MoeGatingTopK.
@@ -1549,16 +1565,22 @@ class WholeDecodeStep3p5:
                     ROUTER_SCALE,
                 )
                 for k in pl.range(TOPK):
-                    pl.write(
-                        expert_indices, [tt, k],
+                    pl.tile.write(
+                        expert_indices_tile, [tt, k],
                         pl.read(topk_idx_tile, [0, k]),
                     )
-                    pl.write(
-                        expert_weights, [tt, k],
+                    pl.tile.write(
+                        expert_weights_tile, [tt, k],
                         pl.read(weights_work, [0, k]),
                     )
+            expert_indices = pl.store(
+                expert_indices_tile, [0, 0], expert_indices,
+            )
+            expert_weights = pl.store(
+                expert_weights_tile, [0, 0], expert_weights,
+            )
 
-        return expert_weights
+        return expert_indices, expert_weights
 
     @pl.function(type=pl.FunctionType.Inline)
     def gate_step(
@@ -1576,7 +1598,7 @@ class WholeDecodeStep3p5:
         pl.Tensor[[BATCH, TOPK], pl.INT32],
         pl.Tensor[[BATCH, TOPK], pl.FP32]
     ]:
-        self._gate(
+        expert_indices, expert_weights = self._gate(
             resid, post_rms_weight, norm_layer_idx, inv_rms,
             gate_w, router_bias,
             expert_indices, expert_weights, num_tokens,
@@ -1748,8 +1770,7 @@ class WholeDecodeStep3p5:
         local_route_row_out: pl.Tensor[
             [1, n_routes_per_rank], pl.INT32
         ],
-        local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         my_rank: pl.Scalar[pl.INT32],
     ) -> tuple[
@@ -1757,21 +1778,68 @@ class WholeDecodeStep3p5:
         pl.Tensor[[1, local_recv_max], pl.FP32],
         pl.Tensor[[local_recv_max], pl.FP32],
         pl.Tensor[[1, n_routes_per_rank], pl.INT32],
-        pl.Tensor[[n_local_experts], pl.INT32],
-        pl.Tensor[[n_local_experts], pl.INT32],
+        pl.Tensor[[n_local_experts_pad], pl.INT32],
         pl.Tensor[[local_route_plan_size], pl.INT32],
         pl.Scalar[pl.TASK_ID],
     ]:
         """Pack routes owned by this rank into fixed local-expert slabs."""
+        # PTO tile.store requires a 2-D Tile. Keep the public rank-1 tensor ABI
+        # and publish through aligned row views of the same backing storage.
+        local_expert_count_view = pl.reshape(
+            local_expert_count, [1, n_local_experts_pad],
+        )
+        local_routed_weight_out_view = pl.reshape(
+            local_routed_weight_out, [1, local_recv_max],
+        )
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="local_route_map_init",
             allow_early_resolve=True,
         ) as route_map_init_tid:
-            route_map_init = pl.tile.full(
+            route_map = pl.tile.full(
                 [1, n_routes_per_rank], dtype=pl.INT32, value=-1,
             )
-            pl.store(route_map_init, [0, 0], local_route_row_out)
+            cursor = pl.array.create(n_local_experts, pl.INT32)
+            for e in pl.range(n_local_experts):
+                cursor[e] = 0
+
+            active_tokens = pl.cast(num_tokens, pl.INDEX)
+            if active_tokens < 0:
+                active_tokens = pl.cast(0, pl.INDEX)
+            if active_tokens > BATCH:
+                active_tokens = pl.cast(BATCH, pl.INDEX)
+            for t in pl.range(active_tokens):
+                for k in pl.range(TOPK):
+                    eid = pl.read(expert_indices, [t, k])
+                    route_owner = eid // n_local_experts
+                    route_local_e = eid - my_rank * n_local_experts
+                    if route_owner == my_rank:
+                        packed_count_i32 = cursor[route_local_e]
+                        route_out_row_i32 = (
+                            route_local_e * expert_recv_max
+                            + packed_count_i32
+                        )
+                        route = t * TOPK + k
+                        pl.tile.write(
+                            route_map,
+                            [0, route],
+                            pl.cast(route_out_row_i32, pl.INT32),
+                        )
+                        cursor[route_local_e] = (
+                            packed_count_i32 + pl.cast(1, pl.INT32)
+                        )
+
+            expert_count_tile = pl.tile.full(
+                [1, n_local_experts_pad], dtype=pl.INT32, value=0,
+            )
+            for e in pl.range(n_local_experts):
+                pl.tile.write(expert_count_tile, [0, e], cursor[e])
+            local_expert_count_view = pl.store(
+                expert_count_tile, [0, 0], local_expert_count_view,
+            )
+            local_route_row_out = pl.store(
+                route_map, [0, 0], local_route_row_out,
+            )
 
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -1785,47 +1853,67 @@ class WholeDecodeStep3p5:
             allow_early_resolve=True,
         ) as local_pack_tid:
             local_e_idx = pl.tile.get_block_idx()
-            local_e_i32 = pl.cast(local_e_idx, pl.INT32)
-            global_e = my_rank * n_local_experts + local_e_i32
-            packed_count = pl.cast(0, pl.INDEX)
+            pack_local_e_i32 = pl.cast(local_e_idx, pl.INT32)
+            global_e = my_rank * n_local_experts + pack_local_e_i32
+            pack_slab_begin = local_e_idx * expert_recv_max
+            pack_slab_begin_i32 = pl.cast(pack_slab_begin, pl.INT32)
+            pack_slab_end_i32 = pack_slab_begin_i32 + expert_recv_max
+            scale_slab = pl.tile.full(
+                [1, expert_recv_max], dtype=pl.FP32, value=0.0,
+            )
+            weight_slab = pl.tile.full(
+                [1, expert_recv_max], dtype=pl.FP32, value=0.0,
+            )
             for t in pl.range(active_tokens):
                 for k in pl.range(TOPK):
                     eid = pl.read(expert_indices, [t, k])
                     if eid == global_e:
-                        out_row = local_e_idx * expert_recv_max + packed_count
                         route = t * TOPK + k
-                        local_routed_x_out[out_row : out_row + 1, :] = (
-                            x[t : t + 1, :]
+                        pack_out_row_i32 = pl.read(
+                            local_route_row_out, [0, route],
                         )
-                        pl.write(
-                            local_routed_x_scale_out,
-                            [0, out_row],
-                            pl.read(x_scale, [t, 0]),
-                        )
-                        pl.write(
-                            local_routed_weight_out,
-                            [out_row],
-                            pl.read(expert_weights, [t, k]),
-                        )
-                        pl.write(
-                            local_route_row_out,
-                            [0, route],
-                            pl.cast(out_row, pl.INT32),
-                        )
-                        packed_count = packed_count + pl.cast(1, pl.INDEX)
-            pl.write(
-                local_expert_offset,
-                [local_e_idx],
-                pl.cast(local_e_idx * expert_recv_max, pl.INT32),
+                        if pack_out_row_i32 >= pack_slab_begin_i32:
+                            if pack_out_row_i32 < pack_slab_end_i32:
+                                out_row = pl.cast(
+                                    pack_out_row_i32, pl.INDEX,
+                                )
+                                pack_slab_row = pl.cast(
+                                    pack_out_row_i32
+                                    - pack_slab_begin_i32,
+                                    pl.INDEX,
+                                )
+                                local_routed_x_out[
+                                    out_row : out_row + 1, :
+                                ] = x[t : t + 1, :]
+                                pl.tile.write(
+                                    scale_slab,
+                                    [0, pack_slab_row],
+                                    pl.read(x_scale, [t, 0]),
+                                )
+                                pl.tile.write(
+                                    weight_slab,
+                                    [0, pack_slab_row],
+                                    pl.read(expert_weights, [t, k]),
+                                )
+            local_routed_x_scale_out = pl.store(
+                scale_slab,
+                [0, pack_slab_begin],
+                local_routed_x_scale_out,
             )
-            pl.write(
-                local_expert_count,
-                [local_e_idx],
-                pl.cast(packed_count, pl.INT32),
+            local_routed_weight_out_view = pl.store(
+                weight_slab,
+                [0, pack_slab_begin],
+                local_routed_weight_out_view,
             )
 
+        local_routed_weight_out = pl.reshape(
+            local_routed_weight_out_view, [local_recv_max],
+        )
         local_route_count = pl.create_tensor(
             [local_route_plan_size], dtype=pl.INT32,
+        )
+        local_route_count_view = pl.reshape(
+            local_route_count, [1, local_route_plan_size],
         )
         with pl.at(
             level=pl.Level.CORE_GROUP,
@@ -1835,12 +1923,16 @@ class WholeDecodeStep3p5:
         ) as local_route_count_tid:
             total_count = pl.cast(0, pl.INT32)
             active_expert_count_i32 = pl.cast(0, pl.INT32)
+            route_plan_tile = pl.tile.full(
+                [1, local_route_plan_size], dtype=pl.INT32, value=0,
+            )
             for e in pl.range(n_local_experts):
-                expert_count_i32 = pl.read(local_expert_count, [e])
+                expert_count_i32 = pl.read(local_expert_count_view, [0, e])
                 if expert_count_i32 > 0:
-                    pl.write(
-                        local_route_count,
+                    pl.tile.write(
+                        route_plan_tile,
                         [
+                            0,
                             pl.cast(active_expert_count_i32, pl.INDEX)
                             + pl.cast(2, pl.INDEX)
                         ],
@@ -1850,15 +1942,23 @@ class WholeDecodeStep3p5:
                         active_expert_count_i32 + pl.cast(1, pl.INT32)
                     )
                 total_count = total_count + expert_count_i32
-            pl.write(local_route_count, [0], total_count)
-            pl.write(local_route_count, [1], active_expert_count_i32)
+            pl.tile.write(route_plan_tile, [0, 0], total_count)
+            pl.tile.write(
+                route_plan_tile, [0, 1], active_expert_count_i32,
+            )
+            local_route_count_view = pl.store(
+                route_plan_tile, [0, 0], local_route_count_view,
+            )
 
+        local_route_count = pl.reshape(
+            local_route_count_view, [local_route_plan_size],
+        )
+        # The rank-2 count view and this persistent rank-1 formal share storage.
         return (
             local_routed_x_out,
             local_routed_x_scale_out,
             local_routed_weight_out,
             local_route_row_out,
-            local_expert_offset,
             local_expert_count,
             local_route_count,
             local_route_count_tid,
@@ -1871,8 +1971,7 @@ class WholeDecodeStep3p5:
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         local_routed_x_scale: pl.Tensor[[1, local_recv_max], pl.FP32],
         local_routed_weight: pl.Tensor[[local_recv_max], pl.FP32],
-        local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
         local_route_count_tid: pl.Scalar[pl.TASK_ID],
         num_tokens: pl.Scalar[pl.INT32],
@@ -1969,7 +2068,7 @@ class WholeDecodeStep3p5:
             down_pipe_buffer,
             routed_workers,
             core_num=routed_workers,
-            deps=[routed_fused_tid],
+            deps=[local_route_count_tid, routed_fused_tid],
             predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
         )
@@ -1983,8 +2082,7 @@ class WholeDecodeStep3p5:
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         local_routed_x_scale: pl.Tensor[[1, local_recv_max], pl.FP32],
         local_routed_weight: pl.Tensor[[local_recv_max], pl.FP32],
-        local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
         local_route_count_tid: pl.Scalar[pl.TASK_ID],
         num_tokens: pl.Scalar[pl.INT32],
@@ -2019,7 +2117,6 @@ class WholeDecodeStep3p5:
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
-            local_expert_offset,
             local_expert_count,
             local_route_count,
             local_route_count_tid,
@@ -2397,7 +2494,7 @@ class WholeDecodeStep3p5:
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         local_expert_count: pl.Out[
-            pl.Tensor[[n_local_experts], pl.INT32]
+            pl.Tensor[[n_local_experts_pad], pl.INT32]
         ],
         attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
         attn_signal_window: pld.DistributedTensor[[COMM_SIGNAL_STRIDE_I32, 1], pl.INT32],
@@ -2409,7 +2506,7 @@ class WholeDecodeStep3p5:
         my_rank: pl.Scalar[pl.INT32],
     ) -> tuple[
         pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        pl.Tensor[[n_local_experts], pl.INT32],
+        pl.Tensor[[n_local_experts_pad], pl.INT32],
     ]:
         # Write attention directly into the dedicated residual Out.  Avoid a
         # create_tensor -> reassign -> assemble handoff here: inside the
@@ -2467,15 +2564,11 @@ class WholeDecodeStep3p5:
         local_route_row = pl.create_tensor(
             [1, n_routes_per_rank], dtype=pl.INT32,
         )
-        local_expert_offset = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
-        )
         (
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
             local_route_row,
-            local_expert_offset,
             local_expert_count,
             local_route_count,
             local_route_count_tid,
@@ -2483,7 +2576,7 @@ class WholeDecodeStep3p5:
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
             local_routed_weight, local_route_row,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             num_tokens, my_rank,
         )
 
@@ -2494,7 +2587,7 @@ class WholeDecodeStep3p5:
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             local_route_count, local_route_count_tid,
             num_tokens,
             w13_r, w13_r_scale,
@@ -2588,7 +2681,7 @@ class WholeDecodeStep3p5:
         next_hidden_out: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         resid_hold: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
         local_expert_count: pl.Out[
-            pl.Tensor[[n_local_experts], pl.INT32]
+            pl.Tensor[[n_local_experts_pad], pl.INT32]
         ],
         attn_tmp_window: pld.DistributedTensor[[BATCH, HIDDEN], pl.BF16],
         attn_signal_window: pld.DistributedTensor[[COMM_SIGNAL_STRIDE_I32, 1], pl.INT32],
@@ -2600,7 +2693,7 @@ class WholeDecodeStep3p5:
         my_rank: pl.Scalar[pl.INT32],
     ) -> tuple[
         pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-        pl.Tensor[[n_local_experts], pl.INT32],
+        pl.Tensor[[n_local_experts_pad], pl.INT32],
     ]:
         # See full_moe_chip_orch: write the post-attention hidden directly
         # into the dedicated residual Out so the loop body reads the post-call
@@ -2657,15 +2750,11 @@ class WholeDecodeStep3p5:
         local_route_row = pl.create_tensor(
             [1, n_routes_per_rank], dtype=pl.INT32,
         )
-        local_expert_offset = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
-        )
         (
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
             local_route_row,
-            local_expert_offset,
             local_expert_count,
             local_route_count,
             local_route_count_tid,
@@ -2673,7 +2762,7 @@ class WholeDecodeStep3p5:
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
             local_routed_weight, local_route_row,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             num_tokens, my_rank,
         )
 
@@ -2684,7 +2773,7 @@ class WholeDecodeStep3p5:
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             local_route_count, local_route_count_tid,
             num_tokens,
             w13_r, w13_r_scale,
@@ -2725,8 +2814,7 @@ class WholeDecodeStep3p5:
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         local_routed_x_scale: pl.Tensor[[1, local_recv_max], pl.FP32],
         local_routed_weight: pl.Tensor[[local_recv_max], pl.FP32],
-        local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
         local_route_count_tid: pl.Scalar[pl.TASK_ID],
         num_tokens: pl.Scalar[pl.INT32],
@@ -2823,7 +2911,7 @@ class WholeDecodeStep3p5:
             down_pipe_buffer,
             routed_workers,
             core_num=routed_workers,
-            deps=[routed_fused_tid],
+            deps=[local_route_count_tid, routed_fused_tid],
             predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
         )
@@ -2836,8 +2924,7 @@ class WholeDecodeStep3p5:
         local_routed_x: pl.Tensor[[local_recv_max, HIDDEN], pl.INT8],
         local_routed_x_scale: pl.Tensor[[1, local_recv_max], pl.FP32],
         local_routed_weight: pl.Tensor[[local_recv_max], pl.FP32],
-        local_expert_offset: pl.Tensor[[n_local_experts], pl.INT32],
-        local_expert_count: pl.Tensor[[n_local_experts], pl.INT32],
+        local_expert_count: pl.Tensor[[n_local_experts_pad], pl.INT32],
         local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
         local_route_count_tid: pl.Scalar[pl.TASK_ID],
         num_tokens: pl.Scalar[pl.INT32],
@@ -2872,7 +2959,7 @@ class WholeDecodeStep3p5:
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             local_route_count, local_route_count_tid,
             num_tokens,
             w13_r, w13_r_scale,
@@ -3031,18 +3118,14 @@ class WholeDecodeStep3p5:
         local_route_row = pl.create_tensor(
             [1, n_routes_per_rank], dtype=pl.INT32,
         )
-        local_expert_offset = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
-        )
         local_expert_count = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
+            [n_local_experts_pad], dtype=pl.INT32,
         )
         (
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
             local_route_row,
-            local_expert_offset,
             local_expert_count,
             local_route_count,
             local_route_count_tid,
@@ -3050,7 +3133,7 @@ class WholeDecodeStep3p5:
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
             local_routed_weight, local_route_row,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             num_tokens, my_rank,
         )
 
@@ -3061,7 +3144,7 @@ class WholeDecodeStep3p5:
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             local_route_count, local_route_count_tid,
             num_tokens,
             w13_r, w13_r_scale,
@@ -3213,18 +3296,14 @@ class WholeDecodeStep3p5:
         local_route_row = pl.create_tensor(
             [1, n_routes_per_rank], dtype=pl.INT32,
         )
-        local_expert_offset = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
-        )
         local_expert_count = pl.create_tensor(
-            [n_local_experts], dtype=pl.INT32,
+            [n_local_experts_pad], dtype=pl.INT32,
         )
         (
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
             local_route_row,
-            local_expert_offset,
             local_expert_count,
             local_route_count,
             local_route_count_tid,
@@ -3232,7 +3311,7 @@ class WholeDecodeStep3p5:
             x_disp_i8, x_disp_scale, expert_indices, expert_weights,
             local_routed_x, local_routed_x_scale,
             local_routed_weight, local_route_row,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             num_tokens, my_rank,
         )
 
@@ -3243,7 +3322,7 @@ class WholeDecodeStep3p5:
             local_routed_x,
             local_routed_x_scale,
             local_routed_weight,
-            local_expert_offset, local_expert_count,
+            local_expert_count,
             local_route_count, local_route_count_tid,
             num_tokens,
             w13_r, w13_r_scale,
@@ -3495,7 +3574,7 @@ class WholeDecodeStep3p5:
             h_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             resid_hold_moe = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             local_expert_count_moe = pl.create_tensor(
-                [n_local_experts], dtype=pl.INT32,
+                [n_local_experts_pad], dtype=pl.INT32,
             )
             # full_moe at layer_idx % 4 == 1 (physical 4,8,12,...). full_idx =
             # (layer_idx - 1) // 4 maps {1,5,9,...} -> {0,1,2,...,9}.

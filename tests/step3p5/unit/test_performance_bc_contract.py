@@ -134,6 +134,34 @@ def _call_path(call: ast.Call) -> str:
     return ".".join(reversed(parts))
 
 
+def _self_method_calls(
+    function: ast.FunctionDef,
+    method_name: str,
+) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr == method_name
+    ]
+
+
+def _pl_function_type(function: ast.FunctionDef) -> str:
+    matches = [
+        ast.unparse(keyword.value)
+        for decorator in function.decorator_list
+        if isinstance(decorator, ast.Call)
+        and _call_path(decorator) == "pl.function"
+        for keyword in decorator.keywords
+        if keyword.arg == "type"
+    ]
+    assert len(matches) == 1, function.name
+    return matches[0]
+
+
 def test_g1_executable_match_is_exact_and_fail_closed() -> None:
     function = _single_function(
         """
@@ -188,6 +216,76 @@ def sample():
         nested_only,
         "for t in pl.range(active_tokens):",
     )["present"]
+
+
+def test_routed_group_members_keep_exact_python_abi_and_call_order() -> None:
+    _, tree = _parse(_CANONICAL)
+    for group_name, member_names in (
+        (
+            "routed_nz_gmm1_swiglu_quant",
+            (
+                (
+                    "routed_nz_gmm1_swiglu_quant_aic",
+                    "pl.FunctionType.AIC",
+                ),
+                (
+                    "routed_nz_gmm1_swiglu_quant_aiv",
+                    "pl.FunctionType.AIV",
+                ),
+            ),
+        ),
+        (
+            "routed_nz_gmm1_swiglu7_quant",
+            (
+                (
+                    "routed_nz_gmm1_swiglu_quant_aic",
+                    "pl.FunctionType.AIC",
+                ),
+                (
+                    "routed_nz_gmm1_swiglu7_quant_aiv",
+                    "pl.FunctionType.AIV",
+                ),
+            ),
+        ),
+        (
+            "routed_nz_down",
+            (
+                ("routed_nz_down_aic", "pl.FunctionType.AIC"),
+                ("routed_nz_down_aiv", "pl.FunctionType.AIV"),
+            ),
+        ),
+    ):
+        group = _method(tree, group_name)
+        assert _pl_function_type(group) == "pl.FunctionType.Group"
+        expected_call_args = [
+            ast.dump(
+                ast.Name(id=arg.arg, ctx=ast.Load()),
+                include_attributes=False,
+            )
+            for arg in group.args.args[1:]
+        ]
+        group_args = ast.dump(group.args, include_attributes=False)
+        group_returns = ast.dump(group.returns, include_attributes=False)
+
+        for member_name, member_type in member_names:
+            member = _method(tree, member_name)
+            assert _pl_function_type(member) == member_type
+            assert ast.dump(
+                member.args,
+                include_attributes=False,
+            ) == group_args, (group_name, member_name)
+            assert ast.dump(
+                member.returns,
+                include_attributes=False,
+            ) == group_returns, (group_name, member_name)
+
+            calls = _self_method_calls(group, member_name)
+            assert len(calls) == 1, (group_name, member_name)
+            assert [
+                ast.dump(argument, include_attributes=False)
+                for argument in calls[0].args
+            ] == expected_call_args, (group_name, member_name)
+            assert not calls[0].keywords, (group_name, member_name)
 
 
 def test_b3_canonical_kv_is_resident_inout_and_holder_never_copies_pool() -> None:
@@ -396,6 +494,94 @@ def test_c3_local_route_pack_and_combine_are_communication_free() -> None:
     assert "pld." not in combine
 
 
+def test_gate_topk_publishes_complete_route_tiles_once() -> None:
+    source, tree = _parse(_CANONICAL)
+    gate = _method(tree, "_gate")
+    gate_topk = _task_scope(gate, "gate_topk")
+    gate_topk_source = _segment(source, gate_topk)
+
+    assert (
+        "expert_indices_tile = pl.tile.full(\n"
+        "                [BATCH, TOPK], dtype=pl.INT32, value=0,"
+        in gate_topk_source
+    )
+    assert (
+        "expert_weights_tile = pl.tile.full(\n"
+        "                [BATCH, TOPK], dtype=pl.FP32, value=0.0,"
+        in gate_topk_source
+    )
+    assert "pl.tile.write(\n                        expert_indices_tile" in (
+        gate_topk_source
+    )
+    assert "pl.tile.write(\n                        expert_weights_tile" in (
+        gate_topk_source
+    )
+
+    stores: dict[str, list[ast.Assign]] = {
+        "expert_indices": [],
+        "expert_weights": [],
+    }
+    for node in ast.walk(gate_topk):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and _call_path(node.value) == "pl.store"
+            and len(node.value.args) == 3
+        ):
+            target = ast.unparse(node.value.args[2])
+            if target in stores:
+                stores[target].append(node)
+    for target, assignments in stores.items():
+        assert len(assignments) == 1, target
+        assert ast.unparse(assignments[0].targets[0]) == target
+        expected_tile = f"{target}_tile"
+        assert [ast.unparse(arg) for arg in assignments[0].value.args] == [
+            expected_tile,
+            "[0, 0]",
+            target,
+        ]
+
+    scalar_writes = [
+        call
+        for call in ast.walk(gate)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pl.write"
+        and call.args
+        and ast.unparse(call.args[0]) in stores
+    ]
+    assert not scalar_writes
+
+    returned = [
+        node for node in ast.walk(gate) if isinstance(node, ast.Return)
+    ]
+    assert len(returned) == 1
+    assert ast.unparse(returned[0].value) == (
+        "(expert_indices, expert_weights)"
+    )
+    gate_step = _method(tree, "gate_step")
+    gate_step_returns = [
+        node
+        for node in ast.walk(gate_step)
+        if isinstance(node, ast.Return)
+    ]
+    assert len(gate_step_returns) == 1
+    assert ast.unparse(gate_step_returns[0].value) == (
+        "(expert_indices, expert_weights)"
+    )
+    gate_calls = _self_method_calls(gate_step, "_gate")
+    assert len(gate_calls) == 1
+    gate_assignments = [
+        node
+        for node in ast.walk(gate_step)
+        if isinstance(node, ast.Assign)
+        and node.value is gate_calls[0]
+    ]
+    assert len(gate_assignments) == 1
+    assert ast.unparse(gate_assignments[0].targets[0]) == (
+        "(expert_indices, expert_weights)"
+    )
+
+
 def test_c3_local_expert_packing_and_combine_cover_active_routes() -> None:
     source, tree = _parse(_CANONICAL)
     dispatch_function = _method(tree, "dispatch_step")
@@ -404,11 +590,12 @@ def test_c3_local_expert_packing_and_combine_cover_active_routes() -> None:
 
     assert "with pl.spmd(\n            n_local_experts," in dispatch
     assert (
-        "global_e = my_rank * n_local_experts + local_e_i32"
+        "global_e = my_rank * n_local_experts + pack_local_e_i32"
         in dispatch
     )
     assert "if eid == global_e:" in dispatch
-    assert "out_row = local_e_idx * expert_recv_max + packed_count" in dispatch
+    assert "pack_out_row_i32 = pl.read(" in dispatch
+    assert "local_route_row_out, [0, route]," in dispatch
     route_map_init = _task_scope(dispatch_function, "local_route_map_init")
     route_map_stores = [
         call
@@ -416,9 +603,12 @@ def test_c3_local_expert_packing_and_combine_cover_active_routes() -> None:
         if isinstance(call, ast.Call)
         and _call_path(call) == "pl.store"
         and [ast.unparse(argument) for argument in call.args]
-        == ["route_map_init", "[0, 0]", "local_route_row_out"]
+        == ["route_map", "[0, 0]", "local_route_row_out"]
     ]
     assert len(route_map_stores) == 1
+    assert "cursor = pl.array.create(n_local_experts, pl.INT32)" in (
+        _segment(source, route_map_init)
+    )
     local_pack = _task_scope(dispatch_function, "local_route_pack")
     local_pack_call = local_pack.items[0].context_expr
     assert isinstance(local_pack_call, ast.Call)
@@ -446,10 +636,15 @@ def test_c3_local_expert_packing_and_combine_cover_active_routes() -> None:
     assert "[local_route_plan_size], dtype=pl.INT32" in dispatch
     assert dispatch.count("pl.Tensor[[local_route_plan_size], pl.INT32]") == 1
     assert "active_expert_count_i32 = pl.cast(0, pl.INT32)" in dispatch
-    assert (
-        "pl.write(local_route_count, [1], active_expert_count_i32)"
-        in dispatch
-    )
+    route_plan_stores = [
+        call
+        for call in ast.walk(local_plan)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pl.store"
+        and [ast.unparse(argument) for argument in call.args]
+        == ["route_plan_tile", "[0, 0]", "local_route_count_view"]
+    ]
+    assert len(route_plan_stores) == 1
     assert "with pl.spmd(\n            BATCH," in combine
     assert "for k in pl.range(TOPK):" in combine
     assert "local_row_i32 = pl.read(local_route_row, [0, route])" in combine
@@ -462,31 +657,111 @@ def test_c3_local_expert_packing_and_combine_cover_active_routes() -> None:
 def test_c3_local_route_map_is_dense_and_each_route_has_one_owner() -> None:
     source, tree = _parse(_CANONICAL)
     function = _method(tree, "dispatch_step")
+    metadata = _task_scope(function, "local_route_map_init")
+    metadata_source = _segment(source, metadata)
     pack = _task_scope(function, "local_route_pack")
     pack_source = _segment(source, pack)
 
+    assert "route_owner = eid // n_local_experts" in metadata_source
+    assert "if route_owner == my_rank:" in metadata_source
+    assert (
+        "route_local_e = eid - my_rank * n_local_experts"
+        in metadata_source
+    )
+    assert "if route_local_e >= 0:" not in metadata_source
+    assert "if route_local_e < n_local_experts:" not in metadata_source
+    assert "packed_count_i32 = cursor[route_local_e]" in metadata_source
+    route_row_assignments = [
+        node
+        for node in ast.walk(metadata)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and ast.unparse(node.targets[0]) == "route_out_row_i32"
+    ]
+    assert len(route_row_assignments) == 1
+    assert (
+        ast.unparse(route_row_assignments[0].value)
+        == "route_local_e * expert_recv_max + packed_count_i32"
+    )
+    route_map_writes = [
+        call
+        for call in ast.walk(metadata)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pl.tile.write"
+        and [ast.unparse(argument) for argument in call.args]
+        == [
+            "route_map",
+            "[0, route]",
+            "pl.cast(route_out_row_i32, pl.INT32)",
+        ]
+    ]
+    assert len(route_map_writes) == 1
     assert "local_e_idx = pl.tile.get_block_idx()" in pack_source
     assert (
-        "global_e = my_rank * n_local_experts + local_e_i32"
+        "global_e = my_rank * n_local_experts + pack_local_e_i32"
         in pack_source
     )
     assert "if eid == global_e:" in pack_source
+    assert "pack_out_row_i32 = pl.read(" in pack_source
+    assert "local_route_row_out, [0, route]," in pack_source
     assert (
-        "out_row = local_e_idx * expert_recv_max + packed_count"
+        "pack_slab_begin_i32 = pl.cast(pack_slab_begin, pl.INT32)"
         in pack_source
     )
-    assert "local_route_row_out," in pack_source
-    assert "[0, route]" in pack_source
-    count_writes = [
+    assert (
+        "pack_slab_end_i32 = pack_slab_begin_i32 + expert_recv_max"
+        in pack_source
+    )
+    assert "if pack_out_row_i32 >= pack_slab_begin_i32:" in pack_source
+    assert "if pack_out_row_i32 < pack_slab_end_i32:" in pack_source
+    assert (
+        "pack_out_row_i32, pl.INDEX,"
+        in pack_source
+    )
+    assert "packed_count =" not in pack_source
+    count_stores = [
         call
+        for call in ast.walk(metadata)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pl.store"
+        and [ast.unparse(argument) for argument in call.args]
+        == ["expert_count_tile", "[0, 0]", "local_expert_count_view"]
+    ]
+    assert len(count_stores) == 1
+    payload_stores = {
+        ast.unparse(call.args[2]): [
+            ast.unparse(call.args[0]),
+            ast.unparse(call.args[1]),
+        ]
         for call in ast.walk(pack)
         if isinstance(call, ast.Call)
-        and _call_path(call) == "pl.write"
-        and len(call.args) >= 2
-        and ast.unparse(call.args[0]) == "local_expert_count"
-        and ast.unparse(call.args[1]) == "[local_e_idx]"
+        and _call_path(call) == "pl.store"
+        and len(call.args) == 3
+    }
+    assert payload_stores["local_routed_x_scale_out"] == [
+        "scale_slab",
+        "[0, pack_slab_begin]",
     ]
-    assert len(count_writes) == 1
+    assert payload_stores["local_routed_weight_out_view"] == [
+        "weight_slab",
+        "[0, pack_slab_begin]",
+    ]
+    for tensor_name in (
+        "local_route_row_out",
+        "local_expert_count",
+    ):
+        assert all(
+            not isinstance(call, ast.Call)
+            or _call_path(call) not in {"pl.write", "pl.store"}
+            or not call.args
+            or ast.unparse(
+                call.args[0]
+                if _call_path(call) == "pl.write"
+                else call.args[2]
+            )
+            != tensor_name
+            for call in ast.walk(pack)
+        ), tensor_name
 
     n_ranks = 8
     n_local = 36
@@ -529,19 +804,28 @@ def test_c3_local_route_plan_tracks_active_local_experts() -> None:
     plan = _task_scope(dispatch_function, "local_route_plan")
     plan_source = _segment(source, plan)
 
-    assert "local_route_plan_size = n_local_experts + 2" in source
+    assert "local_route_plan_valid_size = n_local_experts + 2" in source
+    assert "local_route_plan_size = n_local_experts_pad" in source
+    assert (
+        "assert local_route_plan_valid_size <= local_route_plan_size"
+        in source
+    )
     assert "if expert_count_i32 > 0:" in plan_source
     assert "pl.cast(active_expert_count_i32, pl.INDEX)" in plan_source
     assert "+ pl.cast(2, pl.INDEX)" in plan_source
     assert "pl.cast(e, pl.INT32)" in plan_source
-    assert "pl.write(local_route_count, [0], total_count)" in plan_source
+    assert "pl.tile.write(route_plan_tile, [0, 0], total_count)" in plan_source
     assert (
-        "pl.write(local_route_count, [1], active_expert_count_i32)"
+        "route_plan_tile, [0, 1], active_expert_count_i32,"
+        in plan_source
+    )
+    assert (
+        "route_plan_tile, [0, 0], local_route_count_view,"
         in plan_source
     )
 
     counts = [0, 2, 0, 1, 7, 0, 0, 3] + [0] * 28
-    plan = [0] * (len(counts) + 2)
+    plan = [0] * 40
     active = []
     for expert, count in enumerate(counts):
         plan[0] += count
@@ -552,6 +836,112 @@ def test_c3_local_route_plan_tracks_active_local_experts() -> None:
     assert plan[0] == sum(counts)
     assert plan[2 : 2 + plan[1]] == [1, 3, 4, 7]
     assert all(counts[expert] > 0 for expert in plan[2 : 2 + plan[1]])
+    assert plan[38:] == [0, 0]
+
+
+def test_c3_route_metadata_uses_one_physical_40_entry_abi() -> None:
+    source, tree = _parse(_CANONICAL)
+    dispatch = _method(tree, "dispatch_step")
+    dispatch_source = _segment(source, dispatch)
+
+    count_annotations: list[tuple[str, str]] = []
+    for function in (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    ):
+        for argument in function.args.args:
+            if argument.arg != "local_expert_count":
+                continue
+            assert argument.annotation is not None
+            count_annotations.append(
+                (function.name, ast.unparse(argument.annotation))
+            )
+    assert count_annotations
+    assert all(
+        "n_local_experts_pad" in annotation
+        for _, annotation in count_annotations
+    ), count_annotations
+
+    count_creations: list[tuple[str, ast.Call]] = []
+    for assignment in (
+        node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+    ):
+        if (
+            len(assignment.targets) != 1
+            or not isinstance(assignment.targets[0], ast.Name)
+            or "local_expert_count" not in assignment.targets[0].id
+            or not isinstance(assignment.value, ast.Call)
+            or _call_path(assignment.value) != "pl.create_tensor"
+        ):
+            continue
+        count_creations.append((assignment.targets[0].id, assignment.value))
+    assert count_creations
+    assert all(
+        ast.unparse(call.args[0]) == "[n_local_experts_pad]"
+        for _, call in count_creations
+    ), [
+        (name, ast.unparse(call.args[0]))
+        for name, call in count_creations
+    ]
+
+    assert (
+        "expert_count_tile = pl.tile.full(\n"
+        "                [1, n_local_experts_pad], dtype=pl.INT32, value=0,"
+        in dispatch_source
+    )
+    assert (
+        "route_plan_tile = pl.tile.full(\n"
+        "                [1, local_route_plan_size], dtype=pl.INT32, value=0,"
+        in dispatch_source
+    )
+    assert (
+        "local_expert_count_view = pl.reshape(\n"
+        "            local_expert_count, [1, n_local_experts_pad],"
+        in dispatch_source
+    )
+    assert (
+        "local_route_count_view = pl.reshape(\n"
+        "            local_route_count, [1, local_route_plan_size],"
+        in dispatch_source
+    )
+    assert "pl.read(local_expert_count_view, [0, e])" in dispatch_source
+    assert (
+        "local_routed_weight_out = pl.reshape(\n"
+        "            local_routed_weight_out_view, [local_recv_max],"
+        in dispatch_source
+    )
+    assert (
+        "local_route_count = pl.reshape(\n"
+        "            local_route_count_view, [local_route_plan_size],"
+        in dispatch_source
+    )
+    assert "cursor = pl.array.create(n_local_experts, pl.INT32)" in (
+        dispatch_source
+    )
+    assert "with pl.spmd(\n            n_local_experts," in dispatch_source
+    assert dispatch_source.count("for e in pl.range(n_local_experts):") == 3
+    assert "pl.set_validshape" not in dispatch_source
+
+    scalar_targets = {
+        "local_expert_count",
+        "local_expert_count_view",
+        "local_route_count",
+        "local_route_count_view",
+        "local_route_row_out",
+        "local_routed_x_scale_out",
+        "local_routed_weight_out",
+        "local_routed_weight_out_view",
+    }
+    scalar_writes = [
+        call
+        for call in ast.walk(dispatch)
+        if isinstance(call, ast.Call)
+        and _call_path(call) == "pl.write"
+        and call.args
+        and ast.unparse(call.args[0]) in scalar_targets
+    ]
+    assert not scalar_writes
 
 
 def test_c3_zero_route_rank_keeps_local_combine_and_final_collective_paths() -> None:
@@ -1134,9 +1524,10 @@ def test_c3_expert_storage_keeps_fixed_local_lane_bases() -> None:
     assert "expert_recv_max = BATCH * TOPK" in source
     assert "assert expert_recv_max == 128" in source
     assert "local_recv_max = n_local_experts * expert_recv_max" in source
-    assert "pl.cast(local_e_idx * expert_recv_max, pl.INT32)" in dispatch
+    assert "route_local_e * expert_recv_max" in dispatch
     assert "total = total + count" not in dispatch
-    assert "out_row = local_e_idx * expert_recv_max + packed_count" in dispatch
+    assert "pack_out_row_i32 = pl.read(" in dispatch
+    assert "local_route_row_out, [0, route]," in dispatch
     for body in (expert, expert_swiglu7):
         assert "local_expert_count" in body
         assert "local_route_count" in body
@@ -1351,7 +1742,7 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
         }
         assert down_keywords == {
             "core_num": "routed_workers",
-            "deps": "[routed_fused_tid]",
+            "deps": "[local_route_count_tid, routed_fused_tid]",
             "predicate": "local_route_count[0] > 0",
             "allow_early_resolve": "True",
         }
@@ -1364,7 +1755,7 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     assert "num_tokens" in [arg.arg for arg in wrapper.args.args]
     wrapper_calls = _method_calls(wrapper, "_expert_routed")
     assert len(wrapper_calls) == 1
-    assert ast.unparse(wrapper_calls[0].args[7]) == "num_tokens"
+    assert ast.unparse(wrapper_calls[0].args[6]) == "num_tokens"
 
     orchestration_calls = [
         node
@@ -1375,7 +1766,7 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     ]
     assert len(orchestration_calls) == 2
     assert all(
-        ast.unparse(call.args[7]) == "num_tokens"
+        ast.unparse(call.args[6]) == "num_tokens"
         for call in orchestration_calls
     )
 
@@ -1458,6 +1849,97 @@ def test_routed_gmm1_zero_fills_empty_aiv_row_parts() -> None:
         assert "pto::Shape<1, 1, 1, 8, 256>" in empty_part
         assert "TSTORE(empty_part_out, empty_part_bf16);" in empty_part
         assert "set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);" in empty_part
+
+
+def test_routed_gmm1_publishes_h_bf16_before_cross_core_quant() -> None:
+    begin = "// PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish begin"
+    end = "// PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish end"
+    publish_acquire = (
+        "pipe_barrier(PIPE_ALL);",
+        "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
+        "dsb(DSB_DDR);",
+        "SYNCALL<SyncCoreType::Mix>();",
+        "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
+        "dsb(DSB_DDR);",
+    )
+
+    for path in _ROUTED_GMM1_SOURCES:
+        external_source = path.read_text(encoding="utf-8")
+        assert external_source.count(begin) == 2
+        assert external_source.count(end) == 2
+        cursor = 0
+        for _ in range(2):
+            start = external_source.index(begin, cursor)
+            stop = external_source.index(end, start)
+            authority = external_source[start:stop]
+            op_cursor = 0
+            for op in publish_acquire:
+                op_cursor = authority.index(op, op_cursor) + len(op)
+            cursor = stop + len(end)
+
+        producer_start = external_source.index(begin)
+        producer_prefix = external_source[
+            external_source.rfind(
+                "set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);",
+                0,
+                producer_start,
+            ) : producer_start
+        ]
+        assert (
+            "wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);"
+            in producer_prefix
+        )
+        assert "wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);" in producer_prefix
+
+
+def test_routed_gmm1_publishes_gate_up_before_aiv_consumers() -> None:
+    publish_begin = (
+        "// PYPTO-LIB-AUTHORITY: cross-core-gate-up-publish begin"
+    )
+    publish_end = (
+        "// PYPTO-LIB-AUTHORITY: cross-core-gate-up-publish end"
+    )
+    acquire_begin = (
+        "// PYPTO-LIB-AUTHORITY: cross-core-gate-up-acquire begin"
+    )
+    acquire_end = (
+        "// PYPTO-LIB-AUTHORITY: cross-core-gate-up-acquire end"
+    )
+
+    for path in _ROUTED_GMM1_SOURCES:
+        external_source = path.read_text(encoding="utf-8")
+        assert external_source.count(publish_begin) == 1
+        assert external_source.count(publish_end) == 1
+        assert external_source.count(acquire_begin) == 2
+        assert external_source.count(acquire_end) == 2
+
+        publish = external_source[
+            external_source.index(publish_begin) :
+            external_source.index(publish_end)
+        ]
+        publish_ops = (
+            "pipe_barrier(PIPE_ALL);",
+            "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
+            "dsb(DSB_DDR);",
+        )
+        op_cursor = 0
+        for op in publish_ops:
+            op_cursor = publish.index(op, op_cursor) + len(op)
+
+        cursor = 0
+        for _ in range(2):
+            start = external_source.index(acquire_begin, cursor)
+            stop = external_source.index(acquire_end, start)
+            acquire = external_source[start:stop]
+            acquire_ops = (
+                "SYNCALL<SyncCoreType::Mix>();",
+                "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
+                "dsb(DSB_DDR);",
+            )
+            op_cursor = 0
+            for op in acquire_ops:
+                op_cursor = acquire.index(op, op_cursor) + len(op)
+            cursor = stop + len(acquire_end)
 
 
 def test_regular_routed_quant_math_is_chunk_invariant() -> None:

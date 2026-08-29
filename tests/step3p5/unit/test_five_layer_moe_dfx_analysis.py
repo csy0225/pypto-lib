@@ -24,6 +24,7 @@ from tools.step3p5.analyze_five_layer_moe_dfx import (
     _diagnostic_stage_resources,
     _duration_distribution,
     _execution_limit_classification,
+    _expert_gate_markdown_lines,
     _expert_kernel_release_contract,
     _external_correctness_contract,
     _find_layer_task_ids,
@@ -595,11 +596,17 @@ def _packed_nz_stage(aic: int, aiv: int) -> dict:
     }
 
 
-def _valid_packed_nz_rank() -> dict:
+def _valid_packed_nz_rank(
+    *,
+    gate_up_aic: int = 24,
+    gate_up_aiv: int = 48,
+) -> dict:
     return {
         "layers": {
             layer: {
-                "expert_gate_up": _packed_nz_stage(24, 48),
+                "expert_gate_up": _packed_nz_stage(
+                    gate_up_aic, gate_up_aiv
+                ),
                 "expert_down": _packed_nz_stage(23, 46),
             }
             for layer in ("L3", "L4")
@@ -1554,15 +1561,15 @@ def test_source_identity_contract_matches_only_the_selected_policy() -> None:
     assert packed["policy_id"].startswith("release-packed-nz-")
 
     local_ep_sha256 = (
-        "91d677a874a5a9a4ac394e8a0e1d5e44"
-        "fe7eccd87fa83dc3715a7ae20d392e41"
+        "cdb2bb26ddc0ca773bcddd0629bfc7bd"
+        "fa5c426a334e26dde4364aacd867f348"
     )
     local_ep = _source_identity_contract("local-ep", local_ep_sha256)
     assert local_ep["available"]
     assert local_ep["pass"]
     assert (
         local_ep["policy_id"]
-        == "release-local-ep-91d677a8-full-input-dag-v6"
+        == "release-local-ep-cdb2bb26-resident-dual-latch-22-v2"
     )
 
     local_ep_mismatch = _source_identity_contract(
@@ -1721,8 +1728,8 @@ def test_route_histogram_accepts_exact_local_ep_source_policy(
 ) -> None:
     payload = _local_owner_payload()
     local_ep_sha256 = (
-        "91d677a874a5a9a4ac394e8a0e1d5e44"
-        "fe7eccd87fa83dc3715a7ae20d392e41"
+        "cdb2bb26ddc0ca773bcddd0629bfc7bd"
+        "fa5c426a334e26dde4364aacd867f348"
     )
     payload["provenance"]["source"]["decode_fwd_sha256"] = (
         local_ep_sha256
@@ -2155,6 +2162,9 @@ def test_packed_nz_release_enforces_mixed_resource_grids() -> None:
         "expert_gate_up": {"aic": 24, "aiv": 48},
         "expert_down": {"aic": 23, "aiv": 46},
     }
+    packed_markdown = "\n".join(_expert_gate_markdown_lines(passing))
+    assert "fused 24 AIC/48 AIV" in packed_markdown
+    assert "BS1 down 23 AIC/46 AIV" in packed_markdown
     assert not passing["coverage"]["L3"]["rank1/d0"][
         "execution_nonempty"
     ]
@@ -2169,6 +2179,37 @@ def test_packed_nz_release_enforces_mixed_resource_grids() -> None:
     assert not blocked["pass"]
     assert not blocked["mixed_resource_grid_pass"]
     assert blocked["mixed_resource_errors"][0]["stage"] == "expert_down"
+    assert "aiv_observed_slices" in blocked["mixed_resource_errors"][0][
+        "failed_checks"
+    ]
+
+
+def test_local_ep_soft_mix_release_uses_resident_resource_grid() -> None:
+    ranks = {
+        "rank0/d0": _valid_packed_nz_rank(
+            gate_up_aic=22,
+            gate_up_aiv=44,
+        ),
+    }
+    passing = _expert_kernel_release_contract(ranks, profile="local-ep")
+    assert passing["pass"]
+    assert passing["mixed_resource_grid_pass"]
+    assert passing["mixed_resource_targets"] == {
+        "expert_gate_up": {"aic": 22, "aiv": 44},
+        "expert_down": {"aic": 23, "aiv": 46},
+    }
+    assert "fused task at 22 AIC/44 AIV" in passing["interpretation"]
+    assert "mixed down task at 23 AIC/46 AIV" in passing["interpretation"]
+    local_ep_markdown = "\n".join(_expert_gate_markdown_lines(passing))
+    assert "fused 22 AIC/44 AIV" in local_ep_markdown
+    assert "BS1 down 23 AIC/46 AIV" in local_ep_markdown
+    assert "24 AIC/48 AIV" not in local_ep_markdown
+
+    ranks["rank0/d0"]["layers"]["L3"]["expert_gate_up"][
+        "resources"
+    ]["aiv"]["observed_slices"] = 43
+    blocked = _expert_kernel_release_contract(ranks, profile="local-ep")
+    assert not blocked["pass"]
     assert "aiv_observed_slices" in blocked["mixed_resource_errors"][0][
         "failed_checks"
     ]

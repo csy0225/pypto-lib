@@ -212,9 +212,9 @@ SHARED_DOWN_WORKERS = 2
 # is grid-strided inside the kernel so AICPU no longer submits per expert.
 ROUTED_GRID_WORKERS = 23
 ROUTED_MULTIBATCH_GRID_WORKERS = 22
-# The mixed AIC/AIV GMM1 task uses a whole-die barrier; all 24 AICs must
-# participate. Logical work remains grid-strided and inactive workers no-op.
-ROUTED_FUSED_GRID_WORKERS = 24
+# Keep all mixed AIC/AIV GMM1 groups resident beside two shared-down groups.
+# Logical work remains grid-strided across the 22 resident groups.
+ROUTED_FUSED_GRID_WORKERS = 22
 ROUTED_FUSED_AIV_WORKERS = ROUTED_FUSED_GRID_WORKERS
 
 # MoE-local helper constants are module-level for parse-time closure capture.
@@ -235,12 +235,30 @@ sh_inter_local = INTER_S_LOCAL
 local_recv_max = n_local_experts * expert_recv_max
 stage_rows = 8
 n_routes_per_rank = BATCH * TOPK
-# Count and plan metadata use one 32-byte-aligned physical ABI.  Counts occupy
-# [0, 36), while the route plan occupies total/active plus at most 36 expert
-# IDs in [0, 38).  Their padded tails are explicitly zero-published.
+# Counts occupy [0, 36), while the route plan occupies total/active plus at
+# most 36 expert IDs in [0, 38). Two Soft producer counters start at index 64
+# with a 16-int32 stride; their cache lines are disjoint and stay within
+# [49, 96) for every 4-byte-aligned base. The complete plan and workspace are
+# zero-published before GMM starts.
 local_route_plan_valid_size = n_local_experts + 2
-local_route_plan_size = n_local_experts_pad
-assert local_route_plan_valid_size <= local_route_plan_size
+local_route_soft_sync_offset = 64
+local_route_soft_sync_cache_line_slots = 16
+local_route_soft_sync_counter_count = 2
+local_route_soft_sync_slots = (
+    local_route_soft_sync_cache_line_slots
+    * local_route_soft_sync_counter_count
+)
+local_route_plan_size = (
+    local_route_soft_sync_offset + local_route_soft_sync_slots
+)
+assert (
+    local_route_soft_sync_offset
+    - (local_route_soft_sync_cache_line_slots - 1)
+    >= local_route_plan_valid_size
+)
+assert local_route_plan_size >= (
+    local_route_soft_sync_offset + local_route_soft_sync_slots
+)
 sh_tp_chunk = HIDDEN // tp_size
 # G1 runtime ABI: one active-token count per owner rank.  This is an ordinary
 # host tensor, not a notify/wait signal window.  Its 128-element storage comes
@@ -303,7 +321,9 @@ class WholeDecodeStep3p5:
     )
     def routed_nz_gmm1_swiglu_quant_aic(
         self,
-        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count: pl.InOut[
+            pl.Tensor[[local_route_plan_size], pl.INT32]
+        ],
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
@@ -325,6 +345,7 @@ class WholeDecodeStep3p5:
         h_i8: pl.Out[pl.Tensor[[local_recv_max, inter], pl.INT8]],
         h_scale_dq: pl.Out[pl.Tensor[[1, local_recv_max], pl.FP32]],
     ) -> tuple[
+        pl.Tensor[[local_route_plan_size], pl.INT32],
         pl.Tensor[[local_recv_max, 2 * inter], pl.INT32],
         pl.Tensor[[local_recv_max, inter], pl.BF16],
         pl.Tensor[[local_recv_max, inter], pl.INT8],
@@ -340,7 +361,9 @@ class WholeDecodeStep3p5:
     )
     def routed_nz_gmm1_swiglu_quant_aiv(
         self,
-        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count: pl.InOut[
+            pl.Tensor[[local_route_plan_size], pl.INT32]
+        ],
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
@@ -362,6 +385,7 @@ class WholeDecodeStep3p5:
         h_i8: pl.Out[pl.Tensor[[local_recv_max, inter], pl.INT8]],
         h_scale_dq: pl.Out[pl.Tensor[[1, local_recv_max], pl.FP32]],
     ) -> tuple[
+        pl.Tensor[[local_route_plan_size], pl.INT32],
         pl.Tensor[[local_recv_max, 2 * inter], pl.INT32],
         pl.Tensor[[local_recv_max, inter], pl.BF16],
         pl.Tensor[[local_recv_max, inter], pl.INT8],
@@ -371,7 +395,9 @@ class WholeDecodeStep3p5:
     @pl.function(type=pl.FunctionType.Group)
     def routed_nz_gmm1_swiglu_quant(
         self,
-        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count: pl.InOut[
+            pl.Tensor[[local_route_plan_size], pl.INT32]
+        ],
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
@@ -393,6 +419,7 @@ class WholeDecodeStep3p5:
         h_i8: pl.Out[pl.Tensor[[local_recv_max, inter], pl.INT8]],
         h_scale_dq: pl.Out[pl.Tensor[[1, local_recv_max], pl.FP32]],
     ) -> tuple[
+        pl.Tensor[[local_route_plan_size], pl.INT32],
         pl.Tensor[[local_recv_max, 2 * inter], pl.INT32],
         pl.Tensor[[local_recv_max, inter], pl.BF16],
         pl.Tensor[[local_recv_max, inter], pl.INT8],
@@ -433,7 +460,9 @@ class WholeDecodeStep3p5:
     )
     def routed_nz_gmm1_swiglu7_quant_aiv(
         self,
-        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count: pl.InOut[
+            pl.Tensor[[local_route_plan_size], pl.INT32]
+        ],
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
@@ -455,6 +484,7 @@ class WholeDecodeStep3p5:
         h_i8: pl.Out[pl.Tensor[[local_recv_max, inter], pl.INT8]],
         h_scale_dq: pl.Out[pl.Tensor[[1, local_recv_max], pl.FP32]],
     ) -> tuple[
+        pl.Tensor[[local_route_plan_size], pl.INT32],
         pl.Tensor[[local_recv_max, 2 * inter], pl.INT32],
         pl.Tensor[[local_recv_max, inter], pl.BF16],
         pl.Tensor[[local_recv_max, inter], pl.INT8],
@@ -464,7 +494,9 @@ class WholeDecodeStep3p5:
     @pl.function(type=pl.FunctionType.Group)
     def routed_nz_gmm1_swiglu7_quant(
         self,
-        local_route_count: pl.Tensor[[local_route_plan_size], pl.INT32],
+        local_route_count: pl.InOut[
+            pl.Tensor[[local_route_plan_size], pl.INT32]
+        ],
         gate_up_i32: pl.InOut[
             pl.Tensor[[local_recv_max, 2 * inter], pl.INT32]
         ],
@@ -486,6 +518,7 @@ class WholeDecodeStep3p5:
         h_i8: pl.Out[pl.Tensor[[local_recv_max, inter], pl.INT8]],
         h_scale_dq: pl.Out[pl.Tensor[[1, local_recv_max], pl.FP32]],
     ) -> tuple[
+        pl.Tensor[[local_route_plan_size], pl.INT32],
         pl.Tensor[[local_recv_max, 2 * inter], pl.INT32],
         pl.Tensor[[local_recv_max, inter], pl.BF16],
         pl.Tensor[[local_recv_max, inter], pl.INT8],
@@ -2013,6 +2046,7 @@ class WholeDecodeStep3p5:
         )
         (
             (
+                local_route_count,
                 gate_up_i32,
                 h_bf16,
                 h_i8,
@@ -2035,7 +2069,6 @@ class WholeDecodeStep3p5:
             deps=[local_route_count_tid],
             predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
-            sync_start=True,
         )
 
         active_tokens = pl.cast(num_tokens, pl.INDEX)
@@ -2856,6 +2889,7 @@ class WholeDecodeStep3p5:
         )
         (
             (
+                local_route_count,
                 gate_up_i32,
                 h_bf16,
                 h_i8,
@@ -2878,7 +2912,6 @@ class WholeDecodeStep3p5:
             deps=[local_route_count_tid],
             predicate=(local_route_count[0] > 0),
             allow_early_resolve=True,
-            sync_start=True,
         )
 
         active_tokens = pl.cast(num_tokens, pl.INDEX)

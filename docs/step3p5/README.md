@@ -181,16 +181,25 @@ critical-path rationale is recorded in
 The active per-rank MoE chain is:
 
 Gate routes are published as complete `[16, 8]` INT32/FP32 tiles. Local expert
-counts and the compact route plan use a 40-entry physical INT32 ABI so every
-TSTORE row is 32-byte aligned; only count entries `0:36` and plan entries
-`0:38` are semantic, and the producer zeroes the remaining tail.
+counts use a 40-entry physical INT32 ABI, while the route plan uses 96 entries.
+Only count entries `0:36` and plan entries `0:38` are semantic. Plan entries
+`64` and `80` are the gate/up-ready and hidden-ready counters; the other slots
+in `38:96` are zero padding that keeps metadata and both counter cache lines
+disjoint for every 4-byte-aligned base. The producer zeroes both complete
+tensors.
+
+For `A = min(active_local_experts, 36)`, the gate producer count is
+`G = min(22, 10A)`, the activation producer count is `H = min(22, 5A)`, and
+the quant consumer count is `Q = min(22, A)`. Only AIC blocks `b < G` publish
+gate/up completion; only lane-0 AIV blocks `b < H` await gate/up and publish
+hidden completion; only lane-0 AIV blocks `b < Q` await hidden completion.
 
 | Swimlane task | Runtime shape | Function |
 |---|---:|---|
 | `local_route_map_init` | one CORE_GROUP task | Build route sentinels, owner-local fixed-slab row mappings, and counts with a single GM metadata writer. |
 | `local_route_pack` | owner-local expert grid | Copy payload, scale, and route weight into disjoint fixed expert slabs. |
 | `local_route_plan` | one CORE_GROUP task | Build the compact active-expert plan after all local payload writers complete. |
-| `routed_nz_gmm1_swiglu_quant` | fixed mixed grid | Compute gate/up, activation, and requantization for the active local experts and rows. |
+| `routed_nz_gmm1_swiglu_quant` | 22 AIC / 44 AIV resident mixed grid | Compute gate/up, activation, and requantization; only workers with active expert work participate in the two producer latches. |
 | `routed_nz_down` | 23 workers at BS1, 22 otherwise | Compute the owner-local weighted routed partial. |
 | `local_combine_reduce` | fixed storage grid of 16 | Add the TP-sharded shared partial and this rank's routed rows in FP32. |
 | `tp_all_reduce` | one TP collective | Sum every rank's shared and routed partial into the complete MoE output. |

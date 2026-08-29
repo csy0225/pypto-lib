@@ -880,7 +880,11 @@ def test_physical_metadata_padding_preserves_36_expert_semantics() -> None:
     assert "n_local_experts = N_LOCAL_EXPERTS" in source
     assert "n_local_experts_pad = ((n_local_experts + 7) // 8) * 8" in source
     assert "local_route_plan_valid_size = n_local_experts + 2" in source
-    assert "local_route_plan_size = n_local_experts_pad" in source
+    assert "local_route_soft_sync_offset = 64" in source
+    assert "local_route_soft_sync_cache_line_slots = 16" in source
+    assert "local_route_soft_sync_counter_count = 2" in source
+    assert "local_route_soft_sync_slots = (" in source
+    assert "local_route_plan_size = (" in source
     assert "[1, n_local_experts_pad], dtype=pl.INT32, value=0" in body
     assert "[1, local_route_plan_size], dtype=pl.INT32, value=0" in body
     assert (

@@ -80,6 +80,20 @@ def _segment(source: str, node: ast.AST) -> str:
     return result
 
 
+def _braced_body(source: str, header: str) -> str:
+    header_start = source.index(header)
+    brace_start = source.index("{", header_start + len(header))
+    depth = 0
+    for index in range(brace_start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace_start + 1 : index]
+    raise AssertionError(f"unterminated C++ block for {header!r}")
+
+
 def _method_calls(tree: ast.AST, name: str) -> list[ast.Call]:
     return [
         node
@@ -286,6 +300,64 @@ def test_routed_group_members_keep_exact_python_abi_and_call_order() -> None:
                 for argument in calls[0].args
             ] == expected_call_args, (group_name, member_name)
             assert not calls[0].keywords, (group_name, member_name)
+
+
+def test_routed_gmm1_soft_sync_workspace_is_explicit_inout() -> None:
+    _, tree = _parse(_CANONICAL)
+    function_names = (
+        "routed_nz_gmm1_swiglu_quant_aic",
+        "routed_nz_gmm1_swiglu_quant_aiv",
+        "routed_nz_gmm1_swiglu_quant",
+        "routed_nz_gmm1_swiglu7_quant_aiv",
+        "routed_nz_gmm1_swiglu7_quant",
+    )
+    expected_annotation = (
+        "pl.InOut[pl.Tensor[[local_route_plan_size], pl.INT32]]"
+    )
+    expected_return = "pl.Tensor[[local_route_plan_size], pl.INT32]"
+
+    for function_name in function_names:
+        function = _method(tree, function_name)
+        route_count = next(
+            arg for arg in function.args.args
+            if arg.arg == "local_route_count"
+        )
+        assert route_count.annotation is not None
+        assert ast.unparse(route_count.annotation) == expected_annotation
+        assert isinstance(function.returns, ast.Subscript)
+        assert isinstance(function.returns.slice, ast.Tuple)
+        return_items = function.returns.slice.elts
+        assert len(return_items) == 5
+        assert ast.unparse(return_items[0]) == expected_return
+
+    for function_name, fused_callee in (
+        ("_expert_routed", "self.routed_nz_gmm1_swiglu_quant"),
+        (
+            "_expert_routed_swiglu7",
+            "self.routed_nz_gmm1_swiglu7_quant",
+        ),
+    ):
+        function = _method(tree, function_name)
+        submits = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and _call_path(node.value) == "pl.spmd_submit"
+            and ast.unparse(node.value.args[0]) == fused_callee
+        ]
+        assert len(submits) == 1
+        target = submits[0].targets[0]
+        assert isinstance(target, ast.Tuple)
+        outputs = target.elts[0]
+        assert isinstance(outputs, ast.Tuple)
+        assert [ast.unparse(item) for item in outputs.elts] == [
+            "local_route_count",
+            "gate_up_i32",
+            "h_bf16",
+            "h_i8",
+            "h_scale_dq_all",
+        ]
 
 
 def test_b3_canonical_kv_is_resident_inout_and_holder_never_copies_pool() -> None:
@@ -805,11 +877,13 @@ def test_c3_local_route_plan_tracks_active_local_experts() -> None:
     plan_source = _segment(source, plan)
 
     assert "local_route_plan_valid_size = n_local_experts + 2" in source
-    assert "local_route_plan_size = n_local_experts_pad" in source
-    assert (
-        "assert local_route_plan_valid_size <= local_route_plan_size"
-        in source
-    )
+    assert "local_route_soft_sync_offset = 64" in source
+    assert "local_route_soft_sync_cache_line_slots = 16" in source
+    assert "local_route_soft_sync_counter_count = 2" in source
+    assert "local_route_soft_sync_slots = (" in source
+    assert "local_route_soft_sync_offset + local_route_soft_sync_slots" in source
+    assert "local_route_soft_sync_offset" in source
+    assert "local_route_soft_sync_cache_line_slots - 1" in source
     assert "if expert_count_i32 > 0:" in plan_source
     assert "pl.cast(active_expert_count_i32, pl.INDEX)" in plan_source
     assert "+ pl.cast(2, pl.INDEX)" in plan_source
@@ -825,7 +899,7 @@ def test_c3_local_route_plan_tracks_active_local_experts() -> None:
     )
 
     counts = [0, 2, 0, 1, 7, 0, 0, 3] + [0] * 28
-    plan = [0] * 40
+    plan = [0] * 96
     active = []
     for expert, count in enumerate(counts):
         plan[0] += count
@@ -836,10 +910,29 @@ def test_c3_local_route_plan_tracks_active_local_experts() -> None:
     assert plan[0] == sum(counts)
     assert plan[2 : 2 + plan[1]] == [1, 3, 4, 7]
     assert all(counts[expert] > 0 for expert in plan[2 : 2 + plan[1]])
-    assert plan[38:] == [0, 0]
+    assert plan[38:64] == [0] * 26
+    assert plan[64:] == [0] * 32
 
 
-def test_c3_route_metadata_uses_one_physical_40_entry_abi() -> None:
+def test_c3_soft_latch_cache_lines_are_disjoint_from_route_plan() -> None:
+    valid_size = 38
+    counter_offsets = (64, 80)
+    cache_line_slots = 16
+    plan_size = 96
+
+    for base_mod64 in range(0, 64, 4):
+        cache_lines = []
+        for counter_offset in counter_offsets:
+            counter_mod64 = (base_mod64 + counter_offset * 4) % 64
+            line_start = counter_offset - counter_mod64 // 4
+            line_stop = line_start + cache_line_slots
+            assert line_start >= valid_size
+            assert line_stop <= plan_size
+            cache_lines.append((line_start, line_stop))
+        assert cache_lines[0][1] <= cache_lines[1][0]
+
+
+def test_c3_route_metadata_uses_padded_plan_and_soft_sync_workspace() -> None:
     source, tree = _parse(_CANONICAL)
     dispatch = _method(tree, "dispatch_step")
     dispatch_source = _segment(source, dispatch)
@@ -1678,7 +1771,7 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
     expected_assignments = {
         "ROUTED_GRID_WORKERS": 23,
         "ROUTED_MULTIBATCH_GRID_WORKERS": 22,
-        "ROUTED_FUSED_GRID_WORKERS": 24,
+        "ROUTED_FUSED_GRID_WORKERS": 22,
     }
     assignments = {
         node.targets[0].id: ast.literal_eval(node.value)
@@ -1689,6 +1782,7 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
         and node.targets[0].id in expected_assignments
     }
     assert assignments == expected_assignments
+    assert "ROUTED_FUSED_AIV_WORKERS = ROUTED_FUSED_GRID_WORKERS" in source
     for function_name, fused_callee in (
         ("_expert_routed", "self.routed_nz_gmm1_swiglu_quant"),
         (
@@ -1732,7 +1826,6 @@ def test_regular_routed_expert_adapts_grid_to_shared_worker_budget() -> None:
             "deps": "[local_route_count_tid]",
             "predicate": "local_route_count[0] > 0",
             "allow_early_resolve": "True",
-            "sync_start": "True",
         }
         down = by_callee["self.routed_nz_down"]
         assert ast.unparse(down.args[-1]) == "routed_workers"
@@ -1854,28 +1947,43 @@ def test_routed_gmm1_zero_fills_empty_aiv_row_parts() -> None:
 def test_routed_gmm1_publishes_h_bf16_before_cross_core_quant() -> None:
     begin = "// PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish begin"
     end = "// PYPTO-LIB-AUTHORITY: cross-core-h-bf16-publish end"
-    publish_acquire = (
+    common_prefix = (
         "pipe_barrier(PIPE_ALL);",
         "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
         "dsb(DSB_DDR);",
-        "SYNCALL<SyncCoreType::Mix>();",
+    )
+    common_acquire = (
+        "RoutedSoftAwait(\n"
+        "          v1, kRoutedHiddenReadyOffset, "
+        "activationProducerCount);",
         "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
         "dsb(DSB_DDR);",
     )
 
     for path in _ROUTED_GMM1_SOURCES:
         external_source = path.read_text(encoding="utf-8")
-        assert external_source.count(begin) == 2
-        assert external_source.count(end) == 2
-        cursor = 0
-        for _ in range(2):
-            start = external_source.index(begin, cursor)
-            stop = external_source.index(end, start)
-            authority = external_source[start:stop]
-            op_cursor = 0
-            for op in publish_acquire:
-                op_cursor = authority.index(op, op_cursor) + len(op)
-            cursor = stop + len(end)
+        assert external_source.count(begin) == 1
+        assert external_source.count(end) == 1
+        start = external_source.index(begin)
+        stop = external_source.index(end, start)
+        authority = external_source[start:stop]
+        producer_guard = _braced_body(
+            authority, "if (v41 < activationProducerCount)"
+        )
+        consumer_guard = _braced_body(
+            authority, "if (v41 < quantConsumerCount)"
+        )
+        producer_ops = (*common_prefix, "RoutedSoftPublish(")
+        op_cursor = 0
+        for op in producer_ops:
+            op_cursor = producer_guard.index(op, op_cursor) + len(op)
+        op_cursor = 0
+        for op in common_acquire:
+            op_cursor = consumer_guard.index(op, op_cursor) + len(op)
+        assert authority.count(
+            "RoutedSoftPublish(v1, kRoutedHiddenReadyOffset);"
+        ) == 1
+        assert authority.count("RoutedSoftAwait(") == 1
 
         producer_start = external_source.index(begin)
         producer_prefix = external_source[
@@ -1910,36 +2018,207 @@ def test_routed_gmm1_publishes_gate_up_before_aiv_consumers() -> None:
         external_source = path.read_text(encoding="utf-8")
         assert external_source.count(publish_begin) == 1
         assert external_source.count(publish_end) == 1
-        assert external_source.count(acquire_begin) == 2
-        assert external_source.count(acquire_end) == 2
+        assert external_source.count(acquire_begin) == 1
+        assert external_source.count(acquire_end) == 1
 
         publish = external_source[
             external_source.index(publish_begin) :
             external_source.index(publish_end)
         ]
+        publish_guard = _braced_body(
+            publish, "if ((int64_t) v11 < gateProducerCount)"
+        )
         publish_ops = (
             "pipe_barrier(PIPE_ALL);",
             "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
             "dsb(DSB_DDR);",
+            "RoutedSoftPublish(v1, kRoutedGateUpReadyOffset);",
         )
         op_cursor = 0
         for op in publish_ops:
-            op_cursor = publish.index(op, op_cursor) + len(op)
+            op_cursor = publish_guard.index(op, op_cursor) + len(op)
+        assert publish.count(
+            "RoutedSoftPublish(v1, kRoutedGateUpReadyOffset);"
+        ) == 1
+        publish_start = external_source.index(publish_begin)
+        publish_prefix = external_source[
+            external_source.rfind(
+                "wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);",
+                0,
+                publish_start,
+            ) : publish_start
+        ]
+        drain_ops = (
+            "wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);",
+            "wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);",
+            "wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);",
+            "wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);",
+            "wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);",
+        )
+        op_cursor = 0
+        for op in drain_ops:
+            op_cursor = publish_prefix.index(op, op_cursor) + len(op)
 
-        cursor = 0
-        for _ in range(2):
-            start = external_source.index(acquire_begin, cursor)
-            stop = external_source.index(acquire_end, start)
-            acquire = external_source[start:stop]
-            acquire_ops = (
-                "SYNCALL<SyncCoreType::Mix>();",
-                "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
-                "dsb(DSB_DDR);",
-            )
-            op_cursor = 0
-            for op in acquire_ops:
-                op_cursor = acquire.index(op, op_cursor) + len(op)
-            cursor = stop + len(acquire_end)
+        start = external_source.index(acquire_begin)
+        stop = external_source.index(acquire_end, start)
+        acquire = external_source[start:stop]
+        acquire_guard = _braced_body(
+            acquire, "if (v41 < activationProducerCount)"
+        )
+        acquire_ops = (
+            "RoutedSoftAwait(v1, kRoutedGateUpReadyOffset, "
+            "gateProducerCount);",
+            "dcci(static_cast<__gm__ void *>(0), ENTIRE_DATA_CACHE);",
+            "dsb(DSB_DDR);",
+        )
+        op_cursor = 0
+        for op in acquire_ops:
+            op_cursor = acquire_guard.index(op, op_cursor) + len(op)
+        assert acquire.count("RoutedSoftAwait(") == 1
+
+
+def test_routed_gmm1_uses_asymmetric_soft_producer_latches() -> None:
+    soft_sync = "SYNCALL<SyncAllMode::Soft, SyncCoreType::Mix>("
+    hard_sync = "SYNCALL<SyncCoreType::Mix>();"
+
+    for path in _ROUTED_GMM1_SOURCES:
+        external_source = path.read_text(encoding="utf-8")
+        assert "kRoutedSoftWorkerCount = 22" in external_source
+        assert "kRoutedSoftProducerCount" not in external_source
+        assert "kRoutedGateUpReadyOffset = 64" in external_source
+        assert "kRoutedHiddenReadyOffset = 80" in external_source
+        assert external_source.count("const int64_t v18 = 22;") == 1
+        assert external_source.count("const int64_t v28 = 22;") == 1
+        assert external_source.count("const int64_t v19 = 10;") == 1
+        assert external_source.count("const int64_t v21 = 36;") == 1
+        assert external_source.count("const int64_t v26 = 2;") == 1
+        assert external_source.count("const int64_t v29 = 5;") == 1
+        assert external_source.count("const int64_t v31 = 36;") == 1
+        assert soft_sync not in external_source
+        assert hard_sync not in external_source
+        publish_start = external_source.index(
+            "static __aicore__ inline void RoutedSoftPublish("
+        )
+        publish_stop = external_source.index(
+            "\n}\n\nstatic __aicore__ inline void RoutedSoftAwait(",
+            publish_start,
+        )
+        publish_body = external_source[publish_start:publish_stop]
+        assert publish_body.count("SYNCALL_SOFT_ATOMIC_ADD(") == 1
+        assert "SYNCALL_SOFT_ATOMIC_LOAD(" not in publish_body
+        assert "SYNCALL_SOFT_POLL(" not in publish_body
+
+        await_start = external_source.index(
+            "static __aicore__ inline void RoutedSoftAwait("
+        )
+        await_stop = external_source.index(
+            "\n}\n\n\n// --- ptoas-generated code ---",
+            await_start,
+        )
+        await_body = external_source[await_start:await_stop]
+        assert "int64_t producerCount" in await_body
+        assert await_body.count("SYNCALL_SOFT_ATOMIC_LOAD(counter)") == 1
+        assert "< producerCount) {" in await_body
+        assert "SYNCALL_SOFT_BACKOFF_THRESHOLD" in await_body
+        assert "pipe_barrier(PIPE_ALL);" in await_body
+        assert "dsb(DSB_DDR);" in await_body
+        assert "SYNCALL_SOFT_POLL(" not in await_body
+        assert "SYNCALL_SOFT_MAX_POLL_ITERATIONS" not in await_body
+        assert "PTO_CPU_ASSERT" not in await_body
+        assert "break;" not in await_body
+
+        normalized = re.sub(r"\s+", " ", external_source)
+        assert (
+            "const int64_t activeExpertCount = v26 > v21 ? v21 : v26; "
+            "const int64_t gateWorkItems = activeExpertCount * v19; "
+            "const int64_t gateProducerCount = gateWorkItems < "
+            "kRoutedSoftWorkerCount ? gateWorkItems : "
+            "kRoutedSoftWorkerCount;"
+        ) in normalized
+        assert (
+            "const int64_t gateWorkItems = v44 * v29 * v26; "
+            "const int64_t activationWorkItems = v44 * v29; "
+            "const int64_t gateProducerCount = gateWorkItems < "
+            "kRoutedSoftWorkerCount ? gateWorkItems : "
+            "kRoutedSoftWorkerCount; "
+            "const int64_t activationProducerCount = activationWorkItems < "
+            "kRoutedSoftWorkerCount ? activationWorkItems : "
+            "kRoutedSoftWorkerCount; "
+            "const int64_t quantConsumerCount = v44 < "
+            "kRoutedSoftWorkerCount ? v44 : kRoutedSoftWorkerCount;"
+        ) in normalized
+        assert "int64_t v44 = v43 > v31 ? v31 : v43;" in normalized
+        assert external_source.count(
+            "for (int64_t i27 = (int64_t) v11; "
+            "i27 < gateWorkItems; i27 += v18) {"
+        ) == 1
+        assert external_source.count(
+            "for (int64_t i45 = v41; i45 < activationWorkItems; i45 += v28) {"
+        ) == 1
+        assert external_source.count(
+            "for (int64_t i119 = v41; i119 < v44; i119 += v28) {"
+        ) == 1
+        assert external_source.count(
+            "if (v41 < activationProducerCount) {"
+        ) == 2
+        assert external_source.count("if (v41 < quantConsumerCount) {") == 1
+        assert external_source.count(
+            "RoutedSoftPublish(v1, kRoutedGateUpReadyOffset);"
+        ) == 1
+        assert external_source.count(
+            "RoutedSoftPublish(v1, kRoutedHiddenReadyOffset);"
+        ) == 1
+        assert external_source.count(
+            "RoutedSoftAwait(v1, kRoutedGateUpReadyOffset, "
+            "gateProducerCount);"
+        ) == 1
+        assert external_source.count(
+            "v1, kRoutedHiddenReadyOffset, activationProducerCount);"
+        ) == 1
+
+        assert external_source.count("if ((int64_t) v13 == v40) {") == 1
+        assert "  } else {\n    // pto: %100" not in external_source
+        assert "// pto: %100" not in external_source
+
+
+def test_routed_gmm1_dynamic_latch_participants_match_work_loops() -> None:
+    worker_count = 22
+    selected = {
+        0: (0, 0, 0),
+        1: (10, 5, 1),
+        2: (20, 10, 2),
+        3: (22, 15, 3),
+        4: (22, 20, 4),
+        5: (22, 22, 5),
+        21: (22, 22, 21),
+        22: (22, 22, 22),
+        36: (22, 22, 22),
+    }
+
+    for active_experts in range(37):
+        work_items = (10 * active_experts, 5 * active_experts, active_experts)
+        participants = []
+        for item_count in work_items:
+            active_workers = {
+                block_idx
+                for block_idx in range(worker_count)
+                if tuple(range(block_idx, item_count, worker_count))
+            }
+            participants.append(active_workers)
+
+        gate_workers, activation_workers, quant_workers = participants
+        assert gate_workers == set(
+            range(min(worker_count, 10 * active_experts))
+        )
+        assert activation_workers == set(
+            range(min(worker_count, 5 * active_experts))
+        )
+        assert quant_workers == set(
+            range(min(worker_count, active_experts))
+        )
+        assert quant_workers <= activation_workers <= gate_workers
+        if active_experts in selected:
+            assert tuple(map(len, participants)) == selected[active_experts]
 
 
 def test_regular_routed_quant_math_is_chunk_invariant() -> None:

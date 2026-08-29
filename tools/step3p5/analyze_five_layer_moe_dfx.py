@@ -113,7 +113,7 @@ _PACKED_NZ_DECODE_SHA256 = (
     "da36c09dc275838ee364f76342d74717338ef313d912ba2b372808530489dd14"
 )
 _LOCAL_EP_DECODE_SHA256 = (
-    "91d677a874a5a9a4ac394e8a0e1d5e44fe7eccd87fa83dc3715a7ae20d392e41"
+    "cdb2bb26ddc0ca773bcddd0629bfc7bdfa5c426a334e26dde4364aacd867f348"
 )
 # These are the only upper bounds carried from the release-qualified R5
 # packed-fused analyzer.  R5 had a single mixed fused stage; the route-sidecar
@@ -178,9 +178,9 @@ _FROZEN_SOURCE_POLICIES = {
         "enforce_candidate_release_gate": True,
     },
     "local-ep": {
-        "policy_id": "release-local-ep-91d677a8-full-input-dag-v6",
-        "frozen_ref": "immutable source decode@91d677a8",
-        "decode_sha256_prefix": "91d677a8",
+        "policy_id": "release-local-ep-cdb2bb26-resident-dual-latch-22-v2",
+        "frozen_ref": "immutable source decode@cdb2bb26",
+        "decode_sha256_prefix": "cdb2bb26",
         "decode_sha256": _LOCAL_EP_DECODE_SHA256,
         "golden_protocol_profile": LOCAL_OWNER_PROTOCOL_PROFILE,
         "source_role": "candidate",
@@ -195,6 +195,10 @@ _FROZEN_SOURCE_POLICIES = {
             "tp_all_reduce"
         ),
         "expert_release_family": "packed_nz_mixed",
+        "mixed_resource_targets": {
+            "expert_gate_up": {"aic": 22, "aiv": 44},
+            "expert_down": {"aic": 23, "aiv": 46},
+        },
         "duration_limit_source": (
             "No new per-slice duration threshold is introduced here; timing "
             "qualification remains in the matched A/B/A and swimlane gates."
@@ -283,6 +287,17 @@ _PACKED_NZ_RESOURCE_TARGETS = {
         "aiv": 46,
     },
 }
+
+
+def _mixed_resource_grid_labels(
+    targets: dict[str, dict[str, int]],
+) -> dict[str, str]:
+    return {
+        stage: f"{int(values['aic'])} AIC/{int(values['aiv'])} AIV"
+        for stage, values in targets.items()
+    }
+
+
 _LEGACY_DIAGNOSTIC_STAGE_RESOURCES = {
     "expert_gate_up": "aic",
     "expert_gate": "aic",
@@ -3673,6 +3688,14 @@ def _expert_kernel_release_contract(
     required_aic_stages = _EXPERT_AIC_RELEASE_STAGES[release_family]
     duration_limits = _EXPERT_DURATION_LIMITS_US.get(release_family, {})
     packed_nz_mixed = release_family == "packed_nz_mixed"
+    mixed_resource_targets = (
+        policy.get("mixed_resource_targets", _PACKED_NZ_RESOURCE_TARGETS)
+        if packed_nz_mixed else {}
+    )
+    mixed_resource_labels = (
+        _mixed_resource_grid_labels(mixed_resource_targets)
+        if packed_nz_mixed else {}
+    )
     coverage: dict[str, Any] = {layer: {} for layer in _LAYER_PREFIX}
     coverage_errors: list[dict[str, Any]] = []
     duration_errors: list[dict[str, Any]] = []
@@ -3731,7 +3754,7 @@ def _expert_kernel_release_contract(
             if packed_nz_mixed:
                 stage_checks: dict[str, Any] = {}
                 rank_errors: list[dict[str, Any]] = []
-                for stage, targets in _PACKED_NZ_RESOURCE_TARGETS.items():
+                for stage, targets in mixed_resource_targets.items():
                     stage_data = stages.get(stage)
                     resources = (
                         stage_data.get("resources", {})
@@ -3802,7 +3825,7 @@ def _expert_kernel_release_contract(
                 rank_coverage["mixed_resource_grid"] = {
                     "applicable": True,
                     "pass": not rank_errors,
-                    "targets": _PACKED_NZ_RESOURCE_TARGETS,
+                    "targets": mixed_resource_targets,
                     "stages": stage_checks,
                 }
                 rank_coverage["activation_aiv"] = {
@@ -3814,8 +3837,8 @@ def _expert_kernel_release_contract(
                     ),
                 }
                 rank_coverage["interpretation"] = (
-                    "Packed-NZ nonempty ranks require one fused mixed task at "
-                    "24 AIC/48 AIV and one down mixed task at 23 AIC/46 AIV. "
+                    "Packed-NZ nonempty ranks require fused and down mixed "
+                    "tasks at the policy-selected AIC/AIV resource grids. "
                     "A rank with no routed physical slices is accepted here; "
                     "the task-ID contract must prove explicit predicate skips "
                     "and the route sidecar must prove zero routes."
@@ -4008,9 +4031,7 @@ def _expert_kernel_release_contract(
         "release_family": release_family,
         "required_aic_stages": list(required_aic_stages),
         "duration_limits_us": dict(duration_limits),
-        "mixed_resource_targets": (
-            _PACKED_NZ_RESOURCE_TARGETS if packed_nz_mixed else {}
-        ),
+        "mixed_resource_targets": mixed_resource_targets,
         "duration_limit_source": policy.get("duration_limit_source"),
         "coverage": coverage,
         "coverage_errors": coverage_errors,
@@ -4019,11 +4040,13 @@ def _expert_kernel_release_contract(
         "mixed_resource_errors": mixed_resource_errors,
         "interpretation": (
             (
-                "The da36c09d packed-NZ source is selected by exact source "
-                "SHA. Each execution-nonempty rank must expose one mixed "
-                "fused task at 24 AIC/48 AIV and one mixed down task at "
-                "23 AIC/46 AIV; independent activation/quant stages are not "
-                "required."
+                f"The {policy['policy_id']} policy is selected by exact "
+                "source SHA. Each execution-nonempty rank must expose one "
+                "mixed fused task at "
+                f"{mixed_resource_labels['expert_gate_up']} and one mixed "
+                "down task at "
+                f"{mixed_resource_labels['expert_down']}; independent "
+                "activation/quant stages are not required."
             )
             if packed_nz_mixed
             else (
@@ -4936,6 +4959,31 @@ def _markdown_table(rows: list[list[Any]], headers: list[str]) -> list[str]:
     return output
 
 
+def _expert_gate_markdown_lines(
+    expert_release: dict[str, Any],
+) -> list[str]:
+    if expert_release["release_family"] == "packed_nz_mixed":
+        labels = _mixed_resource_grid_labels(
+            expert_release["mixed_resource_targets"]
+        )
+        return [
+            "- Packed-NZ mixed resource grid gate: "
+            f"`{expert_release['mixed_resource_grid_pass']}` "
+            f"(fused {labels['expert_gate_up']}; "
+            f"BS1 down {labels['expert_down']})",
+            "- Independent activation/quant stage gate: `not applicable` "
+            "(activation and requant execute on fused-task AIV slices)",
+        ]
+    return [
+        "- Expert AIC duration gate: "
+        f"`{expert_release['duration_pass']}` "
+        "(raw diagnostic; enforced only for candidate)",
+        "- Expert activation AIV gate: "
+        f"`{expert_release['activation_pass']}` "
+        "(raw diagnostic; enforced only for candidate)",
+    ]
+
+
 def _write_markdown(report: dict[str, Any], path: Path) -> None:
     def duration_gate_text(resource: dict[str, Any]) -> str:
         if not resource.get("available"):
@@ -5000,23 +5048,7 @@ def _write_markdown(report: dict[str, Any], path: Path) -> None:
         lines.append("- None.")
     hidden_gate = report["external_correctness_contract"]["hidden_state_bit_exact"]
     expert_release = report["expert_kernel_release"]
-    if expert_release["release_family"] == "packed_nz_mixed":
-        expert_gate_lines = [
-            "- Packed-NZ mixed resource grid gate: "
-            f"`{expert_release['mixed_resource_grid_pass']}` "
-            "(fused 24 AIC/48 AIV; BS1 down 23 AIC/46 AIV)",
-            "- Independent activation/quant stage gate: `not applicable` "
-            "(activation and requant execute on fused-task AIV slices)",
-        ]
-    else:
-        expert_gate_lines = [
-            "- Expert AIC duration gate: "
-            f"`{expert_release['duration_pass']}` "
-            "(raw diagnostic; enforced only for candidate)",
-            "- Expert activation AIV gate: "
-            f"`{expert_release['activation_pass']}` "
-            "(raw diagnostic; enforced only for candidate)",
-        ]
+    expert_gate_lines = _expert_gate_markdown_lines(expert_release)
     lines.extend(
         [
             "",
